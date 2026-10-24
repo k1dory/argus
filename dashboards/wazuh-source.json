@@ -1,0 +1,22 @@
+{
+  "id": "wazuh-source",
+  "title": "Источник Wazuh",
+  "description": "Алерты менеджера Wazuh: по серьёзности, правилам, агентам, тактикам MITRE, комплаенс.",
+  "refresh": "60s",
+  "panels": [
+    {"id": "w1", "title": "Алерты по серьёзности", "type": "timeseries", "w": 16, "h": 8,
+     "sql": "SELECT $__timeInterval(timestamp) AS time, countIf(rule_level < 7) AS low, countIf(rule_level BETWEEN 7 AND 11) AS high, countIf(rule_level >= 12) AS critical FROM wazuh_alerts WHERE $__timeFilter(timestamp) GROUP BY time ORDER BY time"},
+    {"id": "w2", "title": "Всего / критичных", "type": "stat", "w": 8, "h": 4,
+     "sql": "SELECT count() AS alerts, countIf(rule_level >= 12) AS critical FROM wazuh_alerts WHERE $__timeFilter(timestamp)"},
+    {"id": "w3", "title": "Compliance, %", "type": "stat", "w": 8, "h": 4, "unit": "%",
+     "sql": "SELECT round(100 * avg(compliant), 1) AS compliance FROM policy_verdicts WHERE evaluated_at = (SELECT max(evaluated_at) FROM policy_verdicts)"},
+    {"id": "w4", "title": "Топ правил", "type": "bar", "w": 12, "h": 8,
+     "sql": "SELECT concat(toString(rule_id), ' · ', any(rule_description)) AS rule, count() AS alerts FROM wazuh_alerts WHERE $__timeFilter(timestamp) GROUP BY rule_id ORDER BY alerts DESC LIMIT 10"},
+    {"id": "w5", "title": "Тактики MITRE ATT&CK", "type": "bar", "w": 12, "h": 8,
+     "sql": "SELECT tactic, count() AS alerts FROM wazuh_alerts ARRAY JOIN mitre_tactics AS tactic WHERE $__timeFilter(timestamp) GROUP BY tactic ORDER BY alerts DESC LIMIT 12"},
+    {"id": "w6", "title": "Агенты", "type": "table", "w": 12, "h": 8,
+     "sql": "SELECT agent_name, count() AS alerts, countIf(rule_level >= 12) AS critical, max(timestamp) AS last FROM wazuh_alerts WHERE $__timeFilter(timestamp) AND agent_name != '' GROUP BY agent_name ORDER BY alerts DESC"},
+    {"id": "w7", "title": "Нарушения политик", "type": "table", "w": 12, "h": 8,
+     "sql": "SELECT policy, entity_name, arrayStringConcat(violations, '; ') AS violations FROM policy_verdicts WHERE compliant = 0 AND evaluated_at = (SELECT max(evaluated_at) FROM policy_verdicts) ORDER BY policy, entity_name LIMIT 50"}
+  ]
+}

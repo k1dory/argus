@@ -1,0 +1,57 @@
+{
+  "id": "wazuh-sca",
+  "title": "Wazuh · SCA: проверки конфигурации",
+  "description": "Security Configuration Assessment: балл по политикам (CIS), какие проверки провалены и на каких хостах. Источник — алерты Wazuh с группой sca.",
+  "refresh": "300s",
+  "panels": [
+    {
+      "id": "score",
+      "title": "Балл по политикам (последний скан)",
+      "type": "table",
+      "w": 14,
+      "h": 6,
+      "sql": "SELECT agent_name AS `хост`, JSONExtractString(raw,'data','sca','policy') AS `политика`, toUInt16OrZero(argMax(JSONExtractString(raw,'data','sca','score'), timestamp)) AS `балл`, toUInt16OrZero(argMax(JSONExtractString(raw,'data','sca','passed'), timestamp)) AS `пройдено`, toUInt16OrZero(argMax(JSONExtractString(raw,'data','sca','failed'), timestamp)) AS `провалено`, max(toString(timestamp)) AS `скан` FROM wazuh_alerts WHERE has(rule_groups,'sca') AND JSONExtractString(raw,'data','sca','type') = 'summary' AND $__timeFilter(timestamp) GROUP BY `хост`, `политика` ORDER BY `балл`"
+    },
+    {
+      "id": "totals",
+      "title": "Проверки за период",
+      "type": "stat",
+      "w": 10,
+      "h": 3,
+      "sql": "SELECT countIf(JSONExtractString(raw,'data','sca','check','result') = 'failed') AS `провалено`, countIf(JSONExtractString(raw,'data','sca','check','result') = 'passed') AS `пройдено`, uniqExact(agent_name) AS `хостов` FROM wazuh_alerts WHERE has(rule_groups,'sca') AND JSONExtractString(raw,'data','sca','type') = 'check' AND $__timeFilter(timestamp)"
+    },
+    {
+      "id": "byhost",
+      "title": "Провалы по хостам",
+      "type": "bar",
+      "w": 10,
+      "h": 3,
+      "sql": "SELECT agent_name AS `хост`, uniqExact(JSONExtractString(raw,'data','sca','check','id')) AS `проваленных_проверок` FROM wazuh_alerts WHERE has(rule_groups,'sca') AND JSONExtractString(raw,'data','sca','check','result') = 'failed' AND $__timeFilter(timestamp) GROUP BY `хост` ORDER BY `проваленных_проверок` DESC LIMIT 15"
+    },
+    {
+      "id": "trend",
+      "title": "Провалено / пройдено по времени",
+      "type": "timeseries",
+      "w": 24,
+      "h": 5,
+      "series": "result",
+      "sql": "SELECT $__timeInterval(timestamp) AS t, JSONExtractString(raw,'data','sca','check','result') AS result, count() AS n FROM wazuh_alerts WHERE has(rule_groups,'sca') AND JSONExtractString(raw,'data','sca','type') = 'check' AND $__timeFilter(timestamp) GROUP BY t, result ORDER BY t"
+    },
+    {
+      "id": "failed",
+      "title": "Проваленные проверки (по хостам, последний результат)",
+      "type": "table",
+      "w": 24,
+      "h": 9,
+      "sql": "SELECT JSONExtractString(raw,'data','sca','check','id') AS `проверка`, any(JSONExtractString(raw,'data','sca','check','title')) AS `название`, groupUniqArray(agent_name) AS `хосты`, any(JSONExtractString(raw,'data','sca','check','compliance','cis')) AS cis, any(JSONExtractString(raw,'data','sca','check','compliance','pci_dss')) AS pci_dss, max(toString(timestamp)) AS `последний_раз` FROM wazuh_alerts WHERE has(rule_groups,'sca') AND JSONExtractString(raw,'data','sca','check','result') = 'failed' AND $__timeFilter(timestamp) GROUP BY `проверка` ORDER BY length(`хосты`) DESC, `проверка` LIMIT 100"
+    },
+    {
+      "id": "topfailed",
+      "title": "Самые частые провалы",
+      "type": "bar",
+      "w": 24,
+      "h": 6,
+      "sql": "SELECT concat(JSONExtractString(raw,'data','sca','check','id'), ' · ', substring(JSONExtractString(raw,'data','sca','check','title'),1,60)) AS `проверка`, count() AS `раз` FROM wazuh_alerts WHERE has(rule_groups,'sca') AND JSONExtractString(raw,'data','sca','check','result') = 'failed' AND $__timeFilter(timestamp) GROUP BY `проверка` ORDER BY `раз` DESC LIMIT 10"
+    }
+  ]
+}

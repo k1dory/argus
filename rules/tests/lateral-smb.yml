@@ -1,0 +1,5 @@
+rule: a41c-lateral-002
+fixture: fixtures/events/august.ndjson
+expect_incidents: 1
+expect_actor: svc-backup
+min_events: 10

@@ -1,0 +1,32 @@
+# Мало места на диске ClickHouse — самый частый способ тихо потерять SIEM:
+# вставки отклоняются, коллектор копит очередь, а дежурный узнаёт через день.
+# Движок раз в цикл пишет событие source argus.system / action disk.usage с
+# занятостью самого заполненного диска (value, percent); это правило заводит
+# критичный инцидент по первому же замеру ≥ 90 % (порог count: 1 нужен ради
+# группировки по узлу) и закрывает его, когда занятость опускается ниже 85 %.
+# Порог меняется здесь, а не переменной окружения: мониторинг хранилища
+# описывается тем же YAML, что и остальные правила.
+title: "ARGUS: ClickHouse disk is almost full"
+id: a41c-ops-062
+level: critical
+tags: [argus.system, ops.storage]
+
+detection:
+  selection:
+    source: argus.system
+    action: disk.usage
+    value: '>= 90'
+  threshold:
+    kind: count
+    count: 1
+    window: 5m
+    group_by: node
+  condition: selection and threshold
+
+close_on:
+  source: argus.system
+  action: disk.usage
+  value: '< 85'
+
+analyst:
+  profile: mock             # разбор не нужен: освободите место или расширьте раздел (README: «Хранилище: отдельный диск»)

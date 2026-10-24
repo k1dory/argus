@@ -1,0 +1,130 @@
+# Профили LLM-аналитика. Бэкенд профиля — имя из реестра движка:
+# openai-compatible (по умолчанию: любой сервер с Chat Completions API — vLLM,
+# llama.cpp, Ollama, облачный провайдер), mock (стенд без модели) или бэкенд,
+# зарегистрированный в коде через analyst.RegisterBackend. Неизвестное имя —
+# ошибка конфигурации на старте.
+# Строгий профиль не покидает периметр: egress: deny проверяет резолв хоста
+# (только приватные адреса или allow_hosts) при каждом соединении, запрещает
+# редиректы и требует https (или явный allow_plain_http).
+# Профили без egress: deny — «облачные»: в них не уходят заметки дежурных из
+# похожих инцидентов, приватные адреса схлопываются до сети, узлы и учётки
+# заменяются хешами, из URL вырезается query, ИНН маскируется; число вызовов
+# в сутки ограничено ANALYST_DAILY_LIMIT (движок, по умолчанию 500).
+# Данные инцидента в промпте обёрнуты в маркеры <<<EVENT_DATA … EVENT_DATA>>>.
+# Переменные окружения: форма «VAR:-default» даёт default, если VAR не задана
+# или пуста; форма без default подставляется только заданной переменной, иначе
+# плейсхолдер остаётся в тексте как есть (с предупреждением в логе). Поэтому у
+# необязательных переменных здесь явный пустой default «:-», а плейсхолдеры
+# ip/incident/reason — шаблоны исполнителя, их заполняет движок при блокировке.
+profiles:
+  on-prem-strict:
+    backend: openai-compatible
+    endpoint: ${ARGUS_LLM_LOCAL_ENDPOINT:-http://llm.internal:8000/v1}
+    model: ${ARGUS_LLM_LOCAL_MODEL:-qwen3-32b-instruct}
+    api_key: ${ARGUS_LLM_LOCAL_API_KEY:-}                 # если локальный сервер требует ключ
+    egress: deny
+    allow_plain_http: ${ARGUS_LLM_LOCAL_PLAIN_HTTP:-true}   # LLM-сервер внутри периметра без TLS; false, когда появится https
+    max_tokens: 2048
+    timeout: 60s
+
+  mock:                       # стенд без модели: детерминированный разбор
+    backend: mock
+
+default_profile: ${ARGUS_ANALYST_PROFILE:-mock}
+force_profile: ${ARGUS_ANALYST_FORCE_PROFILE:-}          # стенд без модели: mock → все правила в mock; в бою пусто
+pii_profile: ${ARGUS_ANALYST_PII_PROFILE:-mock}   # инциденты с ПДн — только сюда (в бою: on-prem-strict)
+
+output:
+  reject_if_confidence_below: 0.35     # ниже — вердикт скрывается; причина показа/скрытия — в shown_reason
+                                       # (порог, короткий summary, evidence не из данных) — одинаково для всех бэкендов
+
+redact:
+  patterns: [email, phone, passport, inn, card]   # для облачных профилей inn включается всегда
+
+notify:
+  telegram:
+    chat_id: ${TELEGRAM_CHAT_ID:-}       # токен бота — только в TELEGRAM_BOT_TOKEN
+    levels: [critical, high]
+  email:                               # пусто host — выключено; пароль только в SMTP_PASSWORD
+    host: ${SMTP_HOST:-}
+    port: ${SMTP_PORT:-587}
+    from: ${SMTP_FROM:-argus@corp.local}
+    to: [${SMTP_TO:-soc@corp.local}]
+    user: ${SMTP_USER:-}
+    password: ${SMTP_PASSWORD:-}
+    starttls: true
+    levels: [critical, high]
+  # Исходящие вебхуки: новый инцидент (incident.created) уровня не ниже min_level → цель.
+  # Ручная эскалация аналитиком (incident.escalated) уходит независимо от min_level: человек
+  # уже решил, что инцидент важный; не нужна цели — уберите её из events. Адрес, секрет и токен — ИМЕНА переменных
+  # окружения (url_env/secret_env/token_env), значения в этот файл не пишутся. Цель
+  # с пустым адресом выключена. Повтор того же события не доставляется дважды (webhook_deliveries).
+  webhooks:
+    # Произвольный приёмник: JSON POST, подпись X-Argus-Signature: sha256=HMAC(тело),
+    # заголовки X-Argus-Event и X-Argus-Delivery (стабильный id доставки для дедупа на стороне получателя).
+    - name: soc-hook
+      kind: webhook
+      min_level: high
+      events: [incident.created, incident.escalated]
+      include_chain: false                     # true — в тело попадает цепочка событий
+      url_env: ARGUS_WEBHOOK_URL
+      secret_env: ARGUS_WEBHOOK_SECRET         # ≥32 символов
+      token_env: ARGUS_WEBHOOK_TOKEN           # необязательный Bearer
+
+# Обратный канал «заблокировать адрес» из карточки инцидента и автоблокировка.
+# Оба исполнителя выключены, пока не заданы адреса; приватные IP не блокируются никогда.
+respond:
+  # Режим: ids — только детект; simulate — журнал «кого бы заблокировал» (по умолчанию);
+  # ips — автоблокировка правилами с блоком respond. Переключается и из консоли.
+  # В ips движок не стартует в бой, если allowlist/never_block не разбирается или
+  # у HTTP-исполнителя нет unblock — откат в simulate с записью в config_errors.
+  mode: ${ARGUS_RESPOND_MODE:-simulate}
+  ttl: ${ARGUS_RESPOND_TTL:-1h}                   # срок автоблокировки (правило может задать свой respond.ttl)
+  manual_ttl: ${ARGUS_RESPOND_MANUAL_TTL:-24h}    # срок ручной блокировки из консоли; 0 — бессрочно (снимается только кнопкой)
+  # Никогда не блокировать: свои сети, мониторинг, VPN администраторов. Приватные
+  # диапазоны и loopback исключены всегда.
+  allowlist:
+    - ${ARGUS_RESPOND_ALLOWLIST_1:-}
+    - ${ARGUS_RESPOND_ALLOWLIST_2:-}
+  # never_block — неснимаемый deny-list инфраструктуры: адреса NGFW, менеджера
+  # Wazuh, консоли, IdP, NAT офисов. Дополняется env ARGUS_RESPOND_NEVER_BLOCK_1..N.
+  never_block:
+    - ${ARGUS_RESPOND_NEVER_BLOCK_1:-}
+    - ${ARGUS_RESPOND_NEVER_BLOCK_2:-}
+  # trusted_sources — CIDR отправителей, чьим событиям по UDP/TCP-syslog можно
+  # верить для автоблокировки (события по file/http/tls/pull доверенные всегда).
+  # Дополняется env ARGUS_RESPOND_TRUSTED_1..N. Без этого события от неизвестных
+  # пиров заводят инцидент, но не блокировку: syslog по UDP подделывается.
+  trusted_sources:
+    - ${ARGUS_RESPOND_TRUSTED_1:-}
+    - ${ARGUS_RESPOND_TRUSTED_2:-}
+  wazuh_active_response:
+    api_url: ${WAZUH_API_URL:-}
+    user: ${WAZUH_API_USER:-wazuh}
+    password: ${WAZUH_API_PASSWORD:-}
+    command: firewall-drop
+    agents: ${WAZUH_AR_AGENTS:-}                     # список id через запятую (001,002); пусто — исполнитель выключен; all — все агенты, с предупреждением
+    insecure_tls: ${WAZUH_INSECURE_TLS:-false}
+    # API Wazuh 4.x не принимает срок блокировки: он задаётся <timeout> в блоке
+    # <active-response> ossec.conf менеджера. Укажите то же число секунд здесь —
+    # иначе движок не может подтвердить снятие по TTL и оставляет блок в списке.
+    timeout: ${WAZUH_AR_TIMEOUT:-0}
+    # Досрочное снятие (кнопка «разблокировать»): кастомная AR-команда на
+    # агентах, вызывающая firewall-drop с "command":"delete". Пусто — нельзя.
+    unblock_command: ${WAZUH_AR_UNBLOCK_COMMAND:-}
+  http:
+    - name: ngfw.usergate
+      method: POST
+      url: ${NGFW_BLOCK_URL:-}                       # напр. https://ug.corp/api/v1/ip_lists/blocked/add
+      headers: {Authorization: "Bearer ${NGFW_TOKEN:-}"}
+      body: '{"ip": "${ip}", "comment": "ARGUS ${incident}: ${reason}"}'
+      insecure_tls: false
+      # Подтверждение блокировки по ответу 2xx (пусто — не проверять):
+      # expect — регулярное выражение с якорями, напр. '^\{"status":\s*"ok"';
+      # expect_json — ключи ответа и ожидаемые значения: {success: true, data.status: ok}.
+      expect: ${NGFW_EXPECT:-}
+      expect_json: {}
+      unblock:                                       # снятие по TTL и вручную; в режиме ips обязателен
+        method: POST
+        url: ${NGFW_UNBLOCK_URL:-}
+        body: '{"ip": "${ip}"}'

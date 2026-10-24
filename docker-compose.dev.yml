@@ -1,0 +1,21 @@
+# Стенд / разработка: make up-dev
+#   docker compose --env-file .env.dev -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+# .env.dev даёт дефолтные секреты (compose требует их через ${VAR:?}),
+# этот override включает ARGUS_DEV=1: приём без токена, дефолтные пароли —
+# только предупреждение migrator'а, движок стартует без ENGINE_TOKEN.
+# В бою этот файл не подключается.
+services:
+  migrator:
+    environment:
+      ARGUS_DEV: "1"
+  collector:
+    environment:
+      ARGUS_DEV: "1"
+  engine:
+    environment:
+      ARGUS_DEV: "1"
+      ARGUS_ANALYST_FORCE_PROFILE: mock
+  web:
+    environment:
+      # http://127.0.0.1:3001 без TLS: кука без Secure
+      SESSION_SECURE: "false"

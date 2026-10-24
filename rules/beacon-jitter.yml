@@ -1,0 +1,22 @@
+# Маячок C2: ровные интервалы обращений к внешнему адресу при малом объёме.
+title: Periodic beacon to external host
+id: a41c-c2-016
+level: low
+tags: [attack.command_and_control, attack.t1071.001]
+
+detection:
+  selection:
+    source.class: netflow
+    bytes: '< 65536'
+  filter:                      # свои сети — не маячок (Go regexp без lookahead)
+    dst.ip|regex: '^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)'
+  threshold:
+    kind: periodic
+    count: 6
+    window: 45m
+    group_by: src.ip
+    jitter: 0.05
+  condition: selection and not filter and threshold
+
+analyst:
+  profile: on-prem-strict

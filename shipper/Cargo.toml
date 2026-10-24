@@ -1,0 +1,18 @@
+[package]
+name = "wazuh-shipper"
+version = "0.2.0"
+edition = "2021"
+description = "Tails Wazuh alerts.json and ships alerts to ClickHouse in batches"
+
+[dependencies]
+anyhow = "1"
+# rustls вместо native-tls: без openssl-sys бинарник статический и живёт в distroless.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "charset"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = true
+strip = true

@@ -1,0 +1,15 @@
+# Доступ к памяти LSASS инструментом из пользовательского temp — подпись валидна, место запуска нет
+title: LSASS memory access from user temp
+id: a41c-cred-004
+level: critical
+tags: [attack.credential_access, attack.t1003.001]
+
+detection:
+  selection:
+    source.class: edr
+    attrs.name|contains: lsass
+    object|regex: '(?i)(temp|appdata|downloads)'
+  condition: selection
+
+analyst:
+  profile: on-prem-strict

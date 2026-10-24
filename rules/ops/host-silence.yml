@@ -1,0 +1,21 @@
+# Узел замолчал: телеметрия с него шла и прекратилась дольше чем на 10 минут.
+# Порог absence считается относительно «сейчас» по последнему событию узла.
+# Причина — выключение, сеть, упавший агент; что именно — разбирает человек.
+title: "Ops: host stopped sending telemetry"
+id: a41c-ops-061
+level: medium
+tags: [ops.availability]
+
+detection:
+  selection:
+    source.class: telemetry
+  threshold:
+    kind: absence
+    window: 10m
+    group_by: node
+  condition: selection and threshold
+
+auto_close: 1h            # заговорил снова / никто не взял — закрываем сами
+
+analyst:
+  profile: on-prem-strict

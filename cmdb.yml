@@ -1,0 +1,9 @@
+# CMDB для обогащения cmdb.owner: узел → владелец, команда, критичность.
+# В бою — экспорт из NetBox/GLPI по расписанию в этот файл.
+nodes:
+  web-01:    {owner: "i.petrov",  team: platform, criticality: high,   note: "публичный nginx"}
+  db-01:     {owner: "a.sidorov", team: data,     criticality: critical, note: "PostgreSQL прод"}
+  app-01:    {owner: "i.petrov",  team: platform, criticality: high}
+  win-dc-01: {owner: "s.ivanova", team: infra,    criticality: critical, note: "контроллер домена"}
+  WKS-2214:  {owner: "a.sidorov", team: office,   criticality: low}
+  fw-01:     {owner: "s.ivanova", team: network,  criticality: critical}

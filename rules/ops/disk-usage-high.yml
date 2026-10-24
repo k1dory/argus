@@ -1,0 +1,34 @@
+# Диск узла заполнен: телеметрия (source.class telemetry, action disk.usage)
+# три замера подряд показывает занятость ≥ 90 %. Один всплеск — не повод для
+# инцидента (ротация логов, временный файл), три за 15 минут — тренд.
+# Собственная телеметрия движка о диске ClickHouse исключена: для неё есть
+# отдельное правило argus-disk-low уровня critical, иначе один и тот же диск
+# давал бы два инцидента.
+# Закрывается сам, когда занятость опускается ниже 85 % (гистерезис, чтобы
+# инцидент не мигал вокруг порога).
+title: "Ops: disk usage above 90%"
+id: a41c-ops-060
+level: high
+tags: [ops.storage, ops.capacity]
+
+detection:
+  selection:
+    source.class: telemetry
+    action: disk.usage
+    value: '>= 90'
+  filter:
+    source: argus.system
+  threshold:
+    kind: count
+    count: 3
+    window: 15m
+    group_by: node
+  condition: selection and not filter and threshold
+
+close_on:
+  source.class: telemetry
+  action: disk.usage
+  value: '< 85'
+
+analyst:
+  profile: on-prem-strict

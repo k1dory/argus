@@ -1,0 +1,7 @@
+# «сейчас» = последнее событие фикстуры + 1 минута: web-01 молчит с 10:20 (больше 10m),
+# db-01 и clickhouse отчитались в 10:50.
+rule: a41c-ops-061
+fixture: fixtures/events/telemetry.ndjson
+now_offset: 1m
+expect_incidents: 1
+expect_actor: web-01

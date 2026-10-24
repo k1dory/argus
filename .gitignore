@@ -1,0 +1,26 @@
+# build artifacts
+*.log
+.env
+backups/
+*.age
+*.enc
+sample/alerts.json
+shipper/target/
+web/.auth.json
+web/.next/
+web/node_modules/
+bin/
+mcp/mcp
+engine/engine
+cosign.key
+sample/waf/*
+!sample/waf/.gitkeep
+caddy/certs/*
+!caddy/certs/.gitkeep
+collector/certs/*
+!collector/certs/.gitkeep
+
+.env.ai
+
+# локальные настройки Claude Code разработчика
+.claude/

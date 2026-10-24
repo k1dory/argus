@@ -1,0 +1,11 @@
+{
+  "config": {
+    "agent": {
+      "max_stale_seconds": 600,
+      "min_version": "v4.9.0"
+    },
+    "sca": {
+      "min_score": 75
+    }
+  }
+}

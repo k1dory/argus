@@ -1,0 +1,18 @@
+# Перебор паролей по SSH: правило Wazuh 5763 на одном узле много раз за полчаса
+title: SSH brute force against a host
+id: a41c-auth-030
+level: high
+tags: [attack.credential_access, attack.t1110]
+
+detection:
+  selection:
+    source: wazuh.agents
+    event.action: rule.5763
+  threshold:
+    count: 20
+    window: 30m
+    group_by: node
+  condition: selection and threshold
+
+analyst:
+  profile: on-prem-strict

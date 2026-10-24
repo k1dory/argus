@@ -1,0 +1,4 @@
+rule: a41c-cred-004
+fixture: fixtures/events/august.ndjson
+expect_incidents: 1
+expect_actor: a.sidorov

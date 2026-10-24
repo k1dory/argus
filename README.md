@@ -1,0 +1,724 @@
+# ARGUS
+
+Единый журнал событий и корреляция на ClickHouse. Коллекторы снимают события с NGFW,
+EDR/XDR, Kubernetes, CI/CD, NetFlow, syslog и телеметрии хостов, нормализуют их в одну
+схему события (субъект · объект · действие · узел · сеанс · значение) и коррелируют
+правилами из git. Правило безопасности и правило эксплуатации пишутся одинаково:
+«20 отказов SSH на узле за полчаса» и «диск занят больше 90 % три замера подряд» —
+один язык, одна лента инцидентов, одна отработка. Каждый инцидент может получить разбор
+языковой модели (локальной, с редакцией ПДн) и разбор внешнего агента через нейтральный
+API. Wazuh подключается как модуль, а не как центр системы. Комплаенс — Policy-as-Code
+на OPA/Rego.
+
+Поток данных: источники → `collector` (Go) → `argus.events` → `engine` (Go): правила →
+инциденты → уведомления, вебхуки, LLM-разбор → консоль `web` (Next.js) за Caddy `:8443`.
+Внешние агенты читают журнал через `argus-mcp` или `GET /api/v1/log` и возвращают вердикт
+через `POST /api/triage/verdicts`. Схема — в [docs/architecture.svg](docs/architecture.svg).
+
+## Компоненты
+
+- `collector/` — Go. Приёмник событий: syslog RFC 5424/3164 с разбором CEF
+  (Check Point, PAN-OS, Kaspersky, CrowdStrike…) и LEEF (UserGate, Ideco), NetFlow v9 /
+  IPFIX с кэшем шаблонов, вебхуки Kubernetes audit и GitLab (audit streaming,
+  system hooks, pipeline). Всё нормализуется в единую схему `argus.events`
+  (субъект · объект · действие · узел · сеанс), источник классифицируется по вендору
+  (`collector.yml`), события с e-mail/телефонами и источники с `pii: true`
+  помечаются флагом ПДн. Что ClickHouse не принял — в `argus.ingest_rejects` (30 дней).
+  Перед отправкой в ClickHouse батчи сохраняются в дисковую очередь
+  `collector-state:/state/spool`; после перезапуска незавершённые батчи
+  отправляются повторно. Успешный ответ вебхука означает, что батч уже записан
+  на диск. При заполнении очереди HTTP возвращает `503` с `Retry-After`, а
+  TCP/TLS-источники получают обратное давление. UDP не подтверждает доставку.
+  После аварии возможен повтор последнего батча, поэтому при анализе сырых
+  событий учитывайте семантику «как минимум один раз».
+- `engine/` — Go. Ядро корреляции: Sigma-подобные правила из `rules/*.yml`
+  (selection / filter / threshold с окнами и distinct), инциденты со статусами
+  отработки, LLM-аналитик по строгой JSON-схеме за интерфейсом `analyst.Backend`
+  (бэкенды `openai-compatible` — Ollama, vLLM, OpenAI и совместимые — и `mock`; профиль
+  `on-prem-strict` с `egress: deny` проверяет резолв хоста), редакцией ПДн и порогом
+  уверенности, Telegram/e-mail и подписанные вебхуки. `argus rules test` гоняет правила по записанному
+  трафику (`fixtures/events/*.ndjson`, ожидания в `rules/tests/`).
+- `rules/` — правила корреляции как файлы в git: `rules/*.yml` — нейтральные к вендору,
+  `rules/ops/` — эксплуатация (диск, тишина узла), `rules/wazuh/` — на алертах Wazuh;
+  `fixtures/` — записанный трафик и телеметрия для `argus rules test`.
+- `shipper/` — Rust, модуль Wazuh. Тейлит `/var/ossec/logs/alerts/alerts.json` (NDJSON),
+  переживает ротацию и усечение файла, ведёт чекпоинт (inode+offset), пишет батчами в
+  `argus.wazuh_alerts`.
+- `policyd/` — Go, модуль Wazuh. Раз в `POLL_INTERVAL` забирает агентов и SCA-результаты из
+  API менеджера (JWT через `POST /security/user/authenticate`), прогоняет через встроенный
+  OPA, вердикты (с полем `status`) кладёт в `argus.policy_verdicts` и отдаёт на
+  `:8080/verdicts` (bearer `POLICYD_TOKEN`, если задан).
+- `policies/` — Rego-политики с юнит-тестами; пороги в `config.json`.
+- `clickhouse/migrations/` — версионированная схема: идемпотентные SQL-файлы,
+  применяются сервисом `migrator` (журнал — `argus.schema_migrations`). `events` и
+  `wazuh_alerts` — TTL 180 дней, `policy_verdicts` — 90, почасовой агрегат
+  `wazuh_alerts_hourly` (materialized view) — 2 года.
+- `dashboards/` — provisioned-дашборды конструктора консоли (JSON-модель):
+  «ARGUS Overview», WAF и, в модуле Wazuh, «Источник Wazuh», FIM, SCA. Свои строятся в консоли:
+  панели timeseries / bar / stat / table, SQL к ClickHouse с макросами `$__timeFilter`,
+  `$__timeInterval`, сетка 24 колонки, экспорт/импорт JSON. Запросы панелей
+  выполняются от пользователя `argus_ro` (`readonly=1`, лимиты неизменяемы).
+- `web/` — консоль на Next.js + shadcn/ui: вход (пароль + опциональный TOTP 2FA, SSO),
+  обзор, «Инциденты» (лента, карта, вердикты движка и агентов, отработка), «Журнал»
+  (все источники, live-tail), «Поиск», «Источники» (живость коллекторов, EPS, доля ПДн),
+  «Правила», «Дашборды», настройки; REST API `/api/*` и `/api/v1/log` для агентов.
+  Разделы модуля Wazuh (алерты, CVE, MITRE ATT&CK, политики, агенты, управление
+  менеджером) появляются при `ARGUS_INTEGRATION_WAZUH=1`.
+- `mcp/` — `argus-mcp`: MCP-сервер для агентов (Claude Code, Cursor) поверх API консоли,
+  профили `full` и `triage` (редакция, псевдонимы, область одного инцидента).
+- `caddy/` — TLS-терминация: консоль `:8443`, вебхуки коллектора `:8089`.
+
+## Запуск
+
+```sh
+./scripts/argus init        # .env (права 600) со всеми секретами + make up
+./scripts/argus init --with-wazuh   # то же плюс модуль Wazuh (shipper, policyd, разделы консоли); --without-wazuh — выключить
+make demo                   # записанный трафик и телеметрия → инциденты за полминуты
+```
+
+`argus init` генерирует пароли семи пользователей ClickHouse, `ENGINE_TOKEN`,
+`ARGUS_INGEST_TOKEN`, `ARGUS_API_TOKEN`, `ARGUS_MCP_HTTP_TOKEN`, `POLICYD_TOKEN`,
+`BACKUP_KEY` (`openssl rand -hex 24`), существующие значения не трогает — его можно
+повторять при апгрейде, чтобы дописать новые переменные. Пароль API менеджера Wazuh
+(`WAZUH_API_PASSWORD`) при включённом модуле впишите руками. Без секретов compose не стартует
+(`${VAR:?}` с подсказкой), а `migrator` отказывает на паролях `argus`, `argus-*`,
+`change-me*`. `make up` больше не генерирует демо-данные — это `make demo`.
+
+Консоль: <https://localhost:8443> (Caddy, внутренний CA; без TLS — <http://127.0.0.1:3001>
+с `SESSION_SECURE=false`). Пароль пользователя `admin` генерируется при первом старте
+и лежит в томе `web-auth`:
+
+```sh
+docker compose exec web cat /data/admin-password.txt
+```
+
+Смените его на странице «Настройки» — файл после этого удаляется (политика паролей как
+у wazuh-passwords-tool: 8–64 символа, заглавная, строчная, цифра и один из `.*+?-`).
+Если стартовый пароль утерян, остановите консоль и сбросьте только пароль `admin`
+(пользователи и 2FA сохранятся):
+
+```sh
+docker compose stop web
+docker compose run --rm --no-deps --entrypoint node web /app/reset-admin-password.cjs
+docker compose up -d web
+docker compose exec web cat /data/admin-password.txt
+```
+
+Новый пароль снова потребуется сменить при первом входе. В консоли код 2FA
+запрашивается только после верного пароля, если она включена у этого пользователя.
+
+Стенд без секретов — `make up-dev`: дефолты из `.env.dev` и `docker-compose.dev.yml`
+(`ARGUS_DEV=1`: приём без токена, слабые пароли только предупреждение). В бою этот
+режим не используется.
+
+Демо-данные — `fixtures/events/*.ndjson` и, для модуля Wazuh, `./sample/alerts.json`; в бою
+укажите в `.env` `WAZUH_ALERTS_DIR=/var/ossec/logs/alerts` (каталог, не файл — bind-mount файла
+пришпиливает inode и прячет ротацию) и доступ до API менеджера для policyd.
+Без живого менеджера policyd просто логирует ошибку и ждёт.
+
+## Пользователи ClickHouse, сети, порты
+
+Админ ClickHouse (`CLICKHOUSE_USER`/`CLICKHOUSE_PASSWORD`) нужен только `migrator`'у.
+Он применяет миграции и заводит служебных пользователей (пароли уходят в ClickHouse
+как `sha256(password + salt)`, в SQL и argv не попадают; гранты декларативны —
+`REVOKE ALL`, затем ровно перечисленное):
+
+| Пользователь | Кто | Права |
+|---|---|---|
+| `argus_ro` | панели дашбордов | `SELECT argus.*`; `readonly=1`, `max_execution_time=20`, `max_memory_usage=2G`, `max_rows_to_read=500M`, `max_result_rows=5000` + `result_overflow_mode=break`, не больше 4 запросов разом — всё в профиле и неизменяемо; консоль настроек в запросе не передаёт и пускает не больше 3 панелей разом — на один процесс, несколько экземпляров консоли делят лимит 4 |
+| `argus_console` | консоль | `SELECT argus.*` + `INSERT` в `incidents`, `console_rule_mutes`, `rule_exceptions`, `console_audit`, `console_dashboards`, `console_settings`; DDL закрыт |
+| `argus_collector` | коллектор | `INSERT` в `events`, `collector_health` (+ цель MV `collector_health_log`), `ingest_rejects` |
+| `argus_shipper` | шиппер | `INSERT` в `wazuh_alerts` (+ цели MV `wazuh_alerts_hourly`, `events`) |
+| `argus_policyd` | policyd | `INSERT` в `policy_verdicts` |
+| `argus_engine` | движок | `SELECT argus.*`, `INSERT` в `incidents`, `incident_verdicts`, `response_log`; `SELECT system.disks` |
+
+У пишущих сервисов `allow_ddl=0` и потолки времени/памяти (`MAX`), у которых сервис
+может ужесточить, но не снять. `SOURCES`/`HOST` не ограничиваются — подсеть compose
+динамическая.
+
+Сети compose: `data` (`internal: true` — ClickHouse и все, кто к нему ходит; наружу
+трафика нет), `edge` (Caddy ↔ web / collector), `egress` (движок — Wazuh API,
+облачный профиль LLM, Telegram; policyd и web — Wazuh API; collector — pull-источники;
+mcp → web). Все сервисы: `cap_drop ALL`, `no-new-privileges`, read-only ФС (кроме
+ClickHouse), `tmpfs` под `/tmp`, лимиты pid и памяти. ClickHouse наружу не публикуется —
+с хоста к нему `docker compose exec clickhouse clickhouse-client`.
+
+| Порт | Что | Кому |
+|---|---|---|
+| `8443/tcp` | консоль, TLS (Caddy) | операторы, MCP по `ARGUS_API_TOKEN` |
+| `8089/tcp` | `https://…/ingest/*` — вебхуки коллектора, TLS (Caddy → collector:8088) | k8s audit, GitLab, Harbor, Argo CD, NDJSON |
+| `5514/udp+tcp` | syslog CEF/LEEF | NGFW, EDR, Jenkins |
+| `6514/tcp` | syslog TLS (RFC 5425); включается `SYSLOG_TLS_ADDR=:6514` + сертификат в `./collector/certs` | NGFW с TLS, NXLog/Winlogbeat |
+| `2055/udp` | NetFlow v9 / IPFIX (`NETFLOW_EXPORTERS` — allow-list) | роутеры |
+| `127.0.0.1:8088` | HTTP коллектора: `/metrics`, `/healthz`, replay | только localhost |
+| `127.0.0.1:8090`, `:8080` | `/metrics`/`/healthz` движка, policyd | только localhost |
+| `127.0.0.1:3001` | консоль без TLS | только localhost |
+| `127.0.0.1:18095` | MCP по HTTP (профиль `mcp`) | только localhost |
+
+`INGEST_BIND` ограничивает интерфейс для 6514/8089 (по умолчанию `0.0.0.0`).
+
+## Коллекторы и правила
+
+```sh
+make replay                                   # залить записанный трафик → инциденты за полминуты
+./scripts/argus rules test                    # тесты правил (rules/tests/*.yml)
+./scripts/argus rules test --replay fixtures/events/august.ndjson
+./scripts/argus rules test --replay fixtures/events/telemetry.ndjson
+```
+
+Куда направлять источники:
+
+| Источник | Как | Куда |
+|---|---|---|
+| NGFW / прокси: Check Point (Log Exporter), PAN-OS, UserGate, Ideco, Fortinet | syslog CEF / LEEF | `:5514` UDP/TCP, `:6514` TLS |
+| Squid | native access.log через syslog | `:5514` |
+| EDR: Kaspersky, Cortex XDR | syslog CEF | `:5514` |
+| CrowdStrike Falcon | Streaming API (OAuth2) | `collector.yml → falcon`, `FALCON_*` |
+| Sysmon, FIM, SCA, rootcheck | агент Wazuh → менеджер (модуль Wazuh) | `WAZUH_ALERTS_DIR` |
+| телеметрия хостов: диск, load, очереди | NDJSON с `value`/`unit` (`scripts/telemetry-sample.sh`) | `POST …:8089/ingest/events` |
+| Kubernetes audit | webhook | `POST https://<host>:8089/ingest/k8s-audit` |
+| GitLab (audit streaming, system hooks, pipeline) | webhook | `POST https://<host>:8089/ingest/gitlab` |
+| Harbor, Argo CD | webhook | `…:8089/ingest/harbor`, `/ingest/argocd` |
+| Jenkins Audit Trail | syslog | `:5514` |
+| Yandex Cloud Audit Trails, VK Cloud | S3-бакет | `collector.yml → s3`, `YC_*` |
+| NetFlow v9 / IPFIX | UDP | `:2055` |
+| всё остальное (RFC 5424/3164, сырой текст) | syslog | `:5514` |
+| свои события единой схемы | NDJSON | `POST …:8089/ingest/events` |
+
+Вебхуки требуют заголовок `X-Argus-Token: $ARGUS_INGEST_TOKEN` (стенд `ARGUS_DEV=1` — без
+него). Запись tcpdump: `docker compose exec collector /collector replay-pcap file.pcap`.
+Пропускная способность: `./scripts/bench-ingest.sh 200000` (см. CHANGELOG).
+
+Утечка секрета в CI (`ci-secret-echo`) автоматикой закрывается только отзывом доказанно того
+же токена: у утечки и у события `*_revoked` из аудита (`source` `*.audit`) совпадают
+неизменяемый `attrs.token_id`, провайдер (`vendor`/`product`) и экземпляр (`attrs.instance`).
+Имя секрета (`attrs.secret_id`) выбирает пользователь — оно только находит инцидент. Ротация
+(`*_rotated`) не закрывает: GitLab заводит при ней новый токен. Утечка из лога CI знает лишь имя
+переменной, поэтому сейчас такие инциденты по ротации или отзыву **не закрываются**, а
+эскалируются с пометкой «закрыт автоматикой, нужна проверка» (тег `argus.needs_review`) — это
+осознанное решение: однофамилец любого возраста иначе закрыл бы утечку действующего секрета.
+
+LLM-аналитик: профили в `engine/argus.analyst.yml`, ключи только через окружение
+(`ARGUS_LLM_LOCAL_ENDPOINT`, `ARGUS_LLM_LOCAL_MODEL`, `ARGUS_LLM_LOCAL_API_KEY`); бэкенд —
+любой сервер с API OpenAI (`/chat/completions`): Ollama, vLLM, LM Studio, OpenAI, совместимые
+шлюзы. Новый бэкенд добавляется реализацией интерфейса `analyst.Backend` в
+`engine/internal/analyst`, без правок в маршрутизации, редакции и проверке ответа.
+Инцидент с ПДн уходит исключительно в `ARGUS_ANALYST_PII_PROFILE`; профиль с
+`egress: deny` не отправит запрос на публичный адрес. Параллелизм и суточный потолок —
+`ANALYST_CONCURRENCY`, `ANALYST_DAILY_LIMIT` (сверх лимита инциденты создаются без
+вердикта). На стенде без модели `ARGUS_ANALYST_FORCE_PROFILE=mock`.
+
+## Хранилище: отдельный диск
+
+Данные ClickHouse держите на отдельном разделе — так же, как `/var/ossec` у
+менеджера Wazuh. Переполненный корневой диск кладёт не только ARGUS: ClickHouse
+перестаёт принимать вставки, а с ним и приём событий. До первого запуска:
+
+```sh
+./scripts/init-storage.sh /srv/argus          # тома compose → /srv/argus/clickhouse, /srv/argus/backups
+./scripts/init-storage.sh /srv/argus /mnt/bkp # бэкапы на другой диск
+./scripts/argus init
+```
+
+Скрипт создаёт именованные тома `argus_clickhouse-data` и `argus_clickhouse-backups`
+поверх каталогов на нужном диске; compose использует их как обычно. Если стек
+уже поднимали на томах по умолчанию — сначала `./scripts/backup.sh`,
+`docker compose down -v`, затем скрипт и `./scripts/restore.sh`.
+
+Оценка места: событие в `events` после сжатия занимает порядка 100–200 байт, то есть
+1 000 EPS — это 86,4 млн событий в сутки и **260–520 ГБ за 30 дней** (плюс индексы, merge,
+spool и копия сырого события в `raw`; измерьте на своих данных за первую неделю). TTL
+`events` и `wazuh_alerts` — 180 дней
+(меняется в миграциях). Оставляйте запас: ClickHouse держит свободными
+`keep_free_space_bytes` и при нехватке места отклоняет вставки, а не тихо
+затирает старое. Память: лимит контейнера `CLICKHOUSE_MEM_LIMIT` (4g по умолчанию),
+ClickHouse берёт 80 % от него (`clickhouse/config.d/memory.xml`).
+
+## Роли, TLS, бэкапы
+
+Консоль публикуется Caddy по TLS на `:8443` (внутренний CA, как у Wazuh dashboard;
+свой сертификат — файлы в `./caddy/certs`, `CONSOLE_TLS` в `.env`). Caddy ставит
+HSTS (`includeSubDomains`), CSP (та же политика продублирована в `next.config.ts`),
+`Permissions-Policy`, лимит тела 16 МБ, access-лог в томе `caddy-data` (ротация 5×50 МБ).
+Консоль доверяет `X-Forwarded-For` только за Caddy (`TRUSTED_PROXY=1`).
+
+Роли: наблюдатель (чтение), аналитик (отработка инцидентов, мьюты, управление Wazuh),
+администратор (пользователи, 2FA). Пользователей создаёт `admin` в «Настройках»,
+пароль показывается один раз. Каждое действие оператора — в `argus.console_audit`.
+
+SSO: при заданных `OIDC_*` на странице входа появляется «Войти через SSO» — OIDC
+authorization code + PKCE (Authentik, Keycloak). Роль берётся из групп IdP на
+каждом входе (`OIDC_GROUP_ADMIN/ANALYST/VIEWER`), локальная запись не нужна;
+без совпавшей группы — отказ (или `OIDC_DEFAULT_ROLE`). Пользователи SSO хранятся
+с префиксом `sso:` (`sso:<subject>`), с локальными не пересекаются: локальный `admin`
+и `sso:admin` — разные учётки, а локальные правила паролей и TOTP к SSO не применяются.
+Карточка инцидента содержит Markdown-досье: проверенный анализ модели, журнал
+переходов и записи аналитиков с автором и временем. Досье можно скачать как
+`INC-12.md` через `GET /api/incidents/INC-12/markdown`; JSON остаётся на
+`GET /api/incidents/INC-12`. Записи команды хранятся отдельно от вывода модели.
+
+Очередь инцидентов: «Открытые», «Мои», «Без ответственного», «Просрочены».
+Лента обновляется кнопкой, чтобы таймер не сбивал прокрутку и ввод. Целевой срок
+первичной реакции считается от создания, круглосуточно: critical 15 минут,
+high 1 час, medium 4 часа, low 24 часа. Просрочка показывается у инцидентов
+со статусом `new`; первое назначение оставляет статус `new` до принятия
+аналитиком. Карточка сохраняет время первого `take` из журнала и показывает,
+была ли реакция в срок; для инцидентов, обработанных до появления журнала,
+историческое время реакции неизвестно.
+Аналитик может взять свободный или назначенный ему инцидент в работу. Статус
+меняет только текущий ответственный; администратор назначает и передаёт
+инциденты локальным аналитикам. Комментарий может добавить любой аналитик в
+любой момент, включая завершённый инцидент. Комментарии хранятся отдельно в
+`incident_comments` и не переписываются при смене статуса. Для них нужна
+миграция `0013_incident_comments.sql` перед запуском новой консоли.
+Ручное закрытие и отметка ложного срабатывания требуют причину от 10 до 2000
+символов. Автор, время, итоговый статус и причина записываются вместе в
+`incident_state_events` (миграция `0016_incident_closure_reason.sql`); для
+старых закрытий без такой записи интерфейс показывает, что автор неизвестен.
+Переходы статуса и ответственного записываются в `incident_state_events` с
+последовательной ревизией через один экземпляр `engine`; `incidents_current`
+соединяет их с версиями детекции. Для нескольких реплик `engine` потребуется
+транзакционный координатор ревизий. Поле `incidents.updated_at` по-прежнему
+имеет секундную точность и описывает снимки детекции, поэтому при совпадении
+времени их версия может быть неоднозначной; операторские переходы от него не
+зависят. Если запись автоматического закрытия в журнал сбоит после записи
+снимка, финальный статус остаётся видимым, но в истории будет пропуск;
+`ArgusIncidentStateWriteFailed` требует проверки оператором. Для новых установок
+нужны миграции 0013 и 0014 до запуска сервисов.
+Регулярный почтовый отчёт по открытым рискам, владельцам и срокам включается
+`RISK_REPORT_INTERVAL=24h` (или, например, `168h`) при настроенных
+`SMTP_HOST`, `SMTP_FROM`, `SMTP_TO`. После первого включения письмо уходит сразу;
+следующий срок считается от подтверждённой отправки, записанной в
+`risk_report_deliveries` (миграция 0015), поэтому перезапуск движка не сдвигает
+расписание. При ошибке SMTP или ClickHouse повтор — через 5 минут. Если письмо
+принято SMTP, а запись о доставке не сохранилась, возможна повторная отправка.
+Сводка считает все открытые инциденты, перечисляет до 50 владельцев и 30
+приоритетных карточек.
+
+Одна установка ARGUS сейчас рассчитана на одного клиента: роли и SSO
+разграничивают действия, но не данные разных клиентов. Для подрядчика с
+несколькими клиентами нужны отдельные установки до появления сквозной модели
+арендаторов в событиях, инцидентах, поиске, экспортах и управляющих API.
+
+Бэкап: `./scripts/backup.sh` — `BACKUP DATABASE` + тома `web-auth` (пользователи, TOTP —
+шифруется), `shipper-state` и `collector-state` (очередь сырых событий — шифруется)
+в `BACKUP_DIR` (по умолчанию `/var/backups/argus`, вне
+дерева проекта), ротация `BACKUP_KEEP_DAYS` (14). Шифрование: `age`
+(`BACKUP_AGE_RECIPIENT`, восстановление — `BACKUP_AGE_IDENTITY`) или, если `age` нет,
+`openssl enc -aes-256-cbc -pbkdf2` с `BACKUP_KEY`; без ключа скрипт отказывает. Ключ
+храните отдельно от бэкапов. Перед восстановлением остановите `collector`,
+`engine`, `web` и `shipper`, затем запустите `./scripts/restore.sh <имя>`.
+Не восстанавливайте том очереди при работающем коллекторе: он держит открытые
+батчи в памяти. Пароль ClickHouse в URL/argv не попадает: запросы идут через `clickhouse-client` внутри
+контейнера с паролем из окружения.
+
+## Реагирование: IPS / IDS
+
+Три режима движка (`ARGUS_RESPOND_MODE`, переключается администратором в «Настройки → Реагирование»,
+каждое переключение в аудите): **ids** — только детект, кнопка «Заблокировать» в карточке работает;
+**simulate** (по умолчанию) — движок пишет в `argus.response_log`, кого заблокировал бы, исполнителей
+не вызывает; **ips** — правила с блоком `respond` блокируют адреса через active-response Wazuh и/или
+HTTP-шаблон NGFW на `ttl` (снятие: у NGFW шаблон `unblock`, у Wazuh — таймаут команды на менеджере).
+В правиле:
+
+```yaml
+respond: { action: block_ip, target: src.ip, min_level: high, ttl: 2h }
+```
+
+Ограничители, все — в `.env` движка:
+
+- `ARGUS_RESPOND_NEVER_BLOCK_1..3` — никогда не блокировать: свои внешние адреса,
+  балансировщик/прокси перед WAF (иначе в `client_ip` будет он), мониторинг, VPN админов.
+  Приватные сети и loopback не блокируются всегда. Старый `ARGUS_RESPOND_ALLOWLIST_*` —
+  то же самое.
+- `ARGUS_RESPOND_TRUSTED_1..3` — доверенные отправители syslog (CIDR). В режиме `ips`
+  автоблокировка выполняется только для событий с доверенным транспортом (файл, HTTP с
+  токеном, TLS, pull-источники) или от отправителей из этих сетей: адрес из подделанного
+  UDP-syslog с чужого хоста блокировку не вызовет. Правило `waf-rce-critical` требует два
+  события подряд.
+- `ARGUS_RESPOND_MANUAL_TTL` (24h) — срок ручной блокировки из карточки; `0` — бессрочно.
+  Снять раньше — кнопка «Разблокировать» (`POST /respond/unblock` движка, в аудите).
+- `ARGUS_RESPOND_TTL` (1h) — срок автоблокировки; при отказе всех исполнителей
+  автоблокировка повторяется трижды с паузами 1/5/15 минут.
+- `WAZUH_AR_AGENTS` — на каких агентах выполнять active-response (пусто — исполнитель
+  Wazuh выключен, `all` — все с предупреждением); `WAZUH_AR_TIMEOUT` равен `<timeout>`
+  команды в `ossec.conf`, `WAZUH_AR_UNBLOCK_COMMAND` — команда снятия.
+- `ARGUS_MAX_NEW_INCIDENTS` (200) — потолок новых инцидентов за цикл (шторм правил),
+  `NOTIFY_*_PER_MINUTE` (20) — rate-limit уведомлений, сверх — одно агрегированное сообщение.
+
+Начинайте с `simulate`: неделю смотрите журнал реагирования в «Настройках» и витрине «WAF», затем
+включайте `ips`. Режим, выставленный в консоли, хранится в `console_settings`, переживает рестарт
+движка и перекрывает `ARGUS_RESPOND_MODE` до кнопки «Вернуть режим из конфига».
+Метрики: `argus_engine_respond_mode`, `argus_engine_auto_blocks_total`,
+`argus_engine_simulated_blocks_total`, `argus_engine_active_blocks`.
+
+## WAF: ModSecurity и Coraza
+
+Коллектор читает **audit-лог в JSON** (`SecAuditLogFormat JSON`; ModSecurity v3 под nginx/Apache и
+Coraza под Caddy/nginx) и **error-лог** (`ModSecurity: …` в nginx/Apache, `Coraza: …` в JSON-логе Caddy):
+файлы с хоста монтируются каталогом `WAF_LOG_DIR` → `/logs/waf`, пути задаются `WAF_AUDIT_LOG` и
+`WAF_ERROR_LOG`; для агентов без файлового доступа — `POST /ingest/modsecurity` (JSON, NDJSON или
+массив). В единой схеме: `source_class=waf`, `action=http.attack`, `outcome=deny|allow` (заблокировано
+или только замечено: DetectionOnly, либо score не набран), атрибуты `category` (sqli, xss, rce, lfi…),
+`rule_ids`, `anomaly_score`, `status`, `engine_mode`, `host`, `method`, `user_agent`.
+Правила `rules/waf-*.yml`: серия атак с адреса, сканер по нескольким хостам, критичный RCE/LFI
+с высоким score — эти три с `respond`; «атака дошла до приложения» (детект + 5xx) — без автоответа,
+её разбирает человек. Из error-лога событием считается итоговая строка транзакции (Access denied
+или оценка anomaly score 949110/980130), промежуточные Warning по отдельным правилам не считаются.
+Витрина — дашборд «WAF · ModSecurity / Coraza». Coraza для Caddy: модуль `coraza-caddy`,
+директива `SecAuditLogFormat JSON` и `SecAuditLog /var/log/caddy/coraza_audit.log`.
+
+## Вебхуки и подключение агента разбора
+
+ARGUS не знает, какой агент или трекер стоит снаружи. Любой раннер — Claude Code,
+Codex, n8n, cron-скрипт — подключается через три нейтральных контракта:
+
+1. **Выход: подписанный вебхук.** Движок отправляет `incident.created` (новый инцидент)
+   и `incident.escalated` (аналитик перевёл инцидент в «Эскалирован») во все цели
+   `notify.webhooks` из `engine/argus.analyst.yml`. Для `incident.created` уровень должен быть
+   не ниже `min_level` цели (по умолчанию `high`). **Ручная эскалация уходит независимо от
+   `min_level`**. В конфиге хранятся только **имена** переменных окружения (`url_env`,
+   `secret_env`, `token_env`); цель с пустым адресом выключена.
+   Запрос: JSON POST, заголовки `X-Argus-Event`, `X-Argus-Delivery` (стабильный id для дедупа),
+   `X-Argus-Signature: sha256=<hex HMAC-SHA256 тела>` (секрет ≥32 символов), необязательный
+   `Authorization: Bearer`. Тело — `{event, delivery_id, sent_at, incident: {id, level, status,
+   rule_id, rule_title, tags, actor, node, sources, event_count, first_ts, last_ts, created_at,
+   pii, url, chain?}}`. Субъект, узел и источники пишет атакующий (логин, hostname, User-Agent):
+   они уходят как есть в структурированном JSON, приёмник сам отвечает за экранирование.
+   Адрес — только `https`; `http` — с `allow_http: true`. Редиректы не выполняются. Ответы 5xx,
+   408, 429 и сетевые ошибки повторяются (8 попыток, пауза от 2 с с удвоением и джиттером,
+   максимум 5 мин), прочие 4xx — окончательный отказ. Очередь — 1000 событий, сверх неё событие
+   отбрасывается с метрикой `dropped`. Дедуп по ключу `инцидент|событие` в
+   `argus.webhook_deliveries` (180 дней) переживает перезапуск; семантика — «хотя бы один раз».
+2. **Чтение: сессия с областью одного инцидента.** Приёмник вебхука открывает сессию
+   `POST /api/triage/sessions {"incident_id": "INC-12", "ttl_sec": 3600}` с bearer
+   `ARGUS_TRIAGE_ISSUER_TOKEN` и получает короткоживущий токен, которым агент читает ровно этот
+   инцидент и связанные с ним события — через REST (`/api/triage/context`, `/api/search`,
+   `/api/v1/log`, `/api/sources`) или через `argus-mcp` в профиле `triage`. Что именно зашито в
+   область и как сервер её держит — в разделе «Сессия разбора» ниже.
+3. **Запись: вердикт обратно в ARGUS.** Агент сдаёт итог одним вызовом
+   `POST /api/triage/verdicts` с тем же токеном сессии: тело — JSON по схеме
+   `argus-triage/v3` (`web/src/lib/shared/triage-verdict.schema.json`: вердикт
+   `true_positive | benign_true_positive | false_positive | undetermined`, `confidence`,
+   `human_needed`, `summary`, `evidence` со ссылками на выданные в сессии события и инциденты,
+   `gaps`, `recommendation`, признаки инъекции). Сервер проверяет схему, совпадение инцидента с
+   токеном, что все ссылки входят в область сессии, что свободный текст — простой текст (URL,
+   HTML, упоминания, обратные кавычки и управляющие символы отклоняются), совпадение `level` и
+   `rule_id` с инцидентом, и принимает один вердикт на сессию (`409 verdict_exists`). Отказ —
+   `422 {"error":"invalid_verdict","rejections":[{path, code}]}` с кодами `schema`, `incident`,
+   `unknown_ref`, `unsafe_text`; тело не больше 64 КБ. Необязательное поле `agent` (имя раннера,
+   `[a-z0-9._-]`) попадает в автора комментария. Принятый вердикт ложится в `argus.agent_verdicts`
+   (миграция 0024), рендерится в Markdown по фиксированному шаблону и появляется комментарием
+   `agent:<имя>` в карточке инцидента; ответ — `201 {id, incident_id, markdown}`.
+   Вердикт агента не меняет статус инцидента и не даёт полномочий на блокировку: решение —
+   за аналитиком, кнопка «Разрешить повторный разбор» выдаёт новую сессию.
+
+Минимальный приёмник на `curl`:
+
+```sh
+# 1. вебхук пришёл: проверить подпись, взять incident.id
+# 2. открыть сессию
+TOKEN=$(curl -sS -H "Authorization: Bearer $ARGUS_TRIAGE_ISSUER_TOKEN" \
+  -d '{"incident_id":"INC-12","ttl_sec":1800}' https://argus/api/triage/sessions | jq -r .token)
+# 3. прочитать карточку и журнал источника за сутки
+curl -sS -H "Authorization: Bearer $TOKEN" https://argus/api/triage/context
+curl -sS -H "Authorization: Bearer $TOKEN" 'https://argus/api/v1/log?log=ci&level=high&since=24h'
+# 4. сдать вердикт
+curl -sS -H "Authorization: Bearer $TOKEN" -d @verdict.json https://argus/api/triage/verdicts
+```
+
+Для Claude Code тот же путь — через `argus-mcp` (`-e ARGUS_MCP_TRIAGE_TOKEN=$TOKEN`): инструменты
+`get_incident`, `search_events`, `get_log`, `sources_health` и `submit`-вызов делает сам
+`POST /api/triage/verdicts`. Изоляция раннера (сеть, файловая система, набор инструментов
+модели) — ответственность того, кто его запускает; ARGUS ограничивает только то, что агент
+видит и что может записать.
+
+### Журнал для агентов: `GET /api/v1/log`
+
+Простой REST поверх `argus.events`, чтобы агент мог спросить «что было в CI критичного за сутки»
+одним запросом без языка поиска:
+
+```
+GET /api/v1/log?log=ci&level=critical&since=24h
+GET /api/v1/log?log=telemetry&node=db-01&action=disk.usage&since=7d&limit=500
+GET /api/v1/log?actor=i.petrov&since=30d&format=ndjson
+```
+
+| Параметр | Значение |
+|---|---|
+| `log` | `source` или `source_class` события: `ci`, `k8s`, `ngfw`, `telemetry`, `argus.system`… |
+| `level` | нижняя граница: `info` (0–2), `low` (3–4), `medium` (5–6), `high` (7–8), `critical` (9–10) |
+| `actor`, `node`, `src_ip`, `action` | точное равенство |
+| `since` / `until` | длительность (`15m`, `24h`, `7d`, не больше 30 дней) и верхняя граница RFC 3339 |
+| `q` | подстрока по `object` и `raw`, без учёта регистра |
+| `limit` | по умолчанию 200, не больше 1000 |
+| `format` | `json` (`{"items":[…],"count":n}`) или `ndjson` |
+
+Авторизация — `ARGUS_API_TOKEN` (весь журнал) или токен сессии разбора (только область
+инцидента, иначе `403`). В ответе каждое событие несёт `value` и `unit` — числовое измерение,
+если источник его передал (см. «Телеметрия хостов»).
+
+## Поиск и MCP для агентов
+
+Страница «Поиск» — аналог Discover: строка запроса по событиям всех источников (и по
+алертам Wazuh при включённом модуле), гистограмма, фасеты по полям, раскрытие записи до исходного JSON,
+выгрузка CSV/JSON. Синтаксис: `root 203.0.113.5 agent:web-01 level>=10 -group:syscheck
+desc:"brute force" srcip:10.0.*`; для событий — `source:k8s.audit actor:oidc:i.petrov attr.rule_groups:sshd`.
+То же через API: `GET /api/search?index=events&q=...&range=24h[&format=csv|export&limit=N]`
+(`index=alerts` — только с модулем Wazuh); простые выборки без языка запросов — `GET /api/v1/log`.
+
+«Журнал» (`/events`) — лента событий всех источников с фильтрами по источнику, хосту,
+серьёзности и правилу, гистограммой, раскрытием до сырого события, связью с инцидентом
+и live-tail (`GET /api/events/tail`, курсор `received_at|id`, только закрытые секунды
+`received_at < now() − 2`). Поле `rule` в запросе событий: `rule:5763` — правило Wazuh,
+`rule:a41c-auth-030` — события источника и узла его инцидентов внутри окна инцидента.
+Ограничения `rule:<правило корреляции>`: берутся 5000 последних инцидентов правила, у
+шумного правила старые окна не попадут; на окне 7–30 дней проверка окон идёт по
+каждому событию диапазона и может упереться в `max_execution_time` (20 с) — тогда
+консоль предложит сузить интервал, добавьте `source:`/`node:` или выберите меньший диапазон.
+
+MCP-сервер `mcp/` отдаёт агентам (Claude Code, Cursor) инструменты `search_alerts`,
+`search_events`, `get_log`, `list_incidents`, `get_incident`, `sources_health` и ресурс
+`argus://search-syntax`. Это мост к API консоли по bearer-токену `ARGUS_API_TOKEN`
+(`.env`, только чтение, ≥32 символов). Локально:
+
+```sh
+make mcp                                   # → bin/argus-mcp
+ARGUS_URL=https://localhost:8443 ARGUS_INSECURE_TLS=1 ARGUS_API_TOKEN=... bin/argus-mcp   # stdio
+docker compose --profile mcp up -d mcp     # Streamable HTTP на 127.0.0.1:18095
+```
+
+По HTTP сервер требует `Authorization: Bearer <ARGUS_MCP_HTTP_TOKEN>` — отдельный токен
+(≥32 символов, не равный `ARGUS_API_TOKEN`; без него в режиме `-http` сервер не стартует)
+и отклоняет запросы с браузерным `Origin`, кроме перечисленных в `ARGUS_MCP_ALLOWED_ORIGINS`.
+Лимит — `ARGUS_MCP_RATE_PER_MIN` (300) запросов в минуту на сессию (`Mcp-Session-Id`) или токен,
+считается после проверки bearer. Инструменты с `limit` отдают до 500 строк без `raw`.
+
+Значения из событий (субъект, узел, IP, домен, хеш) передаются точными фильтрами
+инструментов поиска (`actor`, `node`, `src_ip`, `dst_ip`, `action`, `source`, `domain`,
+`hash`, `rule_id`): каждое валидируется и уходит литералом в кавычках, где ни операторы,
+ни `*` не действуют. Подстановка в `query` превратила бы `svc-backup -action:secret_read`
+в отрицание.
+
+В строке поиска `*` в кавычках — литерал (`actor:"svc-\*"`), маска — без кавычек
+(`srcip:10.0.*`) или, если в маске есть пробелы, `~"…"` (`desc:~"*brute force*"`). Старая
+форма маски в кавычках (`desc:"*foo*"`) отклоняется с подсказкой, а не даёт пустую выдачу.
+
+Ответы консоли проходят редакцию (`triage/redact`, общий код с движком). Профиль `full` (по умолчанию) вырезает секреты и канарейки. Профиль `triage` —
+для агента разбора с облачной моделью: запросы с `ARGUS_MCP_TRIAGE_TOKEN` (или все при
+`ARGUS_MCP_PROFILE=triage`) получают только разрешённые поля, субъекты, владельцы, авторы,
+локальные части e-mail, телефоны и имена в домашних каталогах — псевдонимами `subj-…`
+(ключ `ARGUS_PSEUDONYM_KEY` сервера argus-mcp; один ключ — одинаковые псевдонимы между сессиями;
+псевдоним принимается фильтром `actor`), ссылки обезврежены (`hxxps://`), у строк с `pii=1`
+свободный текст скрыт; свободный `query` и `include_raw` сервер отклоняет. Чтобы поиск
+не стал оракулом по нередактированным данным, в triage `actor` принимает только псевдоним
+`subj-…` из ответов MCP, `node` — только имя, которое MCP уже выдал открытым, или псевдоним
+`host-…` (узел `ws-ivanov` или `srv-<фамилия из логина>` в ответе — псевдоним), `domain` ищется
+равенством `attr.domain` (полное имя с буквенным TLD), а не подстрокой по записи, `hash`
+отклоняется (поля хеша в схеме нет), `list_incidents.q` — только `INC-N`; в текстах ошибок
+консоли процитированное скрыто. Псевдонимы разрешает только тот процесс argus-mcp, который
+их выдал: псевдоним из внешней задачи агент сначала получает заново через `get_incident`. Редакция по
+шаблонам — не гарантия: имена людей в тексте ловит только словарь `ARGUS_REDACT_NAMES_FILE`,
+флаг `pii` — дополнительный сигнал. Запись словаря заменяется целиком и каждым своим словом
+длиннее трёх букв («Сидорова Анна» ловит «Анна Сидорова» и «Сидорова»), но словоформы
+(«Сидоровой», «Анне») — только отдельными записями. Что шаблоны сознательно не ловят —
+в `triage/redact/doc.go`.
+
+Claude Code: `claude mcp add argus -e ARGUS_URL=https://localhost:8443 -e ARGUS_INSECURE_TLS=1 -e ARGUS_API_TOKEN=... -- ./bin/argus-mcp`
+(для агента с облачной моделью — `-e ARGUS_MCP_PROFILE=triage` и `-e ARGUS_PSEUDONYM_KEY=...`).
+
+### Сессия разбора (`triage-session`)
+
+Агент разбора читает ARGUS по короткоживущему токену, а сервер сам ограничивает, что ему видно.
+Изоляция живёт на сервере, а не в промпте.
+
+- **Выпуск.** `POST /api/triage/sessions {"incident_id": "INC-12", "ttl_sec": 3600}` с bearer
+  `ARGUS_TRIAGE_ISSUER_TOKEN` (учётка `triage-issuer`, ≥32 символов, не равна `ARGUS_API_TOKEN`;
+  читать ей ничего нельзя). Срок — не больше 60 минут. Ответ: `token`, `session_id`,
+  `incident_id`, `expires_at`, `related_ids`. Выпуск пишется в журнал (`triage.session`).
+- **Область**, зашитая в токен: свой инцидент; связанные — общий субъект (`same_subject`), узел
+  (`same_node`), IP (`same_remote_ip`, в цепочке — по границам адреса, не подстрокой) или
+  домен/хеш (`same_ioc`) в окне ±7 дней, не больше 20; сущности инцидента с видом — субъект
+  (поле `actor`), узел (`node`), IP (`src`/`dst`) и атрибуты `domain`, `hash`, `md5`, `sha1`,
+  `sha256`, `token_id`, `secret_id` (`attr.<имя>`) его событий в окне ±1 ч.
+- **Привязка строк — граница изоляции.** В каждый запрос поиска сессии сервер добавляет
+  обязательный предикат: события — только своего субъекта или своего узла
+  (`actor_name IN (…) OR node IN (…)`). Привязка зашита в токен при выпуске; нечем привязать —
+  предикат `0`, поиск пуст. Якоря ниже только сужают запрос внутри этой привязки.
+- **Частые значения — не якоря.** Распространённость считается один раз при выпуске за всё окно
+  поиска (от `first_ts − 30 дней` до момента выпуска). Значение, которое встречается больше чем у
+  `ARGUS_TRIAGE_ANCHOR_MAX_SPREAD` (по умолчанию **5**) разных субъектов или узлов, в область не
+  попадает: DNS-сервер, шлюз, прокси, общий реестр образов видят все машины. Субъект и узел самого
+  инцидента проверяются так же: частые (`root`, общий сервер) — якорь только в паре с сущностью
+  другого вида. Подсчёт ограничен 10 с: не уложился — сессия выдаётся, но значения не становятся
+  якорями (отказ безопасный, не 503). Значения сравниваются точно, с учётом регистра.
+- **Что доступно.** `GET /api/triage/context` — карточка, история, комментарии, вердикт движка,
+  связанные и `rule_history` (90 дней, только счётчики). `GET /api/incidents/INC-N` — свой
+  полностью, связанный сводкой, остальные — `403 {"error":"out_of_scope"}`. `GET /api/search` и
+  `GET /api/v1/log` — только равенство по полям (без свободного текста, отрицаний и масок),
+  **каждое** поле-сущность — значение своего вида из области (иначе `403`), окно не раньше
+  `first_ts − 30 дней`, до 200 строк, без `raw` и без фасетов. `GET /api/sources`.
+  `POST /api/triage/verdicts` — один вердикт на сессию. `DELETE /api/triage/sessions` — закрыть
+  сессию. Список инцидентов, markdown, выгрузка — `403`. Новый маршрут API для такого токена
+  закрыт, пока явно не разрешён в `apiGuard`.
+- **Лимит** — `ARGUS_TRIAGE_SESSION_REQUESTS` (100) запросов за сессию, затем
+  `429 {"error":"budget_exhausted"}`, плюс 60 в минуту у каждой сессии отдельно.
+- **Отзыв** (`DELETE /api/triage/sessions`) пишется в `argus.triage_session_revocations`
+  (миграция 0019, TTL) и переживает рестарт консоли. Список отзывов читается один раз на процесс:
+  это верно, пока `web` — одна реплика. **Ограничение:** счётчик бюджета — в памяти процесса,
+  после рестарта `web` он начинается заново; при нескольких репликах бюджет считается в каждой.
+
+## Телеметрия хостов и единые правила
+
+Правило ИБ и правило эксплуатации пишутся одинаково: событие с полями, `selection`,
+`threshold` с окном и `group_by`. Разница только в источнике. Чтобы числовые измерения
+(заполнение диска, load, очередь) жили в том же журнале, у события есть `value` (Float64) и
+`unit`. Любой экспортер шлёт их NDJSON в `POST /ingest/events`:
+
+```json
+{"ts":"2026-10-24 18:00:00.000","source":"telemetry.node","source_class":"telemetry",
+ "action":"disk.usage","node":"db-01","object":"/var/lib/clickhouse","value":91.4,"unit":"percent"}
+```
+
+`scripts/telemetry-sample.sh` — образец на `df`/`uptime` для cron раз в минуту
+(`ARGUS_INGEST_URL`, `ARGUS_INGEST_TOKEN`, `ARGUS_TELEMETRY_SOURCE`). Рядом лежат два правила,
+которые читаются одинаково:
+
+```yaml
+# rules/wazuh/ssh-bruteforce.yml            # rules/ops/disk-usage-high.yml
+detection:                                   detection:
+  selection:                                   selection:
+    source: wazuh.agents                         source.class: telemetry
+    event.action: rule.5763                      action: disk.usage
+  threshold:                                     value: '>= 90'
+    count: 20                                  threshold:
+    window: 30m                                  count: 3
+    group_by: node                               window: 15m
+                                                 group_by: node
+                                               close_on:
+                                                 action: disk.usage
+                                                 value: '< 85'
+```
+
+Собственный сторож диска ClickHouse устроен так же: движок раз в минуту пишет событие
+`source: argus.system, action: disk.usage, value: <занято, %>` и инцидент
+`argus-disk-low` создаёт обычное правило `rules/ops/argus-disk-low.yml`, которое можно
+править или отключить. `rules/ops/host-silence.yml` — узел перестал присылать телеметрию
+(`threshold.kind: absence`). Агрегаций по значению (среднее, максимум за окно) в движке
+нет: «три замера подряд выше порога» выражается `threshold.count`.
+
+## Модуль Wazuh
+
+Wazuh — популярный open-source HIDS, поэтому его поддержка остаётся, но как модуль, а не
+центр системы. Включение: `./scripts/argus init --with-wazuh` или в `.env`
+`ARGUS_INTEGRATION_WAZUH=1` и `COMPOSE_PROFILES=wazuh`. Модуль добавляет:
+
+- `shipper/` (Rust) — тейлит `/var/ossec/logs/alerts/alerts.json`, пишет в `argus.wazuh_alerts`,
+  откуда MV копирует алерты в `argus.events` как `source: wazuh.agents`, `action: rule.<id>`;
+- `policyd/` (Go + OPA) — агенты и SCA из REST API менеджера → `argus.policy_verdicts`;
+- в консоли — «Алерты Wazuh», «Уязвимости» (CVE), «MITRE ATT&CK», «Политики», «Агенты»,
+  «Управление» (группы, `agent.conf`, кастомные правила менеджера через `WAZUH_API_*`),
+  индекс `alerts` в поиске, дашборды `wazuh-*`; пути — `/wazuh/*`;
+- правила корреляции на алертах Wazuh — `rules/wazuh/`.
+
+Без модуля ничего из этого не поднимается и не показывается; таблицы в ClickHouse создаются
+миграциями в любом случае и остаются пустыми. Механика Wazuh не меняется: регистрация агентов,
+доставка `agent.conf` и применение правил — штатные. Для разработки без менеджера:
+`node scripts/mock-wazuh-api.mjs` и `WAZUH_API_URL=http://localhost:55001`.
+
+## Прод: чек-лист перед выкаткой
+
+1. **Диск** — данные ClickHouse на отдельном разделе (`scripts/init-storage.sh`, раздел выше).
+   Движок раз в минуту пишет событие `argus.system / disk.usage` с процентом занятого места,
+   а правило `rules/ops/argus-disk-low.yml` заводит инцидент при 90 % и закрывает его, когда
+   место вернётся; порог меняется в правиле.
+2. **Секреты** — `./scripts/argus init`: семь паролей ClickHouse, `ENGINE_TOKEN`,
+   `ARGUS_INGEST_TOKEN`, `ARGUS_API_TOKEN`, `ARGUS_MCP_HTTP_TOKEN`, `POLICYD_TOKEN`,
+   `BACKUP_KEY`; `WAZUH_API_PASSWORD` — руками. `.env` с правами `600`, в git не попадает.
+   `ARGUS_DEV` в бою не задаётся. Пароль `admin` — из `/data/admin-password.txt`, сменить
+   в «Настройках», включить TOTP или SSO.
+3. **Память** — `CLICKHOUSE_MEM_LIMIT` под машину (4g по умолчанию; ClickHouse берёт
+   80 % от лимита), остальным сервисам лимиты заданы в compose.
+4. **Сертификаты** — свой вместо внутреннего CA: файлы в `./caddy/certs`,
+   `CONSOLE_TLS="/certs/console.crt /certs/console.key"`; syslog TLS — `SYSLOG_TLS_ADDR=:6514`
+   и сертификат в `./collector/certs`; менеджер Wazuh — `WAZUH_CA_FILE` или
+   `WAZUH_CERT_SHA256` вместо `WAZUH_INSECURE_TLS`.
+5. **Сеть** — syslog/NetFlow по UDP не аутентифицируются: закрывайте файрволом по адресам
+   источников, `NETFLOW_EXPORTERS` — allow-list экспортеров, `INGEST_BIND` — интерфейс
+   для TLS-портов. Вебхуки — только через `:8089` (TLS + `X-Argus-Token`).
+6. **Бэкап** — `./scripts/backup.sh` по cron (`0 3 * * * cd /opt/argus && ./scripts/backup.sh`),
+   `BACKUP_DIR` на другом диске, ключ (`BACKUP_KEY` / `BACKUP_AGE_RECIPIENT`) — отдельно
+   от бэкапов; раз в квартал — тестовое `restore.sh` на стенде.
+7. **Реагирование** — `ARGUS_RESPOND_NEVER_BLOCK_*` (свои адреса, балансировщик),
+   `ARGUS_RESPOND_TRUSTED_*` (адреса коллекторов), неделя в `simulate` перед `ips`.
+8. **Мониторинг** — `/metrics` коллектора (8088) и движка (8090, Bearer `METRICS_TOKEN`), готовые алерты
+   `ops/prometheus-alerts.yml`, scrape — `ops/prometheus-scrape.yml`; `docker compose ps`
+   показывает healthcheck'и всех сервисов, включая шиппер (`/healthz` на `shipper:9101` —
+   503, если файл алертов недоступен или ClickHouse не принимает батч дольше 5 минут;
+   `/metrics` там же доступен только из internal-сети `data`). Раннбук — в вики
+   (`argus-siem-runbook`).
+9. **Образы** — `make deploy` проверяет подписи cosign (`COSIGN_PUBKEY` в `.env`);
+   базовые образы пришпилены по digest, релиз не выходит с HIGH/CRITICAL в trivy.
+10. **Windows-хосты** — через агент Wazuh (модуль Wazuh, мастер «Добавить агента» на
+    странице «Управление») либо NXLog/Winlogbeat → syslog CEF в коллектор (6514/tcp с TLS).
+11. **Агенты разбора** — `ARGUS_TRIAGE_ISSUER_TOKEN` отдельно от `ARGUS_API_TOKEN`; приёмник
+    вебхука проверяет `X-Argus-Signature`; изоляция самого раннера (сеть, файлы, инструменты
+    модели) — на стороне раннера, ARGUS ограничивает только область чтения и формат вердикта.
+
+## Обновление
+
+Два пути. **Из исходников** (одна инсталляция, есть docker на хосте):
+
+```sh
+git pull                 # или распаковать новый релиз
+./scripts/argus init     # допишет новые секреты в .env, если появились; затем make up
+```
+
+**Из реестра** (релизный конвейер `.github/workflows/release.yml` собирает образы по
+тегу `vX.Y.Z`; на хосте ничего не компилируется):
+
+```sh
+# .env: ARGUS_IMAGE_PREFIX=ghcr.io/<owner>/argus, COSIGN_PUBKEY=./cosign.pub
+git fetch --tags && git checkout v0.9.0   # compose, миграции, правила, дашборды нужной версии
+make deploy                                # cosign verify + pull образов версии из VERSION + up без сборки
+```
+
+Версия стека — в `VERSION` (показывается в шапке консоли), изменения — в `CHANGELOG.md`.
+Миграции идемпотентны и журналируются в `argus.schema_migrations` — свежая
+установка и апгрейд идут одним путём, руками DDL не применяется; `migrator` при каждом
+запуске сверяет пароли и гранты служебных пользователей. Откат: `git checkout`
+предыдущего тега + `make deploy`; миграции только добавляют (таблицы, колонки, MV),
+поэтому старый код работает на новой схеме.
+
+## CI
+
+`.github/workflows/ci.yml` на каждый push/PR: gofmt/vet/test с `-race` для Go-модулей
+(collector, engine, policyd, mcp, triage), тесты правил на записанном трафике, `cargo fmt/clippy/test`
+шиппера, eslint/тесты/сборка консоли, тесты политик OPA, валидация compose и скриптов
+(`docker compose config`, `bash -n`, shellcheck), сборка образов, сквозной e2e (replay →
+инциденты) на push в main. Аудит зависимостей блокирующий: `govulncheck`,
+`npm audit --audit-level=high`, `cargo audit`. Actions пришпилены по SHA коммита, базовые
+образы Dockerfile — по digest. `make lint` и `make check` — то же локально.
+Релиз — `release.yml` по тегу: проверка `VERSION`/`CHANGELOG`, сборка образов,
+`trivy` (HIGH/CRITICAL с исправлением — стоп), push в `ghcr.io`, подпись `cosign` (секрет
+`COSIGN_PRIVATE_KEY`), бинарники `argus-mcp` под все ОС, заметки релиза из CHANGELOG.
+
+Ревью PR: `.github/workflows/claude-review.yml` на каждый PR в `main` (кроме черновиков и
+форков) запускает Claude Code с inline-комментариями P1/P2. Нужен секрет `ANTHROPIC_API_KEY`
+или `CLAUDE_CODE_OAUTH_TOKEN` и установленное Claude GitHub App. Изменения попадают в `main`
+только через PR.
+
+## Тесты
+
+```sh
+make test          # cargo test + go vet/test (Rego-политики гоняются через встроенный OPA)
+make policy-test   # то же через бинарник opa, если установлен
+make check         # compose config, bash -n, shellcheck
+cd web && npm test && npm run lint && npm run typecheck   # консоль
+```
+
+## Участие и безопасность
+
+Исходный код ARGUS распространяется по [GNU AGPL-3.0](LICENSE). Условия участия —
+в [CONTRIBUTING.md](CONTRIBUTING.md), порядок передачи сведений об уязвимостях —
+в [SECURITY.md](SECURITY.md).

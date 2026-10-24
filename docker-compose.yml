@@ -1,0 +1,584 @@
+# Образы: `make up` собирает из рабочего дерева (тег = VERSION), `make deploy`
+# берёт готовые из реестра (ARGUS_IMAGE_PREFIX=registry.example/org/argus).
+#
+# Секреты обязательны (${VAR:?}): без них compose не стартует. Сгенерировать
+# всё разом — ./scripts/argus init (пишет .env с правами 600). Стенд с
+# дефолтами — make up-dev (.env.dev + docker-compose.dev.yml, ARGUS_DEV=1).
+#
+# Сети:
+#   data   — internal, без выхода наружу: ClickHouse и все, кто к нему ходит.
+#   edge   — Caddy ↔ web / collector (TLS-терминация 8443 и 8089).
+#   egress — кто ходит во внешний мир: движок (Wazuh API, облачный профиль LLM,
+#            Telegram), policyd и web (Wazuh API), collector (pull-источники:
+#            Falcon, S3), mcp → web.
+# Профили: wazuh — shipper и policyd (модуль Wazuh, ARGUS_INTEGRATION_WAZUH=1);
+# mcp — MCP-сервер по HTTP. Включаются COMPOSE_PROFILES=wazuh,mcp в .env.
+# Все сервисы: cap_drop ALL, no-new-privileges, read-only ФС (кроме ClickHouse),
+# tmpfs под /tmp, лимит pid и памяти.
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+
+x-harden: &harden
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  read_only: true
+  tmpfs: [/tmp]
+
+services:
+  clickhouse:
+    # Образ пришпилен по digest multi-arch index (совпадает на Hub и зеркалах).
+    image: ${REGISTRY_MIRROR:-docker.io}/clickhouse/clickhouse-server:24.8@sha256:1ffa82edee000a42c09313bd9f1293d94c570aee74babc1b3ca9983a35fa597b
+    environment:
+      CLICKHOUSE_DB: argus
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-argus}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?CLICKHOUSE_PASSWORD не задан — ./scripts/argus init}
+      # Админ нужен только migrator'у (CREATE USER / GRANT для служебных
+      # пользователей argus_*). Ни один сервис под ним не работает.
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - clickhouse-backups:/var/lib/clickhouse/backups
+      - ./clickhouse/config.d/backups.xml:/etc/clickhouse-server/config.d/backups.xml:ro
+      - ./clickhouse/config.d/memory.xml:/etc/clickhouse-server/config.d/memory.xml:ro
+    # Порт наружу не публикуется: сеть data — internal. Запросы с хоста —
+    # docker compose exec clickhouse clickhouse-client (бэкап так и делает).
+    networks: [data]
+    # Entrypoint образа стартует под root, chown'ит тома и опускается до
+    # clickhouse через setuid — отсюда минимальный набор capabilities.
+    # read_only не ставим: сервер пишет в /var/lib и /var/log.
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID, SYS_NICE, IPC_LOCK]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp]
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    deploy:
+      resources:
+        limits:
+          # ClickHouse берёт 80 % от лимита контейнера (config.d/memory.xml)
+          memory: ${CLICKHOUSE_MEM_LIMIT:-4g}
+          pids: 4096
+    restart: unless-stopped
+    <<: *logging
+
+  # Одноразовый прогон миграций схемы: свежая установка и апгрейд идут
+  # одним путём (scripts/migrate.sh + clickhouse/migrations/*.sql). Затем
+  # заводит служебных пользователей argus_* с минимальными правами.
+  migrator:
+    image: ${REGISTRY_MIRROR:-docker.io}/clickhouse/clickhouse-server:24.8@sha256:1ffa82edee000a42c09313bd9f1293d94c570aee74babc1b3ca9983a35fa597b
+    entrypoint: ["bash", "/migrate.sh"]
+    environment:
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-argus}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?CLICKHOUSE_PASSWORD не задан — ./scripts/argus init}
+      CLICKHOUSE_RO_PASSWORD: ${CLICKHOUSE_RO_PASSWORD:?CLICKHOUSE_RO_PASSWORD не задан — ./scripts/argus init}
+      CLICKHOUSE_CONSOLE_PASSWORD: ${CLICKHOUSE_CONSOLE_PASSWORD:?CLICKHOUSE_CONSOLE_PASSWORD не задан — ./scripts/argus init}
+      CLICKHOUSE_COLLECTOR_PASSWORD: ${CLICKHOUSE_COLLECTOR_PASSWORD:?CLICKHOUSE_COLLECTOR_PASSWORD не задан — ./scripts/argus init}
+      CLICKHOUSE_SHIPPER_PASSWORD: ${CLICKHOUSE_SHIPPER_PASSWORD:?CLICKHOUSE_SHIPPER_PASSWORD не задан — ./scripts/argus init}
+      CLICKHOUSE_POLICYD_PASSWORD: ${CLICKHOUSE_POLICYD_PASSWORD:?CLICKHOUSE_POLICYD_PASSWORD не задан — ./scripts/argus init}
+      CLICKHOUSE_ENGINE_PASSWORD: ${CLICKHOUSE_ENGINE_PASSWORD:?CLICKHOUSE_ENGINE_PASSWORD не задан — ./scripts/argus init}
+      ARGUS_DEV: ${ARGUS_DEV:-0}   # 1 — стенд: дефолтные пароли только предупреждение
+    volumes:
+      - ./clickhouse/migrations:/migrations:ro
+      - ./scripts/migrate.sh:/migrate.sh:ro
+    networks: [data]
+    <<: [*harden, *logging]
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          pids: 128
+    restart: "no"
+
+  # Тома состояния для distroless-сервисов (nonroot, uid 65532): именованный том
+  # создаётся root-овым, а в образе каталога /state нет — права выставляем тут.
+  volume-init:
+    image: ${REGISTRY_MIRROR:-docker.io}/library/busybox:1.37-musl@sha256:fc6dddc4c44b1bfe37f41cae8e67d1693828e8f42a91862816d7953e2c9d3f23
+    command: ["sh", "-c", "chown 65532:65532 /shipper-state /collector-state && chmod 700 /shipper-state /collector-state"]
+    volumes:
+      - shipper-state:/shipper-state
+      - collector-state:/collector-state
+    network_mode: none
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER, DAC_OVERRIDE]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    deploy:
+      resources:
+        limits:
+          pids: 16
+    restart: "no"
+    <<: *logging
+
+  # Модуль Wazuh (ARGUS_INTEGRATION_WAZUH=1, COMPOSE_PROFILES=wazuh в .env): шиппер
+  # alerts.json менеджера → argus.wazuh_alerts и policyd (SCA/вердикты по API).
+  # Без профиля стек работает на коллекторе: syslog, вебхуки, NetFlow, телеметрия.
+  shipper:
+    profiles: ["wazuh"]
+    image: ${ARGUS_IMAGE_PREFIX:-argus}/shipper:${APP_VERSION:-dev}
+    build:
+      context: ./shipper
+      args:
+        REGISTRY: ${REGISTRY_MIRROR:-docker.io}
+    environment:
+      ALERTS_FILE: /data/alerts.json
+      STATE_FILE: /state/shipper.json
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DB: argus
+      CLICKHOUSE_TABLE: wazuh_alerts
+      CLICKHOUSE_USER: argus_shipper
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_SHIPPER_PASSWORD:?CLICKHOUSE_SHIPPER_PASSWORD не задан — ./scripts/argus init}
+      BATCH_SIZE: "500"
+      FLUSH_INTERVAL_MS: "2000"
+      MAX_LINE_BYTES: ${SHIPPER_MAX_LINE_BYTES:-4194304}   # строка alerts.json длиннее — пропускается с предупреждением
+      HEALTH_ADDR: 0.0.0.0:9101                            # /healthz и /metrics: сеть data (internal), наружу не публикуется
+      # CA сертификата ClickHouse — только если CLICKHOUSE_URL станет https:// (в compose — plain http внутри сети data).
+      CLICKHOUSE_CA_FILE: ${CLICKHOUSE_CA_FILE:-}
+    volumes:
+      # Монтируем каталог, а не файл: bind-mount одного файла пришпиливает
+      # inode, и шиппер не увидел бы ротацию alerts.json менеджером.
+      # По умолчанию — демо-алерты (make demo); в бою укажите в .env
+      # WAZUH_ALERTS_DIR=/var/ossec/logs/alerts.
+      - ${WAZUH_ALERTS_DIR:-./sample}:/data:ro
+      - shipper-state:/state
+      - ./caddy/certs:/certs:ro   # CLICKHOUSE_CA_FILE=/certs/<ca>.pem при внешнем ClickHouse по https
+    networks: [data]
+    <<: [*harden, *logging]
+    healthcheck:
+      test: ["CMD", "/bin/busybox", "wget", "-q", "--spider", "http://127.0.0.1:9101/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    depends_on:
+      migrator:
+        condition: service_completed_successfully
+      volume-init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          pids: 256
+    restart: unless-stopped
+
+  policyd:
+    profiles: ["wazuh"]
+    image: ${ARGUS_IMAGE_PREFIX:-argus}/policyd:${APP_VERSION:-dev}
+    build:
+      context: ./policyd
+      args:
+        REGISTRY: ${REGISTRY_MIRROR:-docker.io}
+    environment:
+      WAZUH_API_URL: ${WAZUH_API_URL:-https://wazuh-manager:55000}
+      WAZUH_API_USER: ${WAZUH_API_USER:-wazuh}
+      WAZUH_API_PASSWORD: ${WAZUH_API_PASSWORD:?WAZUH_API_PASSWORD не задан — пароль API менеджера Wazuh}
+      WAZUH_INSECURE_TLS: ${WAZUH_INSECURE_TLS:-false}
+      # Доверие сертификату менеджера без INSECURE: CA-файл (./caddy/certs → /certs)
+      # или SHA-256 отпечаток листового сертификата.
+      WAZUH_CA_FILE: ${WAZUH_CA_FILE:-}
+      WAZUH_CERT_SHA256: ${WAZUH_CERT_SHA256:-}
+      POLL_INTERVAL: ${POLICY_POLL_INTERVAL:-5m}
+      # Бюджет раунда на одного агента: таймаут раунда = max(POLL_INTERVAL, 2m, бюджет × число агентов).
+      # Старое имя в .env (POLICY_PER_AGENT_TIMEOUT) и в контейнере (PER_AGENT_TIMEOUT) ещё читается.
+      POLICY_ROUND_BUDGET_PER_AGENT: ${POLICY_ROUND_BUDGET_PER_AGENT:-${POLICY_PER_AGENT_TIMEOUT:-5s}}
+      POLICY_DIR: /policies
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DB: argus
+      CLICKHOUSE_USER: argus_policyd
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_POLICYD_PASSWORD:?CLICKHOUSE_POLICYD_PASSWORD не задан — ./scripts/argus init}
+      LISTEN_ADDR: ":8080"
+      # Bearer для GET /verdicts; пусто — вердикты только по сети compose.
+      POLICYD_TOKEN: ${POLICYD_TOKEN:-}
+    volumes:
+      - ./policies:/policies:ro
+      - ./caddy/certs:/certs:ro
+    # /verdicts и /healthz — только внутри сети data (консоль читает вердикты
+    # из ClickHouse; наружу порт не публикуется — на хостах он часто занят).
+    networks: [data, egress]
+    <<: [*harden, *logging]
+    healthcheck:
+      test: ["CMD", "/bin/busybox", "wget", "-q", "--spider", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    depends_on:
+      migrator:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          pids: 256
+    restart: unless-stopped
+
+  # Коллектор событий: syslog/CEF/LEEF (5514, TLS 6514), NetFlow v9/IPFIX (2055/udp),
+  # вебхуки k8s audit / GitLab / Harbor / Argo CD (8088 → наружу через Caddy :8089 по TLS).
+  # Всё → argus.events единой схемы; что ClickHouse не принял — argus.ingest_rejects.
+  collector:
+    image: ${ARGUS_IMAGE_PREFIX:-argus}/collector:${APP_VERSION:-dev}
+    build:
+      context: ./collector
+      args:
+        REGISTRY: ${REGISTRY_MIRROR:-docker.io}
+    environment:
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DB: argus
+      CLICKHOUSE_USER: argus_collector
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_COLLECTOR_PASSWORD:?CLICKHOUSE_COLLECTOR_PASSWORD не задан — ./scripts/argus init}
+      ARGUS_INGEST_TOKEN: ${ARGUS_INGEST_TOKEN:?ARGUS_INGEST_TOKEN не задан — ./scripts/argus init}
+      ARGUS_DEV: ${ARGUS_DEV:-0}   # 1 — стенд: HTTP-приём без токена
+      # Syslog по TLS (RFC 5425). Выключен, пока SYSLOG_TLS_ADDR пуст. Включить: в .env
+      # SYSLOG_TLS_ADDR=:6514, сертификат и ключ в ./collector/certs (→ /certs):
+      # SYSLOG_TLS_CERT=/certs/syslog.crt, SYSLOG_TLS_KEY=/certs/syslog.key — без них
+      # коллектор не стартует (стенд ARGUS_DEV=1 — самоподписанный). CLIENT_CA — mTLS источников.
+      SYSLOG_TLS_ADDR: ${SYSLOG_TLS_ADDR:-}
+      SYSLOG_TLS_CERT: ${SYSLOG_TLS_CERT:-}
+      SYSLOG_TLS_KEY: ${SYSLOG_TLS_KEY:-}
+      SYSLOG_TLS_CLIENT_CA: ${SYSLOG_TLS_CLIENT_CA:-}
+      SYSLOG_TCP_MAX_CONNS: ${SYSLOG_TCP_MAX_CONNS:-1024}   # одновременных TCP/TLS-соединений
+      NETFLOW_EXPORTERS: ${NETFLOW_EXPORTERS:-}             # allow-list экспортеров (CIDR через запятую); пусто — все
+      SINK_PENDING_ROWS: ${SINK_PENDING_ROWS:-200000}       # оперативный буфер перед дисковой очередью; при заполнении — обратное давление
+      SINK_SPOOL_DIR: /state/spool
+      SINK_SPOOL_BYTES: ${SINK_SPOOL_BYTES:-8589934592}    # 8 ГБ на collector-state; при заполнении приём блокируется
+      LOG_LEVEL: ${COLLECTOR_LOG_LEVEL:-info}
+      # WAF: файлы логов с хоста (каталог WAF_LOG_DIR монтируется в /logs/waf)
+      WAF_AUDIT_LOG: ${WAF_AUDIT_LOG:-}
+      WAF_ERROR_LOG: ${WAF_ERROR_LOG:-}
+      WAF_FROM_START: ${WAF_FROM_START:-false}
+      # Pull-источники (collector.yml): CrowdStrike Falcon Streaming API, S3-бакеты аудита
+      FALCON_BASE_URL: ${FALCON_BASE_URL:-https://api.crowdstrike.com}
+      FALCON_CLIENT_ID: ${FALCON_CLIENT_ID:-}
+      FALCON_CLIENT_SECRET: ${FALCON_CLIENT_SECRET:-}
+      YC_AUDIT_BUCKET: ${YC_AUDIT_BUCKET:-}
+      YC_AUDIT_PREFIX: ${YC_AUDIT_PREFIX:-}
+      YC_S3_ACCESS_KEY: ${YC_S3_ACCESS_KEY:-}
+      YC_S3_SECRET_KEY: ${YC_S3_SECRET_KEY:-}
+    volumes:
+      - ${WAF_LOG_DIR:-./sample/waf}:/logs/waf:ro
+      - ./collector/certs:/certs:ro     # syslog TLS: сертификат/ключ/CA клиентов
+      - collector-state:/state          # курсоры pull-источников (S3); права — volume-init
+    ports:
+      - "5514:5514/udp"
+      - "5514:5514/tcp"
+      - "${INGEST_BIND:-0.0.0.0}:6514:6514/tcp"   # слушает только при SYSLOG_TLS_ADDR=:6514
+      - "2055:2055/udp"
+      # Вебхуки/метрики по HTTP — только localhost (replay, Prometheus);
+      # снаружи — https://<CONSOLE_HOST>:8089/ingest/* через Caddy.
+      - "127.0.0.1:8088:8088"
+    networks: [data, edge, egress]
+    <<: [*harden, *logging]
+    healthcheck:
+      test: ["CMD", "/collector", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    depends_on:
+      migrator:
+        condition: service_completed_successfully
+      volume-init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          pids: 512
+    restart: unless-stopped
+
+  # Ядро корреляции: правила из ./rules, инциденты, LLM-аналитик, Telegram, реагирование.
+  engine:
+    image: ${ARGUS_IMAGE_PREFIX:-argus}/engine:${APP_VERSION:-dev}
+    build:
+      context: ./engine
+      args:
+        REGISTRY: ${REGISTRY_MIRROR:-docker.io}
+    environment:
+      # Active-response Wazuh как исполнитель реагирования (те же креды, что у policyd)
+      WAZUH_API_URL: ${WAZUH_API_URL:-}
+      WAZUH_API_USER: ${WAZUH_API_USER:-wazuh}
+      WAZUH_API_PASSWORD: ${WAZUH_API_PASSWORD:-}   # нужен только с модулем Wazuh (ARGUS_INTEGRATION_WAZUH=1)
+      WAZUH_INSECURE_TLS: ${WAZUH_INSECURE_TLS:-false}
+      WAZUH_CA_FILE: ${WAZUH_CA_FILE:-}
+      WAZUH_CERT_SHA256: ${WAZUH_CERT_SHA256:-}
+      # Реагирование: ids | simulate | ips (переключается и в консоли), TTL автоблокировки
+      ARGUS_RESPOND_MODE: ${ARGUS_RESPOND_MODE:-simulate}
+      ARGUS_RESPOND_TTL: ${ARGUS_RESPOND_TTL:-1h}
+      ARGUS_RESPOND_MANUAL_TTL: ${ARGUS_RESPOND_MANUAL_TTL:-24h}   # ручная блокировка из карточки; 0 — бессрочно
+      ARGUS_RESPOND_ALLOWLIST_1: ${ARGUS_RESPOND_ALLOWLIST_1:-}
+      ARGUS_RESPOND_ALLOWLIST_2: ${ARGUS_RESPOND_ALLOWLIST_2:-}
+      # Никогда не блокировать (свои внешние адреса, балансировщик перед WAF, мониторинг, VPN)
+      ARGUS_RESPOND_NEVER_BLOCK_1: ${ARGUS_RESPOND_NEVER_BLOCK_1:-}
+      ARGUS_RESPOND_NEVER_BLOCK_2: ${ARGUS_RESPOND_NEVER_BLOCK_2:-}
+      ARGUS_RESPOND_NEVER_BLOCK_3: ${ARGUS_RESPOND_NEVER_BLOCK_3:-}
+      # Доверенные источники событий (CIDR): только их src.ip движок готов блокировать
+      # автоматически — чужие/подделанные адреса из непроверенных источников не блокируются
+      ARGUS_RESPOND_TRUSTED_1: ${ARGUS_RESPOND_TRUSTED_1:-}
+      ARGUS_RESPOND_TRUSTED_2: ${ARGUS_RESPOND_TRUSTED_2:-}
+      ARGUS_RESPOND_TRUSTED_3: ${ARGUS_RESPOND_TRUSTED_3:-}
+      NGFW_BLOCK_URL: ${NGFW_BLOCK_URL:-}
+      NGFW_UNBLOCK_URL: ${NGFW_UNBLOCK_URL:-}
+      NGFW_EXPECT: ${NGFW_EXPECT:-}
+      NGFW_TOKEN: ${NGFW_TOKEN:-}
+      # Токен управляющих POST движка (консоль шлёт X-Argus-Token). Обязателен; стенд — ARGUS_DEV=1.
+      ENGINE_TOKEN: ${ENGINE_TOKEN:?ENGINE_TOKEN не задан — ./scripts/argus init}
+      METRICS_TOKEN: ${METRICS_TOKEN:-}          # Bearer для /metrics; пусто — тот же ENGINE_TOKEN
+      ARGUS_DEV: ${ARGUS_DEV:-0}
+      ARGUS_MAX_NEW_INCIDENTS: ${ARGUS_MAX_NEW_INCIDENTS:-200}   # новых инцидентов за цикл; сверх — шторм, остальное в лог
+      # Исполнитель active-response Wazuh: список id агентов (пусто — выключен; all — все, с предупреждением),
+      # таймаут = <timeout> команды в ossec.conf менеджера, команда снятия блока.
+      WAZUH_AR_AGENTS: ${WAZUH_AR_AGENTS:-}
+      WAZUH_AR_TIMEOUT: ${WAZUH_AR_TIMEOUT:-3600}
+      WAZUH_AR_UNBLOCK_COMMAND: ${WAZUH_AR_UNBLOCK_COMMAND:-}
+      # Rate-limit уведомлений в минуту (сверх — агрегируются в одно сообщение)
+      NOTIFY_TELEGRAM_PER_MINUTE: ${NOTIFY_TELEGRAM_PER_MINUTE:-20}
+      NOTIFY_EMAIL_PER_MINUTE: ${NOTIFY_EMAIL_PER_MINUTE:-20}
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DB: argus
+      CLICKHOUSE_USER: argus_engine
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_ENGINE_PASSWORD:?CLICKHOUSE_ENGINE_PASSWORD не задан — ./scripts/argus init}
+      RULES_DIR: /rules
+      CMDB_FILE: /etc/argus/cmdb.yml
+      POLL_INTERVAL: ${ENGINE_POLL_INTERVAL:-30s}
+      LISTEN_ADDR: ":8090"
+      # Профили аналитика — argus.analyst.yml; секреты только через окружение.
+      ARGUS_ANALYST_PROFILE: ${ARGUS_ANALYST_PROFILE:-mock}
+      ARGUS_ANALYST_FORCE_PROFILE: ${ARGUS_ANALYST_FORCE_PROFILE:-mock}
+      ARGUS_ANALYST_PII_PROFILE: ${ARGUS_ANALYST_PII_PROFILE:-mock}
+      ANALYST_CONCURRENCY: ${ANALYST_CONCURRENCY:-4}        # параллельных запросов к модели
+      ANALYST_DAILY_LIMIT: ${ANALYST_DAILY_LIMIT:-500}      # разборов в сутки; дальше инциденты без вердикта
+      # Профиль on-prem-strict: OpenAI-совместимый эндпоинт внутри контура (vLLM, Ollama, llama.cpp).
+      ARGUS_LLM_LOCAL_ENDPOINT: ${ARGUS_LLM_LOCAL_ENDPOINT:-}
+      ARGUS_LLM_LOCAL_PLAIN_HTTP: ${ARGUS_LLM_LOCAL_PLAIN_HTTP:-true}   # false — локальный эндпоинт только по https
+      ARGUS_LLM_LOCAL_MODEL: ${ARGUS_LLM_LOCAL_MODEL:-}
+      ARGUS_LLM_LOCAL_API_KEY: ${ARGUS_LLM_LOCAL_API_KEY:-}             # если локальный сервер требует ключ
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      # Исходящие вебхуки (notify.webhooks в argus.analyst.yml); пустой адрес — цель выключена.
+      ARGUS_CONSOLE_URL: ${ARGUS_CONSOLE_URL:-}                     # ссылка на карточку инцидента в теле вебхука
+      ARGUS_WEBHOOK_URL: ${ARGUS_WEBHOOK_URL:-}
+      ARGUS_WEBHOOK_SECRET: ${ARGUS_WEBHOOK_SECRET:-}
+      ARGUS_WEBHOOK_TOKEN: ${ARGUS_WEBHOOK_TOKEN:-}
+      # Почтовая эскалация (argus.analyst.yml → notify.email)
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      SMTP_TO: ${SMTP_TO:-}
+      RISK_REPORT_INTERVAL: ${RISK_REPORT_INTERVAL:-}
+    volumes:
+      - ./rules:/rules:ro
+      - ./cmdb.yml:/etc/argus/cmdb.yml:ro
+      - ./caddy/certs:/certs:ro
+    ports:
+      - "127.0.0.1:8090:8090"   # /metrics и /healthz — только localhost
+    networks: [data, egress]
+    <<: [*harden, *logging]
+    healthcheck:
+      test: ["CMD", "/bin/busybox", "wget", "-q", "--spider", "http://127.0.0.1:8090/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    depends_on:
+      migrator:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          pids: 512
+    restart: unless-stopped
+
+  web:
+    image: ${ARGUS_IMAGE_PREFIX:-argus}/web:${APP_VERSION:-dev}
+    build:
+      context: ./web
+      args:
+        APP_VERSION: ${APP_VERSION:-dev}
+        REGISTRY: ${REGISTRY_MIRROR:-docker.io}
+    environment:
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DB: argus
+      CLICKHOUSE_USER: argus_console
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_CONSOLE_PASSWORD:?CLICKHOUSE_CONSOLE_PASSWORD не задан — ./scripts/argus init}
+      # Пароль admin генерируется при первом старте и пишется в /data/admin-password.txt
+      # (том web-auth: docker compose exec web cat /data/admin-password.txt),
+      # меняется на странице «Настройки» — после смены файл удаляется.
+      AUTH_FILE: /data/auth.json
+      # За Caddy: клиентский адрес для аудита и rate-limit берётся из X-Forwarded-For.
+      TRUSTED_PROXY: "1"
+      SESSION_SECURE: ${SESSION_SECURE:-true}
+      # Модуль Wazuh: 1 — страницы «Управление»/SCA и панели алертов в консоли
+      # (вместе с COMPOSE_PROFILES=wazuh для shipper и policyd); 0 — скрыты.
+      ARGUS_INTEGRATION_WAZUH: ${ARGUS_INTEGRATION_WAZUH:-0}
+      # Управляющий контур (страница «Управление»): группы, агенты, правила
+      # через REST API менеджера — те же креды, что у policyd.
+      WAZUH_API_URL: ${WAZUH_API_URL:-https://wazuh-manager:55000}
+      WAZUH_API_USER: ${WAZUH_API_USER:-wazuh}
+      WAZUH_API_PASSWORD: ${WAZUH_API_PASSWORD:-}   # нужен только с модулем Wazuh (ARGUS_INTEGRATION_WAZUH=1)
+      WAZUH_INSECURE_TLS: ${WAZUH_INSECURE_TLS:-false}
+      WAZUH_CA_FILE: ${WAZUH_CA_FILE:-}
+      WAZUH_CERT_SHA256: ${WAZUH_CERT_SHA256:-}
+      # Адрес менеджера для команд установки агента (мастер на странице «Управление»)
+      WAZUH_MANAGER_HOST: ${WAZUH_MANAGER_HOST:-}
+      WAZUH_REGISTRATION_PASSWORD_SET: ${WAZUH_REGISTRATION_PASSWORD_SET:-0}
+      ENGINE_URL: http://engine:8090
+      ENGINE_TOKEN: ${ENGINE_TOKEN:?ENGINE_TOKEN не задан — ./scripts/argus init}
+      COLLECTOR_URL: http://collector:8088
+      INGEST_PUBLIC_URL: ${INGEST_PUBLIC_URL:-}
+      CONSOLE_HOST: ${CONSOLE_HOST:-localhost}
+      # Запросы панелей дашбордов — от read-only пользователя (readonly=1, лимиты CONST)
+      CLICKHOUSE_RO_USER: argus_ro
+      CLICKHOUSE_RO_PASSWORD: ${CLICKHOUSE_RO_PASSWORD:?CLICKHOUSE_RO_PASSWORD не задан — ./scripts/argus init}
+      DASHBOARDS_DIR: /app/dashboards
+      # Bearer-токен для API консоли (MCP-сервер, скрипты): только чтение, ≥32 символов.
+      # Пусто — API только по сессии консоли.
+      ARGUS_API_TOKEN: ${ARGUS_API_TOKEN:-}
+      # Выпуск ограниченных сессий разбора для внешних агентов (POST /api/triage/sessions)
+      # и лимит запросов на сессию.
+      ARGUS_TRIAGE_ISSUER_TOKEN: ${ARGUS_TRIAGE_ISSUER_TOKEN:-}
+      ARGUS_TRIAGE_SESSION_REQUESTS: ${ARGUS_TRIAGE_SESSION_REQUESTS:-}
+      ARGUS_TRIAGE_ANCHOR_MAX_SPREAD: ${ARGUS_TRIAGE_ANCHOR_MAX_SPREAD:-}
+      # SSO через IdP (Authentik/Keycloak): группы IdP → роли консоли на каждом входе
+      OIDC_ISSUER: ${OIDC_ISSUER:-}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
+      OIDC_REDIRECT_URL: ${OIDC_REDIRECT_URL:-https://localhost:8443/api/auth/oidc/callback}
+      OIDC_GROUPS_CLAIM: ${OIDC_GROUPS_CLAIM:-groups}
+      OIDC_GROUP_ADMIN: ${OIDC_GROUP_ADMIN:-argus-admins}
+      OIDC_GROUP_ANALYST: ${OIDC_GROUP_ANALYST:-argus-analysts}
+      OIDC_GROUP_VIEWER: ${OIDC_GROUP_VIEWER:-argus-viewers}
+      OIDC_DEFAULT_ROLE: ${OIDC_DEFAULT_ROLE:-}
+    volumes:
+      - web-auth:/data
+      - ./dashboards:/app/dashboards:ro
+      - ./caddy/certs:/certs:ro
+    ports:
+      - "127.0.0.1:3001:3000"   # прямой доступ без TLS — только localhost (SESSION_SECURE=false)
+    networks: [data, edge, egress]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /app/.next/cache   # standalone-сервер Next пишет только сюда (fetch/route cache)
+    healthcheck:
+      # /api/version без сессии отдаёт только {status:"ok"} — этого достаточно
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:3000/api/version"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      migrator:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          pids: 512
+    restart: unless-stopped
+    <<: *logging
+
+  # MCP-сервер для агентов (Claude Code, Cursor): поиск, инциденты, источники.
+  # Профиль mcp: HTTP — `docker compose --profile mcp up -d mcp` (127.0.0.1:18095).
+  # stdio через compose не работает: `compose run` наследует command → тот же HTTP;
+  # для stdio (Claude Code, Cursor) — локальный бинарник `make mcp` → bin/argus-mcp, см. README.
+  mcp:
+    image: ${ARGUS_IMAGE_PREFIX:-argus}/mcp:${APP_VERSION:-dev}
+    build:
+      context: ./mcp
+      additional_contexts:
+        triage: ./triage   # общий модуль редакции и точных фильтров (replace в go.mod)
+      args:
+        REGISTRY: ${REGISTRY_MIRROR:-docker.io}
+        APP_VERSION: ${APP_VERSION:-dev}
+    profiles: ["mcp"]
+    environment:
+      ARGUS_URL: http://web:3000
+      ARGUS_API_TOKEN: ${ARGUS_API_TOKEN:-}
+      # Bearer для клиентов по HTTP — обязателен в режиме -http (иначе сервер не стартует),
+      # ≥32 символов и НЕ равен ARGUS_API_TOKEN (разные контуры доверия); allow-list браузерных Origin.
+      ARGUS_MCP_HTTP_TOKEN: ${ARGUS_MCP_HTTP_TOKEN:-}
+      ARGUS_MCP_ALLOWED_ORIGINS: ${ARGUS_MCP_ALLOWED_ORIGINS:-}
+      ARGUS_MCP_RATE_PER_MIN: ${ARGUS_MCP_RATE_PER_MIN:-300}   # запросов в минуту на один bearer/сессию
+      # Профиль triage (агент разбора, облачная модель): отдельный токен, редакция до модели,
+      # только точные фильтры, без include_raw. Ключ псевдонимов — общий с engine.
+      ARGUS_MCP_TRIAGE_TOKEN: ${ARGUS_MCP_TRIAGE_TOKEN:-}
+      ARGUS_MCP_PROFILE: ${ARGUS_MCP_PROFILE:-full}
+      ARGUS_PSEUDONYM_KEY: ${ARGUS_PSEUDONYM_KEY:-}
+      ARGUS_REDACT_CANARIES: ${ARGUS_REDACT_CANARIES:-}
+      ARGUS_REDACT_NAMES_FILE: ${ARGUS_REDACT_NAMES_FILE:-}   # путь внутри контейнера: смонтируйте файл словаря отдельно
+    command: ["-http", "0.0.0.0:8095"]
+    ports:
+      - "127.0.0.1:18095:8095"  # нестандартный порт: 8095/8097 на машинах разработчиков заняты
+    networks: [egress]
+    <<: [*harden, *logging]
+    depends_on:
+      web:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+          pids: 128
+    restart: unless-stopped
+
+  # TLS-терминация: консоль :8443 (как у Wazuh dashboard) и вебхуки коллектора :8089.
+  caddy:
+    image: ${REGISTRY_MIRROR:-docker.io}/library/caddy:2.8-alpine@sha256:af32e97399febea808609119bb21544d0265c58a02836576e32a2d082c262c17
+    environment:
+      CONSOLE_HOST: ${CONSOLE_HOST:-localhost}
+      # "internal" (свой CA Caddy) или "/certs/console.crt /certs/console.key"
+      CONSOLE_TLS: ${CONSOLE_TLS:-internal}
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy/certs:/certs:ro
+      - caddy-data:/data       # CA, сертификаты, access.log
+      - caddy-config:/config   # autosave.json
+    ports:
+      - "8443:8443"
+      - "${INGEST_BIND:-0.0.0.0}:8089:8089"
+    networks: [edge]
+    <<: [*harden, *logging]
+    # Бинарник caddy в официальном образе несёт file capability
+    # cap_net_bind_service; с cap_drop ALL + no-new-privileges ядро отказывает
+    # в exec такого файла («operation not permitted»). Возвращаем ровно её —
+    # порты 8443/8089 выше 1024, сама привилегия не используется.
+    cap_add: [NET_BIND_SERVICE]
+    depends_on:
+      - web
+      - collector
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          pids: 256
+    restart: unless-stopped
+
+networks:
+  data:
+    internal: true
+  edge:
+  egress:
+
+volumes:
+  clickhouse-data:
+  clickhouse-backups:
+  caddy-data:
+  caddy-config:
+  shipper-state:
+  collector-state:
+  web-auth:

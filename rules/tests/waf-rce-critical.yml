@@ -1,0 +1,5 @@
+rule: a41c-waf-053
+fixture: fixtures/events/waf.ndjson
+expect_incidents: 1
+expect_actor: 203.0.113.200
+expect_respond_min_events: 2

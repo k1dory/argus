@@ -1,0 +1,5 @@
+# «сейчас» = последнее событие фикстуры + 20 минут: все узлы wazuh молчат дольше 15m
+rule: a41c-ops-040
+fixture: fixtures/events/august.ndjson
+now_offset: 20m
+expect_incidents: 9

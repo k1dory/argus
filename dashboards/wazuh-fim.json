@@ -1,0 +1,65 @@
+{
+  "id": "wazuh-fim",
+  "title": "Wazuh · FIM: что изменилось на хостах",
+  "description": "Контроль целостности файлов (syscheck): какие файлы, на каких хостах, кем и когда. Источник — алерты Wazuh с группой syscheck.",
+  "refresh": "60s",
+  "panels": [
+    {
+      "id": "total",
+      "title": "Изменений файлов",
+      "type": "stat",
+      "w": 6,
+      "h": 3,
+      "sql": "SELECT count() AS `всего`, countIf(JSONExtractString(raw,'syscheck','event') = 'added') AS `добавлено`, countIf(JSONExtractString(raw,'syscheck','event') = 'modified') AS `изменено`, countIf(JSONExtractString(raw,'syscheck','event') = 'deleted') AS `удалено` FROM wazuh_alerts WHERE has(rule_groups,'syscheck') AND $__timeFilter(timestamp)"
+    },
+    {
+      "id": "hosts",
+      "title": "Хосты с изменениями",
+      "type": "stat",
+      "w": 6,
+      "h": 3,
+      "sql": "SELECT uniqExact(agent_name) AS `хостов`, uniqExact(JSONExtractString(raw,'syscheck','path')) AS `файлов` FROM wazuh_alerts WHERE has(rule_groups,'syscheck') AND $__timeFilter(timestamp)"
+    },
+    {
+      "id": "timeline",
+      "title": "Изменения по времени и типу",
+      "type": "timeseries",
+      "w": 12,
+      "h": 6,
+      "series": "event",
+      "sql": "SELECT $__timeInterval(timestamp) AS t, JSONExtractString(raw,'syscheck','event') AS event, count() AS n FROM wazuh_alerts WHERE has(rule_groups,'syscheck') AND $__timeFilter(timestamp) GROUP BY t, event ORDER BY t"
+    },
+    {
+      "id": "byhost",
+      "title": "Хосты по числу изменений",
+      "type": "bar",
+      "w": 8,
+      "h": 7,
+      "sql": "SELECT agent_name AS `хост`, count() AS `изменений` FROM wazuh_alerts WHERE has(rule_groups,'syscheck') AND $__timeFilter(timestamp) GROUP BY `хост` ORDER BY `изменений` DESC LIMIT 15"
+    },
+    {
+      "id": "paths",
+      "title": "Самые «живые» файлы",
+      "type": "table",
+      "w": 16,
+      "h": 7,
+      "sql": "SELECT JSONExtractString(raw,'syscheck','path') AS `путь`, uniqExact(agent_name) AS `хостов`, count() AS `событий`, max(toString(timestamp)) AS `последнее` FROM wazuh_alerts WHERE has(rule_groups,'syscheck') AND $__timeFilter(timestamp) GROUP BY `путь` ORDER BY `событий` DESC LIMIT 20"
+    },
+    {
+      "id": "critical",
+      "title": "Критичные пути: /etc, sudoers, ssh, cron, бинарники",
+      "type": "table",
+      "w": 24,
+      "h": 7,
+      "sql": "SELECT toString(timestamp) AS `время`, agent_name AS `хост`, JSONExtractString(raw,'syscheck','event') AS `событие`, JSONExtractString(raw,'syscheck','path') AS `путь`, JSONExtractString(raw,'syscheck','uname_after') AS `владелец`, JSONExtractString(raw,'syscheck','perm_after') AS `права` FROM wazuh_alerts WHERE has(rule_groups,'syscheck') AND $__timeFilter(timestamp) AND match(JSONExtractString(raw,'syscheck','path'), '^/(etc/(passwd|shadow|sudoers|ssh|cron)|usr/local/bin|usr/bin|bin|sbin)(/|$)') ORDER BY timestamp DESC LIMIT 50"
+    },
+    {
+      "id": "latest",
+      "title": "Последние изменения",
+      "type": "table",
+      "w": 24,
+      "h": 8,
+      "sql": "SELECT toString(timestamp) AS `время`, agent_name AS `хост`, JSONExtractString(raw,'syscheck','event') AS `событие`, JSONExtractString(raw,'syscheck','path') AS `путь`, rule_id AS `правило`, rule_level AS `уровень`, substring(JSONExtractString(raw,'syscheck','md5_after'),1,12) AS md5 FROM wazuh_alerts WHERE has(rule_groups,'syscheck') AND $__timeFilter(timestamp) ORDER BY timestamp DESC LIMIT 100"
+    }
+  ]
+}

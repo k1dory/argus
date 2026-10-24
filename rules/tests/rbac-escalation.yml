@@ -1,0 +1,4 @@
+rule: a41c-k8s-011
+fixture: fixtures/events/august.ndjson
+expect_incidents: 1
+expect_actor: oidc:i.petrov

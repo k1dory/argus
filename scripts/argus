@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# argus — обёртка над стеком, как на лендинге:
+#   argus init [--analyst PROFILE] [--with-wazuh|--without-wazuh] [--no-up]
+#                                              → .env (600) со всеми секретами + make up
+#   argus rules test [--replay FILE]           → тесты правил / replay
+#   argus rules list
+#   argus replay FILE.ndjson                   → залить события в коллектор
+#   argus status                               → здоровье сервисов
+# Модуль Wazuh (shipper, policyd, страницы «Управление»/SCA) включается
+# --with-wazuh: в .env пишутся ARGUS_INTEGRATION_WAZUH=1 и COMPOSE_PROFILES=wazuh;
+# без флага в терминале задаётся вопрос, не в терминале — модуль выключен.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+
+usage() { sed -n '2,11p' "$0"; exit 2; }
+
+# set_var KEY VALUE — заменить первую строку KEY= или #KEY= в .env, иначе дописать.
+# Значение — без спецсимволов awk (0/1, имена профилей через запятую).
+set_var() {
+  local key="$1" val="$2"
+  if grep -qE "^#?${key}=" .env; then
+    awk -v k="$key" -v v="$val" 'BEGIN{done=0} { if (!done && ($0 ~ "^#?" k "=")) { print k "=" v; done=1 } else print }' .env >.env.tmp
+    mv .env.tmp .env
+  else
+    printf '%s=%s\n' "$key" "$val" >>.env
+  fi
+}
+
+# profiles_with NAME — текущий COMPOSE_PROFILES из .env плюс NAME (без дублей);
+# profiles_without NAME — без него. Печатают новый список через запятую.
+current_profiles() { grep -E '^COMPOSE_PROFILES=' .env | head -1 | cut -d= -f2- | sed 's/[[:space:]]*#.*$//' | tr -d '[:space:]' || true; }
+profiles_with() {
+  local cur out="" p; cur="$(current_profiles)"
+  IFS=, read -ra arr <<<"$cur"
+  for p in "${arr[@]+"${arr[@]}"}" "$1"; do
+    [ -n "$p" ] || continue
+    case ",$out," in *",$p,"*) ;; *) out="${out:+$out,}$p" ;; esac
+  done
+  printf '%s' "$out"
+}
+profiles_without() {
+  local cur out="" p; cur="$(current_profiles)"
+  IFS=, read -ra arr <<<"$cur"
+  for p in "${arr[@]+"${arr[@]}"}"; do
+    [ -n "$p" ] && [ "$p" != "$1" ] || continue
+    out="${out:+$out,}$p"
+  done
+  printf '%s' "$out"
+}
+
+engine() {
+  if command -v go >/dev/null 2>&1; then
+    (cd engine && RULES_DIR="$ROOT/rules" go run ./cmd/engine "$@")
+  else
+    docker compose run --rm -v "$ROOT/rules:/rules:ro" -v "$ROOT/fixtures:/fixtures:ro" engine "$@"
+  fi
+}
+
+# Секрет в .env: если переменная задана непустым значением, отличным от
+# заглушки change-me* — не трогаем (пароль «argus-…» может быть настоящим:
+# генерировать поверх него — молча сломать доступ); закомментированную или
+# пустую строку заменяем; иначе дописываем. Значения не попадают в argv
+# внешних команд: sed получает их через переменную окружения не нужно —
+# пишем python-free, чистым bash.
+gen_secret() { openssl rand -hex 24; }
+ensure_secret() {
+  local key="$1" val cur
+  cur=$(grep -E "^${key}=" .env | head -1 | cut -d= -f2- | sed 's/[[:space:]]*#.*$//' || true)
+  case "$cur" in
+    ""|change-me*) ;;
+    *) return 0 ;;
+  esac
+  val=$(gen_secret)
+  if grep -qE "^#?${key}=" .env; then
+    # заменяем первую строку KEY= или #KEY= (значение без спецсимволов: hex)
+    awk -v k="$key" -v v="$val" 'BEGIN{done=0} { if (!done && ($0 ~ "^#?" k "=")) { print k "=" v; done=1 } else print }' .env >.env.tmp
+    mv .env.tmp .env
+  else
+    printf '%s=%s\n' "$key" "$val" >>.env
+  fi
+  echo "init: $key сгенерирован"
+}
+
+case "${1:-}" in
+  init)
+    shift
+    analyst=""; up=1; wazuh=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --analyst) analyst="$2"; shift 2 ;;
+        --with-wazuh) wazuh=1; shift ;;
+        --without-wazuh) wazuh=0; shift ;;
+        --no-up) up=0; shift ;;
+        --rules|--retention|--registry) echo "init: $1 больше не нужен (правила — ./rules, TTL — миграции, реестр — ARGUS_IMAGE_PREFIX)"; shift 2 ;;
+        *) usage ;;
+      esac
+    done
+    umask 077
+    [ -f .env ] || { cp .env.example .env; echo "init: создан .env из .env.example"; }
+    chmod 600 .env
+    for k in CLICKHOUSE_PASSWORD CLICKHOUSE_RO_PASSWORD CLICKHOUSE_CONSOLE_PASSWORD \
+             CLICKHOUSE_COLLECTOR_PASSWORD CLICKHOUSE_SHIPPER_PASSWORD CLICKHOUSE_POLICYD_PASSWORD \
+             CLICKHOUSE_ENGINE_PASSWORD ENGINE_TOKEN ARGUS_INGEST_TOKEN ARGUS_API_TOKEN \
+             ARGUS_MCP_HTTP_TOKEN ARGUS_PSEUDONYM_KEY POLICYD_TOKEN BACKUP_KEY; do
+      ensure_secret "$k"
+    done
+    # Пароль API менеджера Wazuh сгенерировать нельзя (он задаётся на менеджере),
+    # а случайная строка выглядела бы как настоящий и молча давала бы 401.
+    # Compose требует непустое значение: оставляем заглушку change-me, которую
+    # движок при заданном WAZUH_API_URL не принимает (кроме ARGUS_DEV=1).
+    if ! grep -qE '^WAZUH_API_PASSWORD=.+' .env; then
+      if grep -qE '^#?WAZUH_API_PASSWORD=' .env; then
+        awk 'BEGIN{done=0} { if (!done && ($0 ~ /^#?WAZUH_API_PASSWORD=/)) { print "WAZUH_API_PASSWORD=change-me"; done=1 } else print }' .env >.env.tmp
+        mv .env.tmp .env
+      else
+        printf 'WAZUH_API_PASSWORD=change-me\n' >>.env
+      fi
+    fi
+    if grep -qE '^WAZUH_API_PASSWORD=change-me' .env; then
+      echo "init: ВНИМАНИЕ — WAZUH_API_PASSWORD=change-me (заглушка): впишите пароль API менеджера Wazuh, иначе движок не стартует при заданном WAZUH_API_URL"
+    fi
+    if [ -n "$analyst" ]; then
+      set_var ARGUS_ANALYST_PROFILE "$analyst"
+    fi
+    # Модуль Wazuh: флаг, иначе вопрос в терминале; уже включённый в .env не выключаем молча.
+    if [ -z "$wazuh" ]; then
+      if grep -qE '^ARGUS_INTEGRATION_WAZUH=1' .env; then
+        wazuh=1
+      elif [ -t 0 ] && [ -t 1 ]; then
+        printf 'init: подключить модуль Wazuh (shipper alerts.json, policyd SCA, страницы «Управление»)? [y/N] '
+        read -r answer || answer=""
+        case "$answer" in y|Y|yes|YES|д|Д|да|Да) wazuh=1 ;; *) wazuh=0 ;; esac
+      else
+        wazuh=0
+      fi
+    fi
+    if [ "$wazuh" = 1 ]; then
+      set_var ARGUS_INTEGRATION_WAZUH 1
+      set_var COMPOSE_PROFILES "$(profiles_with wazuh)"
+      echo "init: модуль Wazuh включён (ARGUS_INTEGRATION_WAZUH=1, COMPOSE_PROFILES=$(current_profiles)); укажите WAZUH_API_URL/WAZUH_API_PASSWORD и WAZUH_ALERTS_DIR"
+    else
+      set_var ARGUS_INTEGRATION_WAZUH 0
+      rest="$(profiles_without wazuh)"
+      if [ -n "$rest" ]; then set_var COMPOSE_PROFILES "$rest"; else sed -i.bak '/^COMPOSE_PROFILES=/d' .env && rm -f .env.bak; fi
+      echo "init: модуль Wazuh выключен (ARGUS_INTEGRATION_WAZUH=0); включить позже — ./scripts/argus init --with-wazuh --no-up"
+    fi
+    chmod 600 .env
+    echo "init: .env готов (права 600). Пароль admin консоли после старта: docker compose exec web cat /data/admin-password.txt"
+    if [ "$up" = 1 ]; then make up; fi
+    ;;
+  rules)
+    shift
+    case "${1:-}" in
+      test) shift; args=(); for a in "$@"; do case "$a" in --replay) args+=("$a"); replay_next=1 ;; *) if [ "${replay_next:-0}" = 1 ] && [ "${a#/}" = "$a" ]; then args+=("$ROOT/$a"); replay_next=0; else args+=("$a"); fi ;; esac; done; engine rules test ${args[@]+"${args[@]}"} ;;  # bash 3.2: пустой массив под set -u
+      list) engine rules list ;;
+      *) usage ;;
+    esac
+    ;;
+  replay)
+    [ -n "${2:-}" ] || usage
+    # Токен ингеста — из окружения или .env (стенд с ARGUS_DEV=1 пропускает без него).
+    if [ -z "${ARGUS_INGEST_TOKEN:-}" ] && [ -f .env ]; then
+      ARGUS_INGEST_TOKEN=$(grep -E '^ARGUS_INGEST_TOKEN=' .env | head -1 | cut -d= -f2- || true)
+    fi
+    url="${COLLECTOR_URL:-http://localhost:8088}"
+    # REPLAY_REBASE=1 (по умолчанию): сдвинуть метки так, чтобы последнее
+    # событие было «сейчас» — относительные интервалы сохраняются.
+    if [ "${REPLAY_REBASE:-1}" = "1" ] && command -v python3 >/dev/null; then
+      f="$2"; [ "${f#/}" = "$f" ] && f="$ROOT/$f"
+      python3 - "$f" <<'PY' | curl -sS -X POST "$url/ingest/events" -H "X-Argus-Token: ${ARGUS_INGEST_TOKEN:-}" \
+        -H "Content-Type: application/x-ndjson" --data-binary @-
+import json, sys
+from datetime import datetime, timezone
+rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip() and not l.startswith("#")]
+fmt = "%Y-%m-%d %H:%M:%S.%f"
+last = max(datetime.strptime(r["ts"], fmt) for r in rows)
+shift = datetime.now(timezone.utc).replace(tzinfo=None) - last
+for r in rows:
+    r["ts"] = (datetime.strptime(r["ts"], fmt) + shift).strftime(fmt)[:-3]
+    print(json.dumps(r, ensure_ascii=False))
+PY
+    else
+      curl -sS -X POST "$url/ingest/events" -H "X-Argus-Token: ${ARGUS_INGEST_TOKEN:-}" \
+        -H "Content-Type: application/x-ndjson" --data-binary "@${f:-$2}"
+    fi
+    echo
+    ;;
+  status)
+    # ClickHouse наружу не публикуется (сеть data — internal): его состояние — из compose ps.
+    docker compose ps --format 'table {{.Service}}\t{{.Status}}' 2>/dev/null || true
+    for u in "http://localhost:8088/healthz" "http://localhost:8090/healthz" "http://localhost:8080/healthz" "https://localhost:8443/api/version"; do
+      printf '%-40s ' "$u"; curl -ksS --max-time 3 "$u" || echo "DOWN"; echo
+    done
+    ;;
+  *) usage ;;
+esac

@@ -1,0 +1,402 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+/* Тема одна (тёмная), класса .dark нет — вариант dark: намеренно мёртвый,
+   иначе dark:-классы shadcn зависели бы от темы ОС. */
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-plex-sans);
+  --font-mono: var(--font-plex-mono);
+  --font-heading: var(--font-plex-sans);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  /* terminal-dark: концентрические радиусы 16 рамка / 12 поверхность / 10 панель / 8 кнопки / 6 чипы */
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 8px;
+  --radius-xl: 12px;
+  --radius-2xl: 16px;
+  --radius-3xl: 6px;
+  --radius-4xl: 6px;
+  --color-bg-base: #0a0b0d;
+  --color-bg-surface: #101216;
+  --color-bg-elevated: #16181d;
+  --color-border-subtle: #1e2127;
+  --color-border-strong: #2a2e37;
+  --color-text-primary: #e6e8eb;
+  --color-text-secondary: #9ba1ac;
+  --color-text-tertiary: #7d838e;
+  --color-text-disabled: #454b54;
+  --color-kw: #c792ea;
+  --color-str: #c3e88d;
+  --color-fn: #82aaff;
+  --color-num: #f78c6c;
+  --color-const: #ffcb6b;
+  --color-err: #f07178;
+  --color-comment: #7f8796;
+}
+
+/*
+ * Дизайн-система консоли — terminal-dark (скилл владельца, ветка SKILL):
+ * тёмные слои вместо теней (base → surface → elevated), волосяные границы,
+ * акценты — только из синтаксической палитры; ведущий акцент — syntax-func
+ * #82AAFF (ссылки, фокус, активная вкладка). IBM Plex Sans — всё, что написал
+ * человек; IBM Plex Mono — только то, что можно набрать или что выдала машина.
+ */
+:root {
+  --background: #0a0b0d;
+  --foreground: #e6e8eb;
+  --card: #101216;
+  --card-foreground: #e6e8eb;
+  --popover: #16181d;
+  --popover-foreground: #e6e8eb;
+  --primary: #e6e8eb; /* главная кнопка — светлая заливка, текст цвета холста */
+  --primary-foreground: #0a0b0d;
+  --secondary: transparent;
+  --secondary-foreground: #e6e8eb;
+  --muted: #16181d;
+  --muted-foreground: #9ba1ac;
+  --accent: #16181d;
+  --accent-foreground: #e6e8eb;
+  --destructive: #f07178;
+  --border: #1e2127;
+  --input: #2a2e37;
+  --ring: #82aaff; /* ведущий акцент: syntax-func */
+  --surface-deep: #101216;
+  --surface-elevated: #16181d;
+  --border-strong: #2a2e37;
+  --text-tertiary: #7d838e; /* светлее #6B7280: метаданные 12px держат 4.5:1 на холсте */
+  --text-disabled: #454b54;
+  --fg-2: #c5c9d0;
+  --status-ok: #c3e88d;
+  --status-warn: #f78c6c;
+  --status-err: #f07178;
+  /* Серии графиков: низкая — серым, высокая — syntax-number, критичная — syntax-error */
+  --chart-1: #4b515c;
+  --chart-2: #f78c6c;
+  --chart-3: #f07178;
+  --chart-4: #c3e88d;
+  --chart-5: #82aaff;
+  --radius: 8px;
+  --sidebar: #0a0b0d;
+  --sidebar-foreground: #e6e8eb;
+  --sidebar-primary: #82aaff;
+  --sidebar-primary-foreground: #0a0b0d;
+  --sidebar-accent: #16181d;
+  --sidebar-accent-foreground: #e6e8eb;
+  --sidebar-border: #1e2127;
+  --sidebar-ring: #82aaff;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-family: var(--font-plex-sans), system-ui, sans-serif;
+    color: var(--fg-2);
+    -webkit-font-smoothing: antialiased;
+  }
+  h1, h2, h3 {
+    font-family: var(--font-plex-sans), system-ui, sans-serif;
+    font-weight: 600;
+    color: var(--foreground);
+    letter-spacing: -0.02em;
+  }
+  ::selection {
+    background: color-mix(in oklab, var(--ring) 30%, transparent);
+  }
+  :focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+  code, kbd, samp, pre {
+    font-variant-ligatures: none;
+  }
+  /* Скип-линк: невидим до фокуса, при фокусе — окно в левом верхнем углу */
+  .skip-link {
+    position: absolute;
+    left: -9999px;
+    top: 8px;
+    z-index: 100;
+    padding: 8px 12px;
+    background: var(--surface-elevated);
+    border: 1px solid var(--ring);
+    border-radius: 8px;
+    color: var(--foreground);
+    font-size: 13px;
+  }
+  .skip-link:focus {
+    left: 8px;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+@layer components {
+  /* ===== Кнопки: светлая заливка / волосяная обводка; текст — sans ===== */
+  [data-slot="button"] {
+    font-family: var(--font-plex-sans), system-ui, sans-serif;
+    font-weight: 500;
+    box-shadow: none;
+    transition: background-color 150ms linear, border-color 150ms linear, color 150ms linear;
+  }
+  /* Варианты кнопок — в components/ui/button.tsx (утилиты бьют слой components). */
+
+  /* ===== Поля ввода: слой холста внутри поверхности, обводка border-strong ===== */
+  [data-slot="input"],
+  [data-slot="select-trigger"],
+  textarea {
+    background: var(--background);
+    border: 1px solid var(--border-strong);
+    font-size: 13px;
+    box-shadow: none;
+  }
+  [data-slot="input"],
+  textarea {
+    font-family: var(--font-plex-mono), ui-monospace, monospace;
+  }
+  [data-slot="input"]:focus-visible,
+  [data-slot="select-trigger"]:focus-visible,
+  textarea:focus-visible {
+    outline: none;
+    border-color: color-mix(in oklab, var(--ring) 60%, transparent);
+    box-shadow: 0 0 0 1px color-mix(in oklab, var(--ring) 40%, transparent);
+  }
+  [data-slot="input"]::placeholder,
+  textarea::placeholder {
+    color: var(--text-tertiary);
+  }
+  [data-slot="select-content"],
+  [data-slot="dropdown-menu-content"] {
+    background: var(--surface-elevated);
+    border: 1px solid var(--border-strong);
+    box-shadow: none;
+  }
+  [data-slot="card"] {
+    background: var(--card);
+    border: 1px solid var(--border);
+    box-shadow: none;
+  }
+  [data-slot="badge"] {
+    font-size: 11px;
+    font-weight: 500;
+    border-radius: 6px;
+  }
+
+  /* ===== Панель: поверхность surface, волосяная граница, заголовок — sans ===== */
+  .win {
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: var(--card);
+  }
+  .win__bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-height: 40px;
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--border);
+    min-width: 0; /* дочерние элементы могут ужиматься, ничего не вылезает за рамку */
+    overflow: hidden;
+  }
+  .win__title {
+    font-size: 13px;
+    font-weight: 600;
+    line-height: 1.2;
+    color: var(--foreground);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+    flex: 0 1 auto;
+  }
+  .win__rule {
+    flex: 1;
+    min-width: 12px;
+  }
+  .win__meta {
+    font-size: 12px;
+    color: var(--text-tertiary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+    flex: 0 1 auto;
+    max-width: 60%;
+  }
+  .win__body {
+    min-width: 0;
+    padding: 16px;
+  }
+
+  /* Двойная рамка (§10.1): внешняя 16, зазор 4, внутренняя 12 — для того,
+     во что смотрят: сырое событие, гистограмма. */
+  .frame {
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    background: #0d0e11;
+    padding: 4px;
+  }
+  .frame__inner {
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: var(--card);
+    overflow: hidden;
+    border-top-color: rgb(255 255 255 / 0.04);
+  }
+
+  /* Совместимость со старыми классами консоли */
+  .c-frame {
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: var(--card);
+    padding: 0;
+  }
+  .c-label {
+    font-size: 12px;
+    font-weight: 500;
+    letter-spacing: 0.01em;
+    color: var(--text-tertiary);
+  }
+  .c-well {
+    background: var(--background);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+  }
+  .c-led {
+    --led-color: var(--status-ok);
+    width: 8px;
+    height: 8px;
+    border-radius: 9999px; /* статусная точка — единственное круглое */
+    background: var(--led-color);
+  }
+
+  /* ===== Таблицы: только горизонтальные волосяные линии ===== */
+  [data-slot="table"] {
+    font-variant-numeric: tabular-nums;
+  }
+  [data-slot="table-head"] {
+    font-size: 12px;
+    color: var(--text-tertiary);
+    font-weight: 500;
+  }
+  [data-slot="table-row"] {
+    border-color: var(--border);
+  }
+  [data-slot="table-row"]:hover {
+    background: var(--surface-elevated);
+  }
+  [data-slot="table-cell"] {
+    color: var(--fg-2);
+  }
+
+  /* Символьная сетка (фигуры в символьной клетке) */
+  .ascii {
+    font-family: var(--font-plex-mono), ui-monospace, monospace;
+    font-size: 12px;
+    line-height: 1.6;
+    white-space: pre;
+    letter-spacing: 0;
+    color: var(--muted-foreground);
+    margin: 0;
+  }
+  .ascii .hot {
+    color: var(--ring);
+  }
+
+  /* Индикатор ожидания: |/-\ — только пока идёт действие */
+  .ascii-spin::before {
+    content: "|";
+    display: inline-block;
+    width: 1ch;
+    font-family: var(--font-plex-mono), ui-monospace, monospace;
+    animation: ascii-spin 0.6s steps(4) infinite;
+  }
+  @keyframes ascii-spin {
+    0% { content: "|"; }
+    25% { content: "/"; }
+    50% { content: "-"; }
+    75% { content: "\\"; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .ascii-spin::before { animation: none; content: "…"; }
+  }
+
+  /* Новая строка live-tail: подсветка тает за 2 с (только opacity фона) */
+  .row-fresh {
+    animation: row-fresh 2s ease-out;
+  }
+  @keyframes row-fresh {
+    from { background-color: color-mix(in oklab, var(--ring) 10%, transparent); }
+    to { background-color: transparent; }
+  }
+
+  /* Правый край горизонтально прокручиваемого кода — маска, не заливка */
+  .fade-x {
+    mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent 100%);
+  }
+
+  /* Сетка дашборда 24 колонки: < lg — панель во всю ширину, lg…xl — узкие
+     панели по половине, ≥ xl — как задано (--w). Значения ставит DashboardGrid. */
+  .dash-grid {
+    display: grid;
+    gap: 16px;
+    grid-template-columns: repeat(24, minmax(0, 1fr));
+  }
+  .dash-panel {
+    grid-column: span 24 / span 24;
+    --dash-h: 320px;
+    min-height: var(--dash-h);
+  }
+  @media (min-width: 1024px) {
+    .dash-panel { grid-column: span var(--wm, 24) / span var(--wm, 24); }
+  }
+  @media (min-width: 1280px) {
+    .dash-panel { grid-column: span var(--w, 24) / span var(--w, 24); }
+  }
+
+  /* Тосты sonner в стиле консоли */
+  .cn-toast {
+    border-radius: 10px !important;
+    box-shadow: none !important;
+    background: var(--surface-elevated) !important;
+    border: 1px solid var(--border-strong) !important;
+  }
+}

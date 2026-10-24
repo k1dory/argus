@@ -1,0 +1,5 @@
+rule: a41c-auth-030
+fixture: fixtures/events/august.ndjson
+expect_incidents: 1
+expect_actor: web-01
+min_events: 20

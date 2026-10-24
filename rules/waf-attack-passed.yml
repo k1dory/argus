@@ -1,0 +1,19 @@
+# WAF в режиме детекта (DetectionOnly) увидел атаку, а приложение ответило 5xx:
+# запрос дошёл до кода и что-то сломал. Не блокируем — разбирает человек.
+title: "WAF: attack reached the application (detect-only, 5xx)"
+id: a41c-waf-052
+level: high
+tags: [attack.initial_access, attack.t1190]
+
+detection:
+  selection:
+    source.class: waf
+    action: http.attack
+    outcome: allow
+    attrs.status|regex: '^5\d\d$'
+  condition: selection
+
+dedupe: 15m
+
+analyst:
+  profile: on-prem-strict

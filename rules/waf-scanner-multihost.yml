@@ -1,0 +1,27 @@
+# Сканер: один адрес трогает несколько хостов за короткое время (.env,
+# wp-login, phpmyadmin, .git). Блокировать стоит — до того, как найдёт дыру.
+title: "WAF: scanner across multiple hosts"
+id: a41c-waf-051
+level: high
+tags: [attack.reconnaissance, attack.t1595.002]
+
+detection:
+  selection:
+    source.class: waf
+    action: http.attack
+  threshold:
+    kind: distinct
+    field: node
+    distinct: 3
+    window: 10m
+    group_by: src.ip
+  condition: selection and threshold
+
+respond:
+  action: block_ip
+  target: src.ip
+  min_level: high
+  ttl: 6h
+
+analyst:
+  profile: on-prem-strict

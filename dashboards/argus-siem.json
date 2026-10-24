@@ -1,0 +1,26 @@
+{
+  "id": "argus-siem",
+  "title": "ARGUS SIEM Overview",
+  "description": "События по классам, инциденты, ATT&CK-покрытие, вердикты аналитика, ПДн, ложные.",
+  "refresh": "30s",
+  "panels": [
+    {"id": "p1", "title": "События по классам источников", "type": "timeseries", "w": 16, "h": 8, "series": "source_class",
+     "sql": "SELECT $__timeInterval(ts) AS time, source_class, count() AS events FROM events WHERE $__timeFilter(ts) GROUP BY time, source_class ORDER BY time"},
+    {"id": "p2", "title": "Открытых инцидентов", "type": "stat", "w": 8, "h": 4, "unit": "",
+     "sql": "SELECT countIf(status NOT IN ('closed','false_positive')) AS open, countIf(status='escalated') AS escalated FROM (SELECT incident_id, argMax(status, updated_at) AS status FROM incidents GROUP BY incident_id)"},
+    {"id": "p3", "title": "EPS по источникам (60 с)", "type": "table", "w": 8, "h": 4,
+     "sql": "SELECT source, round(sum(events_1m)/60, 1) AS eps FROM collector_health WHERE seen_at >= now() - INTERVAL 2 MINUTE GROUP BY source ORDER BY eps DESC LIMIT 12"},
+    {"id": "p4", "title": "Инциденты по уровню и статусу", "type": "table", "w": 8, "h": 8,
+     "sql": "SELECT level, status, count() AS n FROM (SELECT incident_id, argMax(level, updated_at) AS level, argMax(status, updated_at) AS status, argMax(created_at, updated_at) AS created_at FROM incidents GROUP BY incident_id) WHERE $__timeFilter(created_at) GROUP BY level, status ORDER BY level, status"},
+    {"id": "p5", "title": "Инциденты во времени по правилам", "type": "timeseries", "w": 16, "h": 8, "series": "rule_id",
+     "sql": "SELECT $__timeInterval(created_at) AS time, rule_id, count() AS n FROM (SELECT incident_id, argMax(rule_id, updated_at) AS rule_id, argMax(created_at, updated_at) AS created_at FROM incidents GROUP BY incident_id) WHERE $__timeFilter(created_at) GROUP BY time, rule_id ORDER BY time"},
+    {"id": "p6", "title": "Покрытие ATT&CK тактиками (30 д)", "type": "bar", "w": 12, "h": 8,
+     "sql": "SELECT replaceOne(tag, 'attack.', '') AS tactic, count() AS incidents FROM (SELECT incident_id, argMax(tags, updated_at) AS tags, argMax(created_at, updated_at) AS created_at FROM incidents GROUP BY incident_id) ARRAY JOIN tags AS tag WHERE tag LIKE 'attack.%' AND tag NOT LIKE 'attack.t%' AND created_at >= now() - INTERVAL 30 DAY GROUP BY tag ORDER BY incidents DESC"},
+    {"id": "p7", "title": "Вердикты аналитика", "type": "timeseries", "w": 12, "h": 8,
+     "sql": "SELECT $__timeInterval(evaluated_at) AS time, countIf(shown=1 AND error='') AS shown_to_analyst, countIf(shown=0 AND error='') AS below_threshold, countIf(error!='') AS failed FROM incident_verdicts WHERE $__timeFilter(evaluated_at) GROUP BY time ORDER BY time"},
+    {"id": "p8", "title": "Доля событий с ПДн по источникам", "type": "bar", "w": 12, "h": 7,
+     "sql": "SELECT source, round(100*avg(pii),1) AS pii_pct FROM events WHERE $__timeFilter(ts) GROUP BY source ORDER BY pii_pct DESC LIMIT 12"},
+    {"id": "p9", "title": "Ложные срабатывания по правилам (30 д)", "type": "table", "w": 12, "h": 7,
+     "sql": "SELECT rule_id, count() AS incidents, countIf(status='false_positive') AS false_positive, round(100*countIf(status='false_positive')/count(),1) AS fp_pct FROM (SELECT incident_id, argMax(rule_id, updated_at) AS rule_id, argMax(status, updated_at) AS status, argMax(created_at, updated_at) AS created_at FROM incidents GROUP BY incident_id) WHERE created_at >= now() - INTERVAL 30 DAY GROUP BY rule_id ORDER BY fp_pct DESC"}
+  ]
+}

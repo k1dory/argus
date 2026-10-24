@@ -1,0 +1,20 @@
+# Много крупных DNS-запросов с одного адреса за короткое время
+title: Possible DNS tunnel
+id: a41c-c2-015
+level: high
+tags: [attack.command_and_control, attack.t1071.004]
+
+detection:
+  selection:
+    dst.port: 53
+    bytes: '> 200'
+  filter:
+    dst.ip: [10.0.0.53, 10.0.0.54]    # свои резолверы — не туннель
+  threshold:
+    count: 40
+    window: 5m
+    group_by: src.ip
+  condition: selection and not filter and threshold
+
+analyst:
+  profile: on-prem-strict

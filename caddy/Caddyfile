@@ -1,0 +1,69 @@
+# TLS перед консолью (:8443) и вебхуками коллектора (:8089).
+# По умолчанию — сертификат из внутреннего CA Caddy (tls internal), как у Wazuh
+# dashboard. Свой сертификат: файлы в ./caddy/certs и в .env
+# CONSOLE_TLS="/certs/console.crt /certs/console.key". Имя хоста — CONSOLE_HOST
+# (.env); для IP и localhost сертификаты тоже выпускаются.
+{
+	auto_https disable_redirects
+}
+
+# Общие заголовки. CSP здесь НЕ задаётся: консоль выпускает её сама с nonce на
+# каждый ответ (web/src/proxy.ts); статическая политика из Caddy перекрыла бы
+# nonce и вернула 'unsafe-inline'. Ответы, где CSP от Next нет, добираются
+# директивой ?Content-Security-Policy (ставится только при отсутствии).
+(security) {
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy same-origin
+		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=(), interest-cohort=()"
+		?Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; object-src 'none'; base-uri 'self'; form-action 'self'"
+		-Server
+	}
+}
+
+(access_log) {
+	log {
+		output file /data/access.log {
+			roll_size 50mb
+			roll_keep 5
+		}
+		format json
+	}
+}
+
+# Консоль
+https://{$CONSOLE_HOST:localhost}:8443, https://localhost:8443, https://127.0.0.1:8443 {
+	tls {$CONSOLE_TLS:internal}
+	encode gzip
+	import security
+	import access_log
+	request_body {
+		max_size 16MB
+	}
+	reverse_proxy web:3000 {
+		header_up X-Forwarded-Proto https
+		header_up X-Real-IP {remote_host}
+	}
+}
+
+# Вебхуки коллектора по TLS: k8s audit, GitLab, Harbor, Argo CD, /ingest/events.
+# Наружу — только /ingest/*; /metrics и /healthz коллектора остаются на 127.0.0.1:8088.
+https://{$CONSOLE_HOST:localhost}:8089, https://localhost:8089, https://127.0.0.1:8089 {
+	tls {$CONSOLE_TLS:internal}
+	import security
+	import access_log
+	request_body {
+		max_size 16MB
+	}
+	handle /ingest/* {
+		reverse_proxy collector:8088 {
+			header_up X-Forwarded-Proto https
+			header_up X-Real-IP {remote_host}
+		}
+	}
+	handle {
+		respond 404
+	}
+}

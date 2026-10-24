@@ -1,0 +1,54 @@
+# Алерты Prometheus для ARGUS: scrape /metrics коллектора (8088) и движка (8090).
+# Пример scrape-конфига — ops/prometheus-scrape.yml. Пороги — под сотни-тысячи EPS.
+groups:
+  - name: argus
+    rules:
+      - alert: ArgusEngineStalled
+        expr: time() - argus_engine_last_run_timestamp > 300
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "Движок ARGUS не завершал цикл 5 минут"
+          runbook: "README — «Эксплуатация»: лог движка (docker compose logs engine), ClickHouse доступен?"
+      - alert: ArgusCollectorDrops
+        expr: increase(argus_collector_events_dropped_total[5m]) > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Коллектор отбрасывает события (очередь полна или ClickHouse не принимает)"
+          runbook: "README — «Эксплуатация»: SINK_PENDING_ROWS/SINK_SPOOL_BYTES, место на диске ClickHouse, argus.ingest_rejects"
+      - alert: ArgusCollectorSpoolFilling
+        expr: argus_collector_spool_capacity_bytes > 0 and argus_collector_spool_bytes / argus_collector_spool_capacity_bytes > 0.8
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Дисковая очередь коллектора заполнена более чем на 80 %"
+      - alert: ArgusWebhookFailed
+        expr: increase(argus_engine_webhook_deliveries_total{result=~"failed|dropped"}[15m]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "Вебхук {{ $labels.target }} не доставлен: инцидент не дошёл до внешнего приёмника"
+          runbook: "README — «Исходящие вебхуки»; лог движка, webhook:"
+      - alert: ArgusIncidentStateWriteFailed
+        expr: increase(argus_engine_incident_state_write_errors_total[5m]) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: "Переход инцидента не записался в журнал состояний"
+      - alert: ArgusClickHouseDiskLow
+        expr: argus_clickhouse_disk_free_ratio < 0.15
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "На диске ClickHouse меньше 15 % места (правило a41c-ops-062 заведёт инцидент при занятости ≥ 90 %)"
+          runbook: "README: «Хранилище: отдельный диск»"
+      - alert: ArgusSourceSilent
+        expr: argus_collector_source_last_seen_seconds > 900
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "Источник {{ $labels.source }} молчит 15 минут"
+      - alert: ArgusAnalystErrors
+        expr: increase(argus_engine_analyst_errors_total[15m]) > 5
+        labels: { severity: warning }
+        annotations:
+          summary: "LLM-аналитик ошибается (профиль/эндпоинт недоступен); инциденты создаются без вердикта"

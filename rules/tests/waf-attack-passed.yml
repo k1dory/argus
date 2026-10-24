@@ -1,0 +1,4 @@
+rule: a41c-waf-052
+fixture: fixtures/events/waf.ndjson
+expect_incidents: 1
+expect_actor: 192.0.2.44

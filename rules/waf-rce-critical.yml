@@ -1,0 +1,33 @@
+# RCE/LFI/RFI с высоким anomaly score CRS: не сканер, а целевая попытка.
+# Критично: инцидент заводится по первому же событию (дежурный видит сразу).
+# Блокировка — со второго события в окне dedupe (respond.min_events: 2):
+# одно событие может быть подделанным syslog-сообщением «атака с адреса X»,
+# и без порога любой, кто умеет слать UDP в коллектор, блокировал бы кого
+# угодно. Реальная попытка RCE почти никогда не бывает единственной —
+# сканер/эксплойт шлёт серию запросов, второе событие приходит за секунды.
+# Плюс движок проверяет транспорт: блок только по событиям с доверенным
+# транспортом (file/http/tls/pull) или от адреса из respond.trusted_sources.
+title: "WAF: critical RCE/LFI attempt with high anomaly score"
+id: a41c-waf-053
+level: critical
+tags: [attack.execution, attack.t1190, attack.t1059]
+
+detection:
+  selection:
+    source.class: waf
+    action: http.attack
+    attrs.categories|regex: '(^|,)(rce|lfi|rfi|injection-php|injection-java)(,|$)'
+    attrs.anomaly_score: '>= 20'
+  condition: selection
+
+dedupe: 30m
+
+respond:
+  action: block_ip
+  target: src.ip
+  min_level: critical
+  min_events: 2
+  ttl: 24h
+
+analyst:
+  profile: on-prem-strict

@@ -1,0 +1,7 @@
+# db-01 три замера подряд ≥ 90 % (10:20, 10:25, 10:30); web-01 держится около 40 %;
+# замеры argus.system о диске ClickHouse исключены фильтром.
+rule: a41c-ops-060
+fixture: fixtures/events/telemetry.ndjson
+expect_incidents: 1
+expect_actor: db-01
+min_events: 3

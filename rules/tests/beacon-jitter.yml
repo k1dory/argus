@@ -1,0 +1,5 @@
+rule: a41c-c2-016
+fixture: fixtures/events/august.ndjson
+expect_incidents: 1
+expect_actor: 10.20.3.19
+min_events: 6

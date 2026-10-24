@@ -1,0 +1,105 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="560" viewBox="0 0 1120 560" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13">
+  <style>
+    .box { fill: #0b0b0b; stroke: #f80; stroke-width: 1.5; }
+    .opt { fill: #0b0b0b; stroke: #777; stroke-width: 1.5; stroke-dasharray: 5 4; }
+    .store { fill: #0b0b0b; stroke: #f80; stroke-width: 2; }
+    .t { fill: #eee; }
+    .m { fill: #999; font-size: 11px; }
+    .a { fill: #f80; font-weight: bold; }
+    .ln { stroke: #f80; stroke-width: 1.5; fill: none; marker-end: url(#ar); }
+    .lo { stroke: #777; stroke-width: 1.5; fill: none; stroke-dasharray: 5 4; marker-end: url(#ag); }
+  </style>
+  <defs>
+    <marker id="ar" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#f80"/></marker>
+    <marker id="ag" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#777"/></marker>
+  </defs>
+  <rect width="1120" height="560" fill="#000"/>
+  <text x="20" y="28" class="a" font-size="15">ARGUS — единый журнал событий и корреляция</text>
+
+  <!-- sources -->
+  <rect x="20" y="60" width="200" height="150" class="box"/>
+  <text x="32" y="82" class="a">Источники</text>
+  <text x="32" y="104" class="t">NGFW / EDR · CEF, LEEF</text>
+  <text x="32" y="122" class="t">NetFlow / IPFIX</text>
+  <text x="32" y="140" class="t">k8s audit, GitLab, Harbor</text>
+  <text x="32" y="158" class="t">WAF, syslog, S3-аудит</text>
+  <text x="32" y="176" class="t">телеметрия хостов (NDJSON)</text>
+  <text x="32" y="198" class="m">value · unit — числовые замеры</text>
+
+  <!-- wazuh module -->
+  <rect x="20" y="240" width="200" height="110" class="opt"/>
+  <text x="32" y="262" class="a" fill="#999">Модуль Wazuh</text>
+  <text x="32" y="284" class="t">shipper (Rust) → wazuh_alerts</text>
+  <text x="32" y="302" class="t">policyd (Go + OPA) → verdicts</text>
+  <text x="32" y="320" class="t">страницы /wazuh/* в консоли</text>
+  <text x="32" y="340" class="m">ARGUS_INTEGRATION_WAZUH=1</text>
+
+  <!-- collector -->
+  <rect x="280" y="90" width="170" height="90" class="box"/>
+  <text x="292" y="112" class="a">collector (Go)</text>
+  <text x="292" y="132" class="t">нормализация</text>
+  <text x="292" y="150" class="t">дисковая очередь</text>
+  <text x="292" y="168" class="m">:5514 :6514 :2055 :8089</text>
+
+  <!-- clickhouse -->
+  <rect x="510" y="60" width="200" height="290" class="store"/>
+  <text x="522" y="82" class="a">ClickHouse</text>
+  <text x="522" y="106" class="t">argus.events</text>
+  <text x="522" y="124" class="m">ts · source · action · actor</text>
+  <text x="522" y="140" class="m">node · src/dst · value · unit</text>
+  <text x="522" y="166" class="t">incidents, comments,</text>
+  <text x="522" y="184" class="t">state_events</text>
+  <text x="522" y="208" class="t">incident_verdicts (движок)</text>
+  <text x="522" y="226" class="t">agent_verdicts (агенты)</text>
+  <text x="522" y="250" class="t">webhook_deliveries</text>
+  <text x="522" y="268" class="t">triage_session_revocations</text>
+  <text x="522" y="296" class="t" fill="#999">wazuh_alerts, policy_verdicts</text>
+  <text x="522" y="314" class="m">TTL 180 д · миграции в git</text>
+
+  <!-- engine -->
+  <rect x="770" y="60" width="200" height="150" class="box"/>
+  <text x="782" y="82" class="a">engine (Go)</text>
+  <text x="782" y="104" class="t">rules/*.yml, ops/, wazuh/</text>
+  <text x="782" y="122" class="t">selection · threshold · window</text>
+  <text x="782" y="140" class="t">инциденты, auto_close</text>
+  <text x="782" y="158" class="t">LLM: analyst.Backend</text>
+  <text x="782" y="176" class="t">Telegram, e-mail, вебхуки</text>
+  <text x="782" y="198" class="m">disk.usage о себе → то же правило</text>
+
+  <!-- web -->
+  <rect x="770" y="240" width="200" height="110" class="box"/>
+  <text x="782" y="262" class="a">web (Next.js) за Caddy</text>
+  <text x="782" y="284" class="t">инциденты · журнал · поиск</text>
+  <text x="782" y="302" class="t">правила · дашборды · источники</text>
+  <text x="782" y="320" class="t">/api/* · /api/v1/log</text>
+  <text x="782" y="340" class="m">:8443 · OIDC · TOTP · RBAC</text>
+
+  <!-- agents -->
+  <rect x="20" y="410" width="470" height="120" class="opt"/>
+  <text x="32" y="432" class="a" fill="#999">Внешний агент разбора — любой раннер</text>
+  <text x="32" y="454" class="t">1. вебхук incident.created (HMAC) → приёмник</text>
+  <text x="32" y="472" class="t">2. POST /api/triage/sessions {incident_id} → токен области</text>
+  <text x="32" y="490" class="t">3. чтение: argus-mcp · /api/triage/context · /api/v1/log</text>
+  <text x="32" y="508" class="t">4. POST /api/triage/verdicts — JSON по схеме, один на сессию</text>
+
+  <rect x="560" y="410" width="410" height="120" class="opt"/>
+  <text x="572" y="432" class="a" fill="#999">argus-mcp (Go)</text>
+  <text x="572" y="454" class="t">search_events · get_log · get_incident</text>
+  <text x="572" y="472" class="t">list_incidents · sources_health</text>
+  <text x="572" y="490" class="t">профиль triage: редакция, псевдонимы,</text>
+  <text x="572" y="508" class="t">область одного инцидента</text>
+
+  <!-- arrows -->
+  <path d="M220,120 L278,120" class="ln"/>
+  <path d="M220,290 L510,290" class="lo"/>
+  <path d="M450,135 L508,135" class="ln"/>
+  <path d="M710,120 L768,120" class="ln"/>
+  <path d="M768,150 L710,150" class="ln"/>
+  <path d="M710,290 L768,290" class="ln"/>
+  <path d="M870,210 L870,238" class="ln"/>
+  <path d="M970,120 L1010,120 L1010,460 L972,460" class="lo"/>
+  <text x="1016" y="300" class="m" transform="rotate(90 1016,300)">incident.created, HMAC</text>
+  <path d="M490,470 L558,470" class="lo"/>
+  <path d="M870,350 L870,380 L300,380 L300,408" class="lo"/>
+  <text x="310" y="398" class="m">sessions · context · log · verdicts</text>
+</svg>

@@ -1,0 +1,124 @@
+# CI ARGUS: линт, тесты всех компонентов, правила, аудит зависимостей (блокирующий),
+# сборка образов и сквозной контур на каждый push/PR. Actions пришпилены по SHA
+# коммита (комментарий — версия); обновление: git ls-remote
+# https://github.com/<owner>/<repo> refs/tags/<v>.
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.26"
+  NODE_VERSION: "22"
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        module: [collector, engine, policyd, mcp, triage]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: ${{ matrix.module }}/go.sum
+      - name: gofmt
+        run: |
+          cd ${{ matrix.module }} && test -z "$(gofmt -l .)" || { gofmt -l .; echo 'gofmt: файлы не отформатированы'; exit 1; }
+      - name: vet + test (с детектором гонок)
+        run: cd ${{ matrix.module }} && go vet ./... && go test -race -count=1 ./...
+      - name: govulncheck (блокирующий)
+        run: cd ${{ matrix.module }} && go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  rules:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: engine/go.sum
+      - name: правила корреляции на записанном трафике
+        run: cd engine && RULES_DIR=../rules go run ./cmd/engine rules test --dir ../rules
+
+  shipper:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          components: clippy, rustfmt
+      - run: cd shipper && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
+      - name: cargo audit (блокирующий)
+        run: cargo install cargo-audit --locked && cd shipper && cargo audit
+
+  web:
+    runs-on: ubuntu-latest
+    # Живой ClickHouse для triage-claim-ch.test.ts: реальная конкурентность claim вердикта.
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:24.8
+        env:
+          CLICKHOUSE_DB: argus
+          CLICKHOUSE_USER: default
+          CLICKHOUSE_PASSWORD: ci-only
+        ports:
+          - 8123:8123
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: cd web && npm ci --ignore-scripts
+      - name: eslint (0 ошибок)
+        run: cd web && npx eslint src
+      - name: тесты и сборка
+        env:
+          ARGUS_TEST_CLICKHOUSE_URL: http://localhost:8123
+          ARGUS_TEST_CLICKHOUSE_PASSWORD: ci-only
+        run: cd web && npm test && npm run build
+      - name: npm audit (high/critical — блокирующий)
+        run: cd web && npm audit --audit-level=high
+
+  policies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: open-policy-agent/setup-opa@b2b258e089860efaadaaf71bf6e3aecb4a3eeff1 # v2.4.0
+        with:
+          version: latest
+      - run: opa test policies -v
+
+  compose:
+    # Конфигурация compose валидна (со стендовыми секретами .env.dev) с профилями
+    # и без них, скрипты проходят bash -n / shellcheck, все образы собираются (без запуска).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: |
+          docker compose --env-file .env.dev -f docker-compose.yml -f docker-compose.dev.yml config --quiet
+          docker compose --env-file .env.dev -f docker-compose.yml -f docker-compose.dev.yml --profile wazuh --profile mcp config --quiet
+      - name: скрипты
+        run: |
+          for f in scripts/*.sh scripts/argus; do bash -n "$f"; done
+          sudo apt-get install -y -qq shellcheck >/dev/null && shellcheck -S warning scripts/*.sh scripts/argus
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - run: APP_VERSION=ci docker compose --env-file .env.dev -f docker-compose.yml -f docker-compose.dev.yml --profile wazuh --profile mcp build
+      - name: mcp без compose — как в release.yml (именованный контекст triage)
+        run: docker build -q --build-context triage=./triage -t argus-ci/mcp:check ./mcp
+
+  e2e:
+    # Полный контур в docker compose: replay → инциденты и вердикты. Требует docker на раннере.
+    runs-on: ubuntu-latest
+    needs: [go, rules, web]
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: ./scripts/e2e.sh

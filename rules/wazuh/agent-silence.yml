@@ -1,0 +1,20 @@
+# Узел-источник замолчал: события класса wazuh (алерты агента) шли и прекратились.
+# Порог absence считается относительно «сейчас» по последнему событию группы.
+title: Wazuh agent went silent
+id: a41c-ops-040
+level: medium
+tags: [attack.defense_evasion, attack.t1489]
+
+detection:
+  selection:
+    source.class: wazuh
+  threshold:
+    kind: absence
+    window: 15m
+    group_by: node
+  condition: selection and threshold
+
+auto_close: 1h            # заговорил снова / никто не взял — закрываем сами
+
+analyst:
+  profile: on-prem-strict

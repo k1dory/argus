@@ -1,0 +1,7 @@
+<!-- Память сервера: доля от лимита контейнера (cgroup) или от RAM хоста.
+     Лимит контейнера задаётся в compose (CLICKHOUSE_MEM_LIMIT); без этого
+     ClickHouse на общей машине забирает до 90 % памяти хоста. -->
+<clickhouse>
+    <max_server_memory_usage_to_ram_ratio>0.8</max_server_memory_usage_to_ram_ratio>
+    <mark_cache_size>536870912</mark_cache_size>
+</clickhouse>

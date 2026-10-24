@@ -1,0 +1,65 @@
+{
+  "id": "waf",
+  "title": "WAF · ModSecurity / Coraza",
+  "description": "Атаки на веб по данным WAF: категории CRS, адреса, хосты, что заблокировано и что дошло до приложения.",
+  "refresh": "60s",
+  "panels": [
+    {
+      "id": "totals",
+      "title": "Атаки за период",
+      "type": "stat",
+      "w": 12,
+      "h": 3,
+      "sql": "SELECT count() AS `атак`, countIf(outcome = 'deny') AS `заблокировано`, countIf(outcome = 'allow') AS `пропущено`, uniqExact(src_ip) AS `адресов` FROM events WHERE source_class = 'waf' AND action = 'http.attack' AND $__timeFilter(ts)"
+    },
+    {
+      "id": "hosts",
+      "title": "Хосты под атакой",
+      "type": "stat",
+      "w": 12,
+      "h": 3,
+      "sql": "SELECT uniqExact(node) AS `хостов`, uniqExactIf(node, attrs['engine_mode'] = 'DetectionOnly') AS `хостов_в_режиме_детекта`, countIf(toUInt16OrZero(attrs['status']) >= 500) AS `ответов_5xx` FROM events WHERE source_class = 'waf' AND action = 'http.attack' AND $__timeFilter(ts)"
+    },
+    {
+      "id": "timeline",
+      "title": "Атаки по времени и категории CRS",
+      "type": "timeseries",
+      "w": 24,
+      "h": 6,
+      "series": "category",
+      "sql": "SELECT $__timeInterval(ts) AS t, attrs['category'] AS category, count() AS n FROM events WHERE source_class = 'waf' AND action = 'http.attack' AND $__timeFilter(ts) GROUP BY t, category ORDER BY t"
+    },
+    {
+      "id": "top_src",
+      "title": "Адреса-источники",
+      "type": "bar",
+      "w": 12,
+      "h": 7,
+      "sql": "SELECT src_ip AS `адрес`, count() AS `атак` FROM events WHERE source_class = 'waf' AND action = 'http.attack' AND $__timeFilter(ts) GROUP BY `адрес` ORDER BY `атак` DESC LIMIT 15"
+    },
+    {
+      "id": "top_uri",
+      "title": "Цели: хост и путь",
+      "type": "table",
+      "w": 12,
+      "h": 7,
+      "sql": "SELECT node AS `хост`, object AS `запрос`, count() AS `атак`, uniqExact(src_ip) AS `адресов` FROM events WHERE source_class = 'waf' AND action = 'http.attack' AND $__timeFilter(ts) GROUP BY `хост`, `запрос` ORDER BY `атак` DESC LIMIT 20"
+    },
+    {
+      "id": "passed",
+      "title": "Дошло до приложения: детект без блокировки",
+      "type": "table",
+      "w": 24,
+      "h": 7,
+      "sql": "SELECT toString(ts) AS `время`, src_ip AS `адрес`, node AS `хост`, object AS `запрос`, attrs['category'] AS `категория`, attrs['status'] AS `ответ`, attrs['rule_ids'] AS `правила` FROM events WHERE source_class = 'waf' AND action = 'http.attack' AND outcome = 'allow' AND $__timeFilter(ts) ORDER BY ts DESC LIMIT 50"
+    },
+    {
+      "id": "responses",
+      "title": "Реагирование: блокировки и симуляции",
+      "type": "table",
+      "w": 24,
+      "h": 6,
+      "sql": "SELECT toString(ts) AS `время`, mode AS `режим`, if(dry_run = 1 OR mode = 'simulate', 'симуляция', 'реально') AS `тип`, ip AS `адрес`, incident_id AS `инцидент`, executor AS `исполнитель`, if(ok = 1, 'ok', 'ошибка') AS `итог`, detail AS `детали` FROM response_log WHERE $__timeFilter(ts) ORDER BY ts DESC LIMIT 50"
+    }
+  ]
+}

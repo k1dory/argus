@@ -1,0 +1,19 @@
+# Одна и та же правка sudoers на многих хостах за минуты — раскатка или атака
+title: sudoers changed on many hosts
+id: a41c-fim-021
+level: medium
+tags: [attack.privilege_escalation, attack.t1548.003]
+
+detection:
+  selection:
+    source: wazuh.agents
+    object|contains: sudoers
+  threshold:
+    field: node
+    distinct: 5
+    window: 2m
+    group_by: object
+  condition: selection and threshold
+
+analyst:
+  profile: on-prem-strict

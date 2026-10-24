@@ -1,0 +1,6 @@
+# Телеметрия движка о диске ClickHouse: 91.5 % в 10:45 заводит инцидент, 92.0 % в 10:50 дописывается в него.
+rule: a41c-ops-062
+fixture: fixtures/events/telemetry.ndjson
+expect_incidents: 1
+expect_actor: clickhouse
+min_events: 2

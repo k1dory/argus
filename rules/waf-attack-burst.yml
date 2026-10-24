@@ -1,0 +1,26 @@
+# Серия атак на веб с одного адреса: WAF отбивает каждую по отдельности, а
+# вместе это подбор пейлоадов. В режиме IPS адрес блокируется на 2 часа.
+title: "WAF: burst of web attacks from one address"
+id: a41c-waf-050
+level: high
+tags: [attack.initial_access, attack.t1190]
+
+detection:
+  selection:
+    source.class: waf
+    action: http.attack
+  threshold:
+    kind: count
+    count: 10
+    window: 5m
+    group_by: src.ip
+  condition: selection and threshold
+
+respond:
+  action: block_ip
+  target: src.ip
+  min_level: high
+  ttl: 2h
+
+analyst:
+  profile: on-prem-strict

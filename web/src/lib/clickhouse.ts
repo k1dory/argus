@@ -1,0 +1,249 @@
+import "server-only";
+
+// Серверный доступ к ClickHouse по HTTP-интерфейсу — тот же путь,
+// которым пишут shipper и policyd. Чтение — chQuery, единственная запись
+// консоли — мьюты правил и настройки через chCommand. Только с сервера.
+const CH_URL = process.env.CLICKHOUSE_URL ?? "http://localhost:8123";
+const CH_DB = process.env.CLICKHOUSE_DB ?? "argus";
+const CH_USER = process.env.CLICKHOUSE_USER ?? "default";
+const CH_PASSWORD = process.env.CLICKHOUSE_PASSWORD ?? "";
+// У пользователя консоли в ClickHouse ограничено число одновременных запросов.
+// Несколько открытых карточек не должны исчерпывать этот лимит и выдавать 503.
+const CH_MAX_INFLIGHT = 8;
+
+/** Ожидание слота прервано: истёк maxWaitMs или клиент ушёл (signal). */
+export class LimiterWaitError extends Error {
+  readonly reason: "timeout" | "aborted";
+  constructor(reason: "timeout" | "aborted") {
+    super(reason === "timeout" ? "очередь запросов занята" : "запрос отменён");
+    this.name = "LimiterWaitError";
+    this.reason = reason;
+  }
+}
+
+export type LimiterOptions = { signal?: AbortSignal; maxWaitMs?: number };
+
+/**
+ * Не больше max одновременных fn на процесс; остальные ждут в очереди (FIFO).
+ * Слот освобождается и после ошибки fn. Ожидание можно ограничить по времени
+ * и отменить сигналом — тогда LimiterWaitError, а fn не вызывается.
+ */
+export function createLimiter(max: number) {
+  let inflight = 0;
+  const waiters: Array<() => void> = [];
+  return async function run<T>(fn: () => Promise<T>, opts: LimiterOptions = {}): Promise<T> {
+    if (inflight < max) inflight++;
+    else {
+      await new Promise<void>((resolve, reject) => {
+        const { signal, maxWaitMs } = opts;
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        const cleanup = () => {
+          if (timer) clearTimeout(timer);
+          signal?.removeEventListener("abort", onAbort);
+        };
+        const go = () => {
+          cleanup();
+          resolve();
+        };
+        const fail = (reason: "timeout" | "aborted") => {
+          const i = waiters.indexOf(go);
+          if (i >= 0) waiters.splice(i, 1);
+          cleanup();
+          reject(new LimiterWaitError(reason));
+        };
+        const onAbort = () => fail("aborted");
+        if (signal?.aborted) return fail("aborted");
+        signal?.addEventListener("abort", onAbort, { once: true });
+        if (maxWaitMs != null) timer = setTimeout(() => fail("timeout"), maxWaitMs);
+        waiters.push(go);
+      });
+    }
+    try {
+      return await fn();
+    } finally {
+      const next = waiters.shift();
+      if (next) next(); // слот переходит следующему, inflight не меняется
+      else inflight--;
+    }
+  };
+}
+
+const chLimit = createLimiter(CH_MAX_INFLIGHT);
+
+/** Потолок одного запроса консоли: сервер (max_execution_time) и клиент (AbortSignal) согласованы. */
+export const CH_TIMEOUT_MS = 30_000;
+const DEFAULT_SETTINGS: Record<string, string | number> = { max_execution_time: 30 };
+
+/**
+ * Ошибка хранилища для пользователя: короткая причина без SQL и без внутренностей
+ * сервера. Полный текст — только в console.error на сервере.
+ */
+export class ClickHouseError extends Error {
+  readonly status: number | null;
+  readonly code: number | null;
+  constructor(message: string, status: number | null = null, code: number | null = null) {
+    super(message);
+    this.name = "ClickHouseError";
+    this.status = status;
+    this.code = code;
+  }
+}
+
+/** «Code: 60. DB::Exception: Table argus.x does not exist … while processing …» → короткая причина. */
+export function shortChError(text: string, status: number | null): { message: string; code: number | null } {
+  const code = Number(/Code:\s*(\d+)/.exec(text)?.[1] ?? NaN);
+  const m = /DB::Exception:\s*([^\n]*?)(?:\s*:? ?while processing|\s*\(version|\s*\([A-Z_]+\)\s*$|$)/m.exec(text);
+  const reason = (m?.[1] ?? "").trim().slice(0, 160);
+  if (Number.isFinite(code)) return { message: reason ? `код ${code}: ${reason}` : `код ${code}`, code };
+  if (status === 401 || status === 403) return { message: "доступ к ClickHouse отклонён (учётные данные консоли)", code: null };
+  if (status) return { message: `ClickHouse ответил HTTP ${status}`, code: null };
+  return { message: reason || "запрос не выполнен", code: null };
+}
+
+function connectionError(e: unknown): ClickHouseError {
+  const name = e instanceof Error ? e.name : "";
+  if (name === "TimeoutError" || name === "AbortError") return new ClickHouseError(`ClickHouse не ответил за ${CH_TIMEOUT_MS / 1000} с`);
+  const cause = (e as { cause?: { code?: string } } | null)?.cause?.code;
+  if (cause === "ECONNREFUSED" || cause === "ENOTFOUND" || cause === "EAI_AGAIN") return new ClickHouseError("ClickHouse недоступен: нет соединения");
+  return new ClickHouseError("ClickHouse недоступен");
+}
+
+function chFetch(sql: string, params: Record<string, string | number>, settings: Record<string, string | number>, format: string | null): Promise<string> {
+  return chLimit(() => chFetchWithSlot(sql, params, settings, format));
+}
+
+async function chFetchWithSlot(sql: string, params: Record<string, string | number>, settings: Record<string, string | number>, format: string | null): Promise<string> {
+  const url = new URL(CH_URL);
+  for (const [key, value] of Object.entries({ ...DEFAULT_SETTINGS, ...settings })) url.searchParams.set(key, String(value));
+  url.searchParams.set("database", CH_DB);
+  if (format) url.searchParams.set("default_format", format);
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(`param_${key}`, String(value));
+  let resp: Response;
+  try {
+    resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: "Basic " + Buffer.from(`${CH_USER}:${CH_PASSWORD}`).toString("base64"),
+        "Content-Type": "text/plain",
+      },
+      body: sql,
+      cache: "no-store",
+      signal: AbortSignal.timeout(CH_TIMEOUT_MS),
+    });
+  } catch (e) {
+    console.error("clickhouse:", e instanceof Error ? `${e.name}: ${e.message}` : e);
+    throw connectionError(e);
+  }
+  let text: string;
+  try {
+    text = await resp.text();
+  } catch (e) {
+    console.error("clickhouse response:", e);
+    throw connectionError(e);
+  }
+  // ClickHouse may append an exception after sending HTTP 200. JSONEachRow
+  // escapes newlines within values: only a standalone exception line counts.
+  const exception = /^Code:\s*\d+\.\s*DB::Exception:/m.exec(text);
+  const headerCode = Number(resp.headers.get("X-ClickHouse-Exception-Code"));
+  if (!resp.ok || exception || headerCode > 0) {
+    console.error(`clickhouse ${resp.status}:`, text.slice(0, 2000), "\nSQL:", sql.slice(0, 500));
+    const { message, code } = shortChError(exception ? text.slice(exception.index) : text, resp.status);
+    throw new ClickHouseError(headerCode > 0 && code == null ? `код ${headerCode}: запрос не выполнен` : message, resp.status, code ?? (headerCode > 0 ? headerCode : null));
+  }
+  return text;
+}
+
+/** settings — серверные настройки ClickHouse на запрос (max_execution_time и т.п.). */
+export async function chQuery<T>(sql: string, params: Record<string, string | number> = {}, settings: Record<string, string | number> = {}): Promise<T[]> {
+  const text = await chFetch(sql, params, settings, "JSONEachRow");
+  return text
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as T);
+}
+
+/** Запрос без результата (INSERT/DDL); параметры — тем же server-side binding. */
+export async function chCommand(sql: string, params: Record<string, string | number> = {}, settings: Record<string, string | number> = {}): Promise<void> {
+  await chFetch(sql, params, settings, null);
+}
+
+export type SafeResult<T> = { ok: true; data: T; error: null } | { ok: false; data: null; error: string };
+
+/**
+ * Страница не должна падать целиком из-за хранилища: `{data, error}` вместо
+ * исключения. Ошибка — короткая причина для панели «Хранилище недоступно».
+ */
+export async function safeQuery<T>(fn: () => Promise<T>): Promise<SafeResult<T>> {
+  try {
+    return { ok: true, data: await fn(), error: null };
+  } catch (e) {
+    if (e instanceof ClickHouseError) return { ok: false, data: null, error: e.message };
+    // Ошибки навигации Next (redirect/notFound) должны пройти сквозь обёртку.
+    if (e && typeof e === "object" && "digest" in e && typeof (e as { digest?: unknown }).digest === "string") throw e;
+    console.error("safeQuery:", e);
+    return { ok: false, data: null, error: "запрос к хранилищу не выполнен" };
+  }
+}
+
+/* ===== Состояние служб для LED в шапке ===== */
+
+export type ServiceState = { ok: boolean; detail: string; checkedAt: number };
+const PING_TTL_MS = 10_000;
+const PING_TIMEOUT_MS = 2_000;
+const pingCache = new Map<string, Promise<ServiceState>>();
+
+/** Кэш promise на 10 с: параллельные рендеры делят одну проверку. */
+function pinged(key: string, make: () => Promise<ServiceState>): Promise<ServiceState> {
+  const cur = pingCache.get(key);
+  if (cur) {
+    return cur.then((s) => {
+      if (Date.now() - s.checkedAt < PING_TTL_MS) return s;
+      const next = make();
+      pingCache.set(key, next);
+      return next;
+    });
+  }
+  const p = make();
+  pingCache.set(key, p);
+  return p;
+}
+
+function pingFail(prefix: string, e: unknown): ServiceState {
+  const timeout = e instanceof Error && (e.name === "TimeoutError" || e.name === "AbortError");
+  return { ok: false, detail: `${prefix}: ${timeout ? "нет ответа за 2 с" : "нет соединения"}`, checkedAt: Date.now() };
+}
+
+/** SELECT 1 с таймаутом 2 с — дёшево для каждого рендера layout. */
+export function clickhouseState(): Promise<ServiceState> {
+  return pinged("clickhouse", async () => {
+    const started = Date.now();
+    try {
+      const url = new URL(CH_URL);
+      url.searchParams.set("query", "SELECT 1");
+      const resp = await fetch(url, {
+        headers: { Authorization: "Basic " + Buffer.from(`${CH_USER}:${CH_PASSWORD}`).toString("base64") },
+        cache: "no-store",
+        signal: AbortSignal.timeout(PING_TIMEOUT_MS),
+      });
+      return { ok: resp.ok, detail: resp.ok ? `ClickHouse отвечает · ${Date.now() - started} мс` : `ClickHouse: HTTP ${resp.status}`, checkedAt: Date.now() };
+    } catch (e) {
+      return pingFail("ClickHouse", e);
+    }
+  });
+}
+
+/** /healthz движка корреляции — тем же образом. */
+export function engineState(): Promise<ServiceState> {
+  const base = (process.env.ENGINE_URL ?? "http://localhost:8090").replace(/\/$/, "");
+  return pinged("engine", async () => {
+    const started = Date.now();
+    try {
+      const resp = await fetch(`${base}/healthz`, { cache: "no-store", signal: AbortSignal.timeout(PING_TIMEOUT_MS) });
+      return { ok: resp.ok, detail: resp.ok ? `движок отвечает · ${Date.now() - started} мс` : `движок: HTTP ${resp.status}`, checkedAt: Date.now() };
+    } catch (e) {
+      return pingFail("движок", e);
+    }
+  });
+}
+
+export { RANGES, parseRange, type RangeKey } from "./shared/ranges";

@@ -1,0 +1,5 @@
+rule: a41c-fim-021
+fixture: fixtures/events/august.ndjson
+expect_incidents: 1
+expect_actor: /etc/sudoers.d/90-ops
+min_events: 5

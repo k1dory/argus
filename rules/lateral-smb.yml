@@ -1,0 +1,26 @@
+# Боковое перемещение сервисной учёткой по SMB: одна учётка, много хостов, минуты
+title: Service account SMB fan-out
+id: a41c-lateral-002
+level: critical
+tags: [attack.lateral_movement, attack.t1021.002]
+
+detection:
+  selection:
+    event.action: session.allow
+    dst.port: 445
+    actor.kind: service
+  threshold:
+    field: dst.ip          # разных хостов
+    distinct: 10
+    window: 6m
+    group_by: actor.name
+  condition: selection and threshold
+
+enrich:
+  - edr.process_tree: 120s
+  - ngfw.sessions: 120s
+  - cmdb.owner
+
+analyst:
+  profile: on-prem-strict
+  redact: [user.email, host.serial]
