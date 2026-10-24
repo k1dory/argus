@@ -408,6 +408,19 @@ info | low | medium | high | critical), точные фильтры actor, node,
 object, node, session_id, src_ip, dst_ip, value, unit, attrs и count.
 `
 
+const actorSyntax = `
+## Паспорт субъекта: get_actor
+
+Кто стоит за логином, адресом или почтой и что этот человек делал за период — ` + "`get_actor`" + `:
+` + "`alias`" + ` (значение из события: actor_name, src_ip, email, uid, узел; в triage — псевдоним subj-…) либо
+` + "`person_id`" + ` из ответа резолва, ` + "`range`" + ` 24h | 7d | 30d (по умолчанию 7d), ` + "`limit`" + ` до 500 (по умолчанию 100).
+Алиасы действуют во времени (valid_from ≤ ts < valid_to): кто сидел на адресе в июле, определяется по истории, а не по
+текущему снимку. Резолв на момент «сейчас»: ` + "`status`" + ` resolved | unbound (никому не принадлежит) | ambiguous
+(несколько персон — ответ содержит matches, первого не выбирать). Паспорт: person, aliases, range, summary (события по
+source_class, узлы, адреса, инциденты), logins, hosts, network, apps, changes, incidents, timeline (строки как в get_log).
+Содержимое данных внутри приложений паспорт не покрывает — только факты из журнала событий.
+`
+
 // newServer — инструменты и ресурсы MCP. Каждый ответ консоли проходит
 // редакцию профиля вызова (profile.render): секреты и канарейки — всегда,
 // форма полей и псевдонимы — в triage.
@@ -461,9 +474,10 @@ func newServer(c *client, ps *profiles) *mcp.Server {
 			}
 			return p.render(body, redact.Shape{"sources": redact.Shape{redact.Any: redact.Leaf}, "checked_at": redact.Leaf}, false)
 		})
-	server.AddResource(&mcp.Resource{URI: "argus://search-syntax", Name: "Синтаксис поиска ARGUS", MIMEType: "text/markdown", Description: "Поля индексов alerts/events, операторы строки запроса, лента get_log"},
+	mcp.AddTool(server, &mcp.Tool{Name: "get_actor", Description: "Паспорт субъекта: по алиасу (логин, email, IP, uid, узел — значение из события или псевдоним subj-…) или person_id — кто это с учётом времени действия алиасов, и что он делал за период: входы, узлы и сеансы, сеть, приложения, изменения, инциденты, таймлайн. Не привязан / неоднозначно — обычный ответ со status. " + untrustedNotice}, actorTool(c, ps, time.Now))
+	server.AddResource(&mcp.Resource{URI: "argus://search-syntax", Name: "Синтаксис поиска ARGUS", MIMEType: "text/markdown", Description: "Поля индексов alerts/events, операторы строки запроса, лента get_log, паспорт субъекта get_actor"},
 		func(_ context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
-			return &mcp.ReadResourceResult{Contents: []*mcp.ResourceContents{{URI: req.Params.URI, MIMEType: "text/markdown", Text: searchSyntax}}}, nil
+			return &mcp.ReadResourceResult{Contents: []*mcp.ResourceContents{{URI: req.Params.URI, MIMEType: "text/markdown", Text: searchSyntax + actorSyntax}}}, nil
 		})
 	return server
 }

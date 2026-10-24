@@ -1,7 +1,8 @@
-# Автоматическое ревью PR в main с помощью Claude Code (GitHub Actions).
-# Нужен один из секретов репозитория: ANTHROPIC_API_KEY или
-# CLAUDE_CODE_OAUTH_TOKEN (`claude setup-token`), а также установленное
-# Claude GitHub App: https://github.com/apps/claude.
+# Необязательное ревью PR в main внешним LLM-ревьюером (GitHub Actions).
+# Выключено по умолчанию: включается переменной репозитория CLAUDE_REVIEW=true
+# (Settings → Variables) и одним из секретов ANTHROPIC_API_KEY или
+# CLAUDE_CODE_OAUTH_TOKEN (`claude setup-token`) плюс установленным
+# GitHub App ревьюера: https://github.com/apps/claude. Без переменной job не запускается.
 # Actions пришпилены по SHA коммита (комментарий — версия), как в ci.yml и release.yml.
 name: claude-review
 
@@ -18,6 +19,7 @@ jobs:
   review:
     # Черновики не ревьюим; у PR из форков нет доступа к секретам.
     if: >-
+      vars.CLAUDE_REVIEW == 'true' &&
       !github.event.pull_request.draft &&
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest

@@ -15,6 +15,7 @@ import (
 	"github.com/devitex-soft/argus/engine/internal/analyst"
 	"github.com/devitex-soft/argus/engine/internal/enrich"
 	"github.com/devitex-soft/argus/engine/internal/eval"
+	"github.com/devitex-soft/argus/engine/internal/identity"
 	"github.com/devitex-soft/argus/engine/internal/incidents"
 	"github.com/devitex-soft/argus/engine/internal/model"
 	"github.com/devitex-soft/argus/engine/internal/notify"
@@ -77,7 +78,22 @@ type engine struct {
 
 	excWarnMu sync.Mutex
 	excWarned map[string]bool
+
+	// Паспорт субъекта: алиасы из событий identity.alias и из IDENTITIES_FILE.
+	identity   *identity.Observer
+	identFile  string     // IDENTITIES_FILE; пусто — алиасы только из событий и API
+	identMu    sync.Mutex // identSig и перечитывание файла: цикл и POST /reload
+	identSig   string
+	identRetry []*model.Event // события алиасов, не записанные из-за хранилища: повтор на следующем цикле
 }
+
+// identRetryMax — потолок очереди повтора алиасов: при недоступном хранилище
+// старые события отбрасываются с предупреждением. Очередь живёт только в
+// памяти — рестарт движка её теряет. И обрезка, и рестарт не фатальны:
+// экспортеры повторяют снимки алиасов (VPN-контроллер — каждые несколько
+// минут), а IdP-выдачи можно переслать повторно; ReplacingMergeTree
+// схлопывает дубли.
+const identRetryMax = 10000
 
 type respEntry struct {
 	state string // waiting | done
@@ -128,6 +144,61 @@ func (e *engine) maybeReload(force bool) {
 	slog.Info("rules reloaded", "rules", len(rs))
 }
 
+// observeIdentities применяет события identity.alias(.revoke) к таблицам
+// паспорта; счётчики — в /metrics (argus_engine_identity_alias_total).
+// Не записанные из-за хранилища события повторяются на следующем цикле
+// вместе с новыми: курсор событий общий, и сбой проекции алиасов не должен
+// ни терять их, ни останавливать правила.
+func (e *engine) observeIdentities(ctx context.Context, events []*model.Event) {
+	if len(e.identRetry) > 0 {
+		events = append(append([]*model.Event{}, e.identRetry...), events...)
+	}
+	st := e.identity.Observe(ctx, events)
+	if len(st.Retry) > identRetryMax {
+		slog.Warn("identity: очередь повтора переполнена, старые события отброшены", "dropped", len(st.Retry)-identRetryMax)
+		st.Retry = st.Retry[len(st.Retry)-identRetryMax:]
+	}
+	e.identRetry = st.Retry
+	if st.Invalid > 0 || st.Errors > 0 {
+		slog.Warn("identity: алиасы из событий", "ok", st.OK, "invalid", st.Invalid, "errors", st.Errors, "retry", len(e.identRetry))
+	} else if st.OK > 0 {
+		slog.Debug("identity: алиасы из событий", "ok", st.OK)
+	}
+}
+
+// maybeSyncIdentities перечитывает IDENTITIES_FILE, если он изменился (размер,
+// mtime), и синхронизирует его с хранилищем; force — без проверки отпечатка.
+// Ошибка разбора — в лог, отпечаток запоминается (без повтора каждый цикл);
+// ошибка хранилища — повтор на следующем цикле.
+func (e *engine) maybeSyncIdentities(ctx context.Context, force bool) {
+	if e.identFile == "" {
+		return
+	}
+	e.identMu.Lock()
+	defer e.identMu.Unlock()
+	sig := identity.Signature(e.identFile)
+	if !force && sig == e.identSig {
+		return
+	}
+	if sig == "" {
+		slog.Warn("identities: файл недоступен, оставляю прежние алиасы", "file", e.identFile)
+		e.identSig = sig
+		return
+	}
+	set, err := identity.LoadFile(e.identFile)
+	if err != nil {
+		slog.Warn("identities: файл не разобран, оставляю прежние алиасы", "err", err)
+		e.identSig = sig
+		return
+	}
+	if err := e.identity.SyncFile(ctx, set); err != nil {
+		slog.Warn("identities: синхронизация не удалась, повторю", "err", err)
+		return
+	}
+	e.identSig = sig
+	slog.Info("identities reloaded", "file", e.identFile, "persons", len(set.Persons), "aliases", len(set.Aliases))
+}
+
 func (e *engine) syncRespondMode(ctx context.Context) {
 	v, err := e.ch.ConsoleSetting(ctx, "respond_mode")
 	if err != nil {
@@ -151,8 +222,14 @@ func newEngine(ctx context.Context, rulesDir string, rs []*rules.Rule, acfg anal
 		storms:    map[string]*incidents.Incident{},
 		respState: map[string]respEntry{},
 		excWarned: map[string]bool{},
+		identFile: env("IDENTITIES_FILE", ""),
 	}
 	e.rules.Store(&rs)
+	var identStore identity.Store
+	if ch != nil {
+		identStore = ch
+	}
+	e.identity = identity.New(identStore)
 	routes, problems := webhook.Build(acfg.Notify.Webhooks, os.Getenv)
 	for _, p := range problems {
 		slog.Error("webhook config: цель выключена", "problem", p)
@@ -182,7 +259,7 @@ func run(rulesDir string) {
 		slog.Error("analyst config", "err", err)
 		os.Exit(1)
 	}
-	if msg := wazuhPlaceholderPassword(acfg.Respond.WazuhAR, os.Getenv("WAZUH_API_URL"), os.Getenv("WAZUH_API_PASSWORD")); msg != "" && os.Getenv("ARGUS_DEV") != "1" {
+	if msg := configureWazuh(&acfg, os.Getenv("ARGUS_INTEGRATION_WAZUH"), os.Getenv("WAZUH_API_URL"), os.Getenv("WAZUH_API_PASSWORD")); msg != "" && os.Getenv("ARGUS_DEV") != "1" {
 		slog.Error(msg)
 		os.Exit(1)
 	}
@@ -265,22 +342,29 @@ func (e *engine) maxWindow() time.Duration {
 
 func (e *engine) loop(ctx context.Context, poll time.Duration) {
 	// Стартовый курсор — два окна назад: после рестарта окна восстанавливаются
-	// из базы, а дубли гасит реестр открытых инцидентов.
-	cursor := time.Now().Add(-2 * e.maxWindow())
+	// из базы, а дубли гасит реестр открытых инцидентов. Курсор — секунда
+	// received_at включительно с дедупликацией по хешу строки (store.Cursor):
+	// вставки той же секунды после опроса и остаток секунды за LIMIT не теряются.
+	cursor := store.StartCursor(time.Now().Add(-2 * e.maxWindow()))
 	var buffer []*model.Event
 	ticker := time.NewTicker(poll)
 	defer ticker.Stop()
 	for {
 		e.maybeReload(false)
+		e.maybeSyncIdentities(ctx, false)
 		e.syncRespondMode(ctx)
 		rs := e.current()
-		events, next, err := e.ch.EventsSince(ctx, cursor, 200000)
+		events, next, err := e.pollEvents(ctx, cursor)
 		if err != nil {
 			slog.Warn("events", "err", err)
 			e.m.pollErrors.Add(1)
 		} else {
 			cursor = next
 			e.m.eventsPolled.Add(int64(len(events)))
+			// Алиасы субъектов — из сырого потока, до фильтра кандидатов:
+			// событию identity.alias правило не нужно; не записанные из-за
+			// хранилища повторяются на следующем цикле (observeIdentities).
+			e.observeIdentities(ctx, events)
 			// В буфере живут только кандидаты: события, которые проходят
 			// selection или close_on хотя бы одного правила. При тысячах EPS
 			// это уменьшает буфер на порядки — оценка остаётся дешёвой.
@@ -311,6 +395,36 @@ func (e *engine) loop(ctx context.Context, poll time.Duration) {
 	}
 }
 
+// Страница выборки событий и потолок страниц за один опрос: при шторме
+// дочитываем сразу (курсор помечает More), но не бесконечно — остаток
+// подберёт следующий опрос.
+const (
+	pollPageSize = 200000
+	pollMaxPages = 50
+)
+
+// pollEvents — события от курсора: страницы, упёршиеся в LIMIT, дочитываются в
+// том же опросе, чтобы продолжение по хешу внутри секунды не растягивалось на
+// тики; на следующем опросе секунда перечитывается целиком (store.Cursor).
+func (e *engine) pollEvents(ctx context.Context, cursor store.Cursor) ([]*model.Event, store.Cursor, error) {
+	var all []*model.Event
+	for page := 0; page < pollMaxPages; page++ {
+		events, next, err := e.ch.EventsSince(ctx, cursor, pollPageSize)
+		if err != nil {
+			if page > 0 {
+				return all, cursor, nil // прочитанное не теряем, остаток — следующим опросом
+			}
+			return nil, cursor, err
+		}
+		all = append(all, events...)
+		cursor = next
+		if !next.More {
+			break
+		}
+	}
+	return all, cursor, nil
+}
+
 // cycle — один проход правил по буферу: сработки → инциденты → запись → реакции.
 func (e *engine) cycle(ctx context.Context, rs []*rules.Rule, buffer []*model.Event) []*model.Event {
 	exc, err := e.ch.Exceptions(ctx)
@@ -338,7 +452,7 @@ func (e *engine) cycle(ctx context.Context, rs []*rules.Rule, buffer []*model.Ev
 				toWrite = append(toWrite, inc)
 				slog.Warn("incident: ротация не подтверждена, нужна проверка", "id", inc.IncidentID, "by", c.Event.Action, "token_id", c.Event.Attrs["token_id"])
 			}
-		} else if inc := e.reg.Close(c.Rule.ID, c.Key, note, now); inc != nil {
+		} else if inc := e.reg.Close(c.Rule.ID, c.Key, note, c.Event.Time(), now); inc != nil {
 			closed = append(closed, inc)
 		}
 		for _, inc := range closed {
@@ -471,6 +585,23 @@ func (e *engine) warnException(ruleID, field, value string) {
 	slog.Warn("rule exception: поле вне whitelist — игнорирую", "rule", ruleID, "field", field, "value", value, "allowed", strings.Join(eval.ExceptionFields(), ", "))
 }
 
+// configureWazuh — исполнитель active-response Wazuh существует только при
+// включённом модуле (ARGUS_INTEGRATION_WAZUH=1). Без модуля секция
+// wazuh_active_response из argus.analyst.yml отбрасывается и WAZUH_* не
+// проверяются: установка без Wazuh (./scripts/argus init --without-wazuh) не
+// должна требовать пароль менеджера, которого нет. С модулем — проверка
+// заглушки change-me, как и раньше; непустой результат — причина отказа старта.
+func configureWazuh(acfg *analyst.Config, integration, envURL, envPass string) string {
+	if strings.TrimSpace(integration) != "1" {
+		if acfg.Respond.WazuhAR != nil {
+			slog.Info("respond: модуль Wazuh выключен (ARGUS_INTEGRATION_WAZUH≠1) — исполнитель active-response не настраивается")
+		}
+		acfg.Respond.WazuhAR = nil
+		return ""
+	}
+	return wazuhPlaceholderPassword(acfg.Respond.WazuhAR, envURL, envPass)
+}
+
 // wazuhPlaceholderPassword — пароль API Wazuh остался заглушкой change-me* из
 // argus init, а менеджер задан: движок не стартует (кроме стенда ARGUS_DEV=1),
 // иначе исполнитель active-response молча получал бы 401 на каждую блокировку.
@@ -488,7 +619,7 @@ func wazuhPlaceholderPassword(w *respond.WazuhAR, envURL, envPass string) string
 
 func isCandidate(rs []*rules.Rule, ev *model.Event) bool {
 	for _, r := range rs {
-		if r.Match(ev) || r.MatchClose(ev) {
+		if r.Match(ev) || r.MatchClose(ev) || r.MatchReset(ev) {
 			return true
 		}
 	}

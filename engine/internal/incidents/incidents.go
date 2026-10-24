@@ -359,11 +359,18 @@ func isFinal(status string) bool {
 }
 
 // Close закрывает открытый инцидент правила по ключу (close_on-событие).
-func (r *Registry) Close(ruleID, key, note string, now time.Time) *Incident {
+// evTS — время события восстановления: закрывает только событие позже
+// последнего события инцидента. Буфер движка переоценивается целиком каждый
+// цикл, и без этого сравнения старый нормальный замер (80 → 91 → 93 → 95)
+// закрывал бы инцидент в тот же цикл, что его завёл.
+func (r *Registry) Close(ruleID, key, note string, evTS, now time.Time) *Incident {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for k, inc := range r.open {
 		if inc.RuleID != ruleID || isFinal(inc.Status) {
+			continue
+		}
+		if last := (&model.Event{TS: inc.LastTS}).Time(); !evTS.IsZero() && !last.IsZero() && !evTS.After(last) {
 			continue
 		}
 		if inc.ActorName == key || inc.Node == key || strings.HasPrefix(k, ruleID+"|"+key+"|") {

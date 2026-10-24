@@ -22,6 +22,7 @@ import (
 type ClickHouse struct {
 	base, db, user, pass string
 	http                 *http.Client
+	idStamps             stamps // метки updated_at паспорта (identity.go)
 }
 
 // JSONEachRow escapes newlines inside values, so an exception on its own
@@ -124,18 +125,63 @@ func eventsSelectColumns() string {
 	       bytes, packets, value, unit, pii, attrs, raw`
 }
 
-// EventsSince — события, принятые после курсора received_at (не ts: у
-// источников свои часы, а курсор должен быть монотонным).
-func (c *ClickHouse) EventsSince(ctx context.Context, cursor time.Time, limit int) ([]*model.Event, time.Time, error) {
-	out, err := c.do(ctx, `SELECT `+eventsSelectColumns()+`, toString(received_at) AS received_str
-	FROM events WHERE received_at > {cursor:DateTime} ORDER BY received_at LIMIT {limit:UInt32}
+/* ===== курсор чтения событий =====
+   received_at — секундный DateTime, который ставит база при INSERT. Читать
+   «строго после последней секунды» нельзя: вставка той же секунды, пришедшая
+   после опроса, терялась бы, как и остаток секунды за LIMIT. Поэтому курсор —
+   секунда, читаемая включительно, плюс множество хешей уже обработанных строк
+   этой секунды (дедупликация). Если LIMIT сработал внутри одной секунды,
+   страницы дочитываются по хешу сразу (More), а на следующем опросе секунда
+   перечитывается целиком с дедупликацией по Seen — поздняя вставка с меньшим
+   хешем не теряется. Строки моложе cursorSettle не берутся: вставка получает
+   received_at в начале INSERT, а видна по его завершении — секунда должна
+   «устояться», иначе её хвост остался бы за курсором. */
+
+// Cursor — позиция чтения argus.events.
+type Cursor struct {
+	At   time.Time           // секунда received_at, читается включительно
+	Hash uint64              // продолжение внутри секунды At в пределах одного опроса; 0 — с начала секунды
+	Seen map[uint64]struct{} // хеши строк секунды At, уже отданных вызывающему
+	More bool                // страница упёрлась в LIMIT: дочитать сразу, не дожидаясь следующего опроса
+}
+
+// StartCursor — курсор с начала секунды at.
+func StartCursor(at time.Time) Cursor {
+	return Cursor{At: at.UTC().Truncate(time.Second), Seen: map[uint64]struct{}{}}
+}
+
+// cursorSettle — сколько секунда должна «устояться», прежде чем курсор её
+// пройдёт: строки с received_at моложе этого откладываются до следующего опроса.
+const cursorSettle = 3 * time.Second
+
+// rowHashExpr — устойчивый ключ строки события по всем колонкам единой схемы
+// (своего id у events нет); attrs — по отсортированным ключам, чтобы хеш не
+// зависел от порядка в Map. Внутренний ключ курсора движка, не идентификатор
+// для внешних систем.
+const rowHashExpr = "cityHash64(received_at, ts, source, source_class, action, outcome, severity, actor_name, actor_kind, object, node, session_id, " +
+	"src_ip, src_port, dst_ip, dst_port, proto, bytes, packets, value, unit, pii, " +
+	"arrayStringConcat(arrayMap(k -> concat(k, '=', attrs[k]), arraySort(mapKeys(attrs))), ';'), raw)"
+
+// eventRow — строка выборки EventsSince до разбора курсора.
+type eventRow struct {
+	Event      *model.Event
+	ReceivedAt time.Time
+	Hash       uint64
+}
+
+// EventsSince — события от курсора (по received_at, не ts: у источников свои
+// часы, а курсор должен быть монотонным). Возвращает ещё не отданные события
+// и следующий курсор; см. advanceCursor.
+func (c *ClickHouse) EventsSince(ctx context.Context, cur Cursor, limit int) ([]*model.Event, Cursor, error) {
+	out, err := c.do(ctx, `SELECT `+eventsSelectColumns()+`, toString(received_at) AS received_str, `+rowHashExpr+` AS row_hash
+	FROM events WHERE received_at > {cursor:DateTime} OR (received_at = {cursor:DateTime} AND `+rowHashExpr+` >= {hash:UInt64})
+	ORDER BY received_at, row_hash LIMIT {limit:UInt32}
 	FORMAT JSONEachRow`, nil, map[string]string{
-		"cursor": cursor.UTC().Format("2006-01-02 15:04:05"), "limit": fmt.Sprint(limit)})
+		"cursor": cur.At.UTC().Format("2006-01-02 15:04:05"), "hash": fmt.Sprint(cur.Hash), "limit": fmt.Sprint(limit)})
 	if err != nil {
-		return nil, cursor, err
+		return nil, cur, err
 	}
-	var events []*model.Event
-	last := cursor
+	var rows []eventRow
 	for _, line := range bytes.Split(out, []byte("\n")) {
 		if len(bytes.TrimSpace(line)) == 0 {
 			continue
@@ -143,20 +189,83 @@ func (c *ClickHouse) EventsSince(ctx context.Context, cursor time.Time, limit in
 		var row struct {
 			model.Event
 			ReceivedAt string `json:"received_str"`
+			Hash       uint64 `json:"row_hash"`
 		}
 		if err := json.Unmarshal(line, &row); err != nil {
 			continue
 		}
 		e := row.Event
-		if t, err := time.Parse("2006-01-02 15:04:05", row.ReceivedAt); err == nil {
+		t, err := time.Parse("2006-01-02 15:04:05", row.ReceivedAt)
+		if err != nil {
+			// Без received_at строку не разместить на оси курсора: отдаём как
+			// есть, в дедупликации она не участвует.
+			e.ReceivedAt = time.Time{}
+		} else {
 			e.ReceivedAt = t
-			if t.After(last) {
-				last = t
+		}
+		rows = append(rows, eventRow{Event: &e, ReceivedAt: t, Hash: row.Hash})
+	}
+	events, next := advanceCursor(cur, rows, limit, time.Now())
+	return events, next, nil
+}
+
+// advanceCursor — какие строки выборки отдать и куда сдвинуть курсор.
+//   - строки моложе now − cursorSettle откладываются (секунда ещё не устоялась);
+//   - строки секунды cur.At с хешем из cur.Seen уже отданы — пропускаются;
+//   - выборка упёрлась в LIMIT и последняя секунда моложе cur.At: она могла
+//     быть прочитана не целиком — её строки откладываются, курсор встаёт на её
+//     начало, More — дочитать сразу;
+//   - выборка упёрлась в LIMIT внутри одной секунды (> limit строк за секунду):
+//     всё отдаётся, продолжение с максимального хеша (More); когда страница не
+//     полная, Hash сбрасывается — следующий опрос перечитает секунду с начала,
+//     дедупликация по Seen отдаст только новое;
+//   - иначе курсор — последняя секунда выборки, Seen — её строки.
+func advanceCursor(cur Cursor, rows []eventRow, limit int, now time.Time) ([]*model.Event, Cursor) {
+	settled := now.UTC().Add(-cursorSettle).Truncate(time.Second)
+	truncated := limit > 0 && len(rows) >= limit
+	k := 0
+	for k < len(rows) && !rows[k].ReceivedAt.After(settled) {
+		k++
+	}
+	if k < len(rows) {
+		rows, truncated = rows[:k], false // отрезанный хвост — только неустоявшиеся секунды
+	}
+	if len(rows) == 0 {
+		cur.More = false
+		return nil, cur
+	}
+	last := cur.At
+	for _, r := range rows {
+		if r.ReceivedAt.After(last) {
+			last = r.ReceivedAt
+		}
+	}
+	deferLast := truncated && last.After(cur.At)
+	next := Cursor{At: last, Seen: map[uint64]struct{}{}, More: truncated}
+	if last.Equal(cur.At) {
+		for h := range cur.Seen {
+			next.Seen[h] = struct{}{}
+		}
+	}
+	var out []*model.Event
+	for _, r := range rows {
+		if deferLast && r.ReceivedAt.Equal(last) {
+			continue
+		}
+		if r.ReceivedAt.Equal(cur.At) {
+			if _, ok := cur.Seen[r.Hash]; ok {
+				continue
 			}
 		}
-		events = append(events, &e)
+		out = append(out, r.Event)
+		if r.ReceivedAt.Equal(next.At) {
+			next.Seen[r.Hash] = struct{}{}
+			if truncated && !deferLast && r.Hash > next.Hash {
+				next.Hash = r.Hash
+			}
+		}
 	}
-	return events, last, nil
+	return out, next
 }
 
 // OpenIncidents — незакрытые инциденты и максимальный номер.

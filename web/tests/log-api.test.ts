@@ -3,7 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { installNextMocks, loadAuth } from "./_next-mock";
-import { buildLogSql, LEVEL_MIN, levelOf, logScopeQuery, parseDuration, parseLogParams, toLogItem } from "../src/lib/shared/log-query";
+import { buildLogSql, LEVEL_MIN, levelOf, LOG_COLUMNS, logScopeQuery, parseDuration, parseLogParams, toLogItem } from "../src/lib/shared/log-query";
 
 loadAuth();
 const mocks = installNextMocks();
@@ -74,6 +74,11 @@ test("toLogItem: level из severity, attrs — объект, value/unit — ч�
   assert.equal(item.value, 12.5);
   assert.deepEqual(item.attrs, { job: "test" });
   assert.deepEqual(toLogItem({}).attrs, {});
+  // pii — признак ПДн: по нему MCP скрывает свободный текст в профиле triage; теряться не должен.
+  assert.equal(item.pii, 0);
+  assert.equal(toLogItem({ pii: "1" }).pii, 1);
+  assert.equal(toLogItem({ pii: 2 }).pii, 0, "только 0|1");
+  assert.ok(LOG_COLUMNS.split(", ").includes("pii") && LOG_COLUMNS.startsWith("ts, "), "pii в колонках журнала; ts без алиаса — не затеняет колонку в WHERE");
 });
 
 /* ===== Маршрут ===== */

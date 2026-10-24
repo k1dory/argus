@@ -74,6 +74,29 @@ func (f *fakeConsole) handler(w http.ResponseWriter, r *http.Request) {
 		f.last["query"] = r.URL.RawQuery
 		f.mu.Unlock()
 		_, _ = w.Write([]byte(logBody))
+	case r.URL.Path == "/api/v1/actors":
+		f.mu.Lock()
+		f.last["query"] = r.URL.RawQuery
+		f.mu.Unlock()
+		switch r.URL.Query().Get("alias") {
+		case "project_7_bot", "ipetrov", "10.77.0.42":
+			_, _ = w.Write([]byte(actorResolvedBody))
+		case "10.77.0.99":
+			_, _ = w.Write([]byte(`{"alias":"10.77.0.99","at":"2026-10-24T10:00:00Z","status":"ambiguous","matches":[
+			 {"person_id":"i.petrov","display":"Иван Петров","kind":"person","alias_kind":"ip","valid_from":"2026-10-15T09:00:00Z","valid_to":null},
+			 {"person_id":"a.sidorov","display":"Алексей Сидоров","kind":"person","alias_kind":"ip","valid_from":"2026-10-01T00:00:00Z","valid_to":null}]}`))
+		default:
+			_, _ = w.Write([]byte(`{"alias":"` + r.URL.Query().Get("alias") + `","at":"2026-10-24T10:00:00Z","status":"unbound","matches":[]}`))
+		}
+	case strings.HasPrefix(r.URL.Path, "/api/v1/actors/"):
+		f.mu.Lock()
+		f.last["query"] = r.URL.RawQuery
+		f.mu.Unlock()
+		if r.URL.Path != "/api/v1/actors/i.petrov" {
+			http.Error(w, `{"error":"not_found"}`, http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte(actorBody))
 	case r.URL.Path == "/api/incidents/INC-7":
 		_, _ = w.Write([]byte(cardBody))
 	case r.URL.Path == "/api/incidents/INC-8":

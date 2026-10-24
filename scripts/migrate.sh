@@ -119,7 +119,8 @@ mkuser argus_console "${CLICKHOUSE_CONSOLE_PASSWORD:-}" \
     "INSERT ON argus.console_dashboards" "INSERT ON argus.console_settings" \
     "INSERT ON argus.incident_comments" "INSERT ON argus.triage_session_revocations" \
     "INSERT ON argus.triage_verdicts" "INSERT ON argus.triage_verdict_claims" \
-    "INSERT ON argus.triage_verdict_claims_v2" "INSERT ON argus.agent_verdicts"
+    "INSERT ON argus.triage_verdict_claims_v2" "INSERT ON argus.agent_verdicts" \
+    "INSERT ON argus.identities" "INSERT ON argus.identity_aliases"
 
 # argus_collector — приём событий, heartbeat, dead-letter. У collector_health есть MV
 # в collector_health_log: ClickHouse требует INSERT на цель MV и SELECT на источник.
@@ -138,9 +139,11 @@ mkuser argus_policyd "${CLICKHOUSE_POLICYD_PASSWORD:-}" "$SVC_LIMITS" \
     "INSERT ON argus.policy_verdicts"
 
 # argus_engine — корреляция: читает всё argus, пишет инциденты/вердикты/журнал
-# реагирования; system.disks — для сторожа места.
+# реагирования, собственную телеметрию в events (disk.usage о диске ClickHouse),
+# персоны и алиасы паспорта; system.disks — для сторожа места.
 mkuser argus_engine "${CLICKHOUSE_ENGINE_PASSWORD:-}" "$SVC_LIMITS" \
-    "SELECT ON argus.*" \
+    "SELECT ON argus.*" "INSERT ON argus.events" \
     "INSERT ON argus.incidents" "INSERT ON argus.incident_state_events" "INSERT ON argus.incident_verdicts" "INSERT ON argus.response_log" \
     "INSERT ON argus.risk_report_deliveries" "INSERT ON argus.webhook_deliveries" \
+    "INSERT ON argus.identities" "INSERT ON argus.identity_aliases" \
     "SELECT ON system.disks"

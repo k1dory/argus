@@ -66,8 +66,9 @@ logs:
 rules-test: ## Тесты правил корреляции на записанном трафике (rules/tests)
 	./scripts/argus rules test
 
-replay: ## Залить fixtures/events/august.ndjson в коллектор (демо инцидентов)
+replay: ## Залить записанный трафик (august) и неделю субъектов (identity) в коллектор — демо инцидентов и паспортов
 	./scripts/argus replay fixtures/events/august.ndjson
+	./scripts/argus replay fixtures/events/identity.ndjson
 
 collector-test:
 	cd collector && go vet ./... && go test ./...

@@ -421,3 +421,22 @@ export function renderVerdictMarkdown(doc: VerdictDoc, agent: string, sessionId:
   b.push("", "---", `Записал агент ${code(agent)} через API консоли, сессия ${code(sessionId)}, схема ${code(VERDICT_SCHEMA_ID)}. Текст проверен и очищен консолью.`);
   return b.join("\n") + "\n";
 }
+
+/** Детерминированный UUID комментария агента по сессии разбора: повтор той же
+ *  сессии пишет тот же comment_id, а не второй комментарий. Четыре 32-битных
+ *  FNV-1a с разными солями дают 128 бит; версия 4 и вариант 8 выставлены,
+ *  чтобы строка была валидным UUID для колонки UUID. Чистая функция. */
+export function agentCommentId(sessionId: string): string {
+  const h = [0, 1, 2, 3].map((i) => fnv1a32Hex(`agent-comment:${i}:${sessionId}`)).join("");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-8${h.slice(17, 20)}-${h.slice(20, 32)}`;
+}
+
+/** FNV-1a 32 бит → 8 hex-символов. */
+function fnv1a32Hex(s: string): string {
+  let h = 0x811c9dc5;
+  for (const b of new TextEncoder().encode(s)) {
+    h ^= b;
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0");
+}

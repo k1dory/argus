@@ -133,8 +133,15 @@ func (c Config) Validate() []string {
 		if n == "" {
 			continue
 		}
-		if _, ok := c.Profiles[n]; !ok {
+		p, ok := c.Profiles[n]
+		if !ok {
 			problems = append(problems, fmt.Sprintf("%s: профиль %q не описан в profiles", field, n))
+			continue
+		}
+		// Выбранный профиль без адреса модели — ошибка на старте, а не на
+		// первом разборе: рабочего умолчания (внутренний хост) у endpoint нет.
+		if err := p.endpointOK(); err != nil {
+			problems = append(problems, fmt.Sprintf("%s: profiles.%s: %v", field, n, err))
 		}
 	}
 	sort.Strings(problems)
@@ -172,6 +179,19 @@ func New(cfg Config) *Analyst {
 	return &Analyst{cfg: cfg, clients: map[string]*http.Client{}}
 }
 
+// endpointOK — у профиля с сетевым бэкендом задан адрес модели. Пустой
+// endpoint — не «локальный сервер по умолчанию», а незаполненная настройка:
+// ARGUS_LLM_LOCAL_ENDPOINT для on-prem-strict.
+func (p Profile) endpointOK() error {
+	if backendName(p) == BackendMock {
+		return nil
+	}
+	if strings.TrimSpace(p.Endpoint) == "" {
+		return errors.New("endpoint пуст — задайте адрес сервера модели (для on-prem-strict — ARGUS_LLM_LOCAL_ENDPOINT) или выберите профиль mock")
+	}
+	return nil
+}
+
 // Route выбирает профиль: правило → ПДн-переопределение → дефолт.
 func (a *Analyst) Route(inc *incidents.Incident, ruleProfile string) (string, Profile, error) {
 	name := ruleProfile
@@ -189,6 +209,9 @@ func (a *Analyst) Route(inc *incidents.Incident, ruleProfile string) (string, Pr
 		return name, p, fmt.Errorf("профиль %q не описан в argus.analyst.yml", name)
 	}
 	if _, err := backendFor(p); err != nil {
+		return name, p, fmt.Errorf("профиль %q: %w", name, err)
+	}
+	if err := p.endpointOK(); err != nil {
 		return name, p, fmt.Errorf("профиль %q: %w", name, err)
 	}
 	if inc.PII == 1 && p.Cloud() {

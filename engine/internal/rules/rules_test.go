@@ -47,9 +47,12 @@ detection:
 
 func TestLoadRejectsBrokenRules(t *testing.T) {
 	cases := map[string]string{
-		"без id":         "title: x\ndetection:\n  selection: {a: b}\n",
-		"чужое поле":     "title: x\nid: y\ndetection:\n  selection: {nosuch.field: b}\n",
-		"порог без окна": "title: x\nid: y\ndetection:\n  selection: {node: a}\n  threshold: {count: 3}\n  condition: selection and threshold\n",
+		"без id":                "title: x\ndetection:\n  selection: {a: b}\n",
+		"чужое поле":            "title: x\nid: y\ndetection:\n  selection: {nosuch.field: b}\n",
+		"порог без окна":        "title: x\nid: y\ndetection:\n  selection: {node: a}\n  threshold: {count: 3}\n  condition: selection and threshold\n",
+		"consecutive без reset": "title: x\nid: y\ndetection:\n  selection: {value: '>= 90'}\n  threshold: {kind: consecutive, count: 3, window: 15m}\n  condition: selection and threshold\n",
+		"consecutive count 1":   "title: x\nid: y\ndetection:\n  selection: {value: '>= 90'}\n  reset: {value: '< 90'}\n  threshold: {kind: consecutive, count: 1, window: 15m}\n  condition: selection and threshold\n",
+		"reset с чужим полем":   "title: x\nid: y\ndetection:\n  selection: {value: '>= 90'}\n  reset: {nosuch: 1}\n  threshold: {kind: consecutive, count: 3, window: 15m}\n  condition: selection and threshold\n",
 	}
 	for name, yml := range cases {
 		p := filepath.Join(t.TempDir(), "r.yml")

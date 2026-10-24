@@ -6,6 +6,8 @@ export const searchHref = {
   // События единой схемы — в журнал: источник и хост там структурные фильтры.
   eventSrc: (ip: string) => `/events?q=${encodeURIComponent(`src:${ip}`)}`,
   source: (s: string) => `/events?source=${encodeURIComponent(s)}`,
-  actor: (a: string) => `/events?q=${encodeURIComponent(`actor:${a}`)}`,
+  // Субъект — в паспорт (резолв алиаса в персону); журнал по нему — вторая ссылка со страницы резолва.
+  actor: (a: string) => `/actors/by-alias?v=${encodeURIComponent(a)}`,
+  actorEvents: (a: string) => `/events?q=${encodeURIComponent(`actor:${a}`)}`,
   node: (n: string) => `/events?host=${encodeURIComponent(n)}`,
 };

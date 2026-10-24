@@ -210,3 +210,50 @@ close_on:
 		t.Fatalf("closer по ротации токена: %+v", closers)
 	}
 }
+
+const consecutiveRule = `
+title: disk
+id: t-disk
+level: high
+detection:
+  selection: {source.class: telemetry, action: disk.usage, value: '>= 90'}
+  reset: {source.class: telemetry, action: disk.usage, value: '< 90'}
+  threshold: {kind: consecutive, count: 3, window: 15m, group_by: node}
+  condition: selection and threshold
+close_on: {source.class: telemetry, action: disk.usage, value: '< 85'}
+`
+
+func disk(min int, node string, v float64) *model.Event {
+	e := &model.Event{TS: fmt.Sprintf("2026-10-20 11:%02d:00.000", min), Source: "telemetry.node", SourceClass: "telemetry", Action: "disk.usage", Node: node, Value: v, Unit: "percent"}
+	e.Ensure()
+	return e
+}
+
+// «Три подряд» буквально: замер ниже порога между нарушениями обрывает серию.
+func TestConsecutiveResetsSeries(t *testing.T) {
+	r := mkRule(t, consecutiveRule)
+	flapping := []*model.Event{disk(0, "db", 91), disk(5, "db", 89), disk(10, "db", 92), disk(15, "db", 89), disk(20, "db", 93)}
+	if dets := Run([]*rules.Rule{r}, flapping); len(dets) != 0 {
+		t.Fatalf("91,89,92,89,93 — не подряд, сработок %d", len(dets))
+	}
+	rising := []*model.Event{disk(0, "db", 91), disk(5, "db", 92), disk(10, "db", 93)}
+	dets := Run([]*rules.Rule{r}, rising)
+	if len(dets) != 1 || len(dets[0].Events) != 3 || dets[0].Key != "db" {
+		t.Fatalf("91,92,93 — одна сработка из трёх событий: %+v", dets)
+	}
+	// Сброс действует на свою группу: web не мешает db.
+	mixed := []*model.Event{disk(0, "db", 91), disk(1, "web", 50), disk(5, "db", 92), disk(6, "web", 40), disk(10, "db", 93)}
+	if dets := Run([]*rules.Rule{r}, mixed); len(dets) != 1 || dets[0].Key != "db" {
+		t.Fatalf("сброс другой группы не обрывает серию: %+v", dets)
+	}
+	// После сброса серия начинается заново и может дойти до порога.
+	again := []*model.Event{disk(0, "db", 91), disk(5, "db", 92), disk(10, "db", 80), disk(15, "db", 91), disk(20, "db", 92), disk(25, "db", 93)}
+	dets = Run([]*rules.Rule{r}, again)
+	if len(dets) != 1 || len(dets[0].Events) != 3 || dets[0].First != disk(15, "db", 0).Time() {
+		t.Fatalf("серия после сброса: %+v", dets)
+	}
+	// Сброс и close_on — разные события: 80 закрывает, 89 только обрывает серию.
+	if !r.MatchReset(disk(0, "db", 89)) || r.MatchClose(disk(0, "db", 89)) || !r.MatchClose(disk(0, "db", 80)) {
+		t.Fatal("reset/close_on")
+	}
+}

@@ -185,7 +185,7 @@ services:
     environment:
       WAZUH_API_URL: ${WAZUH_API_URL:-https://wazuh-manager:55000}
       WAZUH_API_USER: ${WAZUH_API_USER:-wazuh}
-      WAZUH_API_PASSWORD: ${WAZUH_API_PASSWORD:?WAZUH_API_PASSWORD не задан — пароль API менеджера Wazuh}
+      WAZUH_API_PASSWORD: ${WAZUH_API_PASSWORD:-}   # обязателен для policyd; интерполяция compose идёт и для выключенного профиля, поэтому проверяет сам policyd на старте
       WAZUH_INSECURE_TLS: ${WAZUH_INSECURE_TLS:-false}
       # Доверие сертификату менеджера без INSECURE: CA-файл (./caddy/certs → /certs)
       # или SHA-256 отпечаток листового сертификата.
@@ -337,6 +337,8 @@ services:
       METRICS_TOKEN: ${METRICS_TOKEN:-}          # Bearer для /metrics; пусто — тот же ENGINE_TOKEN
       ARGUS_DEV: ${ARGUS_DEV:-0}
       ARGUS_MAX_NEW_INCIDENTS: ${ARGUS_MAX_NEW_INCIDENTS:-200}   # новых инцидентов за цикл; сверх — шторм, остальное в лог
+      # Модуль Wazuh: без него исполнитель active-response не настраивается и WAZUH_* не проверяются.
+      ARGUS_INTEGRATION_WAZUH: ${ARGUS_INTEGRATION_WAZUH:-0}
       # Исполнитель active-response Wazuh: список id агентов (пусто — выключен; all — все, с предупреждением),
       # таймаут = <timeout> команды в ossec.conf менеджера, команда снятия блока.
       WAZUH_AR_AGENTS: ${WAZUH_AR_AGENTS:-}
@@ -351,6 +353,9 @@ services:
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_ENGINE_PASSWORD:?CLICKHOUSE_ENGINE_PASSWORD не задан — ./scripts/argus init}
       RULES_DIR: /rules
       CMDB_FILE: /etc/argus/cmdb.yml
+      # Паспорт субъекта: персоны и алиасы (email, login, ip…) с интервалами действия;
+      # файл перечитывается при изменении. Пусто — алиасы только из событий identity.alias и API.
+      IDENTITIES_FILE: /etc/argus/identities.yml
       POLL_INTERVAL: ${ENGINE_POLL_INTERVAL:-30s}
       LISTEN_ADDR: ":8090"
       # Профили аналитика — argus.analyst.yml; секреты только через окружение.
@@ -382,6 +387,7 @@ services:
     volumes:
       - ./rules:/rules:ro
       - ./cmdb.yml:/etc/argus/cmdb.yml:ro
+      - ./identities.yml:/etc/argus/identities.yml:ro
       - ./caddy/certs:/certs:ro
     ports:
       - "127.0.0.1:8090:8090"   # /metrics и /healthz — только localhost

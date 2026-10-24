@@ -33,25 +33,34 @@ export async function POST(req: Request): Promise<Response> {
     }
     const scope = await triageScopeFor(inc);
     const { token, scope: s } = await signTriageToken({ incidentId: inc.incident_id, ...scope, ttlSec: ttl });
+    // Журнал обязателен: без записи о выпуске токен клиенту не отдаётся (strict → 503).
     await audit(guard.session.user, "triage.session", inc.incident_id,
-      `сессия ${s.sessionId}, до ${s.expiresAt}, связанных ${Object.keys(s.related).length}`);
+      `сессия ${s.sessionId}, до ${s.expiresAt}, связанных ${Object.keys(s.related).length}`, { strict: true });
     return Response.json({
       token, token_type: "triage-session", session_id: s.sessionId, incident_id: s.incidentId,
       expires_at: s.expiresAt, related_ids: Object.keys(s.related),
     }, { status: 201, headers: { "Cache-Control": "no-store" } });
   } catch (err) {
     console.error("api/triage/sessions:", err instanceof Error ? err.message : err);
-    return Response.json({ error: "хранилище недоступно" }, { status: 503 });
+    return Response.json({ error: err instanceof Error && err.message.startsWith("журнал действий") ? err.message : "хранилище недоступно" }, { status: 503 });
   }
 }
 
 // DELETE /api/triage/sessions — агент закрывает свою сессию (bearer — сам
 // токен triage-session): после записи вердикта чтение больше не нужно.
 // Бюджет запросов не тратит: иначе после 100 запросов сессию не закрыть.
+// В журнале — triage.session.revoke; отказ журнала отзыв не блокирует.
 export async function DELETE(req: Request): Promise<Response> {
   const guard = await apiGuard(req, "default", { triage: true, uncharged: true });
   if (guard.response) return guard.response;
   if (!guard.session.triage) return Response.json({ error: "нужен токен triage-session" }, { status: 403 });
+  // Исключение из правила «аудит strict до мутации»: отзыв важнее журнала —
+  // при отказе журнала отзыв всё равно выполняется, ошибка — в лог сервера.
+  try {
+    await audit(guard.session.user, "triage.session.revoke", guard.session.triage.incidentId, `сессия ${guard.session.triage.sessionId} отозвана агентом`);
+  } catch (err) {
+    console.error("api/triage/sessions DELETE audit:", err instanceof Error ? err.message : err);
+  }
   try {
     await revokeTriageSession(guard.session.triage);
   } catch (err) {

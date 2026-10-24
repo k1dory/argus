@@ -96,7 +96,8 @@ func (ps *profiles) of(req *mcp.CallToolRequest) *profile {
 var dropRaw = map[string]bool{"raw": true, "full_log": true}
 
 // subjectKeys — поля-субъекты во всех ответах консоли.
-var subjectKeys = map[string]bool{"actor_name": true, "actor": true, "owner": true, "author": true, "user": true, "agent_user": true}
+// person_id и display — персона паспорта субъекта (get_actor).
+var subjectKeys = map[string]bool{"actor_name": true, "actor": true, "owner": true, "author": true, "user": true, "agent_user": true, "person_id": true, "display": true}
 
 // hostKeys — поля-узлы: машина человека (ws-ivanov) — псевдонимом host-….
 var hostKeys = map[string]bool{"node": true, "agent_name": true}
@@ -195,7 +196,7 @@ func (p *profile) render(body []byte, shape redact.Shape, keepRaw bool, known ..
 }
 
 // pretriage — то, что не выражается формой полей: фасеты субъектов → псевдонимы;
-// у строк с pii=1 (rows поиска, items ленты get_log) свободный текст (object,
+// у строк с pii=1 (rows поиска, items ленты get_log, секции паспорта) свободный текст (object,
 // attributes/attrs) скрыт целиком — pii здесь дополнительный сигнал, редакция
 // по шаблонам работает и без него.
 func (p *profile) pretriage(v any) {
@@ -203,7 +204,8 @@ func (p *profile) pretriage(v any) {
 	if !ok {
 		return
 	}
-	for _, list := range []string{"rows", "items"} {
+	// rows — поиск, items — лента get_log, остальные — секции паспорта get_actor.
+	for _, list := range []string{"rows", "items", "timeline", "logins", "hosts", "network", "apps", "changes"} {
 		rows, ok := m[list].([]any)
 		if !ok {
 			continue
@@ -213,6 +215,46 @@ func (p *profile) pretriage(v any) {
 				for _, k := range []string{"object", "attributes", "attrs"} {
 					if _, ok := row[k]; ok {
 						row[k] = piiMasked
+					}
+				}
+			}
+		}
+	}
+	// Паспорт субъекта: значения алиасов-учёток — псевдонимы субъекта, имена
+	// узлов — как узлы; адреса остаются (как src_ip в событиях).
+	for _, list := range []string{"aliases", "ambiguous"} {
+		aliases, ok := m[list].([]any)
+		if !ok {
+			continue
+		}
+		for _, a := range aliases {
+			am, ok := a.(map[string]any)
+			if !ok {
+				continue
+			}
+			v, ok := am["value"].(string)
+			if !ok {
+				continue
+			}
+			switch am["kind"] {
+			case "ip":
+			case "host":
+				am["value"] = p.red.Host(v)
+			default:
+				am["value"] = p.red.Subject(v)
+			}
+		}
+	}
+	// summary.nodes — [{node, count, …}] (или просто строки): узлы людей → host-….
+	if summary, ok := m["summary"].(map[string]any); ok {
+		if nodes, ok := summary["nodes"].([]any); ok {
+			for i, n := range nodes {
+				switch x := n.(type) {
+				case string:
+					nodes[i] = p.red.Host(x)
+				case map[string]any:
+					if s, ok := x["node"].(string); ok {
+						x["node"] = p.red.Host(s)
 					}
 				}
 			}

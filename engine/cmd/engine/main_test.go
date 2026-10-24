@@ -28,12 +28,13 @@ type fakeCH struct {
 	mu      sync.Mutex
 	inserts map[string][]string
 	selects map[string]string
+	fail    map[string]bool // таблица → INSERT отвечает 500
 	srv     *httptest.Server
 }
 
 func newFakeCH(t *testing.T) *fakeCH {
 	t.Helper()
-	f := &fakeCH{inserts: map[string][]string{}, selects: map[string]string{}}
+	f := &fakeCH{inserts: map[string][]string{}, selects: map[string]string{}, fail: map[string]bool{}}
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body := make([]byte, 1<<20)
 		n, _ := r.Body.Read(body)
@@ -42,6 +43,10 @@ func newFakeCH(t *testing.T) *fakeCH {
 		defer f.mu.Unlock()
 		if strings.HasPrefix(q, "INSERT INTO ") {
 			table := strings.Fields(q)[2]
+			if f.fail[table] {
+				http.Error(w, "Code: 243. DB::Exception: fake insert failure", http.StatusInternalServerError)
+				return
+			}
 			for _, line := range strings.Split(strings.TrimSpace(string(body[:n])), "\n") {
 				if line != "" {
 					f.inserts[table] = append(f.inserts[table], line)

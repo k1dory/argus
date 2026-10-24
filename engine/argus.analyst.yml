@@ -19,7 +19,7 @@
 profiles:
   on-prem-strict:
     backend: openai-compatible
-    endpoint: ${ARGUS_LLM_LOCAL_ENDPOINT:-http://llm.internal:8000/v1}
+    endpoint: ${ARGUS_LLM_LOCAL_ENDPOINT:-}                 # обязателен, если профиль выбран (default/pii/force или правило): адрес сервера внутри контура, без умолчания
     model: ${ARGUS_LLM_LOCAL_MODEL:-qwen3-32b-instruct}
     api_key: ${ARGUS_LLM_LOCAL_API_KEY:-}                 # если локальный сервер требует ключ
     egress: deny

@@ -1,0 +1,7 @@
+# «Три подряд» буквально: db-02 колеблется 91 → 89 → 92 → 89 → 93 — замеры ниже 90 %
+# обрывают серию (detection.reset), инцидента нет; web-02 растёт 91 → 92 → 93 — один инцидент.
+rule: a41c-ops-060
+fixture: fixtures/events/telemetry-flapping.ndjson
+expect_incidents: 1
+expect_actor: web-02
+min_events: 3

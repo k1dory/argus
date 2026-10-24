@@ -1,0 +1,42 @@
+# Паспорт субъекта: персоны и их алиасы с интервалами действия. Движок читает
+# файл по IDENTITIES_FILE (compose: /etc/argus/identities.yml) и перечитывает
+# при изменении; записи получают source = yaml, пропавшие из файла алиасы
+# помечаются удалёнными. Алиасы также приходят событиями identity.alias от
+# экспортеров (IdP, VPN-контроллер) и через API консоли — все три источника
+# живут в одной таблице argus.identity_aliases.
+#
+# Алиас действует на событие, если from <= ts < to. Нет from — действует
+# всегда; нет to — по сей день. Даты: YYYY-MM-DD или RFC3339 (UTC).
+# kind: email | login | uid | ip | host | sid | peer; email/login/host
+# приводятся к нижнему регистру, ip — к канонической записи.
+#
+# Пример согласован с cmdb.yml (владельцы узлов) и fixtures/events/identity.ndjson.
+# История адреса 10.77.0.42, который перешёл от a.sidorov к i.petrov, в файле
+# не описана намеренно: её приносят события identity.alias из той же фикстуры
+# (так делает VPN-контроллер), а `make demo` сдвигает даты событий к «сейчас».
+persons:
+  i.petrov:
+    display: "Иван Петров"
+    kind: person
+    team: platform
+    aliases:
+      - {kind: email, value: i.petrov@example.org}
+      - {kind: login, value: ipetrov}
+      - {kind: uid, value: "1001", note: "идентификатор в IdP"}
+      - {kind: ip, value: 10.77.0.11, note: "ноутбук, постоянный адрес VPN"}
+  a.sidorov:
+    display: "Алексей Сидоров"
+    team: data
+    aliases:
+      - {kind: email, value: a.sidorov@example.org}
+      - {kind: login, value: asidorov}
+      - {kind: uid, value: "1002"}
+      - {kind: ip, value: 10.77.0.23, confidence: 0.9, note: "новый ноутбук, VPN"}
+  s.ivanova:
+    display: "Светлана Иванова"
+    team: infra
+    aliases:
+      - {kind: email, value: s.ivanova@example.org}
+      - {kind: login, value: sivanova}
+      - {kind: uid, value: "1003"}
+      - {kind: ip, value: 10.77.0.31}

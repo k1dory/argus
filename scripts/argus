@@ -17,6 +17,15 @@ usage() { sed -n '2,11p' "$0"; exit 2; }
 
 # set_var KEY VALUE — заменить первую строку KEY= или #KEY= в .env, иначе дописать.
 # Значение — без спецсимволов awk (0/1, имена профилей через запятую).
+# comment_var — закомментировать строку KEY=… в .env (значение сохраняется для ручного включения).
+comment_var() {
+  local key="$1"
+  if grep -qE "^${key}=" .env; then
+    awk -v k="$key" '{ if ($0 ~ "^" k "=") print "#" $0; else print }' .env >.env.tmp
+    mv .env.tmp .env
+  fi
+}
+
 set_var() {
   local key="$1" val="$2"
   if grep -qE "^#?${key}=" .env; then
@@ -105,21 +114,6 @@ case "${1:-}" in
              ARGUS_MCP_HTTP_TOKEN ARGUS_PSEUDONYM_KEY POLICYD_TOKEN BACKUP_KEY; do
       ensure_secret "$k"
     done
-    # Пароль API менеджера Wazuh сгенерировать нельзя (он задаётся на менеджере),
-    # а случайная строка выглядела бы как настоящий и молча давала бы 401.
-    # Compose требует непустое значение: оставляем заглушку change-me, которую
-    # движок при заданном WAZUH_API_URL не принимает (кроме ARGUS_DEV=1).
-    if ! grep -qE '^WAZUH_API_PASSWORD=.+' .env; then
-      if grep -qE '^#?WAZUH_API_PASSWORD=' .env; then
-        awk 'BEGIN{done=0} { if (!done && ($0 ~ /^#?WAZUH_API_PASSWORD=/)) { print "WAZUH_API_PASSWORD=change-me"; done=1 } else print }' .env >.env.tmp
-        mv .env.tmp .env
-      else
-        printf 'WAZUH_API_PASSWORD=change-me\n' >>.env
-      fi
-    fi
-    if grep -qE '^WAZUH_API_PASSWORD=change-me' .env; then
-      echo "init: ВНИМАНИЕ — WAZUH_API_PASSWORD=change-me (заглушка): впишите пароль API менеджера Wazuh, иначе движок не стартует при заданном WAZUH_API_URL"
-    fi
     if [ -n "$analyst" ]; then
       set_var ARGUS_ANALYST_PROFILE "$analyst"
     fi
@@ -138,12 +132,26 @@ case "${1:-}" in
     if [ "$wazuh" = 1 ]; then
       set_var ARGUS_INTEGRATION_WAZUH 1
       set_var COMPOSE_PROFILES "$(profiles_with wazuh)"
+      # Пароль API менеджера Wazuh сгенерировать нельзя (он задаётся на менеджере),
+      # а случайная строка выглядела бы как настоящий и молча давала бы 401.
+      # Compose (policyd) требует непустое значение: оставляем заглушку change-me,
+      # которую движок с включённым модулем не принимает (кроме ARGUS_DEV=1).
+      if ! grep -qE '^WAZUH_API_PASSWORD=.+' .env; then
+        set_var WAZUH_API_PASSWORD change-me
+      fi
+      if grep -qE '^WAZUH_API_PASSWORD=change-me' .env; then
+        echo "init: ВНИМАНИЕ — WAZUH_API_PASSWORD=change-me (заглушка): впишите пароль API менеджера Wazuh, иначе движок не стартует"
+      fi
       echo "init: модуль Wazuh включён (ARGUS_INTEGRATION_WAZUH=1, COMPOSE_PROFILES=$(current_profiles)); укажите WAZUH_API_URL/WAZUH_API_PASSWORD и WAZUH_ALERTS_DIR"
     else
       set_var ARGUS_INTEGRATION_WAZUH 0
       rest="$(profiles_without wazuh)"
       if [ -n "$rest" ]; then set_var COMPOSE_PROFILES "$rest"; else sed -i.bak '/^COMPOSE_PROFILES=/d' .env && rm -f .env.bak; fi
-      echo "init: модуль Wazuh выключен (ARGUS_INTEGRATION_WAZUH=0); включить позже — ./scripts/argus init --with-wazuh --no-up"
+      # Без модуля движку не нужны ни адрес менеджера, ни пароль: заглушка
+      # change-me и WAZUH_API_URL закомментируются, чтобы не выглядеть настроенными.
+      comment_var WAZUH_API_URL
+      if grep -qE '^WAZUH_API_PASSWORD=(change-me.*)?$' .env; then comment_var WAZUH_API_PASSWORD; fi
+      echo "init: модуль Wazuh выключен (ARGUS_INTEGRATION_WAZUH=0, WAZUH_* не требуются); включить позже — ./scripts/argus init --with-wazuh --no-up"
     fi
     chmod 600 .env
     echo "init: .env готов (права 600). Пароль admin консоли после старта: docker compose exec web cat /data/admin-password.txt"
@@ -165,7 +173,9 @@ case "${1:-}" in
     fi
     url="${COLLECTOR_URL:-http://localhost:8088}"
     # REPLAY_REBASE=1 (по умолчанию): сдвинуть метки так, чтобы последнее
-    # событие было «сейчас» — относительные интервалы сохраняются.
+    # событие было «сейчас» — относительные интервалы сохраняются. Вместе с ts
+    # сдвигаются attrs.valid_from / attrs.valid_to событий identity.alias, иначе
+    # интервалы алиасов разошлись бы с событиями, к которым они относятся.
     if [ "${REPLAY_REBASE:-1}" = "1" ] && command -v python3 >/dev/null; then
       f="$2"; [ "${f#/}" = "$f" ] && f="$ROOT/$f"
       python3 - "$f" <<'PY' | curl -sS -X POST "$url/ingest/events" -H "X-Argus-Token: ${ARGUS_INGEST_TOKEN:-}" \
@@ -176,8 +186,18 @@ rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip() and not l.startswi
 fmt = "%Y-%m-%d %H:%M:%S.%f"
 last = max(datetime.strptime(r["ts"], fmt) for r in rows)
 shift = datetime.now(timezone.utc).replace(tzinfo=None) - last
+def rebase(v):
+    for f in (fmt, "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return (datetime.strptime(v, f) + shift).strftime(fmt)[:-3]
+        except ValueError:
+            pass
+    return v
 for r in rows:
-    r["ts"] = (datetime.strptime(r["ts"], fmt) + shift).strftime(fmt)[:-3]
+    r["ts"] = rebase(r["ts"])
+    for k in ("valid_from", "valid_to"):
+        if isinstance(r.get("attrs"), dict) and r["attrs"].get(k):
+            r["attrs"][k] = rebase(r["attrs"][k])
     print(json.dumps(r, ensure_ascii=False))
 PY
     else

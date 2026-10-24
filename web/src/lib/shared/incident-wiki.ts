@@ -23,7 +23,8 @@ export function closingEvent(status: IncidentStatus, changes: WikiChange[]): Wik
   }, null);
 }
 
-function literal(value: string): string {
+/** Значение из данных внутри Markdown: спецсимволы экранируются, переводы строк схлопываются. */
+export function literal(value: string): string {
   return value.replace(/[\\`*_{}\[\]()#+.!|>~-]/g, "\\$&").replace(/\r?\n/g, " ");
 }
 

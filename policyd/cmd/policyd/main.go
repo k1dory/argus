@@ -103,6 +103,12 @@ func main() {
 	for _, w := range tlsOpts.Warnings() {
 		log.Warn(w)
 	}
+	// Пароль обязателен: compose больше не требует его на уровне интерполяции
+	// (модуль Wazuh выключаем профилем), поэтому проверка живёт здесь.
+	if os.Getenv("WAZUH_API_PASSWORD") == "" {
+		log.Error("WAZUH_API_PASSWORD не задан — пароль API менеджера Wazuh нужен policyd (модуль Wazuh)")
+		os.Exit(1)
+	}
 	wz, err := wazuh.New(
 		envOr("WAZUH_API_URL", "https://localhost:55000"),
 		envOr("WAZUH_API_USER", "wazuh"),

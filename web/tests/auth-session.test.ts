@@ -79,7 +79,7 @@ test("SSO: имя изолировано префиксом sso:, TTL сесси
   const p = decodeJwt(t);
   assert.equal(p.exp! - p.iat!, 3600);
   const s = await auth.verifySessionToken(t);
-  assert.deepEqual(s, { user: "sso:admin", role: "admin", sso: true, mustChangePassword: false });
+  assert.deepEqual(s, { kind: "console", user: "sso:admin", role: "admin", sso: true, mustChangePassword: false });
   // sso:admin — не встроенный admin: локальный пароль/2FA у него не существуют
   assert.equal(await auth.verifyCredentials("sso:admin", "AdminPassw0rd."), null);
   assert.match((await auth.createUser("sso:x", "viewer") as { error: string }).error, /Имя/);

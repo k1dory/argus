@@ -24,7 +24,8 @@
   <text x="32" y="140" class="t">k8s audit, GitLab, Harbor</text>
   <text x="32" y="158" class="t">WAF, syslog, S3-аудит</text>
   <text x="32" y="176" class="t">телеметрия хостов (NDJSON)</text>
-  <text x="32" y="198" class="m">value · unit — числовые замеры</text>
+  <text x="32" y="194" class="t">identity.alias от IdP / VPN</text>
+  <text x="32" y="206" class="m">value · unit — числовые замеры</text>
 
   <!-- wazuh module -->
   <rect x="20" y="240" width="200" height="110" class="opt"/>
@@ -51,10 +52,11 @@
   <text x="522" y="184" class="t">state_events</text>
   <text x="522" y="208" class="t">incident_verdicts (движок)</text>
   <text x="522" y="226" class="t">agent_verdicts (агенты)</text>
-  <text x="522" y="250" class="t">webhook_deliveries</text>
-  <text x="522" y="268" class="t">triage_session_revocations</text>
-  <text x="522" y="296" class="t" fill="#999">wazuh_alerts, policy_verdicts</text>
-  <text x="522" y="314" class="m">TTL 180 д · миграции в git</text>
+  <text x="522" y="250" class="t">identities, identity_aliases</text>
+  <text x="522" y="268" class="m">алиасы с valid_from / valid_to</text>
+  <text x="522" y="286" class="t">webhook_deliveries, revocations</text>
+  <text x="522" y="304" class="t" fill="#999">wazuh_alerts, policy_verdicts</text>
+  <text x="522" y="322" class="m">TTL 180 д · миграции в git</text>
 
   <!-- engine -->
   <rect x="770" y="60" width="200" height="150" class="box"/>
@@ -69,9 +71,9 @@
   <!-- web -->
   <rect x="770" y="240" width="200" height="110" class="box"/>
   <text x="782" y="262" class="a">web (Next.js) за Caddy</text>
-  <text x="782" y="284" class="t">инциденты · журнал · поиск</text>
-  <text x="782" y="302" class="t">правила · дашборды · источники</text>
-  <text x="782" y="320" class="t">/api/* · /api/v1/log</text>
+  <text x="782" y="284" class="t">инциденты · журнал · субъекты</text>
+  <text x="782" y="302" class="t">паспорт /actors · поиск · правила</text>
+  <text x="782" y="320" class="t">/api/* · /api/v1/log · /api/v1/actors</text>
   <text x="782" y="340" class="m">:8443 · OIDC · TOTP · RBAC</text>
 
   <!-- agents -->

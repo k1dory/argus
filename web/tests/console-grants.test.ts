@@ -25,7 +25,8 @@ function consoleInsertGrants(): Set<string> {
 
 test("каждая таблица из INSERT INTO консоли есть в грантах argus_console", () => {
   const grants = consoleInsertGrants();
-  const tables = new Set([...insertTables("web/src/lib/argus-queries.ts"), ...insertTables("web/src/lib/queries.ts")]);
+  const tables = new Set([...insertTables("web/src/lib/argus-queries.ts"), ...insertTables("web/src/lib/queries.ts"), ...insertTables("web/src/lib/actors.ts")]);
+  assert.ok(tables.has("identity_aliases"), "разбор самого теста: INSERT INTO identity_aliases должен найтись");
   assert.ok(tables.has("triage_verdicts"), "разбор самого теста: INSERT INTO triage_verdicts должен найтись");
   const missing = [...tables].filter((t) => !grants.has(t));
   assert.deepEqual(missing, [], `нет гранта INSERT для argus_console: ${missing.join(", ")}`);

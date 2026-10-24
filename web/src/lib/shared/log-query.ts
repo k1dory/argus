@@ -118,7 +118,11 @@ export const chTs = (ms: number): string => new Date(ms).toISOString().replace("
 
 export type LogSql = { sql: string; params: Record<string, string | number> };
 
-export const LOG_COLUMNS = `toString(ts) AS ts, source, source_class, action, outcome, severity, actor_name, actor_kind, object, node, session_id, src_ip, dst_ip, value, unit, attrs`;
+// ts — без toString(...) AS ts: при включённом анализаторе (ClickHouse 24.8)
+// алиас затенял бы колонку в WHERE/ORDER BY (String против DateTime64), а
+// JSONEachRow и так отдаёт DateTime64 строкой 'YYYY-MM-DD HH:MM:SS.mmm'.
+// pii — признак ПДн в строке: по нему MCP скрывает свободный текст (object, attrs) в профиле triage.
+export const LOG_COLUMNS = `ts, source, source_class, action, outcome, severity, actor_name, actor_kind, object, node, session_id, src_ip, dst_ip, value, unit, attrs, pii`;
 
 /** Параметризованный SQL: значения только через {name:Type}. bind — привязка
  *  строк сессии разбора (обязательный предикат; пусто — ни одной строки). */
@@ -166,6 +170,8 @@ export type LogItem = {
   ts: string; source: string; source_class: string; action: string; outcome: string; severity: number; level: LogLevel;
   actor_name: string; actor_kind: string; object: string; node: string; session_id: string; src_ip: string; dst_ip: string;
   value: number; unit: string; attrs: Record<string, string>;
+  /** 1 — строка содержит ПДн (источник или детектор). */
+  pii: 0 | 1;
 };
 
 export function toLogItem(r: Record<string, unknown>): LogItem {
@@ -175,6 +181,6 @@ export function toLogItem(r: Record<string, unknown>): LogItem {
   return {
     ts: s("ts"), source: s("source"), source_class: s("source_class"), action: s("action"), outcome: s("outcome"), severity, level: levelOf(severity),
     actor_name: s("actor_name"), actor_kind: s("actor_kind"), object: s("object"), node: s("node"), session_id: s("session_id"), src_ip: s("src_ip"), dst_ip: s("dst_ip"),
-    value: Number(r.value ?? 0), unit: s("unit"), attrs,
+    value: Number(r.value ?? 0), unit: s("unit"), attrs, pii: Number(r.pii ?? 0) === 1 ? 1 : 0,
   };
 }

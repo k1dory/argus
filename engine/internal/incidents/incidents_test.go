@@ -3,6 +3,8 @@ package incidents
 import (
 	"testing"
 	"time"
+
+	"github.com/devitex-soft/argus/engine/internal/model"
 )
 
 func TestSweepAutoClosesOnlyUntouched(t *testing.T) {
@@ -23,19 +25,37 @@ func TestSweepAutoClosesOnlyUntouched(t *testing.T) {
 		t.Fatalf("закрыть только INC-1 (new, ci, > 4h): %+v", closed)
 	}
 	// close_on — сильное свидетельство (причина устранена): закрывает и in_progress
-	if inc := reg.Close("ci", "human", "ротация", now); inc == nil || inc.Status != StatusClosed {
+	if inc := reg.Close("ci", "human", "ротация", now, now); inc == nil || inc.Status != StatusClosed {
 		t.Fatalf("close_on должен закрыть и in_progress: %+v", inc)
 	}
 }
 
 func TestCloseByKey(t *testing.T) {
 	reg := NewRegistry(1, []Incident{{IncidentID: "INC-1", RuleID: "ci", Status: StatusNew, ActorName: "bot", Node: "runner"}})
-	inc := reg.Close("ci", "bot", "ротация токена", time.Now())
+	inc := reg.Close("ci", "bot", "ротация токена", time.Now(), time.Now())
 	if inc == nil || inc.Status != StatusClosed || inc.Note == "" {
 		t.Fatalf("%+v", inc)
 	}
-	if reg.Close("ci", "bot", "повтор", time.Now()) != nil {
+	if reg.Close("ci", "bot", "повтор", time.Now(), time.Now()) != nil {
 		t.Fatal("закрытый повторно не закрывается")
+	}
+}
+
+// close_on закрывает только событием восстановления ПОЗЖЕ последнего события
+// инцидента: последовательность 80 → 91 → 93 → 95 в одном буфере не должна
+// заводить и сразу закрывать инцидент старым нормальным замером.
+func TestCloseRequiresRecoveryAfterLastEvent(t *testing.T) {
+	last := time.Date(2026, 10, 20, 10, 30, 0, 0, time.UTC)
+	reg := NewRegistry(1, []Incident{{IncidentID: "INC-1", RuleID: "disk", Status: StatusNew, ActorName: "db-01", Node: "db-01", LastTS: model.FormatTS(last)}})
+	now := last.Add(time.Hour)
+	if inc := reg.Close("disk", "db-01", "80 % в 10:00", last.Add(-30*time.Minute), now); inc != nil {
+		t.Fatalf("старый замер (до последнего нарушения) не закрывает: %+v", inc)
+	}
+	if inc := reg.Close("disk", "db-01", "равно last_ts", last, now); inc != nil {
+		t.Fatalf("замер в момент последнего нарушения не закрывает: %+v", inc)
+	}
+	if inc := reg.Close("disk", "db-01", "84 % в 10:40", last.Add(10*time.Minute), now); inc == nil || inc.Status != StatusClosed {
+		t.Fatalf("восстановление позже последнего нарушения закрывает: %+v", inc)
 	}
 }
 

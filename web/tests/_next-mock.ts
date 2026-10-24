@@ -20,6 +20,7 @@ export type QueryMocks = {
   requestReanalyze: (id: string) => Promise<string | null>;
   addException: (...args: unknown[]) => Promise<void>;
   addIncidentComment: (...args: unknown[]) => Promise<void>;
+  incidentCommentExists: (id: string, commentId: string) => Promise<boolean>;
   deactivateException: (...args: unknown[]) => Promise<void>;
   incidentTransition: (...args: unknown[]) => Promise<void>;
   setRespondMode: (...args: unknown[]) => Promise<void>;
@@ -114,6 +115,7 @@ export function installNextMocks(): Mocks {
     requestReanalyze: async () => "движок недоступен",
     addException: async () => undefined,
     addIncidentComment: async () => undefined,
+    incidentCommentExists: async () => false,
     deactivateException: async () => undefined,
     incidentTransition: async () => undefined,
     setRespondMode: async () => undefined,

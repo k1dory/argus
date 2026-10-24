@@ -139,22 +139,37 @@ export async function incidentComments(id: string, limit = 200): Promise<Inciden
   const rows = await chQuery<IncidentComment>(
     `SELECT comment_id, incident_id, created_at, author, body
      FROM incident_comments WHERE incident_id = {id:String}
-     ORDER BY created_at DESC, comment_id DESC LIMIT {limit:UInt32}`,
+     ORDER BY created_at DESC, comment_id DESC LIMIT 1 BY comment_id LIMIT {limit:UInt32}`,
     { id, limit: Math.min(10_000, Math.max(1, Math.floor(limit))) },
   );
   return rows.reverse();
 }
 
-export async function addIncidentComment(id: string, author: string, body: string): Promise<void> {
+/** Комментарий с заданным comment_id (идемпотентная запись агента) или с новым UUID. */
+export async function addIncidentComment(id: string, author: string, body: string, opts: { commentId?: string } = {}): Promise<void> {
   // JSONEachRow экранирует переводы строк Markdown: String query-параметр
   // ClickHouse отклоняет сырые многострочные значения.
   const row = {
-    comment_id: crypto.randomUUID(), incident_id: id,
+    comment_id: opts.commentId ?? crypto.randomUUID(), incident_id: id,
     created_at: new Date().toISOString().replace("T", " ").replace("Z", ""),
     author, body,
   };
-  await chCommand(`INSERT INTO incident_comments FORMAT JSONEachRow\n${JSON.stringify(row)}`);
+  // Токен дедупликации — страховка от двойной вставки при повторе с тем же
+  // comment_id (действует, если у таблицы включено окно дедупликации); дубли
+  // по comment_id в любом случае схлопываются при чтении (incidentComments).
+  const settings: Record<string, string | number> = opts.commentId ? { insert_deduplicate: 1, insert_deduplication_token: `comment:${opts.commentId}` } : {};
+  await chCommand(`INSERT INTO incident_comments FORMAT JSONEachRow\n${JSON.stringify(row)}`, {}, settings);
 }
+
+/** Есть ли комментарий с таким comment_id у инцидента (повтор записи агента). */
+export async function incidentCommentExists(id: string, commentId: string): Promise<boolean> {
+  const rows = await chQuery<{ c: string | number }>(
+    `SELECT count() AS c FROM incident_comments WHERE incident_id = {id:String} AND comment_id = {cid:UUID}`,
+    { id, cid: commentId },
+  );
+  return Number(rows[0]?.c ?? 0) > 0;
+}
+
 
 export type IncidentStateEvent = {
   event_id: string;
@@ -538,16 +553,22 @@ export type AgentVerdictRow = {
  *  ClickHouse не принимает сырые переводы строк Markdown. */
 export async function saveAgentVerdict(row: Omit<AgentVerdictRow, "created_at">): Promise<void> {
   const created_at = new Date().toISOString().replace("T", " ").replace("Z", "");
-  await chCommand(`INSERT INTO agent_verdicts FORMAT JSONEachRow\n${JSON.stringify({ ...row, created_at })}`);
+  // Одна сессия — один вердикт: токен дедупликации по session_id (если у таблицы
+  // включено окно дедупликации), а при чтении всегда берётся самая ранняя строка сессии.
+  await chCommand(`INSERT INTO agent_verdicts FORMAT JSONEachRow\n${JSON.stringify({ ...row, created_at })}`, {}, { insert_deduplicate: 1, insert_deduplication_token: `agent-verdict:${row.incident_id}:${row.session_id}` });
 }
 
-const AGENT_VERDICT_COLS = `incident_id, session_id, agent, toString(created_at) AS created_at, verdict, confidence, human_needed, verdict_json, markdown`;
+/** Одна строка на сессию — самая ранняя, при равном времени — по документу:
+ *  параллельные записи одной сессии читают одного и того же победителя. */
+const AGENT_VERDICT_COLS = `incident_id, session_id, argMin(agent, (created_at, verdict_json)) AS agent, toString(min(created_at)) AS created_at,
+  argMin(verdict, (created_at, verdict_json)) AS verdict, argMin(confidence, (created_at, verdict_json)) AS confidence, argMin(human_needed, (created_at, verdict_json)) AS human_needed,
+  argMin(verdict_json, (created_at, verdict_json)) AS verdict_json, argMin(markdown, (created_at, verdict_json)) AS markdown`;
 
 /** Вердикты агентов по инциденту, новые первыми. */
 export async function agentVerdictsFor(incidentId: string, limit = 20): Promise<AgentVerdictRow[]> {
   const rows = await chQuery<AgentVerdictRow>(
     `SELECT ${AGENT_VERDICT_COLS} FROM agent_verdicts WHERE incident_id = {inc:String}
-     ORDER BY created_at DESC LIMIT {limit:UInt32}`,
+     GROUP BY incident_id, session_id ORDER BY created_at DESC LIMIT {limit:UInt32}`,
     { inc: incidentId, limit: clampInt(limit, 1, 200, 20) },
   );
   return rows.map((r) => ({ ...r, confidence: Number(r.confidence), human_needed: Number(r.human_needed) }));
@@ -557,7 +578,7 @@ export async function agentVerdictsFor(incidentId: string, limit = 20): Promise<
 export async function agentVerdictBySession(incidentId: string, sessionId: string): Promise<AgentVerdictRow | null> {
   const rows = await chQuery<AgentVerdictRow>(
     `SELECT ${AGENT_VERDICT_COLS} FROM agent_verdicts WHERE incident_id = {inc:String} AND session_id = {sid:String}
-     ORDER BY created_at LIMIT 1`,
+     GROUP BY incident_id, session_id LIMIT 1`,
     { inc: incidentId, sid: sessionId },
   );
   return rows[0] ? { ...rows[0], confidence: Number(rows[0].confidence), human_needed: Number(rows[0].human_needed) } : null;

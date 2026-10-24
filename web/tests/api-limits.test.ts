@@ -32,7 +32,7 @@ test("bearer короче 32 символов отвергается — и да
 test("apiSession: bearer даёт viewer, короткий токен — 401", async () => {
   process.env.ARGUS_API_TOKEN = TOKEN;
   const ok = await auth.apiSession(new Request("http://x/api/sources", { headers: { authorization: `Bearer ${TOKEN}` } }));
-  assert.deepEqual(ok, { user: "api-token", role: "viewer", sso: false, mustChangePassword: false });
+  assert.deepEqual(ok, { kind: "api-token", user: "api-token", role: "viewer", sso: false, mustChangePassword: false });
   assert.equal(await auth.apiSession(new Request("http://x/api/sources", { headers: { authorization: "Bearer short" } })), null);
   process.env.ARGUS_API_TOKEN = "short-configured";
   assert.equal(await auth.apiSession(new Request("http://x/api/sources", { headers: { authorization: "Bearer short-configured" } })), null);

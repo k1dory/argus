@@ -19,10 +19,10 @@ import (
 )
 
 type Threshold struct {
-	Kind     string  `yaml:"kind"`     // distinct | count | absence | periodic (по умолчанию из полей)
+	Kind     string  `yaml:"kind"`     // distinct | count | consecutive | absence | periodic (по умолчанию из полей)
 	Field    string  `yaml:"field"`    // distinct по этому полю
 	Distinct int     `yaml:"distinct"` // сколько разных значений
-	Count    int     `yaml:"count"`    // или просто N событий
+	Count    int     `yaml:"count"`    // или просто N событий; consecutive — N подряд без события detection.reset между ними
 	Window   string  `yaml:"window"`   // 6m, 1h
 	GroupBy  string  `yaml:"group_by"` // по умолчанию actor.name
 	Jitter   float64 `yaml:"jitter"`   // periodic: допустимый коэффициент вариации интервалов (0.05 = 5 %)
@@ -55,6 +55,10 @@ type Rule struct {
 		Filter    map[string]any `yaml:"filter"`
 		Threshold *Threshold     `yaml:"threshold"`
 		Condition string         `yaml:"condition"`
+		// Reset — событие группы, обрывающее серию threshold.kind: consecutive
+		// (нормальный замер между нарушениями). Такие события движок держит в
+		// буфере наравне с selection и close_on.
+		Reset map[string]any `yaml:"reset"`
 	} `yaml:"detection"`
 	Enrich    []any          `yaml:"enrich"` // edr.process_tree: 120s | ngfw.sessions: 120s | cmdb.owner
 	Analyst   Analyst        `yaml:"analyst"`
@@ -78,6 +82,7 @@ type Rule struct {
 	selection []matcher
 	filter    []matcher
 	closeOn   []matcher
+	reset     []matcher // detection.reset
 }
 
 // Respond — что делать автоматически при создании инцидента этим правилом.
@@ -174,6 +179,22 @@ func (r *Rule) CloseMatchKey(e *model.Event) (key string, ok bool) {
 		parts = append(parts, v)
 	}
 	return strings.Join(parts, "\x00"), true
+}
+
+// UsesReset — у правила есть detection.reset (серия consecutive обрывается).
+func (r *Rule) UsesReset() bool { return len(r.reset) > 0 }
+
+// MatchReset — событие обрывает серию consecutive своей группы.
+func (r *Rule) MatchReset(e *model.Event) bool {
+	if len(r.reset) == 0 {
+		return false
+	}
+	for _, m := range r.reset {
+		if !m(e) {
+			return false
+		}
+	}
+	return true
 }
 
 // MatchClose — событие закрывает открытый инцидент этого правила.
@@ -351,7 +372,14 @@ func LoadFile(path string) (*Rule, error) {
 			}
 		case "count":
 			if t.Count == 0 {
-				return nil, fmt.Errorf("threshold: нужен count, distinct, absence или periodic")
+				return nil, fmt.Errorf("threshold: нужен count, distinct, consecutive, absence или periodic")
+			}
+		case "consecutive":
+			if t.Count < 2 {
+				return nil, fmt.Errorf("threshold consecutive: count ≥ 2")
+			}
+			if len(r.Detection.Reset) == 0 {
+				return nil, fmt.Errorf("threshold consecutive требует detection.reset — событие, обрывающее серию")
 			}
 		case "absence":
 			// молчание группы дольше window после активности
@@ -395,6 +423,9 @@ func LoadFile(path string) (*Rule, error) {
 	}
 	if r.closeOn, err = compile(r.CloseOn); err != nil {
 		return nil, fmt.Errorf("close_on: %w", err)
+	}
+	if r.reset, err = compile(r.Detection.Reset); err != nil {
+		return nil, fmt.Errorf("detection.reset: %w", err)
 	}
 	return &r, nil
 }

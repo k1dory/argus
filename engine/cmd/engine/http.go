@@ -86,6 +86,7 @@ func (e *engine) handler() http.Handler {
 		fmt.Fprintf(w, "argus_engine_analyst_rejected_total %d\n", e.m.analystRejected.Load())
 		fmt.Fprintf(w, "argus_engine_notify_suppressed_total %d\n", e.m.notifySuppressed.Load())
 		e.hooks.WriteMetrics(w)
+		e.identity.WriteMetrics(w)
 		fmt.Fprintf(w, "argus_engine_poll_errors_total %d\n", e.m.pollErrors.Load())
 		fmt.Fprintf(w, "argus_engine_last_run_timestamp %d\n", e.m.lastRun.Load())
 	}))
@@ -119,8 +120,9 @@ func (e *engine) handler() http.Handler {
 	mux.HandleFunc("GET /rules/exception_fields", requireToken(e.token, func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"exception_fields": eval.ExceptionFields()})
 	}))
-	mux.HandleFunc("POST /reload", requireToken(e.token, func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("POST /reload", requireToken(e.token, func(w http.ResponseWriter, r *http.Request) {
 		e.maybeReload(true)
+		e.maybeSyncIdentities(r.Context(), true) // identities.yml перечитывается вместе с правилами
 		w.WriteHeader(http.StatusAccepted)
 		fmt.Fprintf(w, "rules: %d\n", len(e.current()))
 	}))

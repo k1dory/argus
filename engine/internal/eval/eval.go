@@ -164,6 +164,15 @@ func runRule(r *rules.Rule, events []*model.Event, now time.Time) []Detection {
 	}
 
 	for _, e := range events {
+		// Событие detection.reset (нормальный замер) обрывает серию своей
+		// группы: «три подряд» — это три без восстановления между ними, а не
+		// любые три за окно.
+		if r.UsesReset() && r.MatchReset(e) {
+			if g := groups[groupKey(keyOf, e)]; g != nil {
+				g.events, g.fired = nil, false
+			}
+			continue
+		}
 		if !r.Match(e) {
 			continue
 		}
@@ -193,7 +202,7 @@ func runRule(r *rules.Rule, events []*model.Event, now time.Time) []Detection {
 			} else {
 				appendTo(out, r, key, e, t)
 			}
-		case "distinct", "count":
+		case "distinct", "count", "consecutive":
 			if g.fired {
 				appendTo(out, r, key, e, t)
 				continue

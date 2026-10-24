@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { installNextMocks, loadAuth } from "./_next-mock";
 import { checkTriageSearch, incidentAccess, TRIAGE_TTL_MAX_SEC, type TriageScope } from "../src/lib/shared/triage";
 import { VERDICT_OK, verdictWith } from "./_verdict-fixture";
+import { agentCommentId } from "../src/lib/shared/triage-verdict";
 
 const auth = loadAuth();
 const mocks = installNextMocks();
@@ -600,16 +601,174 @@ test("вердикт: параллельные сессии — ровно од�
   }
 });
 
+// Идемпотентность записи вердикта по session_id: повтор того же документа —
+// 201 с тем же id без второй строки и второго комментария; оборванный
+// комментарий дописывается при повторе; другой документ той же сессии — 409.
+test("вердикт: повтор той же сессии идемпотентен, оборванный комментарий дописывается, другой документ — 409", async () => {
+  const store = installVerdictStore();
+  try {
+    const { token } = await session();
+    const post = (body: unknown) => verdictsRoute.POST!(req("/api/triage/verdicts", token, { method: "POST", body: JSON.stringify(body) }));
+    // Первая попытка: вердикт записан, комментарий оборвался.
+    const origAdd = mocks.queries.addIncidentComment;
+    mocks.queries.addIncidentComment = async () => { throw new Error("Code: 241. Memory limit exceeded"); };
+    const n = mocks.audit.length;
+    const broken = await post(VERDICT_OK);
+    assert.equal(broken.status, 503);
+    assert.equal(store.verdicts.length, 1, "строка вердикта записана до сбоя");
+    assert.equal(store.comments.length, 0);
+    assert.deepEqual(mocks.audit.slice(n).map((a) => a.action), ["triage.verdict", "triage.verdict.failed"], "журнал до записи и запись о провале");
+    mocks.queries.addIncidentComment = origAdd;
+    // Повтор того же документа: 201 с тем же id, комментарий дописан, вторая строка не появилась.
+    const retry = await post(VERDICT_OK);
+    const retryBody = await retry.json();
+    assert.equal(retry.status, 201, JSON.stringify(retryBody));
+    assert.equal(retryBody.id, store.verdicts[0].session_id);
+    assert.equal(store.verdicts.length, 1);
+    assert.equal(store.comments.length, 1);
+    assert.equal(store.comments[0].id, agentCommentId(store.verdicts[0].session_id), "comment_id детерминирован по сессии");
+    assert.equal(store.comments[0].body, retryBody.markdown);
+    // Ещё один повтор: ничего не дописывается.
+    const again = await post(VERDICT_OK);
+    assert.equal(again.status, 201);
+    assert.equal((await again.json()).id, retryBody.id);
+    assert.equal(store.comments.length, 1);
+    // Другой документ той же сессии — 409 verdict_exists.
+    const other = await post(verdictWith({ human_needed: false }));
+    assert.equal(other.status, 409);
+    assert.equal((await other.json()).error, "verdict_exists");
+    assert.equal(store.verdicts.length, 1);
+  } finally {
+    resetVerdictStore();
+  }
+});
+
+// Параллельный повтор той же сессии: оба проходят предварительное чтение, но
+// запись идемпотентна — один вердикт, один комментарий, одинаковый id в ответах.
+test("вердикт: параллельные POST одной сессии — один вердикт, один комментарий, один id", async () => {
+  const store = installVerdictStore();
+  try {
+    const { token } = await session();
+    const res = await Promise.all([1, 2, 3].map(() => verdictsRoute.POST!(req("/api/triage/verdicts", token, { method: "POST", body: JSON.stringify(VERDICT_OK) }))));
+    const bodies = await Promise.all(res.map((r) => r.json()));
+    assert.deepEqual(res.map((r) => r.status), [201, 201, 201], JSON.stringify(bodies));
+    assert.equal(new Set(bodies.map((b) => b.id)).size, 1, "один и тот же id");
+    assert.equal(store.verdicts.length, 1, "одна строка вердикта на сессию");
+    assert.equal(new Set(store.comments.map((c) => c.id)).size, 1, "один comment_id");
+    assert.equal(store.log.filter((r) => r.state === "claim").length, 1);
+    assert.equal(agentCommentId("x"), agentCommentId("x"));
+    assert.match(agentCommentId("x"), /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-8[0-9a-f]{3}-[0-9a-f]{12}$/, "валидный UUID v4-формы");
+    assert.notEqual(agentCommentId("x"), agentCommentId("y"));
+  } finally {
+    resetVerdictStore();
+  }
+});
+
+// Журнал действий обязателен для мутаций: без записи нет ни токена сессии, ни вердикта.
+test("аудит обязателен: выпуск сессии и запись вердикта без журнала — 503, ничего не записано", async () => {
+  const store = installVerdictStore();
+  const orig = mocks.queries.audit;
+  try {
+    const { token } = await session();
+    mocks.queries.audit = async () => { throw new Error("журнал действий недоступен — действие отменено"); };
+    const issued = await issue();
+    assert.equal(issued.status, 503, "токен без записи о выпуске не выдаётся");
+    assert.equal((await issued.json()).error, "журнал действий недоступен — действие отменено");
+    const v = await verdictsRoute.POST!(req("/api/triage/verdicts", token, { method: "POST", body: JSON.stringify(VERDICT_OK) }));
+    assert.equal(v.status, 503);
+    assert.equal((await v.json()).error, "журнал действий недоступен — действие отменено");
+    assert.equal(store.verdicts.length, 0, "вердикт не записан");
+    assert.equal(store.comments.length, 0);
+    mocks.queries.audit = orig;
+    assert.equal((await verdictsRoute.POST!(req("/api/triage/verdicts", token, { method: "POST", body: JSON.stringify(VERDICT_OK) }))).status, 201, "с журналом — записывается");
+  } finally {
+    mocks.queries.audit = orig;
+    resetVerdictStore();
+  }
+});
+
+// Гонка двух РАЗНЫХ документов одной сессии: оба проходят проверку отсутствия
+// записи, но claim по session_id (строка вердикта, читаемая как «самая ранняя»)
+// выбирает одного победителя; комментарий — от его документа.
+test("вердикт: два разных документа одной сессии одновременно — один 201, второй 409 verdict_exists, комментарий победителя", async () => {
+  const store = installVerdictStore();
+  try {
+    const { token } = await session();
+    const docA = { ...VERDICT_OK, agent: "agent-a" };
+    const docB = verdictWith({ human_needed: false });
+    const post = (body: unknown) => verdictsRoute.POST!(req("/api/triage/verdicts", token, { method: "POST", body: JSON.stringify(body) }));
+    const [ra, rb] = await Promise.all([post(docA), post(docB)]);
+    const statuses = [ra.status, rb.status].sort();
+    assert.deepEqual(statuses, [201, 409], `${ra.status} ${rb.status}`);
+    const winner = ra.status === 201 ? ra : rb;
+    const loser = ra.status === 201 ? rb : ra;
+    const lb = await loser.json();
+    assert.equal(lb.error, "verdict_exists");
+    const wb = await winner.json();
+    assert.equal(store.verdicts.length, 1);
+    assert.equal(store.verdicts[0].markdown, wb.markdown, "ответ победителя — записанный документ");
+    assert.equal(store.comments.length, 1, "один комментарий");
+    assert.equal(store.comments[0].body, store.verdicts[0].markdown, "комментарий — от победившего документа, а не от проигравшего");
+    assert.equal(store.comments[0].author, `agent:${store.verdicts[0].agent}`);
+    assert.equal(lb.id, wb.id);
+  } finally {
+    resetVerdictStore();
+  }
+});
+
+// Порядок записи: журнал до claim — при отказе журнала не остаётся блокирующей отметки.
+test("вердикт: отказ журнала до claim — отметка не ставится, сессия инцидента выдаётся дальше", async () => {
+  const store = installVerdictStore();
+  const orig = mocks.queries.audit;
+  try {
+    const { token } = await session();
+    mocks.queries.audit = async () => { throw new Error("журнал действий недоступен — действие отменено"); };
+    assert.equal((await verdictsRoute.POST!(req("/api/triage/verdicts", token, { method: "POST", body: JSON.stringify(VERDICT_OK) }))).status, 503);
+    assert.equal(store.log.filter((r) => r.state === "claim").length, 0, "claim не записан");
+    assert.equal(await mocks.queries.triageVerdictWinner("INC-7"), null);
+    mocks.queries.audit = orig;
+    assert.equal((await issue()).status, 201, "инцидент не заблокирован отметкой");
+  } finally {
+    mocks.queries.audit = orig;
+    resetVerdictStore();
+  }
+});
+
+// Отзыв сессии пишется в журнал; отказ журнала отзыв не блокирует (исключение из strict-правила).
+test("отзыв сессии: аудит triage.session.revoke; без журнала отзыв всё равно выполняется", async () => {
+  const orig = mocks.queries.audit;
+  try {
+    const s = await session();
+    const { token } = s;
+    const sessionId = (s as { session_id?: string }).session_id ?? "";
+    assert.ok(sessionId, "ответ выпуска содержит session_id");
+    const n = mocks.audit.length;
+    assert.equal((await sessionsRoute.DELETE!(req("/api/triage/sessions", token, { method: "DELETE" }))).status, 204);
+    const rec = mocks.audit.slice(n).find((a) => a.action === "triage.session.revoke");
+    assert.ok(rec, "отзыв в журнале");
+    assert.equal(rec!.target, "INC-7");
+    assert.ok(rec!.detail.includes(sessionId));
+    assert.equal((await contextRoute.GET!(req("/api/triage/context", token))).status, 401, "токен отозван");
+    const fresh = await session();
+    mocks.queries.audit = async () => { throw new Error("журнал действий недоступен — действие отменено"); };
+    assert.equal((await sessionsRoute.DELETE!(req("/api/triage/sessions", fresh.token, { method: "DELETE" }))).status, 204, "отзыв важнее журнала");
+    mocks.queries.audit = orig;
+    assert.equal((await contextRoute.GET!(req("/api/triage/context", fresh.token))).status, 401, "и действительно отозван");
+  } finally {
+    mocks.queries.audit = orig;
+  }
+});
+
 type LogRow = { incidentId: string; state: string; sessionId: string; actor: string };
-type StoredVerdict = { incident_id: string; session_id: string; agent: string; verdict: string; human_needed: number; markdown: string };
+type StoredVerdict = { incident_id: string; session_id: string; agent: string; verdict: string; human_needed: number; markdown: string; verdict_json: string };
 
 /** Хранилище как argus.triage_verdict_claims_v2 / triage_verdicts / agent_verdicts /
  *  incident_comments: claim первой сессии эпохи неизменяем, reopened открывает
  *  новую эпоху, один вердикт на сессию. */
-function installVerdictStore(): { log: LogRow[]; verdicts: StoredVerdict[]; comments: { author: string; body: string }[] } {
+function installVerdictStore(): { log: LogRow[]; verdicts: StoredVerdict[]; comments: { author: string; body: string; id?: string }[] } {
   const log: LogRow[] = [];
   const verdicts: StoredVerdict[] = [];
-  const comments: { author: string; body: string }[] = [];
+  const comments: { author: string; body: string; id?: string }[] = [];
   const owner = new Map<string, string>();
   const delay = () => new Promise<void>((r) => setImmediate(r));
   mocks.queries.saveTriageVerdict = async (m) => {
@@ -627,10 +786,15 @@ function installVerdictStore(): { log: LogRow[]; verdicts: StoredVerdict[]; comm
   };
   mocks.queries.triageVerdictClaim = async (inc) => (owner.has(inc) ? { incident_id: inc, session_id: owner.get(inc)!, claimed_at: "2026-10-12 05:00:00.000" } : null);
   mocks.queries.triageVerdictWinner = async (inc) => owner.get(inc) ?? null;
-  mocks.queries.saveAgentVerdict = async (row) => void verdicts.push(row as StoredVerdict);
+  // Как таблица с чтением «самая ранняя строка сессии»: повтор той же сессии не даёт второго вердикта.
+  mocks.queries.saveAgentVerdict = async (row) => {
+    const r = row as StoredVerdict;
+    if (!verdicts.some((v) => v.incident_id === r.incident_id && v.session_id === r.session_id)) verdicts.push(r);
+  };
   mocks.queries.agentVerdictBySession = async (inc, sid) => verdicts.find((v) => v.incident_id === inc && v.session_id === sid) ?? null;
   mocks.queries.agentVerdictsFor = async (inc) => verdicts.filter((v) => v.incident_id === inc);
-  mocks.queries.addIncidentComment = async (...args: unknown[]) => void comments.push({ author: String(args[1]), body: String(args[2]) });
+  mocks.queries.addIncidentComment = async (...args: unknown[]) => void comments.push({ author: String(args[1]), body: String(args[2]), id: (args[3] as { commentId?: string } | undefined)?.commentId });
+  mocks.queries.incidentCommentExists = async (_inc, cid) => comments.some((c) => c.id === cid);
   return { log, verdicts, comments };
 }
 
@@ -643,6 +807,7 @@ function resetVerdictStore(): void {
   mocks.queries.agentVerdictBySession = async () => null;
   mocks.queries.agentVerdictsFor = async () => [];
   mocks.queries.addIncidentComment = async () => undefined;
+  mocks.queries.incidentCommentExists = async () => false;
 }
 
 function formDataOf(v: Record<string, string>): FormData {

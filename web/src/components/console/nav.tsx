@@ -19,6 +19,7 @@ import {
   Wrench,
   Search,
   ListTree,
+  Users,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -37,6 +38,7 @@ export const NAV_ITEMS = [
   { href: "/", label: "Обзор", icon: Activity },
   { href: "/incidents", label: "Инциденты", icon: Siren },
   { href: "/events", label: "Журнал", icon: ListTree },
+  { href: "/actors", label: "Субъекты", icon: Users },
   { href: "/search", label: "Поиск", icon: Search },
   { href: "/dashboards", label: "Дашборды", icon: LayoutDashboard },
   { href: "/wazuh/alerts", label: "Алерты Wazuh", icon: Bell, wazuh: true },

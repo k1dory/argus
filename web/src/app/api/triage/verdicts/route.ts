@@ -1,7 +1,7 @@
 import { apiGuard } from "@/lib/auth";
-import { addIncidentComment, agentVerdictBySession, audit, claimTriageVerdict, incidentGet, saveAgentVerdict } from "@/lib/argus-queries";
+import { addIncidentComment, agentVerdictBySession, audit, claimTriageVerdict, incidentCommentExists, incidentGet, saveAgentVerdict } from "@/lib/argus-queries";
 import {
-  AGENT_NAME_RE, CONFIDENCE_NUM, DEFAULT_AGENT, VERDICT_MAX_BYTES, checkVerdict, renderVerdictMarkdown, validateVerdictSchema,
+  AGENT_NAME_RE, CONFIDENCE_NUM, DEFAULT_AGENT, VERDICT_MAX_BYTES, agentCommentId, checkVerdict, renderVerdictMarkdown, validateVerdictSchema,
   type Rejection, type VerdictDoc,
 } from "@/lib/shared/triage-verdict";
 
@@ -15,11 +15,17 @@ import {
 // свободный текст — без ссылок, разметки, управляющих символов, псевдонимов
 // и чужих номеров инцидентов (unsafe_text). Невалидный документ — 422 с путями.
 //
-// Запись: атомарная отметка claimTriageVerdict (одна сессия на поколение
-// инцидента; проигравшая получает 409 verdict_published), строка в
-// agent_verdicts, комментарий incident_comments с Markdown от агента, отметка
-// в журнале действий. Одна сессия — один вердикт: повтор — 409 verdict_exists
-// с id уже записанного. Бюджет запросов сессии не тратится: вердикт — цель
+// Запись, по порядку: журнал действий ДО любой записи (strict: нет журнала —
+// нет вердикта и нет отметки, 503) → атомарная отметка claimTriageVerdict (одна
+// сессия на поколение инцидента; проигравшая получает 409 verdict_published) →
+// строка agent_verdicts как claim по session_id (токен дедупликации, при
+// чтении — самая ранняя строка сессии: из двух разных документов одной сессии
+// побеждает один, второй получает 409 verdict_exists) → комментарий
+// incident_comments от победившего документа с детерминированным comment_id
+// (agentCommentId). Повтор той же сессии с тем же документом — 201 с тем же id
+// (незаписанный комментарий дописывается); с другим документом — 409
+// verdict_exists. Провал записи после журнала — вторая запись
+// triage.verdict.failed. Бюджет запросов сессии не тратится: вердикт — цель
 // сессии, его нельзя потерять из-за исчерпанного лимита чтения.
 export async function POST(req: Request): Promise<Response> {
   const guard = await apiGuard(req, "default", { triage: true, uncharged: true });
@@ -57,8 +63,24 @@ export async function POST(req: Request): Promise<Response> {
     const errors = checkVerdict(verdict, { scope, incident: { level: incident.level, rule_id: incident.rule_id } });
     if (errors.length) return rejected(errors);
 
+    const verdictJson = JSON.stringify(verdict);
+    const commentId = agentCommentId(scope.sessionId);
     const existing = await agentVerdictBySession(scope.incidentId, scope.sessionId);
-    if (existing) return Response.json({ error: "verdict_exists", detail: "эта сессия уже записала вердикт", id: existing.session_id }, { status: 409 });
+    if (existing) {
+      if (existing.verdict_json !== verdictJson || existing.agent !== agent) {
+        return Response.json({ error: "verdict_exists", detail: "эта сессия уже записала другой вердикт", id: existing.session_id }, { status: 409 });
+      }
+      // Повтор того же документа: дописать комментарий, если первая попытка оборвалась до него.
+      if (!(await incidentCommentExists(scope.incidentId, commentId))) {
+        await audit(guard.session.user, "triage.verdict", scope.incidentId, `повтор записи сессии ${scope.sessionId}: комментарий дописан`, { strict: true });
+        await addIncidentComment(scope.incidentId, `agent:${agent}`, existing.markdown, { commentId });
+      }
+      return Response.json({ id: existing.session_id, incident_id: scope.incidentId, markdown: existing.markdown }, { status: 201, headers: { "Cache-Control": "no-store" } });
+    }
+
+    // Журнал — до любой записи: при отказе журнала не остаётся ни отметки, ни вердикта.
+    await audit(guard.session.user, "triage.verdict", scope.incidentId,
+      `вердикт ${verdict.verdict} (${verdict.confidence}, человек: ${verdict.human_needed ? "да" : "нет"}) от ${agent}, сессия ${scope.sessionId}`, { strict: true });
 
     const winner = await claimTriageVerdict({ incidentId: scope.incidentId, sessionId: scope.sessionId, actor: guard.session.user });
     if (winner !== scope.sessionId) {
@@ -67,18 +89,31 @@ export async function POST(req: Request): Promise<Response> {
     }
 
     const markdown = renderVerdictMarkdown(verdict, agent, scope.sessionId);
-    await saveAgentVerdict({
-      incident_id: scope.incidentId, session_id: scope.sessionId, agent, verdict: verdict.verdict,
-      confidence: CONFIDENCE_NUM[verdict.confidence] ?? 0, human_needed: verdict.human_needed ? 1 : 0,
-      verdict_json: JSON.stringify(verdict), markdown,
-    });
-    await addIncidentComment(scope.incidentId, `agent:${agent}`, markdown);
-    await audit(guard.session.user, "triage.verdict", scope.incidentId,
-      `вердикт ${verdict.verdict} (${verdict.confidence}, человек: ${verdict.human_needed ? "да" : "нет"}) от ${agent}, сессия ${scope.sessionId}`);
-    return Response.json({ id: scope.sessionId, incident_id: scope.incidentId, markdown }, { status: 201, headers: { "Cache-Control": "no-store" } });
+    try {
+      // Строка вердикта — это и claim по session_id: записать, затем прочитать
+      // победителя сессии (самая ранняя строка, при равном времени — по документу).
+      // Два разных документа одной сессии одновременно: побеждает один, второй — 409.
+      await saveAgentVerdict({
+        incident_id: scope.incidentId, session_id: scope.sessionId, agent, verdict: verdict.verdict,
+        confidence: CONFIDENCE_NUM[verdict.confidence] ?? 0, human_needed: verdict.human_needed ? 1 : 0,
+        verdict_json: verdictJson, markdown,
+      });
+      const stored = await agentVerdictBySession(scope.incidentId, scope.sessionId);
+      if (!stored) throw new Error("вердикт записан, но не читается");
+      if (stored.verdict_json !== verdictJson || stored.agent !== agent) {
+        return Response.json({ error: "verdict_exists", detail: "эта сессия одновременно записала другой вердикт", id: stored.session_id }, { status: 409 });
+      }
+      // Комментарий — от победившего документа под детерминированным comment_id.
+      await addIncidentComment(scope.incidentId, `agent:${stored.agent}`, stored.markdown, { commentId });
+      return Response.json({ id: stored.session_id, incident_id: scope.incidentId, markdown: stored.markdown }, { status: 201, headers: { "Cache-Control": "no-store" } });
+    } catch (err) {
+      await audit(guard.session.user, "triage.verdict.failed", scope.incidentId, `сессия ${scope.sessionId}: ${err instanceof Error ? err.message : "ошибка записи"}`);
+      throw err;
+    }
   } catch (err) {
     console.error("api/triage/verdicts:", err instanceof Error ? err.message : err);
-    return Response.json({ error: "хранилище недоступно — вердикт не записан" }, { status: 503 });
+    const msg = err instanceof Error && err.message.startsWith("журнал действий") ? err.message : "хранилище недоступно — вердикт не записан";
+    return Response.json({ error: msg }, { status: 503 });
   }
 }
 

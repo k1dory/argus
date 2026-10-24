@@ -660,7 +660,14 @@ export function cookieSecure(): boolean {
   return process.env.NODE_ENV === "production";
 }
 
+/** Как аутентифицирован запрос: сессия консоли (кука), служебный bearer
+ *  ARGUS_API_TOKEN, учётка triage-issuer или токен triage-session. Проверки
+ *  прав опираются на kind, а не на имя пользователя: локальный viewer с
+ *  логином api-token остаётся наблюдателем консоли. */
+export type SessionKind = "console" | "api-token" | "issuer" | "triage-session";
+
 export type Session = {
+  kind: SessionKind;
   user: string;
   role: Role;
   sso: boolean;
@@ -703,14 +710,14 @@ export async function verifySessionToken(token: string): Promise<Session | null>
     if (!user) return null;
     if (payload.sso === true) {
       if (!user.startsWith(SSO_PREFIX) || !isRole(payload.role)) return null;
-      return { user, role: payload.role, sso: true, mustChangePassword: false };
+      return { kind: "console", user, role: payload.role, sso: true, mustChangePassword: false };
     }
     if (user.startsWith(SSO_PREFIX)) return null;
     const state = await getAuthState();
     const u = findUser(state, user);
     if (!u) return null;
     if (Number(payload.tv ?? 0) !== u.tokenVersion) return null;
-    return { user, role: u.role, sso: false, mustChangePassword: u.builtin && !state.passwordChanged };
+    return { kind: "console", user, role: u.role, sso: false, mustChangePassword: u.builtin && !state.passwordChanged };
   } catch {
     return null;
   }
@@ -800,12 +807,12 @@ export async function apiSession(req: Request): Promise<Session | null> {
   if (auth.startsWith("Bearer ")) {
     const given = auth.slice(7).trim();
     const triage = JWT_RE.test(given) ? await verifyTriageToken(given) : null;
-    if (triage) return { user: `triage:${triage.sessionId}`, role: "viewer", sso: false, mustChangePassword: false, triage };
+    if (triage) return { kind: "triage-session", user: `triage:${triage.sessionId}`, role: "viewer", sso: false, mustChangePassword: false, triage };
     if (issuerTokenValid(given)) {
-      return { user: "triage-issuer", role: "viewer", sso: false, mustChangePassword: false, issuer: true };
+      return { kind: "issuer", user: "triage-issuer", role: "viewer", sso: false, mustChangePassword: false, issuer: true };
     }
     if (bearerTokenValid(given, process.env.ARGUS_API_TOKEN)) {
-      return { user: "api-token", role: "viewer", sso: false, mustChangePassword: false };
+      return { kind: "api-token", user: "api-token", role: "viewer", sso: false, mustChangePassword: false };
     }
     return null;
   }
