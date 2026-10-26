@@ -3,9 +3,9 @@
 import { useActionState, useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { Link2, Unlink } from "lucide-react";
+import { BadgeCheck, Link2, Unlink } from "lucide-react";
 import { toast } from "sonner";
-import { bindAliasAction, closeAliasAction, type BindAliasState } from "@/lib/actor-actions";
+import { bindAliasAction, closeAliasAction, confirmAliasAction, type BindAliasState } from "@/lib/actor-actions";
 import { ALIAS_KINDS, type AliasKind } from "@/lib/shared/actors";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -16,7 +16,7 @@ import { ConfirmActionForm } from "@/components/console/action-form";
 const initial: BindAliasState = { error: null };
 
 export const ALIAS_KIND_LABELS: Record<AliasKind, string> = {
-  email: "email", login: "логин", uid: "uid", ip: "IP-адрес", host: "хост", sid: "SID", peer: "узел VPN",
+  email: "email", login: "логин", uid: "uid", ip: "IP-адрес", host: "хост", sid: "SID", peer: "узел VPN", phone: "телефон",
 };
 
 export type PersonOption = { person_id: string; display: string };
@@ -121,6 +121,27 @@ export function CloseAliasButton({ personId, kind, value }: { personId: string; 
       <Button type="submit" variant="ghost" size="xs" aria-label={`Закрыть алиас ${value}`}>
         <Unlink strokeWidth={1.5} />
         закрыть
+      </Button>
+    </ConfirmActionForm>
+  );
+}
+
+/** Подтвердить удержанный алиас (admin): confidence = 1 — алиас начинает сшивать события. */
+export function ConfirmAliasButton({ personId, kind, value, policy }: { personId: string; kind: AliasKind; value: string; policy: string | null }) {
+  return (
+    <ConfirmActionForm
+      action={confirmAliasAction}
+      title={`Подтвердить алиас ${ALIAS_KIND_LABELS[kind]} ${value}?`}
+      description={`Движок удержал алиас по политике идентичности${policy ? ` «${policy}»` : ""}. После подтверждения его события и инциденты будут относиться к персоне, в том числе за прошлые периоды внутри интервала действия.`}
+      confirmLabel="Да, подтвердить"
+      successText="Алиас подтверждён"
+    >
+      <input type="hidden" name="person_id" value={personId} />
+      <input type="hidden" name="kind" value={kind} />
+      <input type="hidden" name="value" value={value} />
+      <Button type="submit" variant="ghost" size="xs" aria-label={`Подтвердить алиас ${value}`}>
+        <BadgeCheck strokeWidth={1.5} />
+        подтвердить
       </Button>
     </ConfirmActionForm>
   );

@@ -9,7 +9,7 @@ import { StorageUnavailable } from "@/components/console/storage-error";
 import { Button } from "@/components/ui/button";
 import { safeQuery } from "@/lib/clickhouse";
 import { listPersons, resolveAlias } from "@/lib/actors";
-import { ALIAS_VALUE_MAX, isIp, type AliasKind } from "@/lib/shared/actors";
+import { ALIAS_VALUE_MAX, isIp, isPhone, type AliasKind } from "@/lib/shared/actors";
 import { searchHref } from "@/lib/shared/search-href";
 import { formatTs } from "@/lib/shared/time";
 import { requireActorAccess } from "@/lib/actors-access";
@@ -44,7 +44,7 @@ export default async function ByAliasPage({ searchParams }: PageProps<"/actors/b
   const eventsHref = ip ? searchHref.eventSrc(raw) : searchHref.actorEvents(raw);
   const isAdmin = session.role === "admin";
   const persons = isAdmin ? await safeQuery(() => listPersons("24h")) : null;
-  const guessKind: AliasKind = ip ? "ip" : raw.includes("@") ? "email" : "login";
+  const guessKind: AliasKind = ip ? "ip" : isPhone(raw) ? "phone" : raw.includes("@") ? "email" : "login";
 
   return (
     <>

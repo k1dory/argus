@@ -127,3 +127,52 @@ func TestObserveIdentitiesRetriesOnStoreError(t *testing.T) {
 		t.Fatalf("очередь повтора: %d, первое %s", len(e.identRetry), e.identRetry[0].Attrs["alias_value"])
 	}
 }
+
+// Политики из IDENTITIES_FILE действуют на алиасы из событий: нарушение
+// пишется событием argus.identity / identity.policy.violation в журнал
+// (откуда его читают правила), алиас при reject не записывается, счётчик — в /metrics.
+func TestIdentityPoliciesEmitViolationEvents(t *testing.T) {
+	f := newFakeCH(t)
+	e := testEngine(t, f, rulesDirWith(t, map[string]string{"r.yml": respondRule}), respond.Config{}, "tok", "tok")
+	path := filepath.Join(t.TempDir(), "identities.yml")
+	yml := "persons:\n  i.petrov:\n    aliases:\n      - {kind: email, value: i.petrov@example.org}\n" +
+		"policies:\n  email: { sources: [], on_violation: reject }\n  ip: { sources: [\"event:vpn.*\"], on_violation: flag }\n"
+	if err := os.WriteFile(path, []byte(yml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e.identFile = path
+	ctx := context.Background()
+	e.maybeSyncIdentities(ctx, false)
+	if len(f.rows("identity_aliases")) != 1 || len(f.rows("events")) != 0 {
+		t.Fatalf("файл проходит без политик: aliases %v events %v", f.rows("identity_aliases"), f.rows("events"))
+	}
+	e.observeIdentities(ctx, []*model.Event{
+		{TS: "2026-10-20 10:00:00.000", Source: "idp.example", SourceClass: "identity", Action: "identity.alias", ActorName: "i.petrov",
+			Attrs: map[string]string{"alias_kind": "email", "alias_value": "other@example.org"}},
+		{TS: "2026-10-20 10:00:01.000", Source: "idp.example", SourceClass: "identity", Action: "identity.alias", ActorName: "i.petrov",
+			Attrs: map[string]string{"alias_kind": "ip", "alias_value": "10.77.0.77"}},
+	})
+	aliases := f.rows("identity_aliases")
+	if len(aliases) != 2 || !strings.Contains(aliases[1], `"alias_value":"10.77.0.77"`) || !strings.Contains(aliases[1], `"note":"policy:sources"`) {
+		t.Fatalf("reject не пишется, flag пишется с пометкой: %v", aliases)
+	}
+	events := f.rows("events")
+	if len(events) != 2 {
+		t.Fatalf("события нарушений: %v", events)
+	}
+	var row map[string]any
+	if err := json.Unmarshal([]byte(events[0]), &row); err != nil {
+		t.Fatal(err)
+	}
+	attrs, _ := row["attrs"].(map[string]any)
+	if row["source"] != "argus.identity" || row["action"] != "identity.policy.violation" || row["outcome"] != "failure" || row["severity"] != float64(6) ||
+		row["actor_name"] != "i.petrov" || row["object"] != "email:other@example.org" || row["value"] != float64(1) || row["unit"] != "count" ||
+		attrs["policy"] != "email" || attrs["rule"] != "sources" || attrs["source"] != "idp.example" || attrs["action_taken"] != "reject" {
+		t.Errorf("событие нарушения: %v", row)
+	}
+	code, body := do(t, e.handler(), http.MethodGet, "/metrics", "tok", "")
+	if code != 200 || !strings.Contains(body, `argus_engine_identity_policy_total{rule="sources",action="reject"} 1`) ||
+		!strings.Contains(body, `argus_engine_identity_policy_total{rule="sources",action="flag"} 1`) {
+		t.Errorf("/metrics %d:\n%s", code, body)
+	}
+}

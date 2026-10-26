@@ -12,7 +12,9 @@ import (
 // файле больше нет (сравнение по виду, значению, valid_from и персоне),
 // помечаются deleted = 1. Персоны из файла не удаляются: у них могут быть
 // алиасы из событий и API. Алиасы файла — точка истины для своих записей:
-// отзыв событием закрывает их до следующей перезаписи файла.
+// отзыв событием закрывает их до следующей перезаписи файла. Политики
+// алиасов (policies) вступают в силу после успешной записи файла; без
+// IDENTITIES_FILE политик нет.
 func (o *Observer) SyncFile(ctx context.Context, set Set) error {
 	if o == nil || o.store == nil {
 		return nil
@@ -62,7 +64,8 @@ func (o *Observer) syncFile(ctx context.Context, set Set) error {
 		o.known[p.ID] = true
 	}
 	o.knownMu.Unlock()
-	slog.Info("identity: файл применён", "persons", len(set.Persons), "aliases", len(set.Aliases), "deleted", len(gone))
+	o.SetPolicies(set.Policies)
+	slog.Info("identity: файл применён", "persons", len(set.Persons), "aliases", len(set.Aliases), "deleted", len(gone), "policies", len(set.Policies))
 	return nil
 }
 

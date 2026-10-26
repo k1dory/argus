@@ -17,10 +17,14 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/devitex-soft/argus/engine/internal/model"
 )
 
 // Виды алиасов. Что именно стоит за uid/sid/peer, решает источник
-// (идентификатор в IdP, SID в домене, пир VPN-контроллера).
+// (идентификатор в IdP, SID в домене, пир VPN-контроллера). phone — номер
+// в E.164 (+79991234567): им представляются actor_name событий OTP-шлюзов
+// и телефонии, как login и uid.
 const (
 	KindEmail = "email"
 	KindLogin = "login"
@@ -29,10 +33,11 @@ const (
 	KindHost  = "host"
 	KindSID   = "sid"
 	KindPeer  = "peer"
+	KindPhone = "phone"
 )
 
 // Kinds — допустимые виды алиасов в порядке объявления.
-var Kinds = []string{KindEmail, KindLogin, KindUID, KindIP, KindHost, KindSID, KindPeer}
+var Kinds = []string{KindEmail, KindLogin, KindUID, KindIP, KindHost, KindSID, KindPeer, KindPhone}
 
 // Виды персон.
 const (
@@ -99,6 +104,12 @@ type Store interface {
 	AliasesBySource(ctx context.Context, source string) ([]Alias, error)
 	// KnownPersons — какие из идентификаторов уже заведены (и не удалены).
 	KnownPersons(ctx context.Context, ids []string) (map[string]bool, error)
+	// AliasesByPerson — все неудалённые алиасы персоны данного вида (открытые
+	// и закрытые): состояние для политик алиасов (Policies).
+	AliasesByPerson(ctx context.Context, person, kind string) ([]Alias, error)
+	// InsertEvents — события в журнал argus.events: нарушения политик
+	// (identity.policy.violation) идут туда же, откуда их читают правила.
+	InsertEvents(ctx context.Context, events []*model.Event) error
 }
 
 // ValidKind — вид алиаса известен.
@@ -111,10 +122,15 @@ func ValidKind(kind string) bool {
 	return false
 }
 
+// phoneRe — E.164 после очистки: плюс и от 8 до 15 цифр.
+var phoneRe = regexp.MustCompile(`^\+[1-9][0-9]{7,14}$`)
+
 // Normalize — нормальная форма значения алиаса: email/login/host — нижний
 // регистр без пробелов по краям; ip — каноническая запись адреса (IPv6 —
-// сжатая, без зоны); uid/sid/peer — как есть, без пробелов по краям.
-// Ошибка — вид неизвестен, значение пустое или адрес не разбирается.
+// сжатая, без зоны); phone — E.164: пробелы, дефисы и скобки убираются,
+// обязателен ведущий «+» и 8–15 цифр («+7 (999) 123-45-67» → «+79991234567»);
+// uid/sid/peer — как есть, без пробелов по краям.
+// Ошибка — вид неизвестен, значение пустое, адрес или номер не разбирается.
 func Normalize(kind, value string) (string, error) {
 	if !ValidKind(kind) {
 		return "", fmt.Errorf("неизвестный вид алиаса %q (ожидается %s)", kind, strings.Join(Kinds, " | "))
@@ -141,6 +157,17 @@ func Normalize(kind, value string) (string, error) {
 			return "", fmt.Errorf("ip %q не разбирается: %w", v, err)
 		}
 		v = addr.WithZone("").Unmap().String()
+	case KindPhone:
+		v = strings.Map(func(r rune) rune {
+			switch r {
+			case ' ', '-', '(', ')', '\t':
+				return -1
+			}
+			return r
+		}, v)
+		if !phoneRe.MatchString(v) {
+			return "", fmt.Errorf("phone %q: ожидается E.164 — «+» и 8–15 цифр", value)
+		}
 	}
 	return v, nil
 }

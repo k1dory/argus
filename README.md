@@ -46,7 +46,7 @@ API. Wazuh подключается как модуль, а не как цент
 - `shipper/` — Rust, модуль Wazuh. Тейлит `/var/ossec/logs/alerts/alerts.json` (NDJSON),
   переживает ротацию и усечение файла, ведёт чекпоинт (inode+offset), пишет батчами в
   `argus.wazuh_alerts`.
-- `policyd/` — Go, модуль Wazuh. Раз в `POLL_INTERVAL` забирает агентов и SCA-результаты из
+- `policyd/` — Go, модуль Wazuh. Раз в `POLICY_POLL_INTERVAL` (5m) забирает агентов и SCA-результаты из
   API менеджера (JWT через `POST /security/user/authenticate`), прогоняет через встроенный
   OPA, вердикты (с полем `status`) кладёт в `argus.policy_verdicts` и отдаёт на
   `:8080/verdicts` (bearer `POLICYD_TOKEN`, если задан).
@@ -75,11 +75,12 @@ API. Wazuh подключается как модуль, а не как цент
 ```sh
 ./scripts/argus init        # .env (права 600) со всеми секретами + make up
 ./scripts/argus init --with-wazuh   # то же плюс модуль Wazuh (shipper, policyd, разделы консоли); --without-wazuh — выключить
-make demo                   # записанный трафик и телеметрия → инциденты за полминуты
+make demo                   # записанный трафик и неделя субъектов → инциденты и паспорта за полминуты
 ```
 
 `argus init` генерирует пароли семи пользователей ClickHouse, `ENGINE_TOKEN`,
-`ARGUS_INGEST_TOKEN`, `ARGUS_API_TOKEN`, `ARGUS_MCP_HTTP_TOKEN`, `POLICYD_TOKEN`,
+`ARGUS_INGEST_TOKEN`, `ARGUS_API_TOKEN`, `ARGUS_MCP_HTTP_TOKEN`, `ARGUS_TRIAGE_ISSUER_TOKEN`,
+`ARGUS_PSEUDONYM_KEY`, `POLICYD_TOKEN`,
 `BACKUP_KEY` (`openssl rand -hex 24`), существующие значения не трогает — его можно
 повторять при апгрейде, чтобы дописать новые переменные. Пароль API менеджера Wazuh
 (`WAZUH_API_PASSWORD`) при включённом модуле впишите руками. Без секретов compose не стартует
@@ -649,10 +650,41 @@ detection:                                   detection:
 3. **`PUT /api/v1/identities`** — тот же документ в JSON от внешнего скрипта синхронизации;
    `DELETE /api/v1/identities/{person}/aliases?kind=&value=` закрывает алиас.
 
-Виды алиасов: `email`, `login`, `uid`, `ip`, `host`, `sid`, `peer`; `ip` сопоставляется с `src_ip`,
-`host` — с `node`, остальные — с `actor_name`. Алиас, который в одном окне принадлежит двум персонам,
-показывается как «неоднозначно», а не приписывается первому попавшемуся; субъект без действующего
-алиаса — «не привязан» и виден в списке на `/actors` с действием «Привязать» (admin).
+Виды алиасов: `email`, `login`, `uid`, `phone`, `ip`, `host`, `sid`, `peer`; `ip` сопоставляется с
+`src_ip`, `host` — с `node`, остальные — с `actor_name`. `email`, `login` и `host` сравниваются без
+учёта регистра, `uid`, `sid`, `peer`, `ip` — точно. `phone` — номер в E.164: пробелы, дефисы и скобки
+убираются, обязателен ведущий `+` и 8–15 цифр («+7 (999) 123-45-67» → «+79991234567»); им
+представляются субъекты OTP-шлюзов и телефонии. Алиас, который в одном окне принадлежит двум
+персонам, показывается как «неоднозначно», а не приписывается первому попавшемуся; субъект без
+действующего алиаса — «не привязан» и виден в списке на `/actors` с действием «Привязать» (admin).
+
+**Политики алиасов: чему доверять и как часто можно меняться.** Блок `policies` в `identities.yml`
+ограничивает алиасы, которые приходят событиями `identity.alias` (источник `event:*`); файл и API
+пишет администратор, к ним политики не применяются. Ключ — вид алиаса, вид без политики не ограничен:
+
+```yaml
+policies:
+  ip:    { sources: ["event:vpn.*"], max_open: 3, churn: { max: 20, window: 24h }, on_violation: flag }
+  host:  { sources: ["event:mdm.*"], max_open: 1, churn: { max: 1, window: 30d }, on_violation: hold }
+  email: { sources: ["event:idp.*"], churn: { max: 1, window: 90d }, on_violation: reject }
+  phone: { sources: ["event:idp.*", "event:otp.*"], max_open: 2, on_violation: flag }
+```
+
+`sources` — глобы допустимых источников (пустой список запрещает события для вида),
+`max_open` — не больше одновременно действующих алиасов вида у персоны, `churn: {max, window}` —
+не больше новых интервалов за окно (`24h`, `30d`, `2w`). `on_violation`: `flag` — записать с
+пометкой `policy:<rule>` (по умолчанию); `hold` — записать с `confidence: 0.3`: консоль показывает
+алиас «на удержании», но не использует его для склейки событий и резолва, пока admin не подтвердит;
+`reject` — не записывать. Повтор уже известного интервала нарушением не считается: экспортеры
+повторяют снимки. Так выражается «доверять смене IP, но не устройства»: разные источники и пороги
+на разные виды, без отдельного механизма.
+
+Каждое нарушение — обычное событие в журнале: `source: argus.identity`,
+`action: identity.policy.violation`, `actor_name` — персона, `object` — `вид:значение`,
+`attrs.rule` — `sources | max_open | churn`, `attrs.action_taken`, `value` — наблюдённое число.
+По нему работают те же правила, что и для ИБ: `rules/ops/identity-device-churn.yml` (medium) и
+`rules/ops/identity-untrusted-source.yml` (high); счётчик — `argus_engine_identity_policy_total{rule,action}`.
+Проверить: `REPLAY_REBASE=0 ./scripts/argus rules test --replay fixtures/events/identity-policy.ndjson`.
 
 **Консоль.** «Субъекты» (`/actors`) — персоны с активностью за период и не привязанные субъекты;
 `/actors/<person>` — паспорт с переключателем периода (24h / 7d / 30d, не больше 30 дней за
@@ -705,8 +737,8 @@ Wazuh — популярный open-source HIDS, поэтому его подд�
    а правило `rules/ops/argus-disk-low.yml` заводит инцидент при 90 % и закрывает его, когда
    место вернётся; порог меняется в правиле.
 2. **Секреты** — `./scripts/argus init`: семь паролей ClickHouse, `ENGINE_TOKEN`,
-   `ARGUS_INGEST_TOKEN`, `ARGUS_API_TOKEN`, `ARGUS_MCP_HTTP_TOKEN`, `POLICYD_TOKEN`,
-   `BACKUP_KEY`; `WAZUH_API_PASSWORD` — руками. `.env` с правами `600`, в git не попадает.
+   `ARGUS_INGEST_TOKEN`, `ARGUS_API_TOKEN`, `ARGUS_MCP_HTTP_TOKEN`, `ARGUS_TRIAGE_ISSUER_TOKEN`,
+   `ARGUS_PSEUDONYM_KEY`, `POLICYD_TOKEN`, `BACKUP_KEY`; `WAZUH_API_PASSWORD` — руками. `.env` с правами `600`, в git не попадает.
    `ARGUS_DEV` в бою не задаётся. Пароль `admin` — из `/data/admin-password.txt`, сменить
    в «Настройках», включить TOTP или SSO.
 3. **Память** — `CLICKHOUSE_MEM_LIMIT` под машину (4g по умолчанию; ClickHouse берёт
@@ -783,7 +815,7 @@ make deploy                                # cosign verify + pull образов
 (collector, engine, policyd, mcp, triage), тесты правил на записанном трафике, `cargo fmt/clippy/test`
 шиппера, eslint/тесты/сборка консоли, тесты политик OPA, валидация compose и скриптов
 (`docker compose config`, `bash -n`, shellcheck), сборка образов, сквозной e2e (replay →
-инциденты) на push в main. Аудит зависимостей блокирующий: `govulncheck`,
+инциденты → API-смоук консоли) на push в main. Аудит зависимостей блокирующий: `govulncheck`,
 `npm audit --audit-level=high`, `cargo audit`. Actions пришпилены по SHA коммита, базовые
 образы Dockerfile — по digest. `make lint` и `make check` — то же локально.
 Релиз — `release.yml` по тегу: проверка `VERSION`/`CHANGELOG`, сборка образов,
@@ -797,12 +829,26 @@ make deploy                                # cosign verify + pull образов
 
 ## Тесты
 
+Пять слоёв, от быстрых к медленным:
+
+| Слой | Что проверяет | Как запустить |
+|---|---|---|
+| юнит | Go-модули (`collector`, `engine`, `policyd`, `mcp`, `triage`), шиппер на Rust, Rego-политики через встроенный OPA, чистые модули консоли `web/src/lib/shared/*` и маршруты `web/src/app/api/*` с подменённым ClickHouse | `make test`; `cd web && npm test` |
+| правила | правила корреляции на записанном трафике `fixtures/events/*.ndjson`, ожидания в `rules/tests/` | `./scripts/argus rules test` |
+| интеграция | живой ClickHouse: конкурентный claim вердикта агента (`web/tests/triage-claim-ch.test.ts`); без `ARGUS_TEST_CLICKHOUSE_URL` тест пропускается | `ARGUS_TEST_CLICKHOUSE_URL=http://localhost:8123 ARGUS_TEST_CLICKHOUSE_PASSWORD=… npm test` |
+| API-смоук | живой стенд: `GET /api/version`, приём NDJSON коллектором (`value`/`unit`, `identity.alias`), событие в `GET /api/v1/log`, сессия разбора по демо-инциденту, карточка, граница области, вердикт `argus-triage/v3` и его идемпотентный повтор, резолв алиаса и паспорт субъекта, запрет экспорта токену сессии | `make up-dev && make demo && ./scripts/api-smoke.sh` (параметры `ARGUS_URL`, `ARGUS_API_TOKEN`, `ARGUS_TRIAGE_ISSUER_TOKEN`, `ARGUS_INGEST_URL`, `ARGUS_INGEST_TOKEN`; по умолчанию — `.env.dev`) |
+| e2e | стек с нуля в compose (`argus-e2e`): replay → ≥ 7 инцидентов и вердиктов движка, `argus_ro` только читает, затем API-смоук; в CI — на push в `main` | `./scripts/e2e.sh` (`E2E_TIMEOUT`, сек) |
+
 ```sh
 make test          # cargo test + go vet/test (Rego-политики гоняются через встроенный OPA)
 make policy-test   # то же через бинарник opa, если установлен
 make check         # compose config, bash -n, shellcheck
 cd web && npm test && npm run lint && npm run typecheck   # консоль
+./scripts/api-smoke.sh                                    # API консоли на живом стенде
 ```
+
+Спецификация REST API консоли — OpenAPI в `api/openapi.yaml`; консоль отдаёт её же как
+`/openapi.yaml`. Смоук и тесты маршрутов проверяют поведение, описанное в ней.
 
 ## Участие и безопасность
 

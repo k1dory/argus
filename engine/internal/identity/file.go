@@ -11,10 +11,12 @@ import (
 )
 
 // Set — содержимое identities.yml после проверки и нормализации: персоны и
-// их алиасы в детерминированном порядке (по person_id, затем по порядку в файле).
+// их алиасы в детерминированном порядке (по person_id, затем по порядку в
+// файле) и политики алиасов из событий (policy.go).
 type Set struct {
-	Persons []Person
-	Aliases []Alias
+	Persons  []Person
+	Aliases  []Alias
+	Policies Policies
 }
 
 // Формат identities.yml:
@@ -30,11 +32,16 @@ type Set struct {
 //	      - {kind: login, value: ipetrov}
 //	      - {kind: ip, value: 10.77.0.11, from: 2026-10-01, to: 2026-10-20, confidence: 0.9, note: "ноутбук"}
 //
+//	policies:
+//	  ip: { sources: ["event:vpn.*"], max_open: 2, churn: { max: 20, window: 24h }, on_violation: flag }
+//
 // from/to — YYYY-MM-DD или RFC3339; нет from — алиас действует всегда
 // (1970-01-01), нет to — действует по сей день. Неизвестные ключи и
-// недопустимые значения — ошибка с путём до поля.
+// недопустимые значения — ошибка с путём до поля. policies — ограничения
+// на алиасы из событий по виду (policy.go); к алиасам файла не применяются.
 type fileDoc struct {
-	Persons map[string]filePerson `yaml:"persons"`
+	Persons  map[string]filePerson `yaml:"persons"`
+	Policies map[string]filePolicy `yaml:"policies"`
 }
 
 type filePerson struct {
@@ -72,7 +79,8 @@ func Parse(raw []byte) (Set, error) {
 	dec := yaml.NewDecoder(strings.NewReader(string(raw)))
 	dec.KnownFields(true)
 	var doc fileDoc
-	if err := dec.Decode(&doc); err != nil && !strings.Contains(err.Error(), "EOF") {
+	err := dec.Decode(&doc)
+	if err != nil && !strings.Contains(err.Error(), "EOF") {
 		return Set{}, err
 	}
 	ids := make([]string, 0, len(doc.Persons))
@@ -81,6 +89,9 @@ func Parse(raw []byte) (Set, error) {
 	}
 	sort.Strings(ids)
 	var set Set
+	if set.Policies, err = parsePolicies(doc.Policies); err != nil {
+		return Set{}, err
+	}
 	for _, id := range ids {
 		p := doc.Persons[id]
 		path := "persons." + id

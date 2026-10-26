@@ -4,6 +4,8 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "sync-openapi": "node scripts/sync-openapi.mjs",
+    "prebuild": "node scripts/sync-openapi.mjs",
     "build": "next build",
     "start": "next start",
     "lint": "eslint",

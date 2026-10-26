@@ -9,6 +9,12 @@
 организации. Агенты разбора и LLM-бэкенды подключаются через нейтральные контракты, Wazuh
 стал модулем, правила безопасности и эксплуатации пишутся одним языком.
 
+- **Политики алиасов и вид `phone`.** Блок `policies` в `identities.yml` на вид алиаса: `sources`
+  (глобы доверенных источников событий), `max_open`, `churn {max, window}`, `on_violation`
+  flag | hold | reject; нарушение — событие `argus.identity / identity.policy.violation` с `value`,
+  правила `rules/ops/identity-device-churn.yml` и `identity-untrusted-source.yml`, метрика
+  `argus_engine_identity_policy_total`. Алиасы «на удержании» (confidence < 0.5) консоль показывает,
+  но не склеивает, admin подтверждает. Вид `phone` в E.164 для субъектов OTP и телефонии.
 - **Паспорт сотрудника.** Таблицы `identities` и `identity_aliases` (миграция 0026, алиасы с
   интервалами действия, bloom-индексы по `actor_name` и `src_ip`); источники карты — события
   `identity.alias` / `identity.alias.revoke` от любого экспортера, `identities.yml`
@@ -34,6 +40,13 @@
   `level` (нижняя граница info…critical), `actor`, `node`, `src_ip`, `action`, `since`,
   `until`, `q`, `limit`, `format=json|ndjson`; токен API или токен сессии (в области инцидента).
   В `argus-mcp` — инструмент `get_log` в обоих профилях.
+- **Спецификация и смоук API.** OpenAPI-описание REST API консоли — `api/openapi.yaml`,
+  консоль отдаёт его как `/openapi.yaml`. `scripts/api-smoke.sh` — сквозная проверка API на
+  живом стенде (`make up-dev && make demo`): версия, приём NDJSON коллектором и событие в
+  `GET /api/v1/log`, сессия разбора, карточка, граница области, вердикт `argus-triage/v3` с
+  идемпотентным повтором, резолв алиаса и паспорт субъекта, запрет экспорта токену сессии;
+  вызывается из `scripts/e2e.sh` и CI. `.env.dev` получил `ARGUS_TRIAGE_ISSUER_TOKEN`,
+  `./scripts/argus init` генерирует его вместе с остальными секретами.
 - **LLM за интерфейсом.** `analyst.Backend` с реализациями `openai-compatible` и `mock`;
   маршрутизация по профилям, запрет egress, редакция, проверка ответа и порог уверенности
   применяются к любому бэкенду одинаково. Профиль `cloud-fast` удалён.

@@ -4,7 +4,7 @@ import { notFound } from "next/navigation";
 import { ArrowLeft } from "lucide-react";
 import { Copyable } from "@/components/console/copyable";
 import { DownloadButton } from "@/components/console/download-button";
-import { ActorRangeLinks, ALIAS_KIND_LABELS, BindAliasForm, CloseAliasButton } from "@/components/console/actor-forms";
+import { ActorRangeLinks, ALIAS_KIND_LABELS, BindAliasForm, CloseAliasButton, ConfirmAliasButton } from "@/components/console/actor-forms";
 import { LevelBadge, StatusBadge } from "@/components/console/incident-badges";
 import { Empty, Led, PageHeader, Panel, StatTile } from "@/components/console/panel";
 import { StorageUnavailable } from "@/components/console/storage-error";
@@ -15,7 +15,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { safeQuery } from "@/lib/clickhouse";
 import { audit } from "@/lib/argus-queries";
 import { actorReport, getPerson, personAliases } from "@/lib/actors";
-import { aliasEventsHref, aliasKey, parseActorRange, PERSON_ID_RE, SECTION_LABELS, SECTIONS, type ActorReport, type Section } from "@/lib/shared/actors";
+import { aliasEventsHref, aliasKey, holdPolicy, isHeld, parseActorRange, PERSON_ID_RE, primaryAlias, SECTION_LABELS, SECTIONS, type ActorReport, type Section } from "@/lib/shared/actors";
 import { isIncidentStatus } from "@/lib/shared/incidents";
 import type { LogItem } from "@/lib/shared/log-query";
 import { RANGES } from "@/lib/shared/ranges";
@@ -82,7 +82,7 @@ export default async function ActorPage({ params, searchParams }: PageProps<"/ac
         </div>
       </PageHeader>
 
-      <Panel label="Алиасы" meta={`${fmtNum(aliases.length)} · интервалы действия в UTC`}>
+      <Panel label="Алиасы" meta={`${fmtNum(aliases.length)}${aliases.some(isHeld) ? ` · на удержании ${fmtNum(aliases.filter(isHeld).length)}` : ""} · интервалы действия в UTC`}>
         {aliases.length === 0 ? <Empty>Алиасов нет — паспорт пуст. Добавьте их через identities.yml, событие identity.alias или форму ниже.</Empty> : (
           <div className="c-well overflow-x-auto p-2">
             <Table>
@@ -101,21 +101,34 @@ export default async function ActorPage({ params, searchParams }: PageProps<"/ac
               <TableBody>
                 {aliases.map((a) => {
                   const amb = rr.ok && rr.data.ambiguous.includes(aliasKey(a));
+                  const held = isHeld(a);
+                  const policy = holdPolicy(a);
                   return (
-                    <TableRow key={`${a.kind}|${a.value}|${a.valid_from}`} className="border-border/40">
+                    <TableRow key={`${a.kind}|${a.value}|${a.valid_from}`} className={held ? "border-border/40 text-muted-foreground" : "border-border/40"}>
                       <TableCell className="text-xs">{ALIAS_KIND_LABELS[a.kind]}</TableCell>
                       <TableCell className="font-mono text-xs">
                         <span className="flex items-center gap-2">
                           <Copyable value={a.value} label="Алиас" />
                           {amb && <Badge variant="destructive" title="В этом периоде алиас действует и у другой персоны">неоднозначно</Badge>}
+                          {held && <Badge variant="outline" className="text-[var(--status-warn)]" title={`Удержан политикой идентичности${policy ? `: ${policy}` : ""} — события не сшиваются, пока администратор не подтвердит`}>на удержании</Badge>}
                         </span>
                       </TableCell>
                       <TableCell className="font-mono text-xs whitespace-nowrap">{formatTs(a.valid_from)}</TableCell>
                       <TableCell className="font-mono text-xs whitespace-nowrap">{a.valid_to ? formatTs(a.valid_to) : <span className="text-[var(--status-ok)]">действует</span>}</TableCell>
-                      <TableCell className="font-mono text-xs">{a.source}{a.note ? <span className="text-muted-foreground"> · {a.note}</span> : null}</TableCell>
+                      <TableCell className="font-mono text-xs">
+                        {a.source}
+                        {held && policy ? <span className="text-[var(--status-warn)]"> · политика {policy}</span> : a.note ? <span className="text-muted-foreground"> · {a.note}</span> : null}
+                      </TableCell>
                       <TableCell className="text-right font-mono text-xs">{a.confidence.toFixed(2)}</TableCell>
                       <TableCell className="text-xs"><Link href={aliasEventsHref(a, range)} className="text-[var(--ring)] hover:underline">события</Link></TableCell>
-                      {isAdmin && <TableCell className="text-right">{a.valid_to === null && <CloseAliasButton personId={person.person_id} kind={a.kind} value={a.value} />}</TableCell>}
+                      {isAdmin && (
+                        <TableCell className="text-right">
+                          <span className="flex items-center justify-end gap-1">
+                            {held && <ConfirmAliasButton personId={person.person_id} kind={a.kind} value={a.value} policy={policy} />}
+                            {a.valid_to === null && <CloseAliasButton personId={person.person_id} kind={a.kind} value={a.value} />}
+                          </span>
+                        </TableCell>
+                      )}
                     </TableRow>
                   );
                 })}
@@ -137,7 +150,7 @@ export default async function ActorPage({ params, searchParams }: PageProps<"/ac
 }
 
 function ReportBody({ r, range }: { r: ActorReport; range: string }) {
-  const primary = r.aliases.find((a) => a.kind === "login" && a.valid_to === null) ?? r.aliases.find((a) => a.valid_to === null) ?? r.aliases[0];
+  const primary = primaryAlias(r.aliases);
   return (
     <>
       {r.missing.length > 0 && (
@@ -201,6 +214,7 @@ function ReportBody({ r, range }: { r: ActorReport; range: string }) {
           <li>Источников, не подключённых к ARGUS, и событий старше срока хранения.</li>
           <li>Разделы «Входы» … «Изменения» построены по последним {fmtNum(r.limit)} событиям периода, сводка — по всем.</li>
           {r.ambiguous.length > 0 && <li>Алиасы с пометкой «неоднозначно» делятся с другой персоной — их события могут быть не этого субъекта.</li>}
+          {r.aliases.some(isHeld) && <li>Алиасы «на удержании» (нарушение политики идентичности) в сшивку не входят: их события в паспорте не учтены, пока администратор не подтвердит алиас.</li>}
         </ul>
       </Panel>
     </>
@@ -213,7 +227,7 @@ function SectionPanel({ section, items, limit }: { section: Exclude<Section, "ot
     host: "priv.* · sudo · su · session.*",
     network: "netflow · ngfw · net.*",
     app: "app.* · authorize · oauth",
-    change: "create · update · delete · change · modify — успешные",
+    change: "identity.* · create · update · delete · change · modify — успешные",
   };
   const fail = items.filter((e) => /fail|deny|denied|error/i.test(e.outcome)).length;
   return (

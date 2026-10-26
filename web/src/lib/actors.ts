@@ -10,7 +10,7 @@ import { SEARCH_SETTINGS } from "./search";
 import { chTs, LOG_COLUMNS, toLogItem, type LogItem } from "./shared/log-query";
 import type { TriageBinding } from "./shared/triage";
 import {
-  ACTOR_KINDS, aliasColumnExpr, aliasPredicate, aliasActiveAt, aliasMatches, aliasKey, ambiguousAliases, bucketEvents, canonicalIp, clampWindow, isAliasKind, LOWERCASE_KINDS, normalizeAliasValue, rangeWindow, resolveStatus,
+  ACTOR_KINDS, activeAliases, aliasColumnExpr, aliasPredicate, aliasActiveAt, aliasMatches, aliasKey, ambiguousAliases, bucketEvents, canonicalIp, canonicalPhone, clampWindow, CONFIRMED_NOTE_PREFIX, HOLD_NOTE_PREFIX, isAliasKind, isHeld, LOWERCASE_KINDS, normalizeAliasValue, rangeWindow, resolveStatus,
   type ActorIncident, type ActorRange, type ActorReport, type Alias, type AliasInput, type ClassCount, type IpStat, type NodeStat, type Person, type PersonInput, type ResolveMatch, type ResolveStatus, type SourceCoverage, type Window,
 } from "./shared/actors";
 
@@ -132,25 +132,26 @@ export type Resolution = { status: ResolveStatus; matches: ResolveMatch[] };
 
 /**
  * Персоны, чьи алиасы любого вида равны значению (email/login/host — без
- * учёта регистра) и действуют в момент at. 0 — «не привязан», >1 —
- * «неоднозначно»: показывается явно, первый не выбирается.
+ * учёта регистра, ip и phone — в канонической форме) и действуют в момент at.
+ * 0 — «не привязан», >1 — «неоднозначно»: показывается явно, первый не
+ * выбирается. Удержанные алиасы (confidence < 0.5) персону не резолвят.
  */
 export async function resolveAlias(value: string, atMs = Date.now()): Promise<Resolution> {
   const rows = await chQuery<AliasRow & { display: string; kind: string }>(
     `SELECT a.person_id, a.alias_kind, a.alias_value, a.valid_from, a.valid_to_raw, a.source, a.confidence, a.note, p.display AS display, p.kind AS kind
      FROM (${ALIASES_LATEST}) a LEFT JOIN (${PERSONS_LATEST}) p ON a.person_id = p.person_id
-     WHERE a.alias_value IN ({v:String}, {lv:String}, {cv:String})
+     WHERE a.alias_value IN ({v:String}, {lv:String}, {cv:String}, {pv:String})
        AND a.valid_from <= parseDateTime64BestEffort({at:String}, 3, 'UTC')
        AND (a.valid_to_raw IS NULL OR parseDateTime64BestEffort({at:String}, 3, 'UTC') < a.valid_to_raw)
      ORDER BY a.person_id, a.alias_kind`,
-    { v: value, lv: value.toLowerCase(), cv: canonicalIp(value) ?? value, at: chTs(atMs) },
+    { v: value, lv: value.toLowerCase(), cv: canonicalIp(value) ?? value, pv: canonicalPhone(value) ?? value, at: chTs(atMs) },
   );
   // Один алиас может лежать в нескольких строках (yaml и event:<source>,
   // разные valid_from) — на персону одна запись, открытый интервал предпочтительнее.
   const byPerson = new Map<string, ResolveMatch>();
   for (const r of rows) {
     const a = toAlias(r);
-    if (!a || !aliasMatches(a, value)) continue;
+    if (!a || isHeld(a) || !aliasMatches(a, value)) continue;
     const m: ResolveMatch = { person_id: a.person_id, display: r.display ?? "", kind: r.kind === "service" ? "service" : "person", alias_kind: a.kind, valid_from: a.valid_from, valid_to: a.valid_to };
     const prev = byPerson.get(a.person_id);
     if (!prev || (prev.valid_to !== null && m.valid_to === null)) byPerson.set(a.person_id, m);
@@ -173,7 +174,7 @@ export async function unboundSubjects(range: ActorRange, limit = 30, now = Date.
     ),
     allAliases(),
   ]);
-  const subjectAliases = aliases.filter((a) => ACTOR_KINDS.includes(a.kind));
+  const subjectAliases = activeAliases(aliases).filter((a) => ACTOR_KINDS.includes(a.kind));
   const out: UnboundSubject[] = [];
   for (const t of top) {
     const lastMs = Date.parse(t.last_ts.replace(" ", "T") + "Z");
@@ -215,7 +216,8 @@ function bindPredicate(bind: TriageBinding, params: Record<string, string | numb
  * источников, инциденты (actor_name ∈ субъектных алиасов, действовавших на
  * first_ts), таймлайн последних N событий в форме /api/v1/log и его разбивка
  * по разделам. Персона и алиасы обязательны (исключение), остальное —
- * частичная деградация через missing.
+ * частичная деградация через missing. Удержанные алиасы в aliases остаются
+ * (паспорт их показывает), но ни один предикат их не использует.
  */
 export async function actorReport(person: Person, aliases: Alias[], range: ActorRange, limit: number, opts: ReportOptions = {}): Promise<ActorReport> {
   const now = opts.now ?? Date.now();
@@ -225,8 +227,8 @@ export async function actorReport(person: Person, aliases: Alias[], range: Actor
   const bind = opts.bind ? ` AND ${bindPredicate(opts.bind, params)}` : "";
   const base = `ts >= parseDateTime64BestEffort({from:String}, 3, 'UTC') AND ts < parseDateTime64BestEffort({to:String}, 3, 'UTC') AND ${pred.sql}${bind}`;
 
-  // Инциденты: actor_name инцидента среди субъектных алиасов — для email/login без учёта регистра.
-  const subject = aliases.filter((a) => ACTOR_KINDS.includes(a.kind));
+  // Инциденты: actor_name инцидента среди субъектных алиасов (без удержанных) — для email/login без учёта регистра.
+  const subject = activeAliases(aliases).filter((a) => ACTOR_KINDS.includes(a.kind));
   const incParams: Record<string, string | number> = { from: chTs(w.fromMs), to: chTs(w.toMs) };
   // Сессия разбора: разрешённые инциденты отбираются в SQL до LIMIT — иначе 200
   // других инцидентов субъекта вытеснили бы свой. Array(String) параметром.
@@ -272,7 +274,7 @@ export async function actorReport(person: Person, aliases: Alias[], range: Actor
   const allowed = opts.incidentIds ? new Set(opts.incidentIds) : null;
   const incidents: ActorIncident[] = take(incRows, "инциденты", [] as IncidentRaw[])
     .filter((i) => !allowed || allowed.has(i.id))
-    .filter((i) => aliases.some((a) => ACTOR_KINDS.includes(a.kind) && aliasMatches(a, i.actor_name) && aliasActiveAt(a, Date.parse(i.first_s.replace(" ", "T") + "Z"))))
+    .filter((i) => subject.some((a) => aliasMatches(a, i.actor_name) && aliasActiveAt(a, Date.parse(i.first_s.replace(" ", "T") + "Z"))))
     .map(({ id, level, status, rule_id, rule_title, created_s }) => ({ id, level, status, rule_id, rule_title, created_at: created_s }));
   const timeline: LogItem[] = take(tl, "таймлайн", [] as Record<string, unknown>[]).map(toLogItem);
   let ambiguous: string[] = [];
@@ -339,24 +341,49 @@ export async function bindAlias(person: Person, alias: AliasInput, source: strin
   await insertAliases([{ person_id: person.person_id, a: alias }], source);
 }
 
+/** Новые версии строк алиаса с тем же ключом (person, kind, value, valid_from) и подменёнными полями. */
+async function rewriteAliases(rows: Alias[], patch: (a: Alias) => Pick<Alias, "valid_to" | "confidence" | "note">): Promise<void> {
+  if (!rows.length) return;
+  const params: Record<string, string | number> = {};
+  const values = rows.map((a, j) => {
+    const p = patch(a);
+    params[`p${j}`] = a.person_id; params[`k${j}`] = a.kind; params[`v${j}`] = a.value; params[`f${j}`] = a.valid_from;
+    params[`t${j}`] = p.valid_to ?? ""; params[`s${j}`] = a.source; params[`c${j}`] = p.confidence; params[`n${j}`] = p.note;
+    return `({p${j}:String}, {k${j}:String}, {v${j}:String}, parseDateTime64BestEffort({f${j}:String}, 3, 'UTC'), parseDateTime64BestEffortOrNull({t${j}:String}, 3, 'UTC'), {s${j}:String}, {c${j}:Float32}, {n${j}:String}, now64(3), 0)`;
+  });
+  await chCommand(`INSERT INTO identity_aliases (person_id, alias_kind, alias_value, valid_from, valid_to, source, confidence, note, updated_at, deleted) VALUES ${values.join(", ")}`, params);
+}
+
+/** Последние версии строк алиаса персоны по виду и нормализованному значению. */
+async function aliasRows(personId: string, kind: string, value: string): Promise<Alias[]> {
+  if (!isAliasKind(kind)) return [];
+  const v = normalizeAliasValue(kind, value);
+  return aliasesOf(await chQuery<AliasRow>(
+    `SELECT * FROM (${ALIASES_LATEST}) WHERE person_id = {id:String} AND alias_kind = {k:String} AND alias_value = {v:String}`,
+    { id: personId, k: kind, v },
+  ));
+}
+
+/**
+ * Подтвердить удержанный алиас: версии строки с confidence < 0.5 получают
+ * confidence = 1 новой версией с тем же ключом; пометка policy:hold:<…>
+ * становится policy:confirmed:<…>. Возвращает число подтверждённых.
+ */
+export async function confirmAlias(personId: string, kind: string, value: string): Promise<number> {
+  const rows = (await aliasRows(personId, kind, value)).filter(isHeld);
+  await rewriteAliases(rows, (a) => ({
+    valid_to: a.valid_to, confidence: 1,
+    note: a.note.startsWith(HOLD_NOTE_PREFIX) ? CONFIRMED_NOTE_PREFIX + a.note.slice(HOLD_NOTE_PREFIX.length) : a.note,
+  }));
+  return rows.length;
+}
+
 /**
  * Закрыть алиас: действующие версии строки (person, kind, value) получают
  * valid_to = at новой версией с тем же ключом. Возвращает число закрытых.
  */
 export async function closeAlias(personId: string, kind: string, value: string, atMs = Date.now()): Promise<number> {
-  if (!isAliasKind(kind)) return 0;
-  const v = normalizeAliasValue(kind, value);
-  const rows = aliasesOf(await chQuery<AliasRow>(
-    `SELECT * FROM (${ALIASES_LATEST}) WHERE person_id = {id:String} AND alias_kind = {k:String} AND alias_value = {v:String}`,
-    { id: personId, k: kind, v },
-  )).filter((a) => a.valid_to === null || Date.parse(a.valid_to.replace(" ", "T") + "Z") > atMs);
-  if (!rows.length) return 0;
-  const params: Record<string, string | number> = { at: chTs(atMs) };
-  const values = rows.map((a, j) => {
-    params[`p${j}`] = a.person_id; params[`k${j}`] = a.kind; params[`v${j}`] = a.value; params[`f${j}`] = a.valid_from;
-    params[`s${j}`] = a.source; params[`c${j}`] = a.confidence; params[`n${j}`] = a.note;
-    return `({p${j}:String}, {k${j}:String}, {v${j}:String}, parseDateTime64BestEffort({f${j}:String}, 3, 'UTC'), parseDateTime64BestEffort({at:String}, 3, 'UTC'), {s${j}:String}, {c${j}:Float32}, {n${j}:String}, now64(3), 0)`;
-  });
-  await chCommand(`INSERT INTO identity_aliases (person_id, alias_kind, alias_value, valid_from, valid_to, source, confidence, note, updated_at, deleted) VALUES ${values.join(", ")}`, params);
+  const rows = (await aliasRows(personId, kind, value)).filter((a) => a.valid_to === null || Date.parse(a.valid_to.replace(" ", "T") + "Z") > atMs);
+  await rewriteAliases(rows, (a) => ({ valid_to: chTs(atMs), confidence: a.confidence, note: a.note }));
   return rows.length;
 }

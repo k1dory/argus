@@ -46,6 +46,9 @@ type Stats struct {
 	OK      int // алиасов записано (включая отзывы)
 	Invalid int // событий отклонено: нет attrs, плохое значение, отзыв несуществующего
 	Errors  int // записей не удалось выполнить (ошибка хранилища)
+	// Policy — нарушений политик алиасов (policy.go): flag и hold записаны и
+	// учтены в OK, reject — не записаны и в OK не входят.
+	Policy int
 	// Retry — события, которые не удалось применить из-за хранилища, в порядке
 	// обработки: вызывающий отдаёт их в следующий Observe, чтобы сбой записи
 	// не терял алиасы. Очередь живёт в памяти движка (теряется при рестарте)
@@ -65,11 +68,87 @@ type Observer struct {
 
 	knownMu sync.Mutex
 	known   map[string]bool // person_id, про которые известно, что они заведены
+
+	// policies — действующие политики алиасов из identities.yml (SetPolicies);
+	// nil — без ограничений. policyHits — счётчики нарушений по (rule, action).
+	policies   atomic.Pointer[Policies]
+	policyMu   sync.Mutex
+	policyHits map[[2]string]int64
 }
 
 // New — наблюдатель поверх хранилища; nil store — все вызовы no-op.
 func New(store Store) *Observer {
-	return &Observer{store: store, now: time.Now, known: map[string]bool{}}
+	return &Observer{store: store, now: time.Now, known: map[string]bool{}, policyHits: map[[2]string]int64{}}
+}
+
+// SetPolicies — заменить действующие политики алиасов (перечитывание
+// identities.yml); пустые — снять ограничения.
+func (o *Observer) SetPolicies(ps Policies) {
+	if o == nil {
+		return
+	}
+	if len(ps) == 0 {
+		o.policies.Store(nil)
+		return
+	}
+	cp := make(Policies, len(ps))
+	for k, v := range ps {
+		cp[k] = v
+	}
+	o.policies.Store(&cp)
+}
+
+// Policies — действующие политики (копия для чтения; nil — нет).
+func (o *Observer) Policies() Policies {
+	if o == nil {
+		return nil
+	}
+	if p := o.policies.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+// applyPolicy — проверка алиаса из события политикой его вида: состояние —
+// алиасы персоны того же вида из хранилища плюс ожидающие записи в этом
+// батче (без дублей по ключу). Возвращает алиас после решения (note,
+// confidence), само решение и ошибку хранилища.
+func (o *Observer) applyPolicy(ctx context.Context, a Alias, pending []Alias) (Alias, Decision, error) {
+	ps := o.policies.Load()
+	if ps == nil {
+		return a, Decision{}, nil
+	}
+	if _, ok := (*ps)[a.Kind]; !ok || !strings.HasPrefix(a.Source, SourceEventPrefix) {
+		return a, Decision{}, nil
+	}
+	stored, err := o.store.AliasesByPerson(ctx, a.PersonID, a.Kind)
+	if err != nil {
+		return a, Decision{}, fmt.Errorf("алиасы персоны для политики: %w", err)
+	}
+	seen := map[string]bool{}
+	state := make([]Alias, 0, len(stored)+len(pending))
+	for _, s := range stored {
+		if !seen[s.Key()] {
+			seen[s.Key()] = true
+			state = append(state, s)
+		}
+	}
+	for _, s := range pending {
+		if s.PersonID == a.PersonID && s.Kind == a.Kind && !seen[s.Key()] {
+			seen[s.Key()] = true
+			state = append(state, s)
+		}
+	}
+	dec := ps.Evaluate(a, state)
+	out, _ := dec.Apply(a)
+	return out, dec, nil
+}
+
+// countPolicy — счётчик нарушений для /metrics.
+func (o *Observer) countPolicy(rule, action string) {
+	o.policyMu.Lock()
+	o.policyHits[[2]string{rule, action}]++
+	o.policyMu.Unlock()
 }
 
 // maxKnown — потолок кэша заведённых персон; сверх — кэш сбрасывается.
@@ -114,9 +193,24 @@ func (o *Observer) Observe(ctx context.Context, events []*model.Event) Stats {
 	// отзыв и всё после него) уходит в Retry в порядке обработки — иначе отзыв
 	// не нашёл бы ещё не записанную выдачу и был бы отброшен, а повтор выдачи
 	// оставил бы алиас открытым.
+	// События нарушений политик пишутся в журнал после удачной записи
+	// алиасов (и в конце прохода — ради reject без записи). Это телеметрия:
+	// сбой их вставки только логируется, при abort не записанные пропадают
+	// (нарушения по алиасам из Retry возникнут снова при повторе).
+	var violations []*model.Event
+	flushViolations := func() {
+		if len(violations) == 0 {
+			return
+		}
+		if err := o.store.InsertEvents(ctx, violations); err != nil {
+			slog.Warn("identity: события нарушений политик не записаны", "n", len(violations), "err", err)
+		}
+		violations = violations[:0]
+	}
 	var pending []op
 	flush := func() error {
 		if len(pending) == 0 {
+			flushViolations()
 			return nil
 		}
 		persons := map[string]bool{}
@@ -137,6 +231,7 @@ func (o *Observer) Observe(ctx context.Context, events []*model.Event) Stats {
 		st.OK += len(pending)
 		o.ok.Add(int64(len(pending)))
 		pending = pending[:0]
+		flushViolations()
 		return nil
 	}
 	abort := func(from int, err error) Stats {
@@ -151,6 +246,29 @@ func (o *Observer) Observe(ctx context.Context, events []*model.Event) Stats {
 	}
 	for i, p := range ops {
 		if p.ev.Action == ActionAlias {
+			// Политика вида (если задана): состояние — хранилище плюс
+			// ожидающие записи того же человека и вида.
+			state := make([]Alias, 0, len(pending))
+			for _, q := range pending {
+				state = append(state, q.alias)
+			}
+			a, dec, err := o.applyPolicy(ctx, p.alias, state)
+			if err != nil {
+				st.Errors++
+				o.errs.Add(1)
+				return abort(i, err)
+			}
+			if dec.Rule != "" {
+				st.Policy++
+				o.countPolicy(dec.Rule, dec.Action)
+				violations = append(violations, dec.ViolationEvent(p.ev, p.alias))
+				slog.Warn("identity: нарушение политики алиасов", "person", p.alias.PersonID, "kind", p.alias.Kind, "value", p.alias.Value,
+					"rule", dec.Rule, "limit", dec.Limit, "window", dec.Window, "count", dec.Count, "source", p.ev.Source, "action", dec.Action)
+				if dec.Action == ActionReject {
+					continue
+				}
+			}
+			p.alias = a
 			pending = append(pending, p)
 			continue
 		}
@@ -324,4 +442,19 @@ func (o *Observer) WriteMetrics(w io.Writer) {
 	}
 	fmt.Fprintf(w, "argus_engine_identity_file_syncs_total{result=\"ok\"} %d\n", o.syncOK.Load())
 	fmt.Fprintf(w, "argus_engine_identity_file_syncs_total{result=\"error\"} %d\n", o.syncErr.Load())
+	o.policyMu.Lock()
+	keys := make([][2]string, 0, len(o.policyHits))
+	for k := range o.policyHits {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i][0] != keys[j][0] {
+			return keys[i][0] < keys[j][0]
+		}
+		return keys[i][1] < keys[j][1]
+	})
+	for _, k := range keys {
+		fmt.Fprintf(w, "argus_engine_identity_policy_total{rule=%q,action=%q} %d\n", k[0], k[1], o.policyHits[k])
+	}
+	o.policyMu.Unlock()
 }

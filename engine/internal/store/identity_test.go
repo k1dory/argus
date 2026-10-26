@@ -58,6 +58,13 @@ func TestIdentityAliasesRoundTrip(t *testing.T) {
 	if len(yaml) != 1 || yaml[0].PersonID != "a.sidorov" || yaml[0].ValidTo == nil || !yaml[0].ValidTo.Equal(time.Date(2026, 10, 15, 9, 0, 0, 0, time.UTC)) {
 		t.Errorf("yaml: %+v", yaml)
 	}
+	byPerson, err := c.AliasesByPerson(ctx, "i.petrov", "ip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(gotQuery, "person_id = {person:String} AND alias_kind = {kind:String}") || len(byPerson) != 2 {
+		t.Errorf("AliasesByPerson: %s → %+v", gotQuery, byPerson)
+	}
 	known, err := c.KnownPersons(ctx, []string{"i.petrov", "x"})
 	if err != nil || !known["i.petrov"] || known["x"] {
 		t.Errorf("known: %v %v", known, err)

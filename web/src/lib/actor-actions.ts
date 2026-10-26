@@ -1,7 +1,8 @@
 "use server";
 
 // Server actions паспорта субъекта (только admin): привязать алиас к
-// персоне — существующей или новой — и закрыть алиас (valid_to = сейчас).
+// персоне — существующей или новой, закрыть алиас (valid_to = сейчас) и
+// подтвердить алиас, удержанный политикой идентичности (confidence = 1).
 // Запись идёт в argus.identities / argus.identity_aliases с source=api.
 // Журнал console_audit обязателен и пишется ДО изменения (strict): нет
 // журнала — нет изменения; провал записи — вторая запись *.failed.
@@ -9,7 +10,7 @@ import { revalidatePath } from "next/cache";
 import { authorize } from "./auth";
 import type { FormState } from "./actions";
 import { audit } from "./argus-queries";
-import { bindAlias, closeAlias, getPerson } from "./actors";
+import { bindAlias, closeAlias, confirmAlias, getPerson } from "./actors";
 import { isAliasKind, parseAliasInput, PERSON_ID_RE, TEXT_MAX, type Person } from "./shared/actors";
 
 export type BindAliasState = FormState & { person_id?: string };
@@ -98,6 +99,34 @@ export async function closeAliasAction(formData: FormData): Promise<FormState> {
   } catch (err) {
     await audit(a.session.user, "identity.alias.close.failed", personId, `${kind} = ${value}: ${err instanceof Error ? err.message : "ошибка"}`);
     return { error: shortError("identity.alias.close", err) };
+  }
+  refreshActors(personId);
+  return { error: null, ok: true };
+}
+
+/** Подтвердить удержанный алиас: person_id, kind, value → confidence = 1 новой версией строки. */
+export async function confirmAliasAction(formData: FormData): Promise<FormState> {
+  const a = await authorize("admin");
+  if (!a.ok) return { error: a.error };
+  const personId = String(formData.get("person_id") ?? "");
+  const kind = String(formData.get("kind") ?? "");
+  const value = String(formData.get("value") ?? "").trim();
+  if (!PERSON_ID_RE.test(personId)) return { error: "Некорректный идентификатор персоны" };
+  if (!isAliasKind(kind) || !value) return { error: "Укажите вид и значение алиаса" };
+  try {
+    await audit(a.session.user, "identity.alias.confirm", personId, `${kind} = ${value}`, { strict: true });
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : "журнал действий недоступен" };
+  }
+  try {
+    const n = await confirmAlias(personId, kind, value);
+    if (n === 0) {
+      await audit(a.session.user, "identity.alias.confirm.failed", personId, `${kind} = ${value}: удержанного алиаса нет`);
+      return { error: "Удержанного алиаса с таким значением нет" };
+    }
+  } catch (err) {
+    await audit(a.session.user, "identity.alias.confirm.failed", personId, `${kind} = ${value}: ${err instanceof Error ? err.message : "ошибка"}`);
+    return { error: shortError("identity.alias.confirm", err) };
   }
   refreshActors(personId);
   return { error: null, ok: true };

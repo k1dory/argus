@@ -115,7 +115,9 @@ jobs:
         run: docker build -q --build-context triage=./triage -t argus-ci/mcp:check ./mcp
 
   e2e:
-    # Полный контур в docker compose: replay → инциденты и вердикты. Требует docker на раннере.
+    # Полный контур в docker compose: replay → инциденты и вердикты, argus_ro только читает,
+    # затем API-смоук консоли (scripts/api-smoke.sh: приём → журнал → сессия разбора → вердикт →
+    # паспорт). Требует docker, curl и jq на раннере (ubuntu-latest — есть).
     runs-on: ubuntu-latest
     needs: [go, rules, web]
     if: github.event_name == 'push'

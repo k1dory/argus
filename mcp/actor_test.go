@@ -15,7 +15,8 @@ const actorBody = `{"person":{"person_id":"i.petrov","display":"Иван Пет�
  "aliases":[{"kind":"email","value":"i.petrov@example.org","valid_from":"1970-01-01T00:00:00Z","valid_to":null,"source":"yaml","confidence":1},
             {"kind":"login","value":"ipetrov","valid_from":"1970-01-01T00:00:00Z","valid_to":null,"source":"event:idp.example","confidence":1},
             {"kind":"ip","value":"10.77.0.42","valid_from":"2026-10-15T09:00:00Z","valid_to":null,"source":"event:vpn.example","confidence":1},
-            {"kind":"host","value":"ws-petrov","valid_from":"1970-01-01T00:00:00Z","valid_to":"2026-10-01T00:00:00Z","source":"api","confidence":0.9}],
+            {"kind":"host","value":"ws-petrov","valid_from":"1970-01-01T00:00:00Z","valid_to":"2026-10-01T00:00:00Z","source":"api","confidence":0.9},
+            {"kind":"phone","value":"+74951234567","valid_from":"1970-01-01T00:00:00Z","valid_to":null,"source":"event:otp.example","confidence":1}],
  "range":{"from":"2026-10-17T10:00:00Z","to":"2026-10-24T10:00:00Z","key":"7d"},
  "summary":{"events":12,"by_source_class":{"identity":4,"syslog":6,"netflow":2},
    "nodes":[{"node":"web-01","count":5,"first_ts":"2026-10-18 20:00:00","last_ts":"2026-10-18 20:01:00"},{"node":"db-01","count":2},{"node":"ws-petrov","count":1}],
@@ -45,7 +46,7 @@ func TestGetActorFullByAlias(t *testing.T) {
 	if q.Get("range") != "7d" || q.Get("limit") != "100" {
 		t.Errorf("параметры паспорта по умолчанию: %v", q)
 	}
-	for _, want := range []string{`"person_id":"i.petrov"`, "Иван Петров", `"value":"10.77.0.42"`, `"node":"ws-petrov"`, `"ambiguous"`, `"sources"`, `"missing":["incidents"]`, "INC-7", `"timeline"`, `"internal_column":"x"`} {
+	for _, want := range []string{`"person_id":"i.petrov"`, "Иван Петров", `"value":"10.77.0.42"`, `"value":"+74951234567"`, `"node":"ws-petrov"`, `"ambiguous"`, `"sources"`, `"missing":["incidents"]`, "INC-7", `"timeline"`, `"internal_column":"x"`} {
 		if !strings.Contains(out, want) {
 			t.Errorf("нет %q:\n%s", want, out)
 		}
@@ -131,7 +132,10 @@ func TestGetActorTriage(t *testing.T) {
 		t.Errorf("паспорт не запрошен: %v", q)
 	}
 	assertNoLeak(t, "triage get_actor", out, "i.petrov", "ipetrov", "Петров", "Иван", piiPhone, canary, "ws-petrov",
-		`"internal_column"`, "Иванов", "4510 123456", "project_7_bot")
+		`"internal_column"`, "Иванов", "4510 123456", "project_7_bot", "+74951234567", "74951234567")
+	if !regexp.MustCompile(`"kind":"phone"[^}]*"value":"subj-`).MatchString(out) {
+		t.Errorf("телефон — учётка субъекта, должен стать псевдонимом:\n%s", out)
+	}
 	for _, want := range []string{`"value":"10.77.0.42"`, `"ambiguous":[{"kind":"ip","value":"10.77.0.42"},{"kind":"login","value":"subj-`, `"source":"idp.example"`, `"missing":["incidents"]`, `"key":"7d"`, "web-01", "db-01", "INC-7", `"team":"platform"`, piiMasked, "203.0.113.9"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("нет %q:\n%s", want, out)

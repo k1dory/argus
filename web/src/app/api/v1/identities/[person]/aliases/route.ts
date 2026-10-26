@@ -2,7 +2,7 @@ import { apiGuard } from "@/lib/auth";
 import { audit } from "@/lib/argus-queries";
 import { closeAlias } from "@/lib/actors";
 import { identitiesWriteForbidden } from "@/lib/actors-access";
-import { ALIAS_VALUE_MAX, isAliasKind, PERSON_ID_RE } from "@/lib/shared/actors";
+import { ALIAS_KINDS, ALIAS_VALUE_MAX, isAliasKind, PERSON_ID_RE } from "@/lib/shared/actors";
 
 // DELETE /api/v1/identities/{person}/aliases?kind=&value= — закрыть алиас:
 // действующая версия получает valid_to = сейчас (новая строка, история
@@ -19,7 +19,7 @@ export async function DELETE(req: Request, ctx: { params: Promise<{ person: stri
   const sp = new URL(req.url).searchParams;
   const kind = sp.get("kind") ?? "";
   const value = (sp.get("value") ?? "").trim();
-  if (!isAliasKind(kind)) return Response.json({ error: "invalid_value", detail: "kind: email|login|uid|ip|host|sid|peer" }, { status: 400 });
+  if (!isAliasKind(kind)) return Response.json({ error: "invalid_value", detail: `kind: ${ALIAS_KINDS.join("|")}` }, { status: 400 });
   if (!value || value.length > ALIAS_VALUE_MAX) return Response.json({ error: "invalid_value", detail: `value: непустое значение до ${ALIAS_VALUE_MAX} символов` }, { status: 400 });
   // Журнал — до изменения (strict): без записи алиас не закрывается.
   try {

@@ -10,14 +10,36 @@ import { RANGES } from "./ranges";
 import { literal } from "./incident-wiki";
 import { termToString } from "./search-query";
 
-export const ALIAS_KINDS = ["email", "login", "uid", "ip", "host", "sid", "peer"] as const;
+export const ALIAS_KINDS = ["email", "login", "uid", "ip", "host", "sid", "peer", "phone"] as const;
 export type AliasKind = (typeof ALIAS_KINDS)[number];
 export const isAliasKind = (x: unknown): x is AliasKind => typeof x === "string" && (ALIAS_KINDS as readonly string[]).includes(x);
 
 /** Виды алиасов, сравниваемые без учёта регистра (хранятся в нижнем). */
 export const LOWERCASE_KINDS: readonly AliasKind[] = ["email", "login", "host"];
 /** Виды, значения которых ищутся в actor_name событий и инцидентов. */
-export const ACTOR_KINDS: readonly AliasKind[] = ["email", "login", "uid", "sid", "peer"];
+export const ACTOR_KINDS: readonly AliasKind[] = ["email", "login", "uid", "sid", "peer", "phone"];
+
+/* ===== Алиасы «на удержании» =====
+ * Движок при нарушении политики идентичности (слишком много логинов у одной
+ * персоны за окно и т. п.) не отбрасывает алиас, а записывает его с
+ * confidence < HOLD_CONFIDENCE и note вида «policy:hold:<политика>». Такой
+ * алиас виден в паспорте с пометкой, но в сшивке событий, резолве и подсчётах
+ * не участвует, пока администратор его не подтвердит (confidence = 1). */
+export const HOLD_CONFIDENCE = 0.5;
+export const HOLD_NOTE_PREFIX = "policy:hold:";
+/** Пометка подтверждённого алиаса: тот же текст политики, другой префикс. */
+export const CONFIRMED_NOTE_PREFIX = "policy:confirmed:";
+
+export const isHeld = (a: Pick<Alias, "confidence">): boolean => a.confidence < HOLD_CONFIDENCE;
+
+/** Текст политики из note удержанного алиаса (без префикса); null — пометки нет. */
+export function holdPolicy(a: Pick<Alias, "confidence" | "note">): string | null {
+  if (!isHeld(a)) return null;
+  return a.note.startsWith(HOLD_NOTE_PREFIX) ? a.note.slice(HOLD_NOTE_PREFIX.length) : a.note || null;
+}
+
+/** Алиасы, участвующие в сшивке: без удержанных. */
+export const activeAliases = <T extends Pick<Alias, "confidence">>(aliases: T[]): T[] => aliases.filter((a) => !isHeld(a));
 
 export const PERSON_ID_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 export const PERSON_KINDS = ["person", "service"] as const;
@@ -67,12 +89,29 @@ export function compareValue(a: Pick<Alias, "kind" | "value">): string {
 export const aliasKey = (a: Pick<Alias, "kind" | "value">): string => `${aliasColumn(a.kind)}\u0000${compareValue(a)}`;
 
 /** Нормализация значения алиаса, как у движка: email/login/host — нижний
- *  регистр и обрезка пробелов; ip — каноническая форма адреса (если разобрался). */
+ *  регистр и обрезка пробелов; ip — каноническая форма адреса (если разобрался);
+ *  phone — E.164 без пробелов, дефисов и скобок (если разобрался). */
 export function normalizeAliasValue(kind: AliasKind, value: string): string {
   const v = value.trim();
   if (kind === "ip") return canonicalIp(v) ?? v;
+  if (kind === "phone") return canonicalPhone(v) ?? v;
   return LOWERCASE_KINDS.includes(kind) ? v.toLowerCase() : v;
 }
+
+const PHONE_RE = /^\+\d{8,15}$/;
+
+/**
+ * Каноническая форма телефона — E.164: ведущий «+» и 8–15 цифр. Пробелы,
+ * дефисы, точки и скобки отбрасываются («+7 (999) 123-45-67» → «+79991234567»);
+ * номер без «+» (8999…, 00…) — не телефон: страна неизвестна. null — не разобрать.
+ * Сравнивается с actor_name точно, регистр не приводится.
+ */
+export function canonicalPhone(input: string): string | null {
+  const s = input.trim().replace(/[\s\-().]/g, "");
+  return PHONE_RE.test(s) ? s : null;
+}
+
+export const isPhone = (v: string): boolean => canonicalPhone(v) !== null;
 
 const V4_RE = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
 
@@ -208,6 +247,7 @@ export function aliasInterval(a: Pick<Alias, "valid_from" | "valid_to">, w: Wind
  * Предикат выборки событий персоны: по каждому алиасу — его колонка и его
  * интервал действия внутри окна (открытый valid_to — до конца окна), всё
  * нумерованными параметрами как в buildLogSql. Без алиасов в окне — «0».
+ * Удержанные алиасы (confidence < HOLD_CONFIDENCE) пропускаются.
  * prefix — чтобы два предиката в одном запросе не делили имена параметров;
  * tsColumn — колонка времени (first_ts для инцидентов).
  */
@@ -217,6 +257,7 @@ export function aliasPredicate(aliases: Alias[], window: Window, prefix = "", ts
   const parts: string[] = [];
   let i = 0;
   for (const a of aliases) {
+    if (isHeld(a)) continue; // удержанный алиас не сшивает события
     const iv = aliasInterval(a, w);
     if (!iv) continue;
     const an = `${prefix}a${i}`, fn = `${prefix}f${i}`, tn = `${prefix}t${i}`;
@@ -241,11 +282,12 @@ export function aliasMatches(a: Pick<Alias, "kind" | "value">, raw: string): boo
   return a.value === normalizeAliasValue(a.kind, raw);
 }
 
-/** Пары (вид, значение), которые внутри окна действуют у двух и более персон. */
+/** Пары (вид, значение), которые внутри окна действуют у двух и более персон.
+ *  Удержанные алиасы не сшивают события и неоднозначности не создают. */
 export function ambiguousAliases(all: Alias[], window: Window): Set<string> {
   const byKey = new Map<string, Alias[]>();
   for (const a of all) {
-    if (!aliasInterval(a, window)) continue;
+    if (isHeld(a) || !aliasInterval(a, window)) continue;
     const key = aliasKey(a);
     byKey.set(key, [...(byKey.get(key) ?? []), a]);
   }
@@ -286,11 +328,13 @@ const SU_RE = /(^|[._-])su($|[._-])/;
  * Раздел паспорта по единой схеме события — без знания вендоров: входы по
  * auth./login/logon/sshd, сеансы и привилегии по priv./sudo/su/session., сеть
  * по классу источника netflow/ngfw или net., приложения по app./authorize/oauth,
- * изменения — create|update|delete|change|modify с успешным исходом.
+ * изменения — identity.* (алиасы, нарушения политики идентичности — независимо
+ * от исхода) и create|update|delete|change|modify с успешным исходом.
  */
 export function classifyEvent(action: string, outcome: string, sourceClass = ""): Section {
   const a = action.toLowerCase();
   if (a.startsWith("auth.") || a.includes("login") || a.includes("logon") || a.includes("sshd")) return "login";
+  if (a.startsWith("identity.")) return "change";
   const sc = sourceClass.toLowerCase();
   if (sc === "netflow" || sc === "ngfw" || a.startsWith("net.")) return "network";
   if (a.startsWith("priv.") || a.includes("sudo") || SU_RE.test(a) || a.startsWith("session.")) return "host";
@@ -320,9 +364,11 @@ export function aliasEventsHref(a: Pick<Alias, "kind" | "value">, range: ActorRa
   return `/events?q=${encodeURIComponent(aliasEventsQuery(a))}&range=${range}`;
 }
 
-const PRIMARY_ORDER: AliasKind[] = ["login", "uid", "email", "sid", "peer", "host", "ip"];
+const PRIMARY_ORDER: AliasKind[] = ["login", "uid", "email", "sid", "peer", "phone", "host", "ip"];
 
-export function primaryAlias(aliases: Alias[]): Alias | null {
+/** Основной алиас для ссылки в журнал: действующий прежде закрытого, удержанные не берутся. */
+export function primaryAlias(all: Alias[]): Alias | null {
+  const aliases = activeAliases(all);
   for (const k of PRIMARY_ORDER) {
     const a = aliases.find((x) => x.kind === k && x.valid_to === null) ?? aliases.find((x) => x.kind === k);
     if (a) return a;
@@ -409,6 +455,7 @@ export function parseAliasInput(raw: unknown): AliasInputParse {
   const value0 = str(a.value, ALIAS_VALUE_MAX);
   if (!value0) return bad("value", `непустая строка до ${ALIAS_VALUE_MAX} символов`);
   if (kind === "ip" && !isIp(value0)) return bad("value", "ожидается IPv4 или IPv6");
+  if (kind === "phone" && !isPhone(value0)) return bad("value", "ожидается телефон E.164: «+» и 8–15 цифр");
   const value = normalizeAliasValue(kind, value0);
   if (kind === "email" && !/^[^\s@]+@[^\s@]+$/.test(value)) return bad("value", "ожидается адрес вида user@domain");
   if (/\s/.test(value)) return bad("value", "без пробелов");
@@ -484,7 +531,8 @@ export function actorMarkdown(r: ActorReport): string {
     lines.push("| Вид | Значение | Действует с | По | Источник | Уверенность |", "|---|---|---|---|---|---|");
     for (const a of r.aliases) {
       const amb = r.ambiguous.includes(aliasKey(a)) ? " (неоднозначно)" : "";
-      lines.push(`| ${literal(a.kind)} | ${literal(a.value)}${amb} | ${literal(a.valid_from)} | ${a.valid_to ? literal(a.valid_to) : "действует"} | ${literal(a.source)} | ${literal(String(a.confidence))} |`);
+      const hold = isHeld(a) ? ` (на удержании: ${literal(holdPolicy(a) ?? "политика идентичности")})` : "";
+      lines.push(`| ${literal(a.kind)} | ${literal(a.value)}${amb}${hold} | ${literal(a.valid_from)} | ${a.valid_to ? literal(a.valid_to) : "действует"} | ${literal(a.source)} | ${literal(String(a.confidence))} |`);
     }
   }
   lines.push("", "## Источники данных и их период", "");
@@ -520,5 +568,6 @@ export function actorMarkdown(r: ActorReport): string {
     `- Разделы «Входы» … «Изменения» построены по последним ${r.limit} событиям окна, сводка — по всем.`,
   );
   if (r.ambiguous.length) lines.push("- Алиасы с пометкой «неоднозначно» в окне делятся с другой персоной: их события могут быть не этого субъекта.");
+  if (r.aliases.some(isHeld)) lines.push("- Алиасы «на удержании» (нарушение политики идентичности) в сшивку не входят: их события в паспорте не учтены, пока администратор не подтвердит алиас.");
   return lines.join("\n").trimEnd() + "\n";
 }

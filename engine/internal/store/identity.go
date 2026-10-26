@@ -269,6 +269,13 @@ func (c *ClickHouse) AliasesBySource(ctx context.Context, source string) ([]iden
 	return res, nil
 }
 
+// AliasesByPerson — неудалённые алиасы персоны данного вида, открытые и
+// закрытые (последние версии): состояние для политик алиасов.
+func (c *ClickHouse) AliasesByPerson(ctx context.Context, person, kind string) ([]identity.Alias, error) {
+	return c.aliasSelect(ctx, "person_id = {person:String} AND alias_kind = {kind:String}",
+		map[string]string{"person": person, "kind": kind})
+}
+
 // KnownPersons — какие из идентификаторов заведены и не удалены.
 func (c *ClickHouse) KnownPersons(ctx context.Context, ids []string) (map[string]bool, error) {
 	res := map[string]bool{}

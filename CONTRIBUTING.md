@@ -40,11 +40,15 @@ make check
 make lint
 ```
 
-Для консоли: `cd web && npm test && npm run lint && npm run typecheck`.
-Для LLM-аналитика: `cd analyst && npm test`.
-Для конкретного Go-модуля: `cd collector && go test ./...` (аналогично
-`engine`, `policyd`, `mcp`). CI дополнительно собирает образы и запускает
-сквозной сценарий.
+Для консоли: `cd web && npm test && npm run lint && npm run typecheck`; тест живого
+ClickHouse (`tests/triage-claim-ch.test.ts`) выполняется при заданном
+`ARGUS_TEST_CLICKHOUSE_URL`, иначе пропускается. Для конкретного Go-модуля:
+`cd collector && go test ./...` (аналогично `engine`, `policyd`, `mcp`, `triage`).
+Правила — `./scripts/argus rules test`. На живом стенде (`make up-dev && make demo`) —
+`./scripts/api-smoke.sh`: контракты API консоли для агентов. CI дополнительно
+собирает образы и на push в `main` гоняет `./scripts/e2e.sh` (стек с нуля, replay,
+инциденты, тот же смоук). Слои тестов описаны в README, раздел «Тесты»; изменение
+маршрута `/api/*` сопровождайте правкой `api/openapi.yaml`.
 
 ## Совместимость
 

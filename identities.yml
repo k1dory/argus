@@ -7,8 +7,27 @@
 #
 # Алиас действует на событие, если from <= ts < to. Нет from — действует
 # всегда; нет to — по сей день. Даты: YYYY-MM-DD или RFC3339 (UTC).
-# kind: email | login | uid | ip | host | sid | peer; email/login/host
-# приводятся к нижнему регистру, ip — к канонической записи.
+# kind: email | login | uid | ip | host | sid | peer | phone; email/login/host
+# приводятся к нижнему регистру, ip — к канонической записи, phone — к E.164
+# («+7 (999) 123-45-67» → «+79991234567»: обязателен «+» и 8–15 цифр).
+# Номер телефона — actor_name событий OTP-шлюзов и телефонии, как login и uid.
+#
+# policies — ограничения на алиасы, которые приходят СОБЫТИЯМИ identity.alias
+# (source = event:<источник>). Файл и API консоли пишет администратор, к ним
+# политики не применяются. Ключ — вид алиаса; вид без политики не ограничен.
+#   sources      — глобы допустимых источников событий (сравнение с event:<source>,
+#                  префикс event: в глобе необязателен); нет ключа — любой источник,
+#                  пустой список [] — событиям алиасы этого вида запрещены.
+#   max_open     — не больше одновременно действующих (без to) алиасов вида у персоны.
+#   churn        — не больше max новых интервалов вида у персоны за window
+#                  (24h, 30d, 2w; считается входящий; граница окна — вне окна).
+#   on_violation — flag (записать, note с префиксом policy:<rule>, по умолчанию),
+#                  hold (записать с confidence 0.3 и note policy:hold:<rule> — консоль
+#                  показывает, но в склейке не участвует), reject (не записывать).
+# Каждое нарушение — событие source argus.identity / action identity.policy.violation
+# в журнале (actor_name — персона, object — вид:значение, attrs.rule — sources |
+# max_open | churn), по нему работают rules/ops/identity-*.yml. Повтор уже
+# известного интервала (тот же вид, значение, from) нарушением не считается.
 #
 # Пример согласован с cmdb.yml (владельцы узлов) и fixtures/events/identity.ndjson.
 # История адреса 10.77.0.42, который перешёл от a.sidorov к i.petrov, в файле
@@ -23,6 +42,7 @@ persons:
       - {kind: email, value: i.petrov@example.org}
       - {kind: login, value: ipetrov}
       - {kind: uid, value: "1001", note: "идентификатор в IdP"}
+      - {kind: phone, value: "+7 (999) 123-45-67", note: "рабочий, OTP"}
       - {kind: ip, value: 10.77.0.11, note: "ноутбук, постоянный адрес VPN"}
   a.sidorov:
     display: "Алексей Сидоров"
@@ -40,3 +60,12 @@ persons:
       - {kind: login, value: sivanova}
       - {kind: uid, value: "1003"}
       - {kind: ip, value: 10.77.0.31}
+
+# Пределы согласованы с fixtures/events/identity.ndjson: у i.petrov три открытых
+# ip (10.77.0.11 из файла и из события — разные from — и 10.77.0.42), поэтому
+# max_open для ip — 3. Нарушения демонстрирует fixtures/events/identity-policy.ndjson.
+policies:
+  ip:    { sources: ["event:vpn.*"], max_open: 3, churn: { max: 20, window: 24h }, on_violation: flag }
+  host:  { sources: ["event:mdm.*"], max_open: 1, churn: { max: 1, window: 30d }, on_violation: hold }
+  email: { sources: ["event:idp.*"], churn: { max: 1, window: 90d }, on_violation: reject }
+  phone: { sources: ["event:idp.*", "event:otp.*"], max_open: 2, on_violation: flag }

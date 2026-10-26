@@ -13,7 +13,7 @@ import { apiGuard, outOfScope, type Session } from "./auth";
 import { audit, incidentGet } from "./argus-queries";
 import { actorReport, getPerson, personAliases } from "./actors";
 import { actorApiForbidden } from "./actors-access";
-import { ACTOR_KINDS, aliasInterval, aliasMatches, parseActorsParams, PERSON_ID_RE, rangeWindow, tsMs, type ActorReport, type Alias } from "./shared/actors";
+import { ACTOR_KINDS, aliasInterval, aliasMatches, isHeld, parseActorsParams, PERSON_ID_RE, rangeWindow, tsMs, type ActorReport, type Alias } from "./shared/actors";
 import type { TriageEntityKind, TriageScope } from "./shared/triage";
 
 export type ActorApiResult = { ok: true; report: ActorReport; session: Session } | { ok: false; response: Response };
@@ -48,8 +48,8 @@ export async function actorApi(req: Request, id: string, action: "actor.view" | 
       const inc = await incidentGet(scope.incidentId);
       if (!inc) return { ok: false, response: outOfScope("инцидент сессии разбора не найден") };
       const incWindow = { fromMs: tsMs(inc.first_ts) ?? 0, toMs: (tsMs(inc.last_ts) ?? tsMs(inc.first_ts) ?? 0) + 1 };
-      // Субъект инцидента — субъектный алиас из области, действовавший в момент инцидента.
-      const own = allAliases.some((a) => ACTOR_KINDS.includes(a.kind) && scopedAlias(scope, a) && aliasInterval(a, incWindow) !== null);
+      // Субъект инцидента — субъектный алиас из области (не удержанный), действовавший в момент инцидента.
+      const own = allAliases.some((a) => ACTOR_KINDS.includes(a.kind) && !isHeld(a) && scopedAlias(scope, a) && aliasInterval(a, incWindow) !== null);
       if (!own) return { ok: false, response: outOfScope("персона не является субъектом инцидента сессии разбора") };
       aliases = allAliases.filter((a) => scopedAlias(scope, a));
       subject = { ...person, team: "", note: "" };

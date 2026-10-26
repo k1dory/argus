@@ -220,8 +220,10 @@ func (p *profile) pretriage(v any) {
 			}
 		}
 	}
-	// Паспорт субъекта: значения алиасов-учёток — псевдонимы субъекта, имена
-	// узлов — как узлы; адреса остаются (как src_ip в событиях).
+	// Паспорт субъекта: значения алиасов-учёток (email, login, uid, sid, peer,
+	// phone — номер телефона тоже идентифицирует человека) — псевдонимы
+	// субъекта, имена узлов — как узлы; адреса остаются (как src_ip в
+	// событиях). Неизвестный вид — по умолчанию субъект: безопаснее скрыть.
 	for _, list := range []string{"aliases", "ambiguous"} {
 		aliases, ok := m[list].([]any)
 		if !ok {
@@ -240,6 +242,8 @@ func (p *profile) pretriage(v any) {
 			case "ip":
 			case "host":
 				am["value"] = p.red.Host(v)
+			case "email", "login", "uid", "sid", "peer", "phone":
+				am["value"] = p.red.Subject(v)
 			default:
 				am["value"] = p.red.Subject(v)
 			}

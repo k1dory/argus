@@ -7,8 +7,9 @@ import { parseIdentitiesDoc } from "@/lib/shared/actors";
 // PUT /api/v1/identities — upsert персон и алиасов в форме identities.yml (JSON):
 // {"persons":{"<id>":{"display","kind","team","note","aliases":[{"kind","value",
 // "from","to","confidence","note"}]}}}. Проверка как у файла: person_id по
-// ^[a-z0-9][a-z0-9._-]{0,63}$, kind ∈ email|login|uid|ip|host|sid|peer, адрес
-// разбирается, email/login/host — в нижний регистр, даты YYYY-MM-DD или RFC 3339.
+// ^[a-z0-9][a-z0-9._-]{0,63}$, kind ∈ email|login|uid|ip|host|sid|peer|phone, адрес
+// разбирается, телефон — E.164 («+» и 8–15 цифр), email/login/host — в нижний
+// регистр, даты YYYY-MM-DD или RFC 3339.
 // 200 {"persons":n,"aliases":n}; 422 {"error":"invalid_value","path","detail"}.
 // Доступ: bearer ARGUS_API_TOKEN или администратор консоли. Запись — source=api.
 // Журнал действий обязателен: identity.import пишется ДО изменения (нет журнала

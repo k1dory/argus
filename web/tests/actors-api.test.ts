@@ -23,6 +23,7 @@ const reportRoute = require("../src/app/api/v1/actors/[id]/report/route") as Rou
 const identitiesRoute = require("../src/app/api/v1/identities/route") as Route;
 const aliasesRoute = require("../src/app/api/v1/identities/[person]/aliases/route") as Route;
 const sessionsRoute = require("../src/app/api/triage/sessions/route") as Route;
+const actions = require("../src/lib/actor-actions") as typeof import("../src/lib/actor-actions");
 /* eslint-enable @typescript-eslint/no-require-imports */
 
 /* ===== Поддельный ClickHouse поверх fetch ===== */
@@ -41,6 +42,9 @@ const ALIASES = [
   // Тот же логин второй строкой из события — в резолве персона одна.
   { person_id: "i.petrov", alias_kind: "login", alias_value: "project_7_bot", valid_from: "2026-10-05 00:00:00.000", valid_to_raw: null, source: "event:idp", confidence: 1, note: "" },
   { person_id: "early", alias_kind: "login", alias_value: "project_7_bot", valid_from: "2026-09-01 00:00:00.000", valid_to_raw: "2026-10-05 00:00:00.000", source: "yaml", confidence: 1, note: "" },
+  // Удержан политикой идентичности движка: виден в паспорте, но не сшивает события и не резолвит персону.
+  { person_id: "i.petrov", alias_kind: "login", alias_value: "held_bot", valid_from: "2026-10-01 00:00:00.000", valid_to_raw: null, source: "event:idp", confidence: 0.3, note: "policy:hold:max_logins" },
+  { person_id: "a.sidorov", alias_kind: "phone", alias_value: "+79991234567", valid_from: "2026-10-01 00:00:00.000", valid_to_raw: null, source: "yaml", confidence: 1, note: "" },
 ];
 const EVENTS = [
   { ts: "2026-10-24 11:00:00.000", source: "idp.example", source_class: "identity", action: "auth.login", outcome: "success", severity: 2, actor_name: "project_7_bot", actor_kind: "user", object: "portal", node: "web-01", session_id: "s1", src_ip: "10.0.0.9", dst_ip: "", value: 0, unit: "", attrs: {}, pii: 1 },
@@ -77,12 +81,13 @@ globalThis.fetch = (async (url: URL | string, init?: RequestInit) => {
   if (sql.includes("GROUP BY actor_name ORDER BY count")) return rows([{ actor_name: "nobody", count: "5", first_ts: "2026-10-24 00:00:00.000", last_ts: "2026-10-24 11:00:00.000", sources: ["x"] }]);
   if (p.has("param_lv")) {
     // Резолв (closeAlias тоже передаёт param_v, но без lv/at).
-    const v = p.get("param_v")!, lv = p.get("param_lv")!, at = p.get("param_at")!;
+    const v = p.get("param_v")!, lv = p.get("param_lv")!, pv = p.get("param_pv")!, at = p.get("param_at")!;
     // Как SQL: значение и действие алиаса в момент at (формат времени сортируется лексикографически).
-    return rows(ALIASES.filter((a) => (a.alias_value === v || a.alias_value === lv) && a.valid_from <= at && (a.valid_to_raw === null || at < a.valid_to_raw))
+    return rows(ALIASES.filter((a) => (a.alias_value === v || a.alias_value === lv || a.alias_value === pv) && a.valid_from <= at && (a.valid_to_raw === null || at < a.valid_to_raw))
       .map((a) => ({ ...a, display: PERSONS.find((x) => x.person_id === a.person_id)?.display ?? "", kind: "person" })));
   }
-  if (sql.includes("FROM identity_aliases")) return rows(p.has("param_id") ? ALIASES.filter((a) => a.person_id === p.get("param_id")) : ALIASES);
+  // Алиасы персоны; с param_k/param_v (closeAlias, confirmAlias) — только строки этого вида и значения.
+  if (sql.includes("FROM identity_aliases")) return rows(p.has("param_id") ? ALIASES.filter((a) => a.person_id === p.get("param_id") && (!p.has("param_k") || a.alias_kind === p.get("param_k")) && (!p.has("param_v") || a.alias_value === p.get("param_v"))) : ALIASES);
   if (sql.includes("FROM identities")) return rows(p.has("param_id") ? PERSONS.filter((x) => x.person_id === p.get("param_id")) : PERSONS);
   return rows([]);
 }) as typeof fetch;
@@ -134,9 +139,18 @@ test("резолв: токен API — unbound/resolved/ambiguous, 400 на му
   const ambBody = await amb.json();
   assert.equal(ambBody.status, "ambiguous");
   assert.deepEqual(ambBody.matches.map((m: { person_id: string }) => m.person_id).sort(), ["early", "i.petrov"], "кандидаты показаны явно, первый не выбран");
+  // Телефон — в канонической форме E.164: пробелы и скобки в запросе не мешают.
+  const phone = await resolveRoute.GET!(bearer("/api/v1/actors?alias=%2B7%20(999)%20123-45-67", API));
+  const phoneBody = await phone.json();
+  assert.equal(phoneBody.status, "resolved", JSON.stringify(phoneBody));
+  assert.equal(phoneBody.matches[0].person_id, "a.sidorov");
+  assert.equal(phoneBody.matches[0].alias_kind, "phone");
+  // Удержанный алиас персону не резолвит.
+  const held = await resolveRoute.GET!(bearer("/api/v1/actors?alias=held_bot", API));
+  assert.equal((await held.json()).status, "unbound", "алиас на удержании — не привязан");
   for (const bad of ["", "alias=", "alias=a%00b", "alias=x&at=yesterday", "alias=x&at=2026-10-24", `alias=${"a".repeat(300)}`]) assert.equal((await resolveRoute.GET!(bearer(`/api/v1/actors?${bad}`, API))).status, 400, bad);
   const audits = mocks.audit.slice(n).filter((a) => a.action === "actor.view");
-  assert.equal(audits.length, 4);
+  assert.equal(audits.length, 6);
   assert.equal(audits[0].user, "api-token");
   assert.equal(audits[0].target, "nobody");
   assert.equal((await resolveRoute.GET!(bearer("/api/v1/actors?alias=x", ISSUER))).status, 403, "issuer паспорта не читает");
@@ -148,7 +162,9 @@ test("паспорт: токен API — форма ответа, 404 на не�
   const body = await res.json();
   assert.equal(res.status, 200, JSON.stringify(body));
   assert.deepEqual(body.person, PERSONS[0]);
-  assert.deepEqual(body.aliases[0], { kind: "login", value: "project_7_bot", valid_from: "2026-10-01 00:00:00.000", valid_to: null, source: "yaml", confidence: 1 });
+  assert.deepEqual(body.aliases[0], { kind: "login", value: "project_7_bot", valid_from: "2026-10-01 00:00:00.000", valid_to: null, source: "yaml", confidence: 1, hold: false });
+  const heldAlias = body.aliases.find((a: { value: string }) => a.value === "held_bot");
+  assert.deepEqual(heldAlias, { kind: "login", value: "held_bot", valid_from: "2026-10-01 00:00:00.000", valid_to: null, source: "event:idp", confidence: 0.3, hold: true, policy: "max_logins" }, "удержанный алиас виден с пометкой");
   assert.equal(body.range.key, "24h");
   assert.match(body.range.from, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}$/);
   assert.deepEqual(body.summary.by_source_class, { identity: 1, syslog: 1 });
@@ -173,9 +189,11 @@ test("паспорт: токен API — форма ответа, 404 на не�
   assert.equal(tl.params.get("param_a0"), "project_7_bot");
   assert.ok(tl.sql.includes("(lowerUTF8(actor_name) = {a0:String}"), "login сравнивается без учёта регистра");
   assert.ok(!tl.sql.includes("src_ip = "), "ip-алиас закончился 2026-10-20 — вне окна 24h");
+  assert.ok(![...tl.params.values()].includes("held_bot"), "удержанный алиас в предикате событий не участвует");
   const incSql = calls.slice(from).find((c) => c.sql.includes("FROM incidents_current WHERE ("))!;
   assert.ok(incSql.sql.includes("lowerUTF8(actor_name) IN ({l0:String}, {l1:String})") && !incSql.sql.includes(" actor_name IN"), incSql.sql);
   assert.equal(incSql.params.get("param_l0"), "project_7_bot");
+  assert.ok(![...incSql.params.values()].includes("held_bot"), "удержанный алиас не ищет инциденты");
   assert.ok(!tl.sql.includes("actor_name IN"), "без сессии разбора привязки строк нет");
   assert.equal((await actorRoute.GET!(bearer("/api/v1/actors/nobody", API), ctx({ id: "nobody" }))).status, 404);
   assert.equal((await actorRoute.GET!(bearer("/api/v1/actors/i.petrov?range=1h", API), ctx({ id: "i.petrov" }))).status, 400);
@@ -374,7 +392,8 @@ test("список персон: каждая считается своим пр
   assert.equal(petrov.events, 2);
   assert.equal(petrov.incidents, 1);
   assert.equal(petrov.last_ts, "2026-10-24 11:00:00.000");
-  assert.equal(petrov.aliases, 3);
+  assert.equal(petrov.aliases, 4, "удержанный алиас в счётчике алиасов есть");
+  assert.ok(![...ev.params.values()].includes("held_bot"), "но в предикате активности его нет");
 });
 
 test("DELETE алиаса: valid_to = сейчас новой версией, 204; нет действующего — 404; роли", async () => {
@@ -385,11 +404,45 @@ test("DELETE алиаса: valid_to = сейчас новой версией, 20
   assert.ok(ins, "новая версия строки записана");
   assert.equal(ins.params.get("param_p0"), "i.petrov");
   assert.equal(ins.params.get("param_f0"), "2026-10-01 00:00:00.000", "тот же ключ строки (valid_from)");
-  assert.ok(ins.sql.includes("parseDateTime64BestEffort({at:String}, 3, 'UTC')"));
+  assert.match(ins.params.get("param_t0") ?? "", /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}$/, "valid_to = сейчас");
+  assert.ok(ins.sql.includes("parseDateTime64BestEffortOrNull({t0:String}, 3, 'UTC')"));
+  assert.equal(ins.params.get("param_c0"), "1", "уверенность не меняется");
   assert.equal(mocks.audit.at(-1)?.action, "identity.alias.close");
   assert.equal((await aliasesRoute.DELETE!(bearer("/api/v1/identities/nobody/aliases?kind=login&value=x", API, { method: "DELETE" }), ctx({ person: "nobody" }))).status, 404);
-  assert.equal((await aliasesRoute.DELETE!(bearer("/api/v1/identities/i.petrov/aliases?kind=phone&value=x", API, { method: "DELETE" }), ctx({ person: "i.petrov" }))).status, 400);
+  const badKind = await aliasesRoute.DELETE!(bearer("/api/v1/identities/i.petrov/aliases?kind=badge&value=x", API, { method: "DELETE" }), ctx({ person: "i.petrov" }));
+  assert.equal(badKind.status, 400);
+  assert.equal((await badKind.json()).detail, "kind: email|login|uid|ip|host|sid|peer|phone");
   await auth.createSession("analyst1", "analyst");
   assert.equal((await aliasesRoute.DELETE!(cookie("/api/v1/identities/i.petrov/aliases?kind=login&value=project_7_bot", { method: "DELETE" }), ctx({ person: "i.petrov" }))).status, 403);
+  mocks.jar.clear();
+});
+
+test("подтверждение удержанного алиаса (admin): confidence = 1 новой версией с тем же ключом, пометка policy:confirmed, аудит", async () => {
+  const fd = new FormData();
+  fd.set("person_id", "i.petrov"); fd.set("kind", "login"); fd.set("value", "held_bot");
+  await auth.createSession("analyst1", "analyst");
+  assert.match((await actions.confirmAliasAction(fd)).error ?? "", /Недостаточно прав/);
+  await auth.createSession("admin", "admin");
+  const from = since();
+  const n = mocks.audit.length;
+  assert.deepEqual(await actions.confirmAliasAction(fd), { error: null, ok: true });
+  const ins = calls.slice(from).filter((c) => c.sql.startsWith("INSERT INTO identity_aliases"));
+  assert.equal(ins.length, 1);
+  assert.equal(ins[0].params.get("param_p0"), "i.petrov");
+  assert.equal(ins[0].params.get("param_k0"), "login");
+  assert.equal(ins[0].params.get("param_v0"), "held_bot");
+  assert.equal(ins[0].params.get("param_f0"), "2026-10-01 00:00:00.000", "тот же ключ строки");
+  assert.equal(ins[0].params.get("param_t0"), "", "открытый valid_to сохраняется");
+  assert.equal(ins[0].params.get("param_c0"), "1");
+  assert.equal(ins[0].params.get("param_n0"), "policy:confirmed:max_logins");
+  assert.equal(ins[0].params.get("param_s0"), "event:idp", "источник строки не подменяется");
+  assert.ok(!ins[0].params.has("param_p1"), "только удержанные строки, остальные алиасы персоны не трогаются");
+  assert.deepEqual(mocks.audit.slice(n).map((a) => a.action), ["identity.alias.confirm"]);
+  assert.equal(mocks.audit.at(-1)?.detail, "login = held_bot");
+  // Не удержанный алиас подтверждать нечего: ошибка и запись о провале.
+  fd.set("value", "project_7_bot");
+  const n2 = mocks.audit.length;
+  assert.match((await actions.confirmAliasAction(fd)).error ?? "", /Удержанного алиаса/);
+  assert.deepEqual(mocks.audit.slice(n2).map((a) => a.action), ["identity.alias.confirm", "identity.alias.confirm.failed"]);
   mocks.jar.clear();
 });

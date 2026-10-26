@@ -15,6 +15,7 @@ type fakeStore struct {
 	persons map[string]Person
 	aliases map[string]Alias // Key() → последняя версия
 	deleted map[string]bool
+	events  []*model.Event // InsertEvents: события нарушений политик
 	calls   []string
 	fail    string // имя метода, который должен вернуть ошибку
 }
@@ -91,6 +92,29 @@ func (f *fakeStore) KnownPersons(_ context.Context, ids []string) (map[string]bo
 	return out, nil
 }
 
+func (f *fakeStore) AliasesByPerson(_ context.Context, person, kind string) ([]Alias, error) {
+	f.calls = append(f.calls, "AliasesByPerson")
+	if f.fail == "AliasesByPerson" {
+		return nil, errors.New("boom")
+	}
+	var out []Alias
+	for k, a := range f.aliases {
+		if !f.deleted[k] && a.PersonID == person && a.Kind == kind {
+			out = append(out, a)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeStore) InsertEvents(_ context.Context, events []*model.Event) error {
+	f.calls = append(f.calls, "InsertEvents")
+	if f.fail == "InsertEvents" {
+		return errors.New("boom")
+	}
+	f.events = append(f.events, events...)
+	return nil
+}
+
 func (f *fakeStore) alias(kind, value, person string) (Alias, bool) {
 	for k, a := range f.aliases {
 		if !f.deleted[k] && a.Kind == kind && a.Value == value && a.PersonID == person {
@@ -112,7 +136,14 @@ func TestNormalize(t *testing.T) {
 		{KindIP, "fe80::1%eth0", "fe80::1"},
 		{KindUID, " 4711 ", "4711"},
 		{KindSID, "S-1-5-21-1", "S-1-5-21-1"},
-		{"phone", "+7", ""},
+		{KindPhone, "+7 (999) 123-45-67", "+79991234567"},
+		{KindPhone, " +1-202-555-0143 ", "+12025550143"},
+		{KindPhone, "+7", ""},                     // мало цифр
+		{KindPhone, "79991234567", ""},            // без «+»
+		{KindPhone, "+0999123456", ""},            // ведущий ноль
+		{KindPhone, "+7999123456789012", ""},      // 16 цифр
+		{KindPhone, "+7 999 123 45 67 доб 1", ""}, // буквы
+		{"passport", "4510 123456", ""},           // неизвестный вид
 		{KindEmail, "petrov", ""},
 		{KindLogin, "", ""},
 		{KindLogin, "two words", ""},
@@ -196,7 +227,8 @@ func TestParseFileErrors(t *testing.T) {
 	cases := map[string]string{
 		"persons:\n  I.Petrov:\n    aliases: []\n":                                                   "persons.I.Petrov",
 		"persons:\n  a:\n    kind: robot\n":                                                          "persons.a.kind",
-		"persons:\n  a:\n    aliases: [{kind: phone, value: 1}]\n":                                   "aliases[0]",
+		"persons:\n  a:\n    aliases: [{kind: passport, value: 1}]\n":                                "aliases[0]",
+		"persons:\n  a:\n    aliases: [{kind: phone, value: 89991234567}]\n":                         "aliases[0]",
 		"persons:\n  a:\n    aliases: [{kind: ip, value: 10.0.0.300}]\n":                             "aliases[0]",
 		"persons:\n  a:\n    aliases: [{kind: login, value: x, from: вчера}]\n":                      "aliases[0].from",
 		"persons:\n  a:\n    aliases: [{kind: login, value: x, from: 2026-10-02, to: 2026-10-01}]\n": "aliases[0].to",

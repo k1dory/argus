@@ -1,0 +1,5 @@
+# i.petrov: ip от idp.example при sources ["event:vpn.*"] — одно нарушение, один инцидент.
+rule: a41c-ops-064
+fixture: fixtures/events/identity-policy.ndjson
+expect_incidents: 1
+expect_actor: i.petrov

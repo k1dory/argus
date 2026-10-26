@@ -1,0 +1,26 @@
+# Алиас пришёл от источника, которому политика вида не доверяет: identities.yml
+# → policies → sources перечисляет экспортеры, имеющие право выдавать алиасы
+# этого вида (адреса — VPN-контроллер, хосты — MDM), а движок записал нарушение
+# attrs.rule = sources. Чужой или подделанный экспортер, который привязывает
+# адреса к людям, подменяет паспорт субъекта — поэтому уровень high: инцидент
+# на персону, attrs.source — откуда пришло, attrs.action_taken — что сделал
+# движок (flag — записал с пометкой, hold — с низким доверием, reject — отбросил).
+title: "Ops: identity alias from untrusted source"
+id: a41c-ops-064
+level: high
+tags: [argus.identity, ops.identity]
+
+detection:
+  selection:
+    source: argus.identity
+    action: identity.policy.violation
+    attrs.rule: sources
+  threshold:
+    kind: count
+    count: 1
+    window: 1h
+    group_by: actor.name
+  condition: selection and threshold
+
+analyst:
+  profile: on-prem-strict

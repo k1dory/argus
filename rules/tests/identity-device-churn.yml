@@ -1,0 +1,7 @@
+# a.sidorov: три нарушения host (max_open + два churn) за утро — один инцидент на персону;
+# нарушение sources у i.petrov в это правило не попадает.
+rule: a41c-ops-063
+fixture: fixtures/events/identity-policy.ndjson
+expect_incidents: 1
+expect_actor: a.sidorov
+min_events: 3

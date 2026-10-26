@@ -1,0 +1,29 @@
+# Человек слишком часто меняет устройства или держит больше адресов и хостов,
+# чем положено: политика алиасов из identities.yml (policies → max_open, churn)
+# сработала на алиас из события, и движок записал нарушение в журнал
+# (source argus.identity, action identity.policy.violation, attrs.rule —
+# max_open | churn, attrs.policy — вид алиаса, object — вид:значение). Один
+# инцидент на персону за сутки: смена устройств — серия, а не единичный факт.
+# Что произошло — перевыдача, новый ноутбук, компрометация MDM — решает человек;
+# при on_violation hold алиас записан с confidence 0.3 и в склейке не участвует.
+title: "Ops: identity alias churn above policy"
+id: a41c-ops-063
+level: medium
+tags: [argus.identity, ops.identity]
+
+detection:
+  selection:
+    source: argus.identity
+    action: identity.policy.violation
+    attrs.rule: [churn, max_open]
+  threshold:
+    kind: count
+    count: 1
+    window: 24h
+    group_by: actor.name
+  condition: selection and threshold
+
+auto_close: 24h            # новых нарушений за сутки нет — закрываем сами
+
+analyst:
+  profile: on-prem-strict

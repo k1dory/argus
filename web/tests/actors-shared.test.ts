@@ -3,8 +3,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  actorMarkdown, aliasEventsQuery, aliasInterval, canonicalIp, aliasPredicate, ambiguousAliases, bucketEvents, classifyEvent, clampWindow, isIp, parseActorsParams, parseAliasInput, parseDateInput, parseIdentitiesDoc,
-  primaryAlias, rangeWindow, resolveStatus, aliasKey, type ActorReport, type Alias,
+  actorMarkdown, aliasEventsQuery, aliasInterval, canonicalIp, canonicalPhone, aliasPredicate, ambiguousAliases, bucketEvents, classifyEvent, clampWindow, holdPolicy, isHeld, isIp, isPhone, normalizeAliasValue, parseActorsParams, parseAliasInput, parseDateInput, parseIdentitiesDoc,
+  primaryAlias, rangeWindow, resolveStatus, aliasKey, aliasMatches, activeAliases, ACTOR_KINDS, type ActorReport, type Alias,
 } from "../src/lib/shared/actors";
 import { toLogItem } from "../src/lib/shared/log-query";
 
@@ -91,6 +91,8 @@ test("классификация событий — нейтральные ша�
     ["flow", "allow", "netflow", "network"], ["session.allow", "allow", "ngfw", "network"], ["net.connect", "deny", "edr", "network"],
     ["app.open", "success", "idp", "app"], ["oauth.token", "success", "idp", "app"], ["authorize.application", "success", "idp", "app"],
     ["rbac.change", "success", "k8s", "change"], ["user.delete", "success", "idp", "change"], ["user.delete", "failure", "idp", "other"],
+    // identity.* — всегда «Изменения», независимо от исхода: алиасы и нарушения политики идентичности движка.
+    ["identity.alias", "success", "identity", "change"], ["identity.policy.violation", "hold", "identity", "change"], ["identity.policy.violation", "", "", "change"],
     ["process.create", "success", "edr", "change"], ["issue.resolved", "success", "ci", "other"], ["result", "success", "x", "other"],
   ];
   for (const [action, outcome, cls, want] of cases) assert.equal(classifyEvent(action, outcome, cls), want, `${action}/${outcome}/${cls}`);
@@ -125,7 +127,8 @@ test("контракт identities: person_id, виды, адрес, нижний
     [{ persons: { x: { kind: "robot" } } }, "persons.x.kind"],
     [{ persons: { x: { aliases: [{ kind: "ip", value: "10.0.0.999" }] } } }, "persons.x.aliases[0].value"],
     [{ persons: { x: { aliases: [{ kind: "ip", value: "not-an-ip" }] } } }, "persons.x.aliases[0].value"],
-    [{ persons: { x: { aliases: [{ kind: "phone", value: "1" }] } } }, "persons.x.aliases[0].kind"],
+    [{ persons: { x: { aliases: [{ kind: "badge", value: "1" }] } } }, "persons.x.aliases[0].kind"],
+    [{ persons: { x: { aliases: [{ kind: "phone", value: "89991234567" }] } } }, "persons.x.aliases[0].value"],
     [{ persons: { x: { aliases: [{ kind: "login", value: "a", from: "вчера" }] } } }, "persons.x.aliases[0].from"],
     [{ persons: { x: { aliases: [{ kind: "login", value: "a", from: "2026-10-20", to: "2026-10-01" }] } } }, "persons.x.aliases[0].to"],
     [{ persons: { x: { aliases: [{ kind: "login", value: "a", confidence: 7 }] } } }, "persons.x.aliases[0].confidence"],
@@ -186,4 +189,62 @@ test("Markdown: значения экранированы, разделы на �
   assert.ok(md.includes("## Источники данных и их период") && md.includes("| idp\\.example | identity | 2 |"));
   assert.ok(md.includes("## Чего нет в данных") && md.includes("неоднозначно» в окне делятся"));
   assert.ok(!md.includes("\n# ") || md.indexOf("\n# ") === -1, "никакая строка данных не стала заголовком");
+});
+
+test("телефон: E.164 — «+» и 8–15 цифр, пробелы/дефисы/скобки отбрасываются, регистр не трогается, сравнение с actor_name точное", () => {
+  for (const [raw, want] of [
+    ["+7 (999) 123-45-67", "+79991234567"], ["+79991234567", "+79991234567"], ["+1 415-555-0100", "+14155550100"], [" +44.20.7946.0958 ", "+442079460958"], ["+12345678", "+12345678"], ["+123456789012345", "+123456789012345"],
+  ] as const) assert.equal(canonicalPhone(raw), want, raw);
+  for (const bad of ["89991234567", "0079991234567", "+1234567", "+1234567890123456", "+7 999 abc", "+", "", "7(999)1234567", "+7 999 123 45 67 ext 12"]) assert.equal(canonicalPhone(bad), null, bad);
+  assert.ok(isPhone("+7 999 123-45-67") && !isPhone("+1234567"));
+  assert.equal(normalizeAliasValue("phone", "+7 (999) 123-45-67"), "+79991234567");
+  assert.equal(normalizeAliasValue("phone", "not a phone"), "not a phone", "не разобрался — как есть, отказ даёт parseAliasInput");
+  const ok = parseAliasInput({ kind: "phone", value: "+7 (999) 123-45-67", note: "рабочий" });
+  assert.ok(ok.ok && ok.alias.value === "+79991234567" && ok.alias.kind === "phone");
+  const bad = parseAliasInput({ kind: "phone", value: "8 999 123-45-67" });
+  assert.ok(!bad.ok && bad.field === "value" && /E\.164/.test(bad.error));
+  const doc = parseIdentitiesDoc({ persons: { x: { aliases: [{ kind: "phone", value: "+7 999 123 45 67" }] } } });
+  assert.ok(doc.ok && doc.persons[0].aliases[0].value === "+79991234567");
+  // Телефон — субъектный вид: колонка actor_name, точное сравнение (без lowerUTF8), ключ неоднозначности по actor_name.
+  assert.ok(ACTOR_KINDS.includes("phone"));
+  const a = alias({ kind: "phone", value: "+79991234567" });
+  assert.equal(aliasKey(a), "actor_name\u0000+79991234567");
+  const w = { fromMs: NOW - 7 * DAY, toMs: NOW };
+  const pred = aliasPredicate([a], w);
+  assert.ok(pred.sql.startsWith("((actor_name = {a0:String}") && pred.params.a0 === "+79991234567", pred.sql);
+  assert.ok(aliasMatches(a, "+7 (999) 123-45-67") && !aliasMatches(a, "+79991234568"));
+  assert.equal(aliasEventsQuery(a), "actor:+79991234567", "кавычки — только где нужны");
+  assert.equal(primaryAlias([a, alias({ kind: "ip", value: "10.0.0.1" })])?.kind, "phone", "телефон — субъектный, впереди хоста и адреса");
+  assert.equal(primaryAlias([a, alias({ kind: "login", value: "x" })])?.kind, "login");
+});
+
+test("алиасы на удержании: confidence < 0.5 — видны, но не сшивают: предикат, неоднозначность, основной алиас, Markdown", () => {
+  const held = alias({ kind: "login", value: "held_bot", confidence: 0.3, note: "policy:hold:max_logins", source: "event:idp" });
+  const live = alias({ kind: "login", value: "ipetrov" });
+  assert.ok(isHeld(held) && !isHeld(live) && !isHeld(alias({ kind: "login", value: "x", confidence: 0.5 })), "порог — строго меньше 0.5");
+  assert.equal(holdPolicy(held), "max_logins");
+  assert.equal(holdPolicy(alias({ kind: "login", value: "x", confidence: 0.2, note: "" })), null, "удержан без пометки — политика неизвестна");
+  assert.equal(holdPolicy(alias({ kind: "login", value: "x", confidence: 0.2, note: "ручная заметка" })), "ручная заметка");
+  assert.equal(holdPolicy(live), null);
+  assert.deepEqual(activeAliases([held, live]), [live]);
+  const w = { fromMs: NOW - 7 * DAY, toMs: NOW };
+  const pred = aliasPredicate([held, live], w);
+  assert.equal(Object.keys(pred.params).length, 3, "удержанный алиас в предикат не попал, нумерация без дыр");
+  assert.equal(pred.params.a0, "ipetrov");
+  assert.deepEqual(aliasPredicate([held], w), { sql: "0", params: {} }, "только удержанные — ни одной строки");
+  // Удержанный алиас у второй персоны не делает значение неоднозначным.
+  const other = alias({ kind: "login", value: "ipetrov", person_id: "b", confidence: 0.1, note: "policy:hold:x" });
+  assert.equal(ambiguousAliases([live, other], w).size, 0);
+  assert.equal(primaryAlias([held])?.value, undefined, "ссылка в журнал — не по удержанному");
+  assert.equal(primaryAlias([held, alias({ kind: "ip", value: "10.0.0.5" })])?.kind, "ip");
+  const report: ActorReport = {
+    person: { person_id: "i.petrov", display: "Иван", kind: "person", team: "", note: "" },
+    aliases: [live, held], ambiguous: [],
+    range: { key: "7d", from: "2026-10-17 12:00:00.000", to: "2026-10-24 12:00:00.000" },
+    summary: { events: 0, by_source_class: {}, nodes: [], src_ips: [], incidents: 0 },
+    sources: [], sections: bucketEvents([]), incidents: [], timeline: [], limit: 200, missing: [], generated_at: "2026-10-24 12:00:00.000",
+  };
+  const md = actorMarkdown(report);
+  assert.ok(md.includes("| login | held\\_bot (на удержании: max\\_logins) | "), md);
+  assert.ok(md.includes("Алиасы «на удержании»"), "раздел «чего нет в данных» объясняет удержание");
 });
