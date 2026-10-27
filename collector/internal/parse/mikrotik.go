@@ -27,18 +27,40 @@ var (
 	mtFwAddrRe   = regexp.MustCompile(`(\d+\.\d+\.\d+\.\d+)(?::(\d+))?->(\d+\.\d+\.\d+\.\d+)(?::(\d+))?`)
 	mtFwLenRe    = regexp.MustCompile(`len (\d+)`)
 	mtDhcpAssign = regexp.MustCompile(`^(\S+) assigned (\d+\.\d+\.\d+\.\d+) (?:for|to) (\S+)(?: (\S+))?`)
-	mtDhcpFree   = regexp.MustCompile(`^(\S+) deassigned (\d+\.\d+\.\d+\.\d+) from (\S+)(?: (\S+))?`)
+	mtDhcpFree   = regexp.MustCompile(`^(\S+) deassigned (\d+\.\d+\.\d+\.\d+) (?:from|for) (\S+)(?: (\S+))?`)
 	mtChangedRe  = regexp.MustCompile(`changed by (\S+)`)
 )
 
-// ParseMikroTik распознаёт syslog RouterOS по списку топиков в начале сообщения.
+// mtKnownTopics — топики RouterOS; «a,b text» другого вендора сюда не попадает.
+var mtKnownTopics = map[string]bool{
+	"system": true, "firewall": true, "dhcp": true, "account": true, "info": true, "warning": true,
+	"error": true, "critical": true, "wireless": true, "interface": true, "dns": true, "ppp": true,
+	"l2tp": true, "ipsec": true, "ospf": true, "bgp": true, "route": true, "script": true,
+	"e-mail": true, "ntp": true, "web-proxy": true, "hotspot": true, "caps": true, "wireguard": true,
+}
+
+// ParseMikroTik распознаёт syslog RouterOS. С bsd-syslog=yes роутер шлёт тело
+// без списка топиков (уровень — в PRI), с bsd-syslog=no — «topics,level тело»;
+// поэтому сначала топики, а без них — характерные строки RouterOS: вход/выход,
+// аренды DHCP, журнал правил firewall, изменения конфигурации.
 func ParseMikroTik(sl Syslog) (model.Event, bool) {
-	m := mtTopicsRe.FindStringSubmatch(strings.TrimSpace(sl.Message))
-	if m == nil {
-		return model.Event{}, false
+	msg := strings.TrimSpace(sl.Message)
+	var topics []string
+	body := msg
+	if m := mtTopicsRe.FindStringSubmatch(msg); m != nil {
+		for _, t := range strings.Split(m[1], ",") {
+			if mtKnownTopics[strings.TrimPrefix(t, "!")] {
+				topics = strings.Split(m[1], ",")
+				body = strings.TrimSpace(m[2])
+				break
+			}
+		}
 	}
-	topics := strings.Split(m[1], ",")
-	body := strings.TrimSpace(m[2])
+	// Без топиков ParseSyslog принимает префикс правила firewall («drop-input: in:…»)
+	// за тег приложения — возвращаем его в тело.
+	if topics == nil && sl.AppName != "" && sl.ProcID == "" {
+		body = sl.AppName + ": " + body
+	}
 	has := func(t string) bool {
 		for _, x := range topics {
 			if x == t {
@@ -47,38 +69,39 @@ func ParseMikroTik(sl Syslog) (model.Event, bool) {
 		}
 		return false
 	}
-	// Хотя бы один известный топик RouterOS: иначе «a,b text» любого вендора
-	// попадёт сюда.
-	known := false
-	for _, t := range topics {
-		switch t {
-		case "system", "firewall", "dhcp", "account", "info", "warning", "error", "critical",
-			"wireless", "interface", "dns", "ppp", "l2tp", "ipsec", "ospf", "bgp", "route", "script", "e-mail", "ntp", "web-proxy", "hotspot", "caps", "wireguard":
-			known = true
-		}
-	}
-	if !known {
+	isFirewall := has("firewall") || (mtFwIfRe.MatchString(body) && mtFwAddrRe.MatchString(body))
+	isDhcp := has("dhcp") || mtDhcpAssign.MatchString(body) || mtDhcpFree.MatchString(body)
+	isAuth := mtLoginRe.MatchString(body) || mtLoginFail.MatchString(body) || mtLogoutRe.MatchString(body)
+	isConfig := has("system") || (mtChangedRe.MatchString(body) && !strings.Contains(body, " ssh2"))
+	if topics == nil && !isFirewall && !isDhcp && !isAuth && !isConfig {
 		return model.Event{}, false
 	}
 
 	e := model.Event{
 		Source: "net.routeros", SourceClass: "network", Vendor: "MikroTik", Product: "routeros",
 		Node: sl.Hostname, Raw: sl.Message, Outcome: "unknown", Severity: 2,
-		Attrs: map[string]string{"topics": m[1]},
+		Attrs: map[string]string{},
 	}
 	if !sl.Timestamp.IsZero() {
 		e.SetTS(sl.Timestamp, "")
 	}
-	switch {
-	case has("critical"):
-		e.Severity = 8
-	case has("error"):
-		e.Severity = 6
-	case has("warning"):
-		e.Severity = 4
+	if topics != nil {
+		e.Attrs["topics"] = strings.Join(topics, ",")
+		e.Action = "routeros." + topics[0]
+		switch {
+		case has("critical"):
+			e.Severity = 8
+		case has("error"):
+			e.Severity = 6
+		case has("warning"):
+			e.Severity = 4
+		}
+	} else {
+		e.Action = "routeros.event"
+		if sl.Severity >= 0 && sl.Severity < 7 {
+			e.Severity = uint8((7 - sl.Severity) * 10 / 7)
+		}
 	}
-	first := topics[0]
-	e.Action = "routeros." + first
 
 	// Вход/выход: успех идёт с топиком account, отказ — system,error,critical
 	// без account, поэтому сначала по тексту, потом по топикам.
@@ -97,7 +120,7 @@ func ParseMikroTik(sl Syslog) (model.Event, bool) {
 		e.Attrs["method"] = x[3]
 	case has("account"):
 		e.Action, e.Object = "auth.event", body
-	case has("firewall"):
+	case isFirewall:
 		e.Action = "net.firewall"
 		if col := strings.Index(body, ": in:"); col > 0 {
 			e.Attrs["prefix"] = body[:col]
@@ -128,7 +151,7 @@ func ParseMikroTik(sl Syslog) (model.Event, bool) {
 		if e.SrcIP == "" {
 			e.Object = body
 		}
-	case has("dhcp"):
+	case isDhcp:
 		if x := mtDhcpAssign.FindStringSubmatch(body); x != nil {
 			e.Action, e.Outcome, e.Object = "dhcp.assign", "success", x[2]
 			e.Attrs["server"], e.Attrs["mac"] = x[1], strings.ToLower(x[3])
@@ -144,7 +167,7 @@ func ParseMikroTik(sl Syslog) (model.Event, bool) {
 		} else {
 			e.Action, e.Object = "dhcp.event", body
 		}
-	case has("system"):
+	case isConfig:
 		if x := mtChangedRe.FindStringSubmatch(body); x != nil {
 			e.Action, e.Outcome, e.ActorName, e.ActorKind, e.Object, e.Severity = "system.config", "success", x[1], "user", body, 4
 		} else if strings.Contains(body, "rebooted") || strings.Contains(body, "router was rebooted") {
