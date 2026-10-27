@@ -3,6 +3,7 @@
 package normalize
 
 import (
+	"net/netip"
 	"regexp"
 	"strconv"
 	"strings"
@@ -24,6 +25,52 @@ type SourceRule struct {
 type Normalizer struct {
 	Rules     []SourceRule
 	PIIFields []string // ключи CEF/LEEF, по которым ищем e-mail и т.п.
+	// InternalNets — «свои» сети для направления потока (attrs.scope у NetFlow):
+	// inbound — снаружи внутрь, outbound — изнутри наружу, internal — обе стороны
+	// свои, external — обе чужие (транзит). Пусто — RFC 1918, 100.64/10, loopback,
+	// link-local; свои белые блоки добавляются через INTERNAL_NETS.
+	InternalNets []netip.Prefix
+}
+
+var defaultInternalNets = func() []netip.Prefix {
+	var out []netip.Prefix
+	for _, c := range []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "fc00::/7", "fe80::/10", "::1/128"} {
+		out = append(out, netip.MustParsePrefix(c))
+	}
+	return out
+}()
+
+// IsInternal — адрес из своих сетей (InternalNets или умолчания).
+func (n *Normalizer) IsInternal(ip string) bool {
+	a, err := netip.ParseAddr(ip)
+	if err != nil {
+		return false
+	}
+	a = a.Unmap()
+	nets := n.InternalNets
+	if len(nets) == 0 {
+		nets = defaultInternalNets
+	}
+	for _, p := range nets {
+		if p.Contains(a) {
+			return true
+		}
+	}
+	return false
+}
+
+// FlowScope — направление потока относительно своих сетей.
+func (n *Normalizer) FlowScope(src, dst string) string {
+	si, di := n.IsInternal(src), n.IsInternal(dst)
+	switch {
+	case si && di:
+		return "internal"
+	case !si && di:
+		return "inbound"
+	case si && !di:
+		return "outbound"
+	}
+	return "external"
 }
 
 // ПДн-эвристики: e-mail (с обфускацией «[at]»/«(at)»/«[dot]»), российские
@@ -197,6 +244,17 @@ func (n *Normalizer) FromFlow(f parse.Flow, source, exporter string) model.Event
 	e.SetTS(end, "")
 	if !f.Start.IsZero() {
 		e.Attrs["duration_ms"] = strconv.FormatInt(end.Sub(f.Start).Milliseconds(), 10)
+	}
+	e.Attrs["scope"] = n.FlowScope(f.SrcIP, f.DstIP)
+	if f.Proto == 6 {
+		if fl := parse.TCPFlagsString(f.TCPFlags); fl != "" {
+			e.Attrs["tcp_flags"] = fl
+		}
+		// Попытка соединения без ответа: SYN есть, ACK нет — так выглядят сканы и
+		// стук в закрытые порты; установленные сессии несут ACK.
+		if f.TCPFlags&0x02 != 0 && f.TCPFlags&0x10 == 0 {
+			e.Attrs["syn_only"] = "1"
+		}
 	}
 	e.Ensure()
 	return e

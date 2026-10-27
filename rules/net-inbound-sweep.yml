@@ -1,0 +1,28 @@
+# Обход адресов: один внешний адрес пробует один и тот же порт (или несколько) на
+# десятках наших хостов — поиск открытого сервиса по всему блоку.
+title: "Network: inbound host sweep"
+id: a41c-net-071
+level: high
+tags: [attack.reconnaissance, attack.t1595.001]
+
+detection:
+  selection:
+    source.class: netflow
+    attrs.scope: inbound
+    attrs.syn_only: "1"
+  threshold:
+    kind: distinct
+    field: dst.ip
+    distinct: 20
+    window: 10m
+    group_by: src.ip
+  condition: selection and threshold
+
+respond:
+  action: block_ip
+  target: src.ip
+  min_level: high
+  ttl: 12h
+
+analyst:
+  profile: on-prem-strict

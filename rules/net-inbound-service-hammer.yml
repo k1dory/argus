@@ -1,0 +1,23 @@
+# Долбёжка в один сервис: много попыток соединения снаружи к портам управления и
+# баз данных за короткое время — подбор пароля или перебор на уровне соединений.
+# Один адрес и один порт: это не скан, это цель.
+title: "Network: inbound hammering of admin/database ports"
+id: a41c-net-072
+level: medium
+tags: [attack.credential_access, attack.t1110]
+
+detection:
+  selection:
+    source.class: netflow
+    attrs.scope: inbound
+    attrs.syn_only: "1"
+    dst.port: [22, 2202, 2222, 23, 3389, 5900, 445, 1433, 3306, 5432, 6379, 27017, 8006, 8007, 8443, 9200]
+  threshold:
+    kind: count
+    count: 60
+    window: 10m
+    group_by: src.ip
+  condition: selection and threshold
+
+analyst:
+  profile: on-prem-strict

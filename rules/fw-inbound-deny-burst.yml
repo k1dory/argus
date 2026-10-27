@@ -1,0 +1,22 @@
+# Серия отказов межсетевого экрана с одного адреса по разным портам: журнал drop-правил
+# (nftables на роутере, firewall RouterOS с log=yes) — те же сканы, но уже с ответом
+# «нет», без NetFlow. Работает с любым источником, где action=net.firewall, outcome=deny.
+title: "Firewall: inbound deny burst across ports"
+id: a41c-net-073
+level: medium
+tags: [attack.reconnaissance, attack.t1046]
+
+detection:
+  selection:
+    action: net.firewall
+    outcome: deny
+  threshold:
+    kind: distinct
+    field: dst.port
+    distinct: 30
+    window: 10m
+    group_by: src.ip
+  condition: selection and threshold
+
+analyst:
+  profile: on-prem-strict

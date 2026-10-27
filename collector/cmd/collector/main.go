@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"regexp"
@@ -363,6 +364,20 @@ func main() {
 		go (&listen.TailFile{Path: fcfg.Path, Source: src, FromStart: fcfg.FromStart, Handle: handle}).Run(ctx)
 	}
 
+	if v := strings.TrimSpace(os.Getenv("INTERNAL_NETS")); v != "" {
+		for _, c := range strings.Split(v, ",") {
+			c = strings.TrimSpace(c)
+			if c == "" {
+				continue
+			}
+			pfx, perr := netip.ParsePrefix(c)
+			if perr != nil {
+				slog.Error("INTERNAL_NETS", "cidr", c, "err", perr)
+				os.Exit(1)
+			}
+			norm.InternalNets = append(norm.InternalNets, pfx)
+		}
+	}
 	dec := parse.NewDecoder()
 	if dec.Allow, err = parse.ParseCIDRs(cfg.Listeners.NetFlow.Exporters); err != nil {
 		slog.Error("NETFLOW_EXPORTERS", "err", err)

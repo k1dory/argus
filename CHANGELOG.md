@@ -3,6 +3,18 @@
 Версия стека — в файле `VERSION`, схема ClickHouse версионируется миграциями
 в `clickhouse/migrations/` (журнал — таблица `argus.schema_migrations`).
 
+## 1.0.0-rc7 — 2026-10-28
+
+- **Направление потоков NetFlow.** Коллектор ставит `attrs.scope` (`inbound` | `outbound` | `internal` |
+  `external`) по своим сетям (`INTERNAL_NETS`, по умолчанию RFC 1918, 100.64/10, loopback), `attrs.tcp_flags`
+  и `attrs.syn_only=1` для TCP-попыток без ответа (SYN без ACK) — так сканы и стук в закрытые порты
+  отделяются от ответного трафика DNS и CDN.
+- **Правила «кто стучится снаружи».** `net-inbound-portscan` (50 портов с адреса за 10 минут, high,
+  `block_ip`), `net-inbound-sweep` (20 наших адресов, high, `block_ip`), `net-inbound-service-hammer`
+  (60 попыток в порты управления и БД, medium), `fw-inbound-deny-burst` (30 портов в журнале отказов
+  фаервола `net.firewall`/`deny` с любого источника, medium). Фикстура `fixtures/events/netflow-inbound.ndjson`
+  и тесты: ответный DNS, установленные сессии и исходящие потоки под правила не попадают.
+
 ## 1.0.0-rc6 — 2026-10-28
 
 - **Syslog Huawei VRP (info-center).** Заголовок с годом (`Oct 27 2026 21:47:12 host`) и тело

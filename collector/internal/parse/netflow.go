@@ -15,6 +15,7 @@ type Flow struct {
 	SrcIP, DstIP     string
 	SrcPort, DstPort uint16
 	Proto            uint8
+	TCPFlags         uint8 // tcpControlBits (поле 6): SYN=0x02, ACK=0x10 …
 	Bytes, Packets   uint64
 	Start, End       time.Time
 	Fields           map[uint16][]byte // все поля шаблона как есть
@@ -390,6 +391,9 @@ func (d *Decoder) decodeData(key string, tid uint16, body []byte, stamp func(*Fl
 		}
 		fl.Bytes = uN(fields[1])
 		fl.Packets = uN(fields[2])
+		if v := fields[6]; len(v) >= 1 {
+			fl.TCPFlags = v[len(v)-1] // при двухбайтовом поле флаги в младшем байте
+		}
 		stamp(&fl, fields)
 		flows = append(flows, fl)
 		if len(body)-off < 4 { // паддинг набора
@@ -425,6 +429,21 @@ func uN(b []byte) uint64 {
 		n = n<<8 | uint64(x)
 	}
 	return n
+}
+
+// TCPFlagsString — флаги TCP буквами в привычном порядке tcpdump-подобных
+// инструментов: "S", "SA", "FPA"… Пусто, когда флагов нет.
+func TCPFlagsString(f uint8) string {
+	var b []byte
+	for _, x := range []struct {
+		bit uint8
+		c   byte
+	}{{0x02, 'S'}, {0x10, 'A'}, {0x01, 'F'}, {0x04, 'R'}, {0x08, 'P'}, {0x20, 'U'}, {0x40, 'E'}, {0x80, 'C'}} {
+		if f&x.bit != 0 {
+			b = append(b, x.c)
+		}
+	}
+	return string(b)
 }
 
 // ProtoName — номер протокола IP в имя для колонки proto.

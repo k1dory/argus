@@ -251,6 +251,7 @@ services:
       SYSLOG_TLS_CLIENT_CA: ${SYSLOG_TLS_CLIENT_CA:-}
       SYSLOG_TCP_MAX_CONNS: ${SYSLOG_TCP_MAX_CONNS:-1024}   # одновременных TCP/TLS-соединений
       NETFLOW_EXPORTERS: ${NETFLOW_EXPORTERS:-}             # allow-list экспортеров (CIDR через запятую); пусто — все
+      INTERNAL_NETS: ${INTERNAL_NETS:-}                     # свои сети для attrs.scope потоков; пусто — RFC 1918 и т.п.
       SINK_PENDING_ROWS: ${SINK_PENDING_ROWS:-200000}       # оперативный буфер перед дисковой очередью; при заполнении — обратное давление
       SINK_SPOOL_DIR: /state/spool
       SINK_SPOOL_BYTES: ${SINK_SPOOL_BYTES:-8589934592}    # 8 ГБ на collector-state; при заполнении приём блокируется

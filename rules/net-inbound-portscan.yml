@@ -1,0 +1,29 @@
+# Скан портов снаружи: один внешний адрес стучится в десятки портов наших адресов
+# (SYN без ответа). Источник — NetFlow с границы; attrs.scope/syn_only ставит коллектор
+# (INTERNAL_NETS). Ответный трафик (DNS, CDN) под правило не попадает: у него ACK.
+title: "Network: inbound port scan"
+id: a41c-net-070
+level: high
+tags: [attack.reconnaissance, attack.t1046]
+
+detection:
+  selection:
+    source.class: netflow
+    attrs.scope: inbound
+    attrs.syn_only: "1"
+  threshold:
+    kind: distinct
+    field: dst.port
+    distinct: 50
+    window: 10m
+    group_by: src.ip
+  condition: selection and threshold
+
+respond:
+  action: block_ip
+  target: src.ip
+  min_level: high
+  ttl: 12h
+
+analyst:
+  profile: on-prem-strict
