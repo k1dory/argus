@@ -1,6 +1,6 @@
 # Базовые образы пришпилены по digest (см. collector/Dockerfile — как обновлять).
 ARG REGISTRY=docker.io
-FROM ${REGISTRY}/library/golang:1.26@sha256:3c3e25a4da13fd0478eed2df1eb35a0e667094a7124d3993a6a1d30f71c17e79 AS build
+FROM ${REGISTRY}/library/golang:1.26@sha256:24a707af49702fa44f02785475d02fb752f6982d3e9c0afb7696e1f0204e7ce9 AS build
 WORKDIR /src
 # Общий модуль редакции и фильтров (replace ../triage в go.mod) — именованный
 # контекст triage: compose (build.additional_contexts), release.yml (build-contexts),
