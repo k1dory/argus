@@ -247,6 +247,11 @@ func main() {
 			e.Attrs = map[string]string{}
 		}
 		e.Attrs["transport"] = transport
+		// Направление для любого события с двумя адресами (NGFW, firewall, syslog), не только
+		// NetFlow: правила про «снаружи внутрь» одни на все источники.
+		if e.SrcIP != "" && e.DstIP != "" && e.Attrs["scope"] == "" {
+			e.Attrs["scope"] = norm.FlowScope(e.SrcIP, e.DstIP)
+		}
 		item := queuedEvent{event: e}
 		if transport != "udp" {
 			item.ack = make(chan error, 1)

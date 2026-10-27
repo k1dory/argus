@@ -4,12 +4,15 @@ id: a41c-c2-016
 level: low
 tags: [attack.command_and_control, attack.t1071.001]
 
+# Только исходящие потоки (attrs.scope ставит коллектор по INTERNAL_NETS): без этого
+# правило ловило внешние сканеры, стучащие в наши адреса с ровным интервалом.
 detection:
   selection:
     source.class: netflow
+    attrs.scope: outbound
     bytes: '< 65536'
-  filter:                      # свои сети — не маячок (Go regexp без lookahead)
-    dst.ip|regex: '^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)'
+  filter:                      # резолверы и время — ровные интервалы по природе
+    dst.port: [53, 123]
   threshold:
     kind: periodic
     count: 6
