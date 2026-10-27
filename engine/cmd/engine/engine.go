@@ -354,13 +354,13 @@ func (e *engine) loop(ctx context.Context, poll time.Duration) {
 		e.maybeSyncIdentities(ctx, false)
 		e.syncRespondMode(ctx)
 		rs := e.current()
-		events, next, err := e.pollEvents(ctx, cursor)
-		if err != nil {
-			slog.Warn("events", "err", err)
-			e.m.pollErrors.Add(1)
-		} else {
-			cursor = next
-			e.m.eventsPolled.Add(int64(len(events)))
+		// Страницы обрабатываются по одной: в памяти живёт одна страница плюс
+		// буфер кандидатов, а не весь хвост с курсора. После рестарта на
+		// стенде с NetFlow (≈800 тыс. событий в час) накопленный хвост целиком
+		// не помещался в лимит контейнера и движок уходил в цикл OOM.
+		polled := 0
+		next, err := e.pollEvents(ctx, cursor, func(events []*model.Event) {
+			polled += len(events)
 			// Алиасы субъектов — из сырого потока, до фильтра кандидатов:
 			// событию identity.alias правило не нужно; не записанные из-за
 			// хранилища повторяются на следующем цикле (observeIdentities).
@@ -373,6 +373,13 @@ func (e *engine) loop(ctx context.Context, poll time.Duration) {
 					buffer = append(buffer, ev)
 				}
 			}
+		})
+		if err != nil {
+			slog.Warn("events", "err", err)
+			e.m.pollErrors.Add(1)
+		} else {
+			cursor = next
+			e.m.eventsPolled.Add(int64(polled))
 			cut := time.Now().Add(-2 * e.maxWindow())
 			kept := buffer[:0]
 			for _, ev := range buffer {
@@ -399,30 +406,30 @@ func (e *engine) loop(ctx context.Context, poll time.Duration) {
 // дочитываем сразу (курсор помечает More), но не бесконечно — остаток
 // подберёт следующий опрос.
 const (
-	pollPageSize = 200000
-	pollMaxPages = 50
+	pollPageSize = 50000
+	pollMaxPages = 200
 )
 
-// pollEvents — события от курсора: страницы, упёршиеся в LIMIT, дочитываются в
-// том же опросе, чтобы продолжение по хешу внутри секунды не растягивалось на
-// тики; на следующем опросе секунда перечитывается целиком (store.Cursor).
-func (e *engine) pollEvents(ctx context.Context, cursor store.Cursor) ([]*model.Event, store.Cursor, error) {
-	var all []*model.Event
+// pollEvents — события от курсора постранично: каждая страница отдаётся в
+// handle и освобождается, страницы, упёршиеся в LIMIT, дочитываются в том же
+// опросе, чтобы продолжение по хешу внутри секунды не растягивалось на тики;
+// на следующем опросе секунда перечитывается целиком (store.Cursor).
+func (e *engine) pollEvents(ctx context.Context, cursor store.Cursor, handle func([]*model.Event)) (store.Cursor, error) {
 	for page := 0; page < pollMaxPages; page++ {
 		events, next, err := e.ch.EventsSince(ctx, cursor, pollPageSize)
 		if err != nil {
 			if page > 0 {
-				return all, cursor, nil // прочитанное не теряем, остаток — следующим опросом
+				return cursor, nil // обработанное не теряем, остаток — следующим опросом
 			}
-			return nil, cursor, err
+			return cursor, err
 		}
-		all = append(all, events...)
+		handle(events)
 		cursor = next
 		if !next.More {
 			break
 		}
 	}
-	return all, cursor, nil
+	return cursor, nil
 }
 
 // cycle — один проход правил по буферу: сработки → инциденты → запись → реакции.

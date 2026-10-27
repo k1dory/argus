@@ -119,10 +119,12 @@ func (c *ClickHouse) insert(ctx context.Context, table string, rows []any) error
 
 // eventsSelectColumns — колонки события единой схемы в порядке model.Event;
 // перечислены явно, чтобы SELECT * не тянул служебные колонки будущих миграций.
+// raw в движке не используется (правила смотрят на поля и attrs), а это самая
+// тяжёлая колонка: при шторме NetFlow именно она раздувала память опроса.
 func eventsSelectColumns() string {
 	return `ts, source, source_class, vendor, product, action, outcome, severity,
 	       actor_name, actor_kind, object, node, session_id, src_ip, src_port, dst_ip, dst_port, proto,
-	       bytes, packets, value, unit, pii, attrs, raw`
+	       bytes, packets, value, unit, pii, attrs, '' AS raw`
 }
 
 /* ===== курсор чтения событий =====

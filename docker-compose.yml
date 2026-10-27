@@ -405,7 +405,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1g
+          memory: ${ENGINE_MEM_LIMIT:-2g}
           pids: 512
     restart: unless-stopped
 
