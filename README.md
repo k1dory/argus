@@ -255,6 +255,7 @@ make replay                                   # залить записанны�
 | Jenkins Audit Trail | syslog | `:5514` |
 | MikroTik RouterOS (вход/выход, firewall с `log=yes`, DHCP, изменения конфигурации) | `/system logging action … target=remote` (7.16: `bsd-syslog=yes`; 7.21: `remote-log-format=syslog`), топики `system,account,firewall,dhcp,error,warning,critical` c `!debug` | `:5514`; потоки — `/ip traffic-flow` v9 на `:2055` |
 | Huawei VRP / CloudEngine (вход/выход, команды, конфигурация, линки) | `info-center enable`, `info-center loghost <argus> port 5514 source-ip <mgmt>` | `:5514` |
+| Access-логи reverse proxy (NetBird, любой другой с журналом запросов) | NDJSON `action: proxy.access`, `src_ip` — клиент, `node` — хост сервиса, `object` — хост+путь, `attrs.status`/`country`; правила `rules/proxy-*.yml` | `POST …:8089/ingest/events` |
 | Yandex Cloud Audit Trails, VK Cloud | S3-бакет | `collector.yml → s3`, `YC_*` |
 | NetFlow v9 / IPFIX | UDP; `INTERNAL_NETS` — свои сети для `attrs.scope` (inbound/outbound/internal/external) и `attrs.syn_only` у TCP-попыток без ответа | `:2055` |
 | всё остальное (RFC 5424/3164, в том числе ISO-время в заголовке BSD как у rsyslog, сырой текст) | syslog | `:5514` |

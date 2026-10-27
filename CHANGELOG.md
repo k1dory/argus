@@ -3,6 +3,15 @@
 Версия стека — в файле `VERSION`, схема ClickHouse версионируется миграциями
 в `clickhouse/migrations/` (журнал — таблица `argus.schema_migrations`).
 
+## 1.0.0-rc11 — 2026-10-28
+
+- **Правила для опубликованных сервисов** по access-логам reverse proxy (`action: proxy.access`,
+  настоящий адрес клиента): `proxy-login-bruteforce` (20 неудачных запросов к странице входа за
+  10 минут с адреса, high), `proxy-path-scan` (15 разных путей с отказами за 10 минут, medium),
+  `proxy-foreign-access` (обращения не из ожидаемой страны, low; страна задаётся в правиле).
+  Фикстура `fixtures/events/proxy-access.ndjson`: легитимный клиент с тысячами запросов и
+  единичными промахами под правила не попадает.
+
 ## 1.0.0-rc10 — 2026-10-28
 
 - `attrs.scope` ставится и событиям, пришедшим готовыми через `POST /ingest/events` (агенты Vector,

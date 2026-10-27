@@ -1,0 +1,22 @@
+# Подбор пароля через опубликованный сервис: с одного адреса много неудачных запросов
+# к странице входа за короткое время. Источник — access-логи reverse proxy (proxy.access),
+# где виден настоящий адрес клиента; бэкенд за прокси его не знает.
+title: "Proxy: login brute force against a published service"
+id: a41c-net-074
+level: high
+tags: [attack.credential_access, attack.t1110.001]
+
+detection:
+  selection:
+    action: proxy.access
+    outcome: failure
+    object|contains: login
+  threshold:
+    kind: count
+    count: 20
+    window: 10m
+    group_by: src.ip
+  condition: selection and threshold
+
+analyst:
+  profile: on-prem-strict

@@ -1,0 +1,5 @@
+rule: a41c-net-074
+fixture: fixtures/events/proxy-access.ndjson
+expect_incidents: 1
+expect_actor: 203.0.113.9
+min_events: 20

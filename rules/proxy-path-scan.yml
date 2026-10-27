@@ -1,0 +1,21 @@
+# Сканер публикации: один адрес перебирает разные пути и получает отказы (404/403/401) —
+# поиск .env, .git, админок. Обычный клиент ходит по десятку известных путей и не промахивается.
+title: "Proxy: path scanning of a published service"
+id: a41c-net-075
+level: medium
+tags: [attack.reconnaissance, attack.t1595.003]
+
+detection:
+  selection:
+    action: proxy.access
+    outcome: failure
+  threshold:
+    kind: distinct
+    field: object
+    distinct: 15
+    window: 10m
+    group_by: src.ip
+  condition: selection and threshold
+
+analyst:
+  profile: on-prem-strict

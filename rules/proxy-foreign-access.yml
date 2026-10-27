@@ -1,0 +1,21 @@
+# Обращения к публикациям не из ожидаемой страны. Порог низкий, уровень low: это не атака,
+# а сигнал «кто-то не из нашей географии ходит в сервис, который открыт всему интернету».
+# Страна — ISO 3166-1 alpha-2 из геолокации прокси; ожидаемую подставить под свой контур.
+title: "Proxy: access to a published service from outside the expected country"
+id: a41c-net-076
+level: low
+tags: [attack.reconnaissance]
+
+detection:
+  selection:
+    action: proxy.access
+    attrs.country: 'not RU'
+  threshold:
+    kind: count
+    count: 5
+    window: 1h
+    group_by: src.ip
+  condition: selection and threshold
+
+analyst:
+  profile: on-prem-strict
