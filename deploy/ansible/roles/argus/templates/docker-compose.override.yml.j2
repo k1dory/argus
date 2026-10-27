@@ -1,0 +1,12 @@
+# Управляется ansible (роль argus): боевые identities.yml / cmdb.yml из {{ argus_etc_dir }}
+# вместо демо-файлов репозитория. compose подхватывает override сам; тома с тем же
+# целевым путём заменяют запись из docker-compose.yml.
+services:
+  engine:
+    volumes:
+{% if argus_cmdb_src | length > 0 %}
+      - {{ argus_etc_dir }}/cmdb.yml:/etc/argus/cmdb.yml:ro
+{% endif %}
+{% if argus_identities_src | length > 0 %}
+      - {{ argus_etc_dir }}/identities.yml:/etc/argus/identities.yml:ro
+{% endif %}

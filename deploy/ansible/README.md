@@ -53,3 +53,11 @@ ansible-playbook -i inventory.yml deploy/ansible/argus.yml -l argus1
 После прогона: пароль `admin` — `docker compose --project-directory /opt/argus exec web cat
 /data/admin-password.txt`; первая проверка — `./scripts/api-smoke.sh` на хосте; источники — раздел
 «Коллекторы и правила» в корневом README.
+
+## Боевые identities.yml и cmdb.yml
+
+Файлы в репозитории — демо (персоны и узлы из `fixtures/`). На стенде их подменяют
+`argus_identities_src` / `argus_cmdb_src` — пути к файлам на управляющей машине: роль кладёт
+их в `argus_etc_dir` (`/etc/argus`) и пишет `docker-compose.override.yml`, который монтирует
+их в движок вместо файлов checkout. Override не в git (`.gitignore`), обновление кода по тегу
+его не трогает; содержимое движок перечитывает по mtime без перезапуска.

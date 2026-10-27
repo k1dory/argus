@@ -41,6 +41,14 @@ argus_enable_mcp: false                 # профиль compose mcp (argus-mcp 
 #   SYSLOG_TLS_ADDR: ":6514"
 argus_env: {}
 
+# Боевые identities.yml и cmdb.yml вне checkout: файлы с управляющей машины кладутся в
+# argus_etc_dir на хосте и подменяют демо-файлы репозитория через docker-compose.override.yml
+# (make up / make deploy зовут docker compose без -f, override подхватывается сам).
+# Пусто — остаются файлы из репозитория (демо-персоны и демо-узлы).
+argus_identities_src: ""
+argus_cmdb_src: ""
+argus_etc_dir: /etc/argus
+
 # Резервные копии: scripts/backup.sh по cron от root.
 argus_backup_cron: true
 argus_backup_cron_hour: "3"

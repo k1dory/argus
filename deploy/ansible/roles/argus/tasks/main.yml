@@ -93,6 +93,44 @@
     - scripts/gen-sample.sh
     - scripts/bench-ingest.sh
 
+# Боевые карты идентичностей и CMDB живут вне checkout: git reset по тегу их не трогает,
+# а compose подхватывает docker-compose.override.yml сам. Запись in-place (unsafe_writes):
+# файлы примонтированы в движок как файлы, новый inode контейнер бы не увидел; содержимое
+# движок перечитывает по mtime, пересоздание нужно только при смене самого монтирования —
+# его делает docker compose up по изменившемуся override.
+- name: Каталог боевых конфигов
+  ansible.builtin.file:
+    path: "{{ argus_etc_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: argus_identities_src | length > 0 or argus_cmdb_src | length > 0
+
+- name: Карты идентичностей и CMDB с управляющей машины
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "{{ argus_etc_dir }}/{{ item.name }}"
+    owner: root
+    group: root
+    mode: "0644"
+    unsafe_writes: true
+  loop:
+    - { name: identities.yml, src: "{{ argus_identities_src }}" }
+    - { name: cmdb.yml, src: "{{ argus_cmdb_src }}" }
+  loop_control:
+    label: "{{ item.name }}"
+  when: item.src | length > 0
+
+- name: docker-compose.override.yml — боевые файлы вместо демо в движке
+  ansible.builtin.template:
+    src: docker-compose.override.yml.j2
+    dest: "{{ argus_dir }}/docker-compose.override.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  when: argus_identities_src | length > 0 or argus_cmdb_src | length > 0
+
 - name: Тома данных ClickHouse на отдельном каталоге
   ansible.builtin.command:
     cmd: ./scripts/init-storage.sh {{ argus_data_dir | quote }} {{ argus_backup_dir | quote }}

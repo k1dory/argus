@@ -24,3 +24,4 @@ collector/certs/*
 
 # локальные настройки Claude Code разработчика
 .claude/
+docker-compose.override.yml
