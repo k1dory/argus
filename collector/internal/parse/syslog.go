@@ -164,6 +164,13 @@ func parse3164(s Syslog, rest string) (Syslog, error) {
 			}
 		}
 	}
+	// Mmm dd yyyy hh:mm:ss HOST MSG — Huawei VRP (info-center) пишет год в заголовок.
+	if s.Timestamp.IsZero() && len(rest) >= 20 && rest[6] == ' ' && rest[11] == ' ' {
+		if t, err := time.Parse("Jan _2 2006 15:04:05", rest[:20]); err == nil {
+			s.Timestamp = t.UTC()
+			rest = strings.TrimLeft(rest[20:], " ")
+		}
+	}
 	// Mmm dd hh:mm:ss HOST TAG[pid]: MSG
 	if s.Timestamp.IsZero() && len(rest) >= 15 {
 		if t, err := time.Parse("Jan _2 15:04:05", rest[:15]); err == nil {

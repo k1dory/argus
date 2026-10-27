@@ -319,6 +319,8 @@ func main() {
 				e = jk
 			} else if mt, ok := parse.ParseMikroTik(sl); ok {
 				e = mt
+			} else if vr, ok := parse.ParseVRP(sl); ok {
+				e = vr
 			} else {
 				e = norm.FromSyslog(sl, line)
 			}

@@ -253,7 +253,8 @@ make replay                                   # залить записанны�
 | GitLab (audit streaming, system hooks, pipeline) | webhook | `POST https://<host>:8089/ingest/gitlab` |
 | Harbor, Argo CD | webhook | `…:8089/ingest/harbor`, `/ingest/argocd` |
 | Jenkins Audit Trail | syslog | `:5514` |
-| MikroTik RouterOS (вход/выход, firewall с `log=yes`, DHCP, изменения конфигурации) | `/system logging action … target=remote bsd-syslog=yes`, топики `system,account,firewall,dhcp,error,warning,critical` c `!debug` | `:5514`; потоки — `/ip traffic-flow` v9 на `:2055` |
+| MikroTik RouterOS (вход/выход, firewall с `log=yes`, DHCP, изменения конфигурации) | `/system logging action … target=remote` (7.16: `bsd-syslog=yes`; 7.21: `remote-log-format=syslog`), топики `system,account,firewall,dhcp,error,warning,critical` c `!debug` | `:5514`; потоки — `/ip traffic-flow` v9 на `:2055` |
+| Huawei VRP / CloudEngine (вход/выход, команды, конфигурация, линки) | `info-center enable`, `info-center loghost <argus> port 5514 source-ip <mgmt>` | `:5514` |
 | Yandex Cloud Audit Trails, VK Cloud | S3-бакет | `collector.yml → s3`, `YC_*` |
 | NetFlow v9 / IPFIX | UDP | `:2055` |
 | всё остальное (RFC 5424/3164, в том числе ISO-время в заголовке BSD как у rsyslog, сырой текст) | syslog | `:5514` |
