@@ -63,6 +63,16 @@
   register: argus_git
   no_log: "{{ argus_git_token | length > 0 }}"
 
+# Роль выставляет скриптам исполняемые биты; без этого git считал бы смену режима
+# локальной правкой и на следующем прогоне отказывался обновлять checkout
+# («Local modifications exist»).
+- name: "Код: git не следит за режимами файлов в каталоге стека"
+  ansible.builtin.command:
+    cmd: git config core.fileMode false
+    chdir: "{{ argus_dir }}"
+  when: argus_source == 'git'
+  changed_when: false
+
 - name: "Код: rsync рабочей копии с управляющей машины"
   ansible.posix.synchronize:
     src: "{{ argus_local_src | regex_replace('/*$', '') }}/"
