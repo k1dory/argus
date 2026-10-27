@@ -88,7 +88,9 @@ make demo                   # записанный трафик и неделя 
 `change-me*`. `make up` больше не генерирует демо-данные — это `make demo`.
 
 Консоль: <https://localhost:8443> (Caddy, внутренний CA; без TLS — <http://127.0.0.1:3001>
-с `SESSION_SECURE=false`). Пароль пользователя `admin` генерируется при первом старте
+с `SESSION_SECURE=false`). Открывать по имени или адресу сервера — задайте его в `CONSOLE_HOST`
+(`.env`): Caddy выпустит на него сертификат и будет отдавать его клиентам без SNI (`default_sni`),
+иначе обращение по IP завершится ошибкой TLS. Пароль пользователя `admin` генерируется при первом старте
 и лежит в томе `web-auth`:
 
 ```sh
@@ -109,6 +111,10 @@ docker compose exec web cat /data/admin-password.txt
 
 Новый пароль снова потребуется сменить при первом входе. В консоли код 2FA
 запрашивается только после верного пароля, если она включена у этого пользователя.
+
+Развёртывание на сервер через Ansible — роль `deploy/ansible/roles/argus` и плейбук
+`deploy/ansible/argus.yml` ([описание](deploy/ansible/README.md)): код, тома данных, `.env` с
+секретами на хосте, `make up`, ожидание готовности, cron бэкапа.
 
 Стенд без секретов — `make up-dev`: дефолты из `.env.dev` и `docker-compose.dev.yml`
 (`ARGUS_DEV=1`: приём без токена, слабые пароли только предупреждение). В бою этот
@@ -161,6 +167,70 @@ ClickHouse), `tmpfs` под `/tmp`, лимиты pid и памяти. ClickHouse
 `INGEST_BIND` ограничивает интерфейс для 6514/8089 (по умолчанию `0.0.0.0`).
 
 ## Коллекторы и правила
+
+### ARGUS и конвейеры доставки: Vector, Fluent Bit, Filebeat
+
+ARGUS не заменяет конвейер доставки логов. Vector, Fluent Bit или Filebeat решают задачу
+«собрать с хостов, разобрать, доставить»; ARGUS начинается там, где они заканчивают: единая
+схема события, хранение в ClickHouse, корреляция правилами, инциденты с отработкой, паспорт
+сотрудника и API для агентов. В контуре, где конвейер уже стоит, правильная связка — он
+собирает и приводит события к схеме ARGUS, а в коллектор ARGUS идут только протоколы, которые
+конвейер не разбирает: CEF/LEEF от NGFW, NetFlow, вебхуки Kubernetes и CI.
+
+Пример для Vector: `sshd` из journald → схема ARGUS → `POST /ingest/events` (NDJSON, токен приёма).
+
+```toml
+[sources.journal]
+type = "journald"
+include_units = ["ssh"]
+
+[transforms.argus]
+type = "remap"
+inputs = ["journal"]
+source = '''
+  . = {
+    "ts": format_timestamp!(.timestamp, "%Y-%m-%d %H:%M:%S%.3f"),
+    "source": "vector.sshd",
+    "source_class": "syslog",
+    "vendor": "openssh", "product": "sshd",
+    "node": .host,
+    "raw": .message,
+    "attrs": {}
+  }
+  m, err = parse_regex(.raw, r'^(?P<outcome>Accepted|Failed) (?P<method>\S+) for (?:invalid user )?(?P<user>\S+) from (?P<ip>\S+) port (?P<port>\d+)')
+  if err == null {
+    .action = "auth.ssh"
+    .outcome = if m.outcome == "Accepted" { "success" } else { "failure" }
+    .actor_name = m.user
+    .actor_kind = "user"
+    .src_ip = m.ip
+    .src_port = to_int!(m.port)
+    .attrs.method = m.method
+    .severity = if .outcome == "failure" { 5 } else { 2 }
+  } else {
+    .action = "syslog.sshd"
+    .object = .raw
+  }
+'''
+
+[sinks.argus]
+type = "http"
+inputs = ["argus"]
+uri = "https://argus.example.org:8089/ingest/events"
+method = "post"
+encoding.codec = "json"
+framing.method = "newline_delimited"
+batch.max_events = 500
+request.headers.X-Argus-Token = "${ARGUS_INGEST_TOKEN}"
+tls.ca_file = "/etc/vector/argus-ca.crt"
+```
+
+Поля схемы: `ts` (`YYYY-MM-DD HH:MM:SS.mmm`, UTC), `source`, `source_class`, `action`, `outcome`,
+`severity` 0–10, `actor_name`/`actor_kind`, `object`, `node`, `session_id`, `src_ip`/`dst_ip`,
+`src_port`/`dst_port`, `proto`, `bytes`, `packets`, `value`/`unit`, `pii`, `attrs` (строки), `raw`.
+Отсутствующие поля заполняются умолчаниями; телеметрия (`disk.usage` с `value`) и алиасы
+(`identity.alias`) идут тем же путём — Vector с источником `host_metrics` или `exec` закрывает
+и это без отдельного агента.
 
 ```sh
 make replay                                   # залить записанный трафик → инциденты за полминуты

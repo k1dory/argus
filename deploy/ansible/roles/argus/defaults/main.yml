@@ -1,0 +1,54 @@
+---
+# Роль argus: развернуть стек ARGUS (docker compose) на хосте с Docker.
+# Хост уже подготовлен: Ubuntu 24.04 или Debian 12/13, docker-ce с плагином
+# compose, sudo без пароля у пользователя Ansible. Что роль НЕ делает:
+# не ставит Docker, не настраивает фаервол и sshd — это роли вашей инфраструктуры.
+
+# Откуда брать код. git — клон репозитория (публичный или с deploy-ключом на хосте);
+# local — rsync рабочей копии с управляющей машины (для приватного репозитория
+# или стенда без доступа к Git-серверу).
+argus_source: git                       # git | local
+argus_repo_url: https://github.com/k1dory/argus.git
+argus_version: opensource               # ветка или тег
+argus_local_src: ""                     # при argus_source: local — путь к checkout на управляющей машине
+
+argus_dir: /opt/argus                   # куда кладётся код и .env
+argus_data_dir: /srv/argus              # данные ClickHouse (scripts/init-storage.sh); "" — тома compose по умолчанию
+argus_backup_dir: "{{ argus_data_dir }}/backups"
+
+# Состав стека.
+argus_with_wazuh: false                 # модуль Wazuh: shipper, policyd, разделы консоли
+argus_analyst_profile: mock             # mock | on-prem-strict (нужен ARGUS_LLM_LOCAL_ENDPOINT)
+argus_enable_mcp: false                 # профиль compose mcp (argus-mcp по HTTP на 127.0.0.1:18095)
+
+# Дополнительные переменные .env (ключ: значение). Секреты сюда не класть —
+# их генерирует `scripts/argus init` прямо на хосте. Примеры:
+#   ARGUS_LLM_LOCAL_ENDPOINT: https://llm.example.org/v1
+#   CONSOLE_TLS: "/certs/console.crt /certs/console.key"
+#   SYSLOG_TLS_ADDR: ":6514"
+argus_env: {}
+
+# Резервные копии: scripts/backup.sh по cron от root.
+argus_backup_cron: true
+argus_backup_cron_hour: "3"
+argus_backup_cron_minute: "0"
+
+# Сколько ждать `make up` (сборка образов на первом прогоне идёт долго) и старт консоли.
+argus_up_timeout_sec: 1800
+argus_ready_retries: 60
+argus_ready_delay_sec: 10
+
+# Что исключить при rsync рабочей копии (argus_source: local).
+argus_rsync_excludes:
+  - .git
+  - .env
+  - .env.ai
+  - web/node_modules
+  - web/.next
+  - web/.auth.json
+  - shipper/target
+  - bin
+  - backups
+  - .claude
+  - "caddy/certs/*"
+  - "collector/certs/*"

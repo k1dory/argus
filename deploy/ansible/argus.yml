@@ -1,0 +1,17 @@
+---
+# Развёртывание ARGUS на подготовленном хосте (Docker уже стоит).
+#
+#   ansible-playbook -i inventory.yml deploy/ansible/argus.yml -l argus1
+#
+# Хост в инвентаре — группа argus; переменные роли — в group_vars/host_vars
+# (см. roles/argus/defaults/main.yml). Для приватного репозитория:
+#   argus_source: local, argus_local_src: /path/to/argus
+#
+# Фаервол, sshd, Docker и пользователи — дело ролей вашей инфраструктуры;
+# пример полного конвейера «ВМ → харденинг → Docker → ARGUS» — в README рядом.
+- name: ARGUS
+  hosts: argus
+  become: true
+  gather_facts: true
+  roles:
+    - role: argus

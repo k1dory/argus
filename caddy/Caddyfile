@@ -5,6 +5,10 @@
 # (.env); для IP и localhost сертификаты тоже выпускаются.
 {
 	auto_https disable_redirects
+	# Клиент без SNI (браузер или curl по IP-адресу) получает сертификат CONSOLE_HOST;
+	# без этого Caddy отвечает TLS-ошибкой. Для доступа по адресу укажите его в
+	# CONSOLE_HOST — внутренний CA выпускает сертификаты и на IP.
+	default_sni {$CONSOLE_HOST:localhost}
 }
 
 # Общие заголовки. CSP здесь НЕ задаётся: консоль выпускает её сама с nonce на

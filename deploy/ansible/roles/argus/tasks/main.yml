@@ -1,0 +1,154 @@
+---
+# Порядок: код → тома данных → .env (секреты генерирует хост) → make up → ожидание консоли.
+# Все шаги идемпотентны: повторный прогон обновляет код и перезапускает только
+# изменившиеся сервисы; .env существующие значения не трогает.
+
+- name: Проверить входные переменные
+  ansible.builtin.assert:
+    that:
+      - argus_source in ['git', 'local']
+      - argus_source != 'local' or argus_local_src | length > 0
+      - argus_analyst_profile in ['mock', 'on-prem-strict']
+      - argus_analyst_profile != 'on-prem-strict' or ('ARGUS_LLM_LOCAL_ENDPOINT' in argus_env)
+    fail_msg: >-
+      argus_source: git|local; при local нужен argus_local_src; профиль on-prem-strict
+      требует ARGUS_LLM_LOCAL_ENDPOINT в argus_env.
+
+- name: Пакеты для скриптов стека
+  ansible.builtin.apt:
+    name: [git, make, jq, curl, openssl, rsync]
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Убедиться, что Docker с плагином compose на месте
+  ansible.builtin.command: docker compose version
+  changed_when: false
+
+- name: Каталог стека
+  ansible.builtin.file:
+    path: "{{ argus_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: "Код: клон или обновление репозитория"
+  ansible.builtin.git:
+    repo: "{{ argus_repo_url }}"
+    dest: "{{ argus_dir }}"
+    version: "{{ argus_version }}"
+    force: false
+    update: true
+  when: argus_source == 'git'
+
+- name: "Код: rsync рабочей копии с управляющей машины"
+  ansible.posix.synchronize:
+    src: "{{ argus_local_src | regex_replace('/*$', '') }}/"
+    dest: "{{ argus_dir }}/"
+    archive: true
+    delete: false
+    rsync_opts: "{{ ['--omit-dir-times', '--no-perms', '--chmod=Du+rwx,go+rx,Fu+rw,go+r']
+                    + (argus_rsync_excludes | map('regex_replace', '^(.*)$', '--exclude=\\1') | list) }}"
+  when: argus_source == 'local'
+
+- name: Исполняемые биты скриптов
+  ansible.builtin.file:
+    path: "{{ argus_dir }}/{{ item }}"
+    mode: "0755"
+  loop:
+    - scripts/argus
+    - scripts/init-storage.sh
+    - scripts/backup.sh
+    - scripts/restore.sh
+    - scripts/migrate.sh
+    - scripts/e2e.sh
+    - scripts/api-smoke.sh
+    - scripts/telemetry-sample.sh
+    - scripts/gen-sample.sh
+    - scripts/bench-ingest.sh
+
+- name: Тома данных ClickHouse на отдельном каталоге
+  ansible.builtin.command:
+    cmd: ./scripts/init-storage.sh {{ argus_data_dir | quote }} {{ argus_backup_dir | quote }}
+    chdir: "{{ argus_dir }}"
+  register: argus_storage
+  changed_when: "'→' in argus_storage.stdout"
+  when: argus_data_dir | length > 0
+
+- name: ".env: секреты и состав стека (существующие значения не меняются)"
+  ansible.builtin.command:
+    cmd: >-
+      ./scripts/argus init --no-up
+      {{ '--with-wazuh' if argus_with_wazuh else '--without-wazuh' }}
+      --analyst {{ argus_analyst_profile | quote }}
+    chdir: "{{ argus_dir }}"
+  register: argus_init
+  changed_when: "'init:' in argus_init.stdout"
+
+- name: ".env: дополнительные переменные"
+  ansible.builtin.lineinfile:
+    path: "{{ argus_dir }}/.env"
+    regexp: "^#?{{ item.key }}="
+    line: "{{ item.key }}={{ item.value }}"
+    mode: "0600"
+  loop: "{{ argus_env | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  no_log: true
+
+- name: ".env: профиль compose mcp"
+  ansible.builtin.lineinfile:
+    path: "{{ argus_dir }}/.env"
+    regexp: "^#?COMPOSE_PROFILES="
+    line: "COMPOSE_PROFILES={{ ((['wazuh'] if argus_with_wazuh else []) + ['mcp']) | join(',') }}"
+    mode: "0600"
+  when: argus_enable_mcp
+
+- name: Собрать и поднять стек (первый прогон собирает образы, это долго)
+  ansible.builtin.command:
+    cmd: make up
+    chdir: "{{ argus_dir }}"
+  async: "{{ argus_up_timeout_sec }}"
+  poll: 15
+  register: argus_up
+  changed_when: "'Started' in argus_up.stdout or 'Created' in argus_up.stdout or 'Recreated' in argus_up.stdout"
+
+# По имени, а не по 127.0.0.1: клиент без SNI получает сертификат default_sni
+# (CONSOLE_HOST), а для имени localhost Caddy выпускает свой всегда.
+- name: Дождаться консоли
+  ansible.builtin.uri:
+    url: https://localhost:8443/api/version
+    validate_certs: false
+    status_code: 200
+  register: argus_ready
+  retries: "{{ argus_ready_retries }}"
+  delay: "{{ argus_ready_delay_sec }}"
+  until: argus_ready.status == 200
+
+- name: Дождаться коллектора
+  ansible.builtin.uri:
+    url: http://127.0.0.1:8088/healthz
+    status_code: 200
+  register: argus_collector_ready
+  retries: 12
+  delay: 5
+  until: argus_collector_ready.status == 200
+
+- name: Резервные копии по cron
+  ansible.builtin.cron:
+    name: argus backup
+    user: root
+    hour: "{{ argus_backup_cron_hour }}"
+    minute: "{{ argus_backup_cron_minute }}"
+    job: "cd {{ argus_dir }} && ./scripts/backup.sh >> /var/log/argus-backup.log 2>&1"
+    state: "{{ 'present' if argus_backup_cron else 'absent' }}"
+
+- name: Что дальше
+  ansible.builtin.debug:
+    msg:
+      - "Консоль: https://{{ ansible_host | default(inventory_hostname) }}:8443 (внутренний CA Caddy — предупреждение браузера ожидаемо)"
+      - "Пароль admin: docker compose --project-directory {{ argus_dir }} exec web cat /data/admin-password.txt"
+      - "Проверка API: cd {{ argus_dir }} && ./scripts/api-smoke.sh"
+      - "Демо-данные: cd {{ argus_dir }} && make demo"
+      - "Источники: syslog :5514, TLS :6514, NetFlow :2055/udp, вебхуки и NDJSON https://…:8089/ingest/* с X-Argus-Token из .env"
