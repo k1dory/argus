@@ -505,8 +505,10 @@ func TestObserveAbortsBatchOnFlushError(t *testing.T) {
 			t.Fatalf("Retry в порядке обработки: %d → %s %s", i, e.TS, e.Action)
 		}
 	}
+	// До ошибки записи допустим один OpenAliases — проверка снимка без valid_from
+	// (TestObserveImplicitSnapshotIsRepeat); после неё отзыв в хранилище не ходит.
 	calls := strings.Join(st.calls, ",")
-	if strings.Contains(calls, "OpenAliases") {
+	if i := strings.LastIndex(calls, "UpsertAliases"); i < 0 || strings.Contains(calls[i:], "OpenAliases") {
 		t.Fatalf("отзыв после ошибки flush не должен ходить в хранилище: %s", calls)
 	}
 	st.fail = ""
@@ -527,5 +529,51 @@ func TestObserveAbortsBatchOnFlushError(t *testing.T) {
 	s = o2.Observe(ctx, batch[1:])
 	if len(s.Retry) != 2 || s.Retry[0] != batch[1] || s.Retry[1] != batch[2] || s.Errors != 1 {
 		t.Fatalf("ошибка отзыва: %+v", s)
+	}
+}
+
+// Снимок без valid_from при уже действующем алиасе — повтор, а не новый интервал:
+// экспортер шлёт «кто сейчас на адресе» каждые несколько минут. Явный valid_from —
+// новая выдача с известным началом, она пишется отдельной строкой.
+func TestObserveImplicitSnapshotIsRepeat(t *testing.T) {
+	st := newFakeStore()
+	o := New(st)
+	ctx := context.Background()
+	snap := func(ts string) *model.Event {
+		return ev(ts, ActionAlias, "i.petrov", "vpn.example", map[string]string{"alias_kind": "ip", "alias_value": "10.77.0.11"})
+	}
+	s := o.Observe(ctx, []*model.Event{snap("2026-10-13 08:00:00.000")})
+	if s.OK != 1 || s.Repeated != 0 {
+		t.Fatalf("первый снимок: %+v", s)
+	}
+	s = o.Observe(ctx, []*model.Event{snap("2026-10-13 08:05:00.000"), snap("2026-10-13 08:10:00.000")})
+	if s.OK != 0 || s.Repeated != 2 || len(st.aliases) != 1 {
+		t.Fatalf("повторы снимка не должны плодить интервалы: %+v, строк %d", s, len(st.aliases))
+	}
+	a, _ := st.alias(KindIP, "10.77.0.11", "i.petrov")
+	if !a.ValidFrom.Equal(time.Date(2026, 10, 13, 8, 0, 0, 0, time.UTC)) {
+		t.Fatalf("valid_from первого снимка сохранён: %+v", a)
+	}
+	// Один батч с двумя снимками: второй — повтор ожидающей записи, OpenAliases не нужен.
+	st2 := newFakeStore()
+	s = New(st2).Observe(ctx, []*model.Event{snap("2026-10-13 09:00:00.000"), snap("2026-10-13 09:05:00.000")})
+	if s.OK != 1 || s.Repeated != 1 || len(st2.aliases) != 1 {
+		t.Fatalf("повтор внутри батча: %+v, строк %d", s, len(st2.aliases))
+	}
+	// Явный valid_from — отдельный интервал даже при открытом алиасе.
+	s = o.Observe(ctx, []*model.Event{ev("2026-10-13 08:20:00.000", ActionAlias, "i.petrov", "vpn.example",
+		map[string]string{"alias_kind": "ip", "alias_value": "10.77.0.11", "valid_from": "2026-10-13 08:20:00"})})
+	if s.OK != 1 || s.Repeated != 0 || len(st.aliases) != 2 {
+		t.Fatalf("явный valid_from — новая строка: %+v, строк %d", s, len(st.aliases))
+	}
+	// Снимок закрытого алиаса (valid_to в прошлом) — не повтор: алиас не действует.
+	st3 := newFakeStore()
+	o3 := New(st3)
+	o3.Observe(ctx, []*model.Event{ev("2026-10-13 07:00:00.000", ActionAlias, "a.sidorov", "vpn.example",
+		map[string]string{"alias_kind": "ip", "alias_value": "10.77.0.42", "valid_to": "2026-10-13 07:30:00"})})
+	s = o3.Observe(ctx, []*model.Event{ev("2026-10-13 08:00:00.000", ActionAlias, "a.sidorov", "vpn.example",
+		map[string]string{"alias_kind": "ip", "alias_value": "10.77.0.42"})})
+	if s.OK != 1 || s.Repeated != 0 {
+		t.Fatalf("после закрытого интервала снимок открывает новый: %+v", s)
 	}
 }

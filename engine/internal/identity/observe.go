@@ -49,6 +49,9 @@ type Stats struct {
 	// Policy — нарушений политик алиасов (policy.go): flag и hold записаны и
 	// учтены в OK, reject — не записаны и в OK не входят.
 	Policy int
+	// Repeated — снимков без valid_from, повторивших уже действующий алиас:
+	// строка не пишется, это не ошибка и не нарушение.
+	Repeated int
 	// Retry — события, которые не удалось применить из-за хранилища, в порядке
 	// обработки: вызывающий отдаёт их в следующий Observe, чтобы сбой записи
 	// не терял алиасы. Очередь живёт в памяти движка (теряется при рестарте)
@@ -168,6 +171,9 @@ func (o *Observer) Observe(ctx context.Context, events []*model.Event) Stats {
 		ev    *model.Event
 		alias Alias
 		ts    time.Time
+		// implicitFrom — в событии нет attrs.valid_from: это снимок «алиас
+		// действует сейчас», а не новая выдача с известным началом.
+		implicitFrom bool
 	}
 	var ops []op
 	for _, ev := range events {
@@ -181,7 +187,7 @@ func (o *Observer) Observe(ctx context.Context, events []*model.Event) Stats {
 			slog.Warn("identity: событие "+ev.Action+" отклонено", "source", ev.Source, "ts", ev.TS, "actor", ev.ActorName, "err", err)
 			continue
 		}
-		ops = append(ops, op{ev: ev, alias: a, ts: ev.Time()})
+		ops = append(ops, op{ev: ev, alias: a, ts: ev.Time(), implicitFrom: strings.TrimSpace(ev.Attrs["valid_from"]) == ""})
 	}
 	if len(ops) == 0 {
 		return st
@@ -246,6 +252,32 @@ func (o *Observer) Observe(ctx context.Context, events []*model.Event) Stats {
 	}
 	for i, p := range ops {
 		if p.ev.Action == ActionAlias {
+			// Снимок без valid_from при уже действующем таком же алиасе — повтор,
+			// а не новый интервал: экспортер шлёт «кто сейчас на адресе» раз в
+			// несколько минут, и без этой проверки каждая отправка плодила бы строку
+			// с новым valid_from (замечено на стенде по api-smoke).
+			if p.implicitFrom && p.alias.ValidTo == nil {
+				repeated := false
+				for _, q := range pending {
+					if q.alias.PersonID == p.alias.PersonID && q.alias.Kind == p.alias.Kind && q.alias.Value == p.alias.Value && q.alias.ValidTo == nil {
+						repeated = true
+						break
+					}
+				}
+				if !repeated {
+					open, err := o.store.OpenAliases(ctx, p.alias.Kind, p.alias.Value, p.alias.PersonID)
+					if err != nil {
+						st.Errors++
+						o.errs.Add(1)
+						return abort(i, err)
+					}
+					repeated = len(open) > 0
+				}
+				if repeated {
+					st.Repeated++
+					continue
+				}
+			}
 			// Политика вида (если задана): состояние — хранилище плюс
 			// ожидающие записи того же человека и вида.
 			state := make([]Alias, 0, len(pending))

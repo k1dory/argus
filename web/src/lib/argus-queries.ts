@@ -560,18 +560,25 @@ export async function saveAgentVerdict(row: Omit<AgentVerdictRow, "created_at">)
 
 /** Одна строка на сессию — самая ранняя, при равном времени — по документу:
  *  параллельные записи одной сессии читают одного и того же победителя. */
-const AGENT_VERDICT_COLS = `incident_id, session_id, argMin(agent, (created_at, verdict_json)) AS agent, toString(min(created_at)) AS created_at,
+// ClickHouse подставляет псевдонимы SELECT вместо одноимённых колонок во всём запросе:
+// `argMin(verdict_json, (created_at, verdict_json)) AS verdict_json` превращается в агрегат
+// внутри агрегата (ILLEGAL_AGGREGATION, замечено на стенде). Поэтому запросы идут с
+// prefer_column_name_to_alias = 1, а агрегат по created_at назван first_created.
+const AGENT_VERDICT_COLS = `incident_id, session_id, argMin(agent, (created_at, verdict_json)) AS agent, toString(min(created_at)) AS first_created,
   argMin(verdict, (created_at, verdict_json)) AS verdict, argMin(confidence, (created_at, verdict_json)) AS confidence, argMin(human_needed, (created_at, verdict_json)) AS human_needed,
   argMin(verdict_json, (created_at, verdict_json)) AS verdict_json, argMin(markdown, (created_at, verdict_json)) AS markdown`;
+
+const AGENT_VERDICT_SETTINGS = { prefer_column_name_to_alias: 1 };
 
 /** Вердикты агентов по инциденту, новые первыми. */
 export async function agentVerdictsFor(incidentId: string, limit = 20): Promise<AgentVerdictRow[]> {
   const rows = await chQuery<AgentVerdictRow>(
     `SELECT ${AGENT_VERDICT_COLS} FROM agent_verdicts WHERE incident_id = {inc:String}
-     GROUP BY incident_id, session_id ORDER BY created_at DESC LIMIT {limit:UInt32}`,
+     GROUP BY incident_id, session_id ORDER BY first_created DESC LIMIT {limit:UInt32}`,
     { inc: incidentId, limit: clampInt(limit, 1, 200, 20) },
+    AGENT_VERDICT_SETTINGS,
   );
-  return rows.map((r) => ({ ...r, confidence: Number(r.confidence), human_needed: Number(r.human_needed) }));
+  return rows.map(agentVerdictRow);
 }
 
 /** Вердикт сессии разбора, если она его уже записала (одна сессия — один вердикт). */
@@ -580,8 +587,15 @@ export async function agentVerdictBySession(incidentId: string, sessionId: strin
     `SELECT ${AGENT_VERDICT_COLS} FROM agent_verdicts WHERE incident_id = {inc:String} AND session_id = {sid:String}
      GROUP BY incident_id, session_id LIMIT 1`,
     { inc: incidentId, sid: sessionId },
+    AGENT_VERDICT_SETTINGS,
   );
-  return rows[0] ? { ...rows[0], confidence: Number(rows[0].confidence), human_needed: Number(rows[0].human_needed) } : null;
+  return rows[0] ? agentVerdictRow(rows[0]) : null;
+}
+
+/** Строка ClickHouse → AgentVerdictRow: first_created → created_at, числа — числами. */
+function agentVerdictRow(r: AgentVerdictRow & { first_created?: string }): AgentVerdictRow {
+  const { first_created, ...rest } = r;
+  return { ...rest, created_at: first_created ?? r.created_at, confidence: Number(r.confidence), human_needed: Number(r.human_needed) };
 }
 
 /** Ещё не истёкшие отзывы: jti → срок токена (мс). */

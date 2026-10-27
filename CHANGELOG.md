@@ -9,6 +9,11 @@
 организации. Агенты разбора и LLM-бэкенды подключаются через нейтральные контракты, Wazuh
 стал модулем, правила безопасности и эксплуатации пишутся одним языком.
 
+- **Развёртывание и стенд.** Роль Ansible `deploy/ansible/roles/argus` и плейбук для хоста с Docker;
+  Caddy отдаёт сертификат `CONSOLE_HOST` клиентам без SNI (доступ по IP). По итогам первого
+  стенда: снимок `identity.alias` без `valid_from` при действующем алиасе — повтор, а не новый
+  интервал; чтение вердиктов агента с `prefer_column_name_to_alias` (псевдоним затенял колонку
+  внутри `argMin`, ILLEGAL_AGGREGATION), live-тест с ClickHouse покрывает запись и чтение вердикта.
 - **Политики алиасов и вид `phone`.** Блок `policies` в `identities.yml` на вид алиаса: `sources`
   (глобы доверенных источников событий), `max_open`, `churn {max, window}`, `on_violation`
   flag | hold | reject; нарушение — событие `argus.identity / identity.policy.violation` с `value`,

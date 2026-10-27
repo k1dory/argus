@@ -43,7 +43,7 @@ async function runMigration(f: string): Promise<void> {
 }
 
 async function applyMigrations(): Promise<void> {
-  for (const f of ["0013_incident_comments.sql", "0017_webhook_deliveries.sql", "0018_webhook_task_id.sql", "0020_triage_verdicts.sql", "0021_triage_verdict_claims.sql", "0024_agent_verdicts.sql", "0025_drop_task_id.sql"]) await runMigration(f);
+  for (const f of ["0013_incident_comments.sql", "0017_webhook_deliveries.sql", "0018_webhook_task_id.sql", "0020_triage_verdicts.sql", "0021_triage_verdict_claims.sql", "0024_agent_verdicts.sql", "0025_drop_task_id.sql", "0027_dedup_windows.sql"]) await runMigration(f);
 }
 
 /** Строка журнала с заданным временем (reopened пишется с пустым task_id, как в консоли). */
@@ -168,4 +168,28 @@ test("обновление 0025: действующий claim задачи пе�
   // повтор миграции ничего не дублирует
   await runMigration("0025_drop_task_id.sql");
   assert.equal(await claimRows(live), 1);
+});
+
+// Чтение вердиктов агента идёт через argMin по (created_at, verdict_json) с агрегатом
+// по той же колонке: псевдоним результата, совпадающий с именем колонки, ClickHouse
+// подставляет внутрь argMin (ILLEGAL_AGGREGATION) — мок SQL такого не ловит, стенд поймал.
+test("agent_verdicts: запись и чтение одной сессии на живом ClickHouse, дубль схлопывается", { skip }, async () => {
+  const { saveAgentVerdict, agentVerdictsFor, agentVerdictBySession } = q();
+  const incidentId = inc(77);
+  const row = {
+    incident_id: incidentId, session_id: sid(0x77), agent: "smoke", verdict: "undetermined", confidence: 0.6, human_needed: 1,
+    verdict_json: JSON.stringify({ schema: "argus-triage/v3", incident_id: incidentId, verdict: "undetermined" }), markdown: "# вердикт",
+  };
+  await saveAgentVerdict(row);
+  await saveAgentVerdict(row); // тот же токен дедупликации — вторая строка не появляется (окно 0027)
+  const bySession = await agentVerdictBySession(incidentId, row.session_id);
+  assert.equal(bySession?.verdict, "undetermined");
+  assert.equal(bySession?.confidence, 0.6);
+  assert.equal(bySession?.human_needed, 1);
+  assert.match(bySession?.created_at ?? "", /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/);
+  const list = await agentVerdictsFor(incidentId);
+  assert.equal(list.length, 1);
+  assert.equal(list[0].session_id, row.session_id);
+  const raw = await ch().chQuery<{ n: string }>("SELECT count() AS n FROM agent_verdicts WHERE incident_id = {i:String}", { i: incidentId });
+  assert.equal(Number(raw[0].n), 1, "дедупликация вставки по токену");
 });

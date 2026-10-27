@@ -64,14 +64,19 @@ func TestRepoIdentitiesFileAndFixture(t *testing.T) {
 	if s.Invalid != 0 || s.Errors != 0 || s.Policy != 0 || len(st.events) != 0 {
 		t.Fatalf("фикстура под политиками файла: %+v, нарушений %d", s, len(st.events))
 	}
-	var fromEvent bool
+	// Телефон уже выдан файлом и действует: снимок из otp.example без valid_from —
+	// повтор, а не второй интервал. Алиас в карте один, источник — файл.
+	var phones int
 	for k, a := range st.aliases {
-		if !st.deleted[k] && a.Kind == KindPhone && a.Value == "+79991234567" && a.PersonID == "i.petrov" && a.Source == "event:otp.example" {
-			fromEvent = true
+		if !st.deleted[k] && a.Kind == KindPhone && a.Value == "+79991234567" && a.PersonID == "i.petrov" {
+			phones++
+			if a.Source != SourceYAML {
+				t.Errorf("телефон должен остаться алиасом файла, получил source %q", a.Source)
+			}
 		}
 	}
-	if !fromEvent {
-		t.Error("телефон из события otp.example не записан")
+	if phones != 1 || s.Repeated == 0 {
+		t.Errorf("телефон: строк %d (ожидалась одна), повторов снимков %d (ожидался хотя бы один)", phones, s.Repeated)
 	}
 	// Событие OTP: actor_name — сам номер, как login у ssh.
 	var otp bool
