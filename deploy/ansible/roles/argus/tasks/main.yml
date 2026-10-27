@@ -41,6 +41,7 @@
     force: false
     update: true
   when: argus_source == 'git'
+  register: argus_git
 
 - name: "Код: rsync рабочей копии с управляющей машины"
   ansible.posix.synchronize:
@@ -48,9 +49,13 @@
     dest: "{{ argus_dir }}/"
     archive: true
     delete: false
-    rsync_opts: "{{ ['--omit-dir-times', '--no-perms', '--chmod=Du+rwx,go+rx,Fu+rw,go+r']
+    delay_updates: false   # несовместимо с --inplace
+    # --inplace: identities.yml и cmdb.yml примонтированы в контейнер движка как файлы;
+    # обычный rsync пишет во временный файл и переименовывает, контейнер остаётся со старым inode.
+    rsync_opts: "{{ ['--omit-dir-times', '--no-perms', '--inplace', '--chmod=Du+rwx,go+rx,Fu+rw,go+r']
                     + (argus_rsync_excludes | map('regex_replace', '^(.*)$', '--exclude=\\1') | list) }}"
   when: argus_source == 'local'
+  register: argus_sync
 
 - name: Исполняемые биты скриптов
   ansible.builtin.file:
@@ -116,6 +121,18 @@
 
 # По имени, а не по 127.0.0.1: клиент без SNI получает сертификат default_sni
 # (CONSOLE_HOST), а для имени localhost Caddy выпускает свой всегда.
+# Файлы карты идентичностей и CMDB примонтированы в контейнер движка как файлы:
+# если их inode сменился (новый файл, rsync без --inplace), контейнер видит старую
+# версию до пересоздания. При изменении этих файлов пересоздаём движок.
+- name: Пересоздать движок после смены identities.yml или cmdb.yml
+  ansible.builtin.command:
+    cmd: docker compose up -d --force-recreate --no-deps engine
+    chdir: "{{ argus_dir }}"
+  when: >-
+    (argus_sync.stdout_lines | default([]) | select('search', '(identities|cmdb)\.yml') | list | length > 0)
+    or (argus_git is defined and argus_git.changed | default(false))
+  changed_when: true
+
 - name: Дождаться консоли
   ansible.builtin.uri:
     url: https://localhost:8443/api/version
