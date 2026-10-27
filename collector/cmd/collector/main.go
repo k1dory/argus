@@ -424,6 +424,10 @@ func main() {
 				events[i].Attrs = map[string]string{}
 			}
 			events[i].Attrs["transport"] = "http"
+			// Направление — и для готовых событий NDJSON (агенты Vector, журналы фаерволов).
+			if events[i].SrcIP != "" && events[i].DstIP != "" && events[i].Attrs["scope"] == "" {
+				events[i].Attrs["scope"] = norm.FlowScope(events[i].SrcIP, events[i].DstIP)
+			}
 			rows[i] = events[i]
 		}
 		if err := pq.PushContext(requestCtx, rows); err != nil {
