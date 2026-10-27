@@ -34,6 +34,23 @@
     group: root
     mode: "0755"
 
+- name: Каталог без .git при argus_source git
+  ansible.builtin.stat:
+    path: "{{ argus_dir }}/.git"
+  register: argus_gitdir
+  when: argus_source == 'git'
+
+# Переход с rsync-копии на git: превратить каталог в checkout, не теряя .env и тома.
+- name: "Код: каталог из rsync → git checkout (.env сохраняется)"
+  ansible.builtin.shell:
+    cmd: >-
+      set -e; cd {{ argus_dir | quote }};
+      [ -z "$(ls -A)" ] && exit 0;
+      git init -q; git remote add origin {{ argus_repo_url | quote }} 2>/dev/null || true;
+      git fetch -q --tags origin; git reset -q --hard {{ argus_version | quote }}
+    creates: "{{ argus_dir }}/.git"
+  when: argus_source == 'git' and not argus_gitdir.stat.exists and argus_git_token | length == 0
+
 - name: "Код: клон или обновление репозитория"
   ansible.builtin.git:
     repo: "{{ argus_repo_url if argus_git_token | length == 0

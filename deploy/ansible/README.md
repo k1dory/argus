@@ -31,6 +31,9 @@ ansible-playbook -i inventory.yml deploy/ansible/argus.yml -l argus1
 `read:packages`, нужен только для приватных пакетов) и `make deploy`. Для приватного репозитория
 код выкачивается с `argus_git_token` (право чтения содержимого).
 
+Переход стенда с rsync-копии на `argus_source: git`: роль сама превращает каталог в checkout
+(`git init`, `fetch`, `reset --hard <тег>`), `.env` и тома не трогаются.
+
 Приватный репозиторий или стенд без доступа к Git-серверу: `argus_source: local`,
 `argus_local_src: /path/to/argus` — код уезжает `rsync` с управляющей машины
 (нужна коллекция `ansible.posix`).
