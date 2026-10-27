@@ -232,9 +232,11 @@
 # Файлы карты идентичностей и CMDB примонтированы в контейнер движка как файлы:
 # если их inode сменился (новый файл, rsync без --inplace), контейнер видит старую
 # версию до пересоздания. При изменении этих файлов пересоздаём движок.
+# APP_VERSION из VERSION, как в Makefile: без него compose подставит тег dev и соберёт
+# движок на хосте вместо подписанного образа релиза.
 - name: Пересоздать движок после смены identities.yml или cmdb.yml
-  ansible.builtin.command:
-    cmd: docker compose up -d --force-recreate --no-deps engine
+  ansible.builtin.shell:
+    cmd: APP_VERSION="$(cat VERSION)" docker compose up -d --force-recreate --no-deps {{ '--no-build' if argus_images == 'registry' else '' }} engine
     chdir: "{{ argus_dir }}"
   when: >-
     (argus_sync.stdout_lines | default([]) | select('search', '(identities|cmdb)\.yml') | list | length > 0)
