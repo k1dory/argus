@@ -24,6 +24,13 @@ argus_analyst_profile: mock
 ansible-playbook -i inventory.yml deploy/ansible/argus.yml -l argus1
 ```
 
+**Образы из реестра релиза** вместо сборки на хосте: `argus_images: registry`,
+`argus_version: v1.0.0` (тег релиза — версия образов берётся из `VERSION` в выкачанном коде),
+`argus_image_prefix: ghcr.io/<owner>/argus`; роль ставит `cosign`, проверяет подписи по `cosign.pub`
+из репозитория, делает `docker login` (`argus_registry_user`, `argus_registry_token` с правом
+`read:packages`, нужен только для приватных пакетов) и `make deploy`. Для приватного репозитория
+код выкачивается с `argus_git_token` (право чтения содержимого).
+
 Приватный репозиторий или стенд без доступа к Git-серверу: `argus_source: local`,
 `argus_local_src: /path/to/argus` — код уезжает `rsync` с управляющей машины
 (нужна коллекция `ansible.posix`).

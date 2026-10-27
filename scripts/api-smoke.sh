@@ -64,11 +64,15 @@ if [ "$code" = 200 ] && [ "$(jget .status)" = ok ]; then pass 1 "GET /api/versio
 else fail 1 "GET /api/version → $code: $(snippet)"; fi
 
 # ── 2. приём NDJSON коллектором: измерение value/unit и identity.alias ──────────
+# Смоук не должен оставлять следов в инцидентах: класс событий smoke не попадает
+# ни под одно поставляемое правило, алиас повторяет уже существующий.
 RUN="smoke-$(date -u +%Y%m%d%H%M%S)-$$"
 TS="$(date -u +'%Y-%m-%d %H:%M:%S.000')"
 # identity.alias повторяет алиас, который уже есть в identities.yml у той же
 # персоны: снимок идемпотентен, новых сущностей в карте идентичностей не появляется.
-printf '{"ts":"%s","source":"telemetry.smoke","source_class":"telemetry","action":"disk.usage","outcome":"success","severity":1,"node":"%s","object":"/smoke","value":42.5,"unit":"percent"}\n' "$TS" "$RUN" >"$TMP/events.ndjson"
+# source_class smoke, а не telemetry: иначе правило host-silence (absence по узлу
+# класса telemetry) через 10 минут заводило бы инцидент на каждый прогон смоука.
+printf '{"ts":"%s","source":"telemetry.smoke","source_class":"smoke","action":"disk.usage","outcome":"success","severity":1,"node":"%s","object":"/smoke","value":42.5,"unit":"percent"}\n' "$TS" "$RUN" >"$TMP/events.ndjson"
 printf '{"ts":"%s","source":"idp.smoke","source_class":"identity","action":"identity.alias","outcome":"success","severity":1,"actor_name":"%s","actor_kind":"user","node":"%s","attrs":{"alias_kind":"login","alias_value":"%s","confidence":"1"}}\n' "$TS" "$SMOKE_PERSON" "$RUN" "${SMOKE_PERSON//./}" >>"$TMP/events.ndjson"
 printf 'header = "X-Argus-Token: %s"\n' "$ARGUS_INGEST_TOKEN" >"$TMP/ingest.cfg"
 code=$(curl -ksS --max-time 30 -o "$BODY" -w '%{http_code}' -X POST -K "$TMP/ingest.cfg" \

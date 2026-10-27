@@ -8,6 +8,7 @@
     that:
       - argus_source in ['git', 'local']
       - argus_source != 'local' or argus_local_src | length > 0
+      - argus_images in ['build', 'registry']
       - argus_analyst_profile in ['mock', 'on-prem-strict']
       - argus_analyst_profile != 'on-prem-strict' or ('ARGUS_LLM_LOCAL_ENDPOINT' in argus_env)
     fail_msg: >-
@@ -35,13 +36,15 @@
 
 - name: "Код: клон или обновление репозитория"
   ansible.builtin.git:
-    repo: "{{ argus_repo_url }}"
+    repo: "{{ argus_repo_url if argus_git_token | length == 0
+              else argus_repo_url | regex_replace('^https://', 'https://x-access-token:' ~ argus_git_token ~ '@') }}"
     dest: "{{ argus_dir }}"
     version: "{{ argus_version }}"
     force: false
     update: true
   when: argus_source == 'git'
   register: argus_git
+  no_log: "{{ argus_git_token | length > 0 }}"
 
 - name: "Код: rsync рабочей копии с управляющей машины"
   ansible.posix.synchronize:
@@ -110,6 +113,35 @@
     mode: "0600"
   when: argus_enable_mcp
 
+- name: ".env: образы из реестра и ключ подписи"
+  ansible.builtin.lineinfile:
+    path: "{{ argus_dir }}/.env"
+    regexp: "^#?{{ item.key }}="
+    line: "{{ item.key }}={{ item.value }}"
+    mode: "0600"
+  loop:
+    - { key: ARGUS_IMAGE_PREFIX, value: "{{ argus_image_prefix }}" }
+    - { key: COSIGN_PUBKEY, value: "{{ './cosign.pub' if argus_verify_signatures else '' }}" }
+  loop_control:
+    label: "{{ item.key }}"
+  when: argus_images == 'registry'
+
+- name: cosign для проверки подписей образов
+  ansible.builtin.get_url:
+    url: "https://github.com/sigstore/cosign/releases/download/{{ argus_cosign_version }}/cosign-linux-amd64"
+    dest: /usr/local/bin/cosign
+    checksum: "sha256:{{ argus_cosign_sha256 }}"
+    mode: "0755"
+  when: argus_images == 'registry' and argus_verify_signatures
+
+- name: Вход в реестр образов
+  ansible.builtin.command:
+    cmd: docker login {{ argus_registry | quote }} -u {{ argus_registry_user | quote }} --password-stdin
+    stdin: "{{ argus_registry_token }}"
+  when: argus_images == 'registry' and argus_registry_token | length > 0
+  changed_when: false
+  no_log: true
+
 - name: Собрать и поднять стек (первый прогон собирает образы, это долго)
   ansible.builtin.command:
     cmd: make up
@@ -118,6 +150,17 @@
   poll: 15
   register: argus_up
   changed_when: "'Started' in argus_up.stdout or 'Created' in argus_up.stdout or 'Recreated' in argus_up.stdout"
+  when: argus_images == 'build'
+
+- name: Проверить подписи, выкачать образы релиза и поднять стек без сборки
+  ansible.builtin.command:
+    cmd: make deploy
+    chdir: "{{ argus_dir }}"
+  async: "{{ argus_up_timeout_sec }}"
+  poll: 15
+  register: argus_deploy
+  changed_when: "'Started' in argus_deploy.stdout or 'Created' in argus_deploy.stdout or 'Recreated' in argus_deploy.stdout or 'Pulled' in argus_deploy.stdout"
+  when: argus_images == 'registry'
 
 # По имени, а не по 127.0.0.1: клиент без SNI получает сертификат default_sni
 # (CONSOLE_HOST), а для имени localhost Caddy выпускает свой всегда.

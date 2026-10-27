@@ -9,8 +9,21 @@
 # или стенда без доступа к Git-серверу).
 argus_source: git                       # git | local
 argus_repo_url: https://github.com/k1dory/argus.git
-argus_version: opensource               # ветка или тег
+argus_version: opensource               # ветка или тег (для образов из реестра — тег релиза vX.Y.Z)
 argus_local_src: ""                     # при argus_source: local — путь к checkout на управляющей машине
+argus_git_token: ""                     # приватный репозиторий: токен с правом чтения кода (в URL, не в логах)
+
+# Образы: build — собирать на хосте (make up); registry — брать из реестра релиза
+# (make deploy: cosign verify → pull → up без сборки). Версия образов = файл VERSION
+# в выкачанном коде, поэтому argus_version должен указывать на тег релиза.
+argus_images: build                     # build | registry
+argus_image_prefix: ghcr.io/k1dory/argus
+argus_registry: ghcr.io
+argus_registry_user: ""                 # docker login; для GHCR — логин GitHub
+argus_registry_token: ""                # токен с правом read:packages (приватные пакеты); пусто — без логина
+argus_verify_signatures: true           # cosign verify --key cosign.pub из репозитория перед pull
+argus_cosign_version: v3.1.4
+argus_cosign_sha256: "424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa"   # cosign-linux-amd64
 
 argus_dir: /opt/argus                   # куда кладётся код и .env
 argus_data_dir: /srv/argus              # данные ClickHouse (scripts/init-storage.sh); "" — тома compose по умолчанию

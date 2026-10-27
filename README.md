@@ -868,8 +868,8 @@ git pull                 # или распаковать новый релиз
 тегу `vX.Y.Z`; на хосте ничего не компилируется):
 
 ```sh
-# .env: ARGUS_IMAGE_PREFIX=ghcr.io/<owner>/argus, COSIGN_PUBKEY=./cosign.pub
-git fetch --tags && git checkout v0.9.0   # compose, миграции, правила, дашборды нужной версии
+# .env: ARGUS_IMAGE_PREFIX=ghcr.io/k1dory/argus, COSIGN_PUBKEY=./cosign.pub (ключ лежит в корне репозитория)
+git fetch --tags && git checkout v1.0.0-rc1   # compose, миграции, правила, дашборды нужной версии
 make deploy                                # cosign verify + pull образов версии из VERSION + up без сборки
 ```
 
