@@ -139,10 +139,33 @@ func parseSDElement(body string, out map[string]string) {
 	}
 }
 
+// isoHeaderLayouts — ISO 8601 в заголовке BSD-формата: так шлют rsyslog
+// (ForwardFormat, «2026-10-27T23:42:55.001234+03:00») и RouterOS с
+// syslog-time-format=iso8601 («2026-10-27T23:42:55.0019+0300», без двоеточия в зоне).
+var isoHeaderLayouts = []string{
+	time.RFC3339Nano,
+	"2006-01-02T15:04:05.999999999-0700",
+	"2006-01-02T15:04:05-0700",
+	"2006-01-02T15:04:05.999999999",
+	"2006-01-02T15:04:05",
+}
+
 func parse3164(s Syslog, rest string) (Syslog, error) {
 	s.Format = "rfc3164"
+	// ISO-время вместо «Mmm dd hh:mm:ss»: <PRI>2026-10-27T23:42:55+03:00 HOST MSG
+	if len(rest) > 19 && rest[4] == '-' && rest[10] == 'T' {
+		if sp := strings.IndexByte(rest, ' '); sp > 0 {
+			for _, layout := range isoHeaderLayouts {
+				if t, err := time.Parse(layout, rest[:sp]); err == nil {
+					s.Timestamp = t.UTC()
+					rest = strings.TrimLeft(rest[sp+1:], " ")
+					break
+				}
+			}
+		}
+	}
 	// Mmm dd hh:mm:ss HOST TAG[pid]: MSG
-	if len(rest) >= 15 {
+	if s.Timestamp.IsZero() && len(rest) >= 15 {
 		if t, err := time.Parse("Jan _2 15:04:05", rest[:15]); err == nil {
 			// BSD-формат без года: подставляем текущий; «31 декабря» в первых
 			// числах января — это прошлый год, а не событие из будущего

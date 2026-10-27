@@ -3,6 +3,20 @@
 Версия стека — в файле `VERSION`, схема ClickHouse версионируется миграциями
 в `clickhouse/migrations/` (журнал — таблица `argus.schema_migrations`).
 
+## 1.0.0-rc4 — 2026-10-27
+
+- **Syslog MikroTik RouterOS.** Коллектор разбирает сообщения по списку топиков (`system,info,account …`):
+  вход и отказ входа → `auth.login` с учёткой, адресом и способом; журнал правил firewall →
+  `net.firewall` с адресами, портами, протоколом, флагами и префиксом правила (`deny` для
+  drop/reject); аренды DHCP → `dhcp.assign` / `dhcp.release` с MAC и именем хоста; изменения
+  конфигурации → `system.config` с автором. Источник `net.routeros`, класс `network`.
+- **ISO-время в заголовке BSD-формата.** `<PRI>2026-10-27T23:42:55+03:00 host …` (rsyslog
+  ForwardFormat, RouterOS с `syslog-time-format=iso8601`, зона и без двоеточия) разбирается как
+  RFC 3164 с точным временем; раньше время попадало в имя узла.
+- **Роль Ansible.** `argus_identities_src` / `argus_cmdb_src`: боевые карты вне checkout через
+  `docker-compose.override.yml`; `core.fileMode=false` в каталоге стека (исполняемые биты
+  скриптов ломали обновление по тегу).
+
 ## 1.0.0-rc3 — 2026-10-27
 
 rc1 и rc2 не публиковались: trivy остановил релиз на HIGH в stdlib Go 1.26.8 (crypto/x509) и в

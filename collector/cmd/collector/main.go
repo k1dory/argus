@@ -317,6 +317,8 @@ func main() {
 				e = sq
 			} else if jk, ok := parse.ParseJenkins(sl.Message, sl.Hostname); ok {
 				e = jk
+			} else if mt, ok := parse.ParseMikroTik(sl); ok {
+				e = mt
 			} else {
 				e = norm.FromSyslog(sl, line)
 			}
