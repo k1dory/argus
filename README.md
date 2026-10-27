@@ -869,7 +869,7 @@ git pull                 # или распаковать новый релиз
 
 ```sh
 # .env: ARGUS_IMAGE_PREFIX=ghcr.io/k1dory/argus, COSIGN_PUBKEY=./cosign.pub (ключ лежит в корне репозитория)
-git fetch --tags && git checkout v1.0.0-rc2   # compose, миграции, правила, дашборды нужной версии
+git fetch --tags && git checkout v1.0.0-rc3   # compose, миграции, правила, дашборды нужной версии
 make deploy                                # cosign verify + pull образов версии из VERSION + up без сборки
 ```
 

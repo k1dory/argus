@@ -1,6 +1,6 @@
 # Базовые образы пришпилены по digest (см. collector/Dockerfile — как обновлять).
 ARG REGISTRY=docker.io
-FROM ${REGISTRY}/library/node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32 AS build
+FROM ${REGISTRY}/library/node:22-alpine@sha256:fe4f6d74e20370acb04ad889077d14d0f64a9c8ea6a42bc60cddf1e844699914 AS build
 WORKDIR /src
 COPY package.json package-lock.json ./
 # --ignore-scripts: postinstall-хуки зависимостей не выполняются (supply chain);
@@ -9,9 +9,13 @@ RUN npm ci --ignore-scripts
 COPY . .
 RUN npm run build
 
-FROM ${REGISTRY}/library/node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32
+FROM ${REGISTRY}/library/node:22-alpine@sha256:fe4f6d74e20370acb04ad889077d14d0f64a9c8ea6a42bc60cddf1e844699914
 ARG APP_VERSION=dev
 ENV NODE_ENV=production APP_VERSION=$APP_VERSION
+# Рантайму npm не нужен, а в его vendored-зависимостях (brace-expansion, pacote, sigstore…)
+# trivy находит HIGH; пакеты Alpine поднимаем до исправленных (libcrypto и т.п.).
+RUN apk upgrade --no-cache \
+    && rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack /opt/yarn-*
 WORKDIR /app
 COPY --from=build /src/.next/standalone ./
 COPY --from=build /src/.next/static ./.next/static
