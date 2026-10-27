@@ -40,7 +40,10 @@ persons:
     team: platform
     aliases:
       - {kind: email, value: i.petrov@example.org}
+      - {kind: email, value: i.petrov@corp.local, note: "почта в NGFW (демо-трафик)"}
       - {kind: login, value: ipetrov}
+      - {kind: login, value: i.petrov, note: "логин в EDR и NGFW (демо-трафик)"}
+      - {kind: uid, value: "oidc:i.petrov", note: "субъект k8s-аудита (демо-трафик)"}
       - {kind: uid, value: "1001", note: "идентификатор в IdP"}
       - {kind: phone, value: "+7 (999) 123-45-67", note: "рабочий, OTP"}
       - {kind: ip, value: 10.77.0.11, note: "ноутбук, постоянный адрес VPN"}
@@ -50,8 +53,23 @@ persons:
     aliases:
       - {kind: email, value: a.sidorov@example.org}
       - {kind: login, value: asidorov}
+      - {kind: login, value: a.sidorov, note: "логин в EDR (демо-трафик)"}
       - {kind: uid, value: "1002"}
       - {kind: ip, value: 10.77.0.23, confidence: 0.9, note: "новый ноутбук, VPN"}
+  # Сервисные учётки из демо-трафика: вид service, чтобы они не висели в списке
+  # «не привязанных» и чтобы паспорт показывал, что делает учётка, а не человек.
+  svc-backup:
+    display: "svc-backup (резервное копирование)"
+    kind: service
+    team: infra
+    aliases:
+      - {kind: login, value: svc-backup}
+  project-7-bot:
+    display: "project_7_bot (бот CI проекта 7)"
+    kind: service
+    team: platform
+    aliases:
+      - {kind: login, value: project_7_bot}
   s.ivanova:
     display: "Светлана Иванова"
     team: infra

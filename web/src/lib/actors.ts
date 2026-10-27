@@ -163,12 +163,15 @@ export async function resolveAlias(value: string, atMs = Date.now()): Promise<Re
 export type UnboundSubject = { actor_name: string; count: number; first_ts: string; last_ts: string; sources: string[] };
 
 /** Топ actor_name за период без действующего (на момент последней активности) субъектного алиаса. */
+// Системные субъекты (actor_kind system: телеметрия самого ARGUS, сторожа) людям не
+// принадлежат и в список не попадают; сервисные учётки остаются — их заводят персонами вида service.
 export async function unboundSubjects(range: ActorRange, limit = 30, now = Date.now()): Promise<UnboundSubject[]> {
   const w = clampWindow(rangeWindow(range, now));
   const [top, aliases] = await Promise.all([
     chQuery<{ actor_name: string; count: string | number; first_ts: string; last_ts: string; sources: string[] }>(
       `SELECT actor_name, count() AS count, toString(min(ts)) AS first_ts, toString(max(ts)) AS last_ts, groupUniqArray(5)(source) AS sources
-       FROM events WHERE ts >= parseDateTime64BestEffort({from:String}, 3, 'UTC') AND ts < parseDateTime64BestEffort({to:String}, 3, 'UTC') AND actor_name != ''
+       FROM events WHERE ts >= parseDateTime64BestEffort({from:String}, 3, 'UTC') AND ts < parseDateTime64BestEffort({to:String}, 3, 'UTC')
+         AND actor_name != '' AND actor_kind != 'system'
        GROUP BY actor_name ORDER BY count DESC LIMIT {limit:UInt32}`,
       { from: chTs(w.fromMs), to: chTs(w.toMs), limit: Math.max(limit * 3, 30) },
     ),
