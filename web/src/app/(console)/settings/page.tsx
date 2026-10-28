@@ -109,9 +109,9 @@ export default async function SettingsPage() {
                   <span>
                     {u.name}
                     {u.name === session.user && <span className="text-[var(--ring)]"> · это вы</span>}
-                    <span className="text-muted-foreground"> · {ROLE_LABELS[u.role]} · с {formatTs(u.createdAt, "date")}{u.totp ? " · 2FA" : ""}{u.builtin ? " · встроенный" : ""}</span>
+                    <span className="text-muted-foreground"> · {ROLE_LABELS[u.role]} · с {formatTs(u.createdAt, "date")}{u.totp ? " · 2FA" : ""}{u.builtin ? " · встроенный" : ""}{u.sso ? " · SSO" : ""}</span>
                   </span>
-                  {isAdmin && u.name !== session.user && !u.builtin && (
+                  {isAdmin && u.name !== session.user && !u.builtin && !u.sso && (
                     <span className="flex items-center gap-1">
                       <ResetPasswordButton name={u.name} />
                       <DeleteUserButton name={u.name} />

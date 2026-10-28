@@ -71,7 +71,12 @@ type AuthState = {
   tokenVersion?: number;
   // Дополнительные пользователи с ролями (admin — встроенный, всегда есть).
   users?: ConsoleUser[];
+  // Кто входил через SSO (IdP): пароля и TOTP здесь нет, роль — из групп IdP на
+  // момент последнего входа. Нужны, чтобы назначать им инциденты.
+  ssoUsers?: SsoUser[];
 };
+
+export type SsoUser = { name: string; role: Role; firstLogin: string; lastLogin: string };
 
 const PASSWORD_SYMBOLS = ".*+?-";
 
@@ -353,14 +358,33 @@ export async function verifyCredentials(user: string, password: string): Promise
 
 /* ===== Пользователи и роли (управляет admin) ===== */
 
-export type UserInfo = { name: string; role: Role; createdAt: string; totp: boolean; builtin: boolean };
+export type UserInfo = { name: string; role: Role; createdAt: string; totp: boolean; builtin: boolean; sso: boolean };
 
 export async function listUsers(): Promise<UserInfo[]> {
   const state = await getAuthState();
   return [
-    { name: state.user, role: "admin", createdAt: state.generatedAt, totp: Boolean(state.totpSecret), builtin: true },
-    ...(state.users ?? []).map((u) => ({ name: u.name, role: u.role, createdAt: u.createdAt, totp: Boolean(u.totpSecret), builtin: false })),
+    { name: state.user, role: "admin", createdAt: state.generatedAt, totp: Boolean(state.totpSecret), builtin: true, sso: false },
+    ...(state.users ?? []).map((u) => ({ name: u.name, role: u.role, createdAt: u.createdAt, totp: Boolean(u.totpSecret), builtin: false, sso: false })),
+    ...(state.ssoUsers ?? []).map((u) => ({ name: u.name, role: u.role, createdAt: u.firstLogin, totp: false, builtin: false, sso: true })),
   ];
+}
+
+/** Запоминает вход через SSO: пользователь появляется в списке сотрудников с ролью
+ *  из групп IdP (обновляется каждым входом), чтобы ему можно было назначать инциденты. */
+export async function recordSsoLogin(name: string, role: Role): Promise<void> {
+  if (!isRole(role) || !name) return;
+  const now = new Date().toISOString();
+  await mutateState<void>(async (state) => {
+    const list = [...(state.ssoUsers ?? [])];
+    const i = list.findIndex((u) => u.name === name);
+    if (i >= 0) {
+      if (list[i].role === role) list[i] = { ...list[i], lastLogin: now };
+      else list[i] = { ...list[i], role, lastLogin: now };
+    } else {
+      list.push({ name, role, firstLogin: now, lastLogin: now });
+    }
+    return { next: { ...state, ssoUsers: list }, result: undefined };
+  });
 }
 
 const USER_NAME_RE = /^[a-z0-9._-]{2,32}$/;

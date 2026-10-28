@@ -30,9 +30,10 @@ function TakeForm({ incidentId }: { incidentId: string }) {
   </form>;
 }
 
-function AssignForm({ incidentId, users }: { incidentId: string; users: { name: string; role: string }[] }) {
+function AssignForm({ incidentId, owner, users }: { incidentId: string; owner: string; users: { name: string; role: string }[] }) {
   const [state, action, pending] = useActionState(assignIncidentAction, initial);
-  const analysts = users.filter((u) => u.role === "analyst");
+  // Аналитики и администраторы, кроме текущего ответственного; наблюдателям не назначают.
+  const analysts = users.filter((u) => (u.role === "analyst" || u.role === "admin") && u.name !== owner);
   return <form action={action} aria-busy={pending} className="flex flex-col gap-2">
     <input type="hidden" name="incident_id" value={incidentId} />
     <FieldGroup><Field data-disabled={pending || analysts.length === 0}>
@@ -40,11 +41,11 @@ function AssignForm({ incidentId, users }: { incidentId: string; users: { name: 
     <div className="flex flex-wrap items-center gap-2">
       <select id="assign-owner" name="owner" required defaultValue="" className="h-10 min-w-44 border border-border bg-[var(--surface-deep)] px-2 text-sm" disabled={pending || analysts.length === 0}>
         <option value="" disabled>Выберите сотрудника</option>
-        {analysts.map((u) => <option key={u.name} value={u.name}>{u.name}</option>)}
+        {analysts.map((u) => <option key={u.name} value={u.name}>{u.name}{u.role === "admin" ? " (администратор)" : ""}</option>)}
       </select>
       <Button type="submit" variant="secondary" disabled={pending || analysts.length === 0}>{pending ? "Назначаю…" : "Назначить"}</Button>
     </div>
-    {analysts.length === 0 && <FieldDescription>Нет доступных аналитиков. Добавьте сотрудника с ролью аналитика в настройках.</FieldDescription>}
+    {analysts.length === 0 && <FieldDescription>Некому назначить: добавьте сотрудника с ролью аналитика в настройках или дождитесь его входа через SSO.</FieldDescription>}
     </Field></FieldGroup>
     <Result state={state} />
   </form>;
@@ -128,7 +129,7 @@ export function IncidentStatusForm({ incidentId, status, owner, currentUser, isA
   return <div className="flex flex-col gap-5">
     {!open && <p className="text-sm text-muted-foreground">Инцидент завершён. Дополнительные сведения можно добавить в досье.</p>}
     {open && (!owner || mine && status !== "in_progress") && <TakeForm incidentId={incidentId} />}
-    {open && isAdmin && <AssignForm incidentId={incidentId} users={users} />}
+    {open && isAdmin && <AssignForm incidentId={incidentId} owner={owner} users={users} />}
     {open && mine && status !== "new" && status !== "waiting_owner" && <StatusForm key={status} incidentId={incidentId} status={status} exceptions={exceptions} />}
     {open && !mine && owner && !isAdmin && <p className="text-xs text-muted-foreground">Статус меняет ответственный: {owner}.</p>}
   </div>;

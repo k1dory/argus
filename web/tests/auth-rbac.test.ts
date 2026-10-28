@@ -117,6 +117,25 @@ test("бросающие действия (muteRule, dashboards): viewer — dig
   await assert.rejects(actions.muteRuleAction(formData({ rule_id: "1", muted: "1" })), isRedirect);
 });
 
+test("вход через SSO запоминает сотрудника: он в списке с ролью IdP, без пароля, роль обновляется входом, назначить ему можно", async () => {
+  await auth.recordSsoLogin("sso:ivanov", "analyst");
+  await auth.recordSsoLogin("sso:ivanov", "analyst");
+  let u = (await auth.listUsers()).find((x) => x.name === "sso:ivanov");
+  assert.ok(u && u.sso && !u.builtin && u.role === "analyst" && !u.totp);
+  assert.equal((await auth.listUsers()).filter((x) => x.name === "sso:ivanov").length, 1);
+  await auth.recordSsoLogin("sso:ivanov", "admin");
+  u = (await auth.listUsers()).find((x) => x.name === "sso:ivanov");
+  assert.equal(u?.role, "admin");
+  await auth.recordSsoLogin("", "admin");
+  assert.ok(!(await auth.listUsers()).some((x) => x.name === ""));
+  const writes: unknown[][] = [];
+  mocks.queries.incidentGet = async () => ({ incident_id: "INC-30", rule_id: "r1", actor_name: "", node: "", owner: "", status: "new" });
+  mocks.queries.incidentTransition = async (...args) => void writes.push(args);
+  await login("admin");
+  assert.equal((await incidents.assignIncidentAction({ error: null }, formData({ incident_id: "INC-30", owner: "sso:ivanov" }))).error, null);
+  assert.deepEqual(writes, [[{ id: "INC-30", kind: "assign", owner: "sso:ivanov", actor: "admin", role: "admin" }]]);
+});
+
 test("setIncidentStatus: статус из прототипа (toString/constructor) отвергается, реальный — принимается", async () => {
   await login("analyst1");
   for (const status of ["toString", "constructor", "__proto__", "hasOwnProperty", "nope", "waiting_owner"]) {
@@ -159,9 +178,11 @@ test("комментарий доступен аналитику без назн
   assert.match((await incidents.assignIncidentAction({ error: null }, formData({ incident_id: "INC-22", owner: "analyst2" }))).error ?? "", /Недостаточно прав/);
   await login("admin");
   assert.match((await incidents.assignIncidentAction({ error: null }, formData({ incident_id: "INC-22", owner: "viewer1" }))).error ?? "", /Выберите аналитика/);
-  assert.match((await incidents.assignIncidentAction({ error: null }, formData({ incident_id: "INC-22", owner: "adm2" }))).error ?? "", /Выберите аналитика/);
+  // Администратор — тоже ответственный: в маленькой команде инциденты разбирает и он.
+  assert.equal((await incidents.assignIncidentAction({ error: null }, formData({ incident_id: "INC-22", owner: "adm2" }))).error, null);
+  assert.deepEqual(writes[2], [{ id: "INC-22", kind: "assign", owner: "adm2", actor: "admin", role: "admin" }]);
   assert.equal((await incidents.assignIncidentAction({ error: null }, formData({ incident_id: "INC-22", owner: "analyst2" }))).error, null);
-  assert.deepEqual(writes[2], [{ id: "INC-22", kind: "assign", owner: "analyst2", actor: "admin", role: "admin" }]);
+  assert.deepEqual(writes[3], [{ id: "INC-22", kind: "assign", owner: "analyst2", actor: "admin", role: "admin" }]);
   await login("analyst2");
   assert.match((await incidents.setIncidentStatusAction({ error: null }, formData({ incident_id: "INC-22", status: "closed" }))).error ?? "", /Сначала возьмите/);
   await login("analyst1");

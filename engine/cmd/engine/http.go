@@ -61,6 +61,7 @@ func (e *engine) handler() http.Handler {
 			"status": "ok", "rules": len(e.current()), "incidents_created": e.m.incidentsCreated.Load(),
 			"incidents_closed": e.m.incidentsClosed.Load(), "reloads": e.m.reloads.Load(),
 			"last_run": time.Unix(e.m.lastRun.Load(), 0).UTC().Format(time.RFC3339), "errors": e.m.pollErrors.Load(),
+			"buffer_events": e.m.bufferEvents.Load(), "buffer_evicted": e.m.bufferEvicted.Load(),
 		})
 	})
 	mux.HandleFunc("GET /metrics", requireToken(e.mtoken, func(w http.ResponseWriter, _ *http.Request) {
@@ -89,6 +90,8 @@ func (e *engine) handler() http.Handler {
 		e.identity.WriteMetrics(w)
 		fmt.Fprintf(w, "argus_engine_poll_errors_total %d\n", e.m.pollErrors.Load())
 		fmt.Fprintf(w, "argus_engine_last_run_timestamp %d\n", e.m.lastRun.Load())
+		fmt.Fprintf(w, "argus_engine_buffer_events %d\n", e.m.bufferEvents.Load())
+		fmt.Fprintf(w, "argus_engine_buffer_evicted_total %d\n", e.m.bufferEvicted.Load())
 	}))
 	mux.HandleFunc("GET /rules", requireToken(e.token, func(w http.ResponseWriter, _ *http.Request) {
 		type item struct {

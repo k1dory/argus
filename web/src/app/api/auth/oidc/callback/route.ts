@@ -1,5 +1,5 @@
 import { cookies } from "next/headers";
-import { createSession, recordLoginFailure } from "@/lib/auth";
+import { createSession, recordLoginFailure, recordSsoLogin } from "@/lib/auth";
 import { audit } from "@/lib/argus-queries";
 import { exchange, oidcConfig } from "@/lib/oidc";
 
@@ -22,6 +22,7 @@ export async function GET(req: Request): Promise<Response> {
     // user.name уже с префиксом sso: — отдельное пространство имён (см. oidc.ts)
     const user = await exchange(cfg, code, verifier, nonce);
     await createSession(user.name, user.role, true);
+    await recordSsoLogin(user.name, user.role);
     await audit(user.name, "session.login", user.name, `sso · ${user.role} · groups: ${user.groups.join(",")}`);
     return Response.redirect(new URL("/", url.origin), 302);
   } catch (e) {

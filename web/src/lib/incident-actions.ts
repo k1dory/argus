@@ -109,7 +109,9 @@ export async function assignIncidentAction(_prev: FormState, formData: FormData)
   if (!owner || owner.length > 120) return { error: "Выберите ответственного" };
   try {
     const users = await listUsers();
-    if (!users.some((u) => u.name === owner && u.role === "analyst")) return { error: "Выберите аналитика из списка" };
+    // Ответственный — аналитик или администратор (в маленькой команде разбирают и
+    // они), локальный или вошедший через SSO; наблюдателю инцидент не отдаётся.
+    if (!users.some((u) => u.name === owner && (u.role === "analyst" || u.role === "admin"))) return { error: "Выберите аналитика или администратора из списка" };
     const inc = await incidentGet(id);
     if (!inc) return { error: "Инцидент не найден" };
     if (FINAL_STATUSES.has(inc.status)) return { error: "Инцидент уже завершён" };

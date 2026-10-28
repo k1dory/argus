@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -45,6 +46,8 @@ type metrics struct {
 	blockFailures    atomic.Int64
 	untrustedSkips   atomic.Int64 // автоблокировка не выполнена: недоверенный источник события
 	notifySuppressed atomic.Int64 // уведомления, ушедшие в сводку или отброшенные лимитом
+	bufferEvents     atomic.Int64 // кандидатов в буфере после последнего цикла
+	bufferEvicted    atomic.Int64 // кандидатов выброшено сверх ENGINE_BUFFER_MAX (окно урезано)
 }
 
 type engine struct {
@@ -68,6 +71,7 @@ type engine struct {
 	ctx        context.Context // жизнь процесса: разборы и HTTP-ручки отменяются при остановке
 	token      string          // ENGINE_TOKEN; пусто только при ARGUS_DEV=1
 	mtoken     string          // METRICS_TOKEN (по умолчанию = ENGINE_TOKEN)
+	bufferMax  int             // ENGINE_BUFFER_MAX: потолок буфера кандидатов, 0 — без предела
 
 	sysMu  sync.Mutex
 	storms map[string]*incidents.Incident // rule_id → открытый инцидент «шторм»
@@ -280,6 +284,14 @@ func run(rulesDir string) {
 		slog.Warn("respond config", "msg", msg)
 	}
 	poll, _ := time.ParseDuration(env("POLL_INTERVAL", "30s"))
+	e.bufferMax = defaultBufferMax
+	if v := strings.TrimSpace(os.Getenv("ENGINE_BUFFER_MAX")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			e.bufferMax = n
+		} else {
+			slog.Warn("ENGINE_BUFFER_MAX: ожидается целое ≥ 0, оставлен по умолчанию", "value", v, "default", defaultBufferMax)
+		}
+	}
 	if poll <= 0 {
 		poll = 30 * time.Second
 	}
@@ -340,12 +352,44 @@ func (e *engine) maxWindow() time.Duration {
 	return w
 }
 
+// defaultBufferMax — потолок буфера кандидатов (ENGINE_BUFFER_MAX). Кандидат с
+// десятком attrs занимает около килобайта: миллион — порядка гигабайта. Сверх
+// потолка выбрасываются самые старые: окно самых широких правил урезается, но
+// движок не уходит в OOM-цикл и остальные правила продолжают работать.
+const defaultBufferMax = 1_000_000
+
+// retention — сколько буфер держит кандидатов: самое широкое окно правил плюс два
+// опроса на запас. Стартовый курсор после рестарта — на ту же глубину: окна
+// восстанавливаются из базы, дубли гасит реестр открытых инцидентов.
+func (e *engine) retention(poll time.Duration) time.Duration {
+	return e.maxWindow() + 2*poll
+}
+
+// trimBuffer оставляет кандидатов не старше cut (по received_at; без времени
+// приёма — оставляет) и не больше max штук (0 — без предела), выбрасывая самые
+// старые: буфер пополняется в порядке приёма. Возвращает выброшенных сверх max.
+func trimBuffer(buffer []*model.Event, cut time.Time, max int) ([]*model.Event, int) {
+	kept := buffer[:0]
+	for _, ev := range buffer {
+		if ev.ReceivedAt.IsZero() || !ev.ReceivedAt.Before(cut) {
+			kept = append(kept, ev)
+		}
+	}
+	evicted := 0
+	if max > 0 && len(kept) > max {
+		evicted = len(kept) - max
+		fresh := make([]*model.Event, max)
+		copy(fresh, kept[evicted:])
+		kept = fresh
+	}
+	return kept, evicted
+}
+
 func (e *engine) loop(ctx context.Context, poll time.Duration) {
-	// Стартовый курсор — два окна назад: после рестарта окна восстанавливаются
-	// из базы, а дубли гасит реестр открытых инцидентов. Курсор — секунда
-	// received_at включительно с дедупликацией по хешу строки (store.Cursor):
-	// вставки той же секунды после опроса и остаток секунды за LIMIT не теряются.
-	cursor := store.StartCursor(time.Now().Add(-2 * e.maxWindow()))
+	// Курсор — секунда received_at включительно с дедупликацией по хешу строки
+	// (store.Cursor): вставки той же секунды после опроса и остаток секунды за
+	// LIMIT не теряются.
+	cursor := store.StartCursor(time.Now().Add(-e.retention(poll)))
 	var buffer []*model.Event
 	ticker := time.NewTicker(poll)
 	defer ticker.Stop()
@@ -358,7 +402,7 @@ func (e *engine) loop(ctx context.Context, poll time.Duration) {
 		// буфер кандидатов, а не весь хвост с курсора. После рестарта на
 		// стенде с NetFlow (≈800 тыс. событий в час) накопленный хвост целиком
 		// не помещался в лимит контейнера и движок уходил в цикл OOM.
-		polled := 0
+		polled, evicted := 0, 0
 		next, err := e.pollEvents(ctx, cursor, func(events []*model.Event) {
 			polled += len(events)
 			// Алиасы субъектов — из сырого потока, до фильтра кандидатов:
@@ -373,6 +417,13 @@ func (e *engine) loop(ctx context.Context, poll time.Duration) {
 					buffer = append(buffer, ev)
 				}
 			}
+			// Потолок держится и внутри опроса: хвост после рестарта (или шторм)
+			// иначе целиком ложится в память до первой чистки.
+			if e.bufferMax > 0 && len(buffer) > e.bufferMax+e.bufferMax/10 {
+				var n int
+				buffer, n = trimBuffer(buffer, time.Time{}, e.bufferMax)
+				evicted += n
+			}
 		})
 		if err != nil {
 			slog.Warn("events", "err", err)
@@ -380,15 +431,15 @@ func (e *engine) loop(ctx context.Context, poll time.Duration) {
 		} else {
 			cursor = next
 			e.m.eventsPolled.Add(int64(polled))
-			cut := time.Now().Add(-2 * e.maxWindow())
-			kept := buffer[:0]
-			for _, ev := range buffer {
-				if ev.ReceivedAt.IsZero() || !ev.ReceivedAt.Before(cut) {
-					kept = append(kept, ev)
-				}
+			var n int
+			buffer, n = trimBuffer(buffer, time.Now().Add(-e.retention(poll)), e.bufferMax)
+			evicted += n
+			if evicted > 0 {
+				e.m.bufferEvicted.Add(int64(evicted))
+				slog.Warn("buffer: кандидатов больше ENGINE_BUFFER_MAX — самые старые выброшены, окно широких правил урезано", "evicted", evicted, "max", e.bufferMax, "polled", polled)
 			}
-			buffer = kept
 			buffer = e.cycle(ctx, rs, buffer)
+			e.m.bufferEvents.Store(int64(len(buffer)))
 			e.m.lastRun.Store(time.Now().Unix())
 		}
 		e.checkDisks(ctx, time.Now())
