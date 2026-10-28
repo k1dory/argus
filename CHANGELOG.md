@@ -3,6 +3,21 @@
 Версия стека — в файле `VERSION`, схема ClickHouse версионируется миграциями
 в `clickhouse/migrations/` (журнал — таблица `argus.schema_migrations`).
 
+## 1.0.0-rc15 — 2026-10-28
+
+- **Правила по отказам входа с агентов хостов**: `host-ssh-bruteforce` (a41c-auth-031: 10 `auth.ssh`
+  failure с одного адреса за 10 минут, high) и `host-login-bruteforce` (a41c-auth-032: 8 `auth.login`
+  failure к веб-интерфейсу/API хоста — Proxmox VE, PBS — с одного адреса за 10 минут, high).
+  До этого подбор по SSH ловился только через модуль Wazuh (`rules/wazuh/ssh-bruteforce.yml`), а
+  агенты Vector слали `auth.ssh` failure впустую. Фикстура `fixtures/events/host-auth.ndjson`:
+  сканер с разными логинами на двух узлах — инцидент, три опечатки администратора — нет.
+- `scripts/pipeline-check.sh` — сквозная проверка на стенде: фикстура со сдвигом времени на «сейчас»
+  → `POST /ingest/events` → ожидание инцидента по правилу и субъекту в ClickHouse.
+- **Правила для песочниц агентов** (события `sandbox.*` от sandboxd платформы agent-sandbox через
+  агент Vector): `sandbox-egress-denied` (a41c-agent-080: 3 отказа выхода с одного адреса агента за
+  10 минут, medium), `sandbox-api-auth-failures` (a41c-agent-081: 10 отказов 401/403 API платформы
+  на шлюзе за 10 минут, high). Фикстура `fixtures/events/sandbox.ndjson`.
+
 ## 1.0.0-rc14 — 2026-10-28
 
 - `ENGINE_BUFFER_MAX` из `.env` пробрасывается в контейнер движка (в rc13 переменная читалась

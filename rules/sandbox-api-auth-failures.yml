@@ -1,0 +1,20 @@
+# Отказы API платформы песочниц (401/403): подбор или утёкший ключ арендатора, сломанный
+# клиент. sandboxd не пишет адрес клиента в строку http — группируем по узлу-шлюзу.
+title: "Agent sandbox: burst of API authorization failures"
+id: a41c-agent-081
+level: high
+tags: [attack.credential_access, attack.t1110]
+
+detection:
+  selection:
+    action: sandbox.api
+    outcome: deny
+  threshold:
+    kind: count
+    count: 10
+    window: 10m
+    group_by: node
+  condition: selection and threshold
+
+analyst:
+  profile: on-prem-strict

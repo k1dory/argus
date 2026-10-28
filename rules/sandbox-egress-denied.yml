@@ -1,0 +1,22 @@
+# Агент в песочнице (agent-sandbox) раз за разом ходит к хостам вне политики выхода:
+# sandboxd пишет egress verdict=deny на каждую попытку. Единичный отказ — ошибка промпта
+# или инструмента, серия с одного агента — он пытается выйти туда, куда не положено
+# (эксфильтрация, подмена зависимостей, обход политики). Группировка по адресу агента в VLAN.
+title: "Agent sandbox: repeated egress denials from one agent"
+id: a41c-agent-080
+level: medium
+tags: [attack.exfiltration, attack.t1041]
+
+detection:
+  selection:
+    action: sandbox.egress
+    outcome: deny
+  threshold:
+    kind: count
+    count: 3
+    window: 10m
+    group_by: src.ip
+  condition: selection and threshold
+
+analyst:
+  profile: on-prem-strict

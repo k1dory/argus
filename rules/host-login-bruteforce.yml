@@ -1,0 +1,22 @@
+# Подбор пароля к веб-интерфейсу или API хоста (Proxmox VE/PBS «authentication failure»,
+# другие службы с auth.login failure и адресом). Порог ниже SSH: формы входа без ключей
+# перебирают медленнее, а легитимных промахов у администратора — единицы.
+title: "Host: login brute force against a management interface"
+id: a41c-auth-032
+level: high
+tags: [attack.credential_access, attack.t1110.001]
+
+detection:
+  selection:
+    action: auth.login
+    outcome: failure
+    source|startswith: host.
+  threshold:
+    kind: count
+    count: 8
+    window: 10m
+    group_by: src.ip
+  condition: selection and threshold
+
+analyst:
+  profile: on-prem-strict

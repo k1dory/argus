@@ -1,0 +1,5 @@
+rule: a41c-agent-081
+fixture: fixtures/events/sandbox.ndjson
+expect_incidents: 1
+expect_actor: asb-gw1
+min_events: 10

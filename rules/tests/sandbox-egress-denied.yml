@@ -1,0 +1,5 @@
+rule: a41c-agent-080
+fixture: fixtures/events/sandbox.ndjson
+expect_incidents: 1
+expect_actor: 10.170.77.12
+min_events: 3

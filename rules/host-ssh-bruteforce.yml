@@ -1,0 +1,22 @@
+# Подбор пароля или учётки по SSH на хосте с агентом (journald sshd → auth.ssh failure,
+# включая «Invalid user» на серверах только с ключами). Порог — 10 отказов с одного
+# адреса за 10 минут: обычный человек столько не ошибается, сканеры — за секунды.
+# Внутренний адрес с таким потоком — чужой скрипт или заражённый хост, не меньше.
+title: "Host: SSH brute force from one address"
+id: a41c-auth-031
+level: high
+tags: [attack.credential_access, attack.t1110.001]
+
+detection:
+  selection:
+    action: auth.ssh
+    outcome: failure
+  threshold:
+    kind: count
+    count: 10
+    window: 10m
+    group_by: src.ip
+  condition: selection and threshold
+
+analyst:
+  profile: on-prem-strict

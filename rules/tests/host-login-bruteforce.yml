@@ -1,0 +1,5 @@
+rule: a41c-auth-032
+fixture: fixtures/events/host-auth.ndjson
+expect_incidents: 1
+expect_actor: 203.0.113.77
+min_events: 8
