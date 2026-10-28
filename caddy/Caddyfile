@@ -71,3 +71,25 @@ https://{$CONSOLE_HOST:localhost}:8089, https://localhost:8089, https://127.0.0.
 		respond 404
 	}
 }
+
+# MCP для агентов разбора (профиль compose mcp): Streamable HTTP argus-mcp за TLS.
+# Bearer проверяет сам argus-mcp (ARGUS_MCP_HTTP_TOKEN); здесь — только сети клиентов:
+# MCP_ALLOWED_NETS — CIDR через пробел (.env), по умолчанию только localhost.
+https://{$CONSOLE_HOST:localhost}:8445, https://localhost:8445, https://127.0.0.1:8445 {
+	tls {$CONSOLE_TLS:internal}
+	import security
+	import access_log
+	@allowed remote_ip {$MCP_ALLOWED_NETS:127.0.0.1/32}
+	handle @allowed {
+		reverse_proxy mcp:8095 {
+			header_up X-Forwarded-Proto https
+			header_up X-Real-IP {remote_host}
+			transport http {
+				read_timeout 5m
+			}
+		}
+	}
+	handle {
+		respond 403
+	}
+}

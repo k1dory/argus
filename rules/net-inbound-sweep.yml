@@ -2,7 +2,7 @@
 # десятках наших хостов — поиск открытого сервиса по всему блоку.
 title: "Network: inbound host sweep"
 id: a41c-net-071
-level: high
+level: medium
 tags: [attack.reconnaissance, attack.t1595.001]
 
 detection:
@@ -18,10 +18,14 @@ detection:
     group_by: src.ip
   condition: selection and threshold
 
+# Фон интернета: сотни сканеров в сутки. Без новых событий два часа — закрывается
+# автоматикой; повтор с того же адреса заводит новый инцидент.
+auto_close: 2h
+
 respond:
   action: block_ip
   target: src.ip
-  min_level: high
+  min_level: medium
   ttl: 12h
 
 analyst:

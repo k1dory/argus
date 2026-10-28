@@ -553,6 +553,7 @@ services:
       CONSOLE_HOST: ${CONSOLE_HOST:-localhost}
       # "internal" (свой CA Caddy) или "/certs/console.crt /certs/console.key"
       CONSOLE_TLS: ${CONSOLE_TLS:-internal}
+      MCP_ALLOWED_NETS: ${MCP_ALLOWED_NETS:-127.0.0.1/32}
     volumes:
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - ./caddy/certs:/certs:ro
@@ -561,6 +562,7 @@ services:
     ports:
       - "8443:8443"
       - "${INGEST_BIND:-0.0.0.0}:8089:8089"
+      - "${MCP_BIND:-127.0.0.1}:8445:8445"   # MCP для агентов за TLS (профиль mcp); наружу — MCP_BIND=0.0.0.0 + MCP_ALLOWED_NETS
     networks: [edge]
     <<: [*harden, *logging]
     # Бинарник caddy в официальном образе несёт file capability

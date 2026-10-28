@@ -3,7 +3,7 @@
 # «нет», без NetFlow. Работает с любым источником, где action=net.firewall, outcome=deny.
 title: "Firewall: inbound deny burst across ports"
 id: a41c-net-073
-level: medium
+level: low
 tags: [attack.reconnaissance, attack.t1046]
 
 detection:
@@ -17,6 +17,10 @@ detection:
     window: 10m
     group_by: src.ip
   condition: selection and threshold
+
+# Фон интернета: сотни сканеров в сутки. Без новых событий два часа — закрывается
+# автоматикой; повтор с того же адреса заводит новый инцидент.
+auto_close: 2h
 
 analyst:
   profile: on-prem-strict

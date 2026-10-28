@@ -3,7 +3,7 @@
 # (INTERNAL_NETS). Ответный трафик (DNS, CDN) под правило не попадает: у него ACK.
 title: "Network: inbound port scan"
 id: a41c-net-070
-level: high
+level: medium
 tags: [attack.reconnaissance, attack.t1046]
 
 detection:
@@ -19,10 +19,14 @@ detection:
     group_by: src.ip
   condition: selection and threshold
 
+# Фон интернета: сотни сканеров в сутки. Без новых событий два часа — закрывается
+# автоматикой; повтор с того же адреса заводит новый инцидент.
+auto_close: 2h
+
 respond:
   action: block_ip
   target: src.ip
-  min_level: high
+  min_level: medium
   ttl: 12h
 
 analyst:

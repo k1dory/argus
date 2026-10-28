@@ -3,7 +3,7 @@
 # Один адрес и один порт: это не скан, это цель.
 title: "Network: inbound hammering of admin/database ports"
 id: a41c-net-072
-level: medium
+level: low
 tags: [attack.credential_access, attack.t1110]
 
 detection:
@@ -18,6 +18,10 @@ detection:
     window: 10m
     group_by: src.ip
   condition: selection and threshold
+
+# Фон интернета: сотни сканеров в сутки. Без новых событий два часа — закрывается
+# автоматикой; повтор с того же адреса заводит новый инцидент.
+auto_close: 2h
 
 analyst:
   profile: on-prem-strict
