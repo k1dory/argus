@@ -359,6 +359,7 @@ services:
       IDENTITIES_FILE: /etc/argus/identities.yml
       POLL_INTERVAL: ${ENGINE_POLL_INTERVAL:-30s}
       ENGINE_BUFFER_MAX: ${ENGINE_BUFFER_MAX:-1000000}
+      ENGINE_LOOKBACK_MAX: ${ENGINE_LOOKBACK_MAX:-1h}
       LISTEN_ADDR: ":8090"
       # Профили аналитика — argus.analyst.yml; секреты только через окружение.
       ARGUS_ANALYST_PROFILE: ${ARGUS_ANALYST_PROFILE:-mock}

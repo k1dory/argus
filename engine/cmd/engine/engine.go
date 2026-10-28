@@ -72,6 +72,7 @@ type engine struct {
 	token      string          // ENGINE_TOKEN; пусто только при ARGUS_DEV=1
 	mtoken     string          // METRICS_TOKEN (по умолчанию = ENGINE_TOKEN)
 	bufferMax  int             // ENGINE_BUFFER_MAX: потолок буфера кандидатов, 0 — без предела
+	lookback   time.Duration   // ENGINE_LOOKBACK_MAX: потолок глубины буфера и стартового курсора
 
 	sysMu  sync.Mutex
 	storms map[string]*incidents.Incident // rule_id → открытый инцидент «шторм»
@@ -285,6 +286,14 @@ func run(rulesDir string) {
 	}
 	poll, _ := time.ParseDuration(env("POLL_INTERVAL", "30s"))
 	e.bufferMax = defaultBufferMax
+	e.lookback = defaultLookback
+	if v := strings.TrimSpace(os.Getenv("ENGINE_LOOKBACK_MAX")); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			e.lookback = d
+		} else {
+			slog.Warn("ENGINE_LOOKBACK_MAX: ожидается длительность > 0, оставлен по умолчанию", "value", v, "default", defaultLookback)
+		}
+	}
 	if v := strings.TrimSpace(os.Getenv("ENGINE_BUFFER_MAX")); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
 			e.bufferMax = n
@@ -358,11 +367,21 @@ func (e *engine) maxWindow() time.Duration {
 // движок не уходит в OOM-цикл и остальные правила продолжают работать.
 const defaultBufferMax = 1_000_000
 
-// retention — сколько буфер держит кандидатов: самое широкое окно правил плюс два
-// опроса на запас. Стартовый курсор после рестарта — на ту же глубину: окна
-// восстанавливаются из базы, дубли гасит реестр открытых инцидентов.
+// defaultLookback — потолок глубины буфера и стартового курсора (ENGINE_LOOKBACK_MAX).
+// Окно самого широкого правила может быть сутками (identity-device-churn: 24h), но
+// вычитывать сутки событий после каждого рестарта — часы опроса и гигабайты памяти;
+// такие правила оцениваются по доступной глубине и добирают состояние по ходу работы.
+const defaultLookback = time.Hour
+
+// retention — сколько буфер держит кандидатов: самое широкое окно правил (не глубже
+// ENGINE_LOOKBACK_MAX) плюс два опроса на запас. Стартовый курсор после рестарта — на
+// ту же глубину: окна восстанавливаются из базы, дубли гасит реестр открытых инцидентов.
 func (e *engine) retention(poll time.Duration) time.Duration {
-	return e.maxWindow() + 2*poll
+	w := e.maxWindow()
+	if e.lookback > 0 && w > e.lookback {
+		w = e.lookback
+	}
+	return w + 2*poll
 }
 
 // trimBuffer оставляет кандидатов не старше cut (по received_at; без времени

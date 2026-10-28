@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/devitex-soft/argus/engine/internal/model"
+	"github.com/devitex-soft/argus/engine/internal/rules"
 )
 
 func TestTrimBufferByAgeAndCap(t *testing.T) {
@@ -27,5 +28,17 @@ func TestTrimBufferByAgeAndCap(t *testing.T) {
 	}
 	if kept, evicted = trimBuffer(nil, now, 1); len(kept) != 0 || evicted != 0 {
 		t.Fatalf("пустой буфер: kept=%d evicted=%d", len(kept), evicted)
+	}
+}
+
+func TestRetentionCappedByLookback(t *testing.T) {
+	e := &engine{lookback: time.Hour}
+	e.rules.Store(&[]*rules.Rule{})
+	if got := e.retention(30 * time.Second); got != 16*time.Minute {
+		t.Fatalf("без правил: %v, ожидалось 15m + 2×30s", got)
+	}
+	e.lookback = 10 * time.Minute
+	if got := e.retention(30 * time.Second); got != 11*time.Minute {
+		t.Fatalf("потолок: %v, ожидалось 10m + 1m", got)
 	}
 }
