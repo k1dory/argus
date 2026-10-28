@@ -534,7 +534,7 @@ services:
     command: ["-http", "0.0.0.0:8095"]
     ports:
       - "127.0.0.1:18095:8095"  # нестандартный порт: 8095/8097 на машинах разработчиков заняты
-    networks: [egress]
+    networks: [egress, edge]   # edge — чтобы Caddy мог проксировать :8445 → mcp:8095
     <<: [*harden, *logging]
     depends_on:
       web:
