@@ -239,6 +239,9 @@ make replay                                   # залить записанны�
 ./scripts/argus rules test --replay fixtures/events/telemetry.ndjson
 ```
 
+Поведение вендоров на стыках (RouterOS, Huawei VRP, Vector, NetBird, Authentik, nftables, PBS) —
+в [docs/integrations.md](docs/integrations.md).
+
 Куда направлять источники:
 
 | Источник | Как | Куда |
