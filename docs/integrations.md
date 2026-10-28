@@ -91,6 +91,47 @@
   приходят в journald с `SYSLOG_IDENTIFIER=kernel`, их разбирает агент (`net.firewall`/`deny`).
   Широковещательный DHCP провайдерского сегмента (`0.0.0.0 → 255.255.255.255`) — шум.
 
+## Proxmox VE
+
+- Вход в веб-интерфейс и API — в journald `pvedaemon`: `<root@pam> successful auth for user 'x@pam'`,
+  `authentication failure; rhost=::ffff:1.2.3.4 user=x@pam msg=…` (адрес с префиксом `::ffff:`,
+  его надо срезать). Задачи — `<user> starting task UPID:node:pid:pstart:start:type:id:user:` и
+  `<user> end task UPID:… OK` (иначе текст ошибки); прочие действия от имени пользователя —
+  `<user> update VM 100: -memory 2048`.
+- Шум в `pvedaemon`/`pveproxy`: `worker N started/finished`, `starting N worker(s)`, `received
+  signal HUP`/`restarting server` (ротация логов), `VM N qga command failed … got timeout` каждые
+  минуты у ВМ без guest-agent.
+- `/var/log/pveproxy/access.log` — Common Log Format с пользователем (`root@pam!token`), но
+  почти целиком опрос интерфейса (`GET /api2/extjs/cluster/resources` раз в секунды). Берите
+  `POST /api2/*/access/ticket` (вход: 200 успех, 401 отказ), `POST`/`PUT`/`DELETE` (изменения)
+  и любые ответы ≥ 400; `GET` с кодом < 400 отбрасывайте на агенте.
+- Каталог `/var/log/pveproxy` — `0700 www-data`: группой `www-data` файл не прочитать. Нужен
+  POSIX ACL (`setfacl -m u:vector:rx /var/log/pveproxy`, `-d -m u:vector:r` для новых файлов
+  после logrotate `create 640`); пакет `acl` на гипервизорах по умолчанию не стоит.
+
+## Caddy и другие прокси в контейнерах
+
+- Источник Vector `docker_logs` читает stdout контейнера через сокет Docker — пользователь
+  `vector` должен состоять в группе `docker` (после добавления — рестарт службы).
+- Access-лог Caddy — JSON с `logger: http.log.access` (у именованных логов — `http.log.access.<name>`):
+  `request.client_ip` (с учётом `trusted_proxies`), `request.remote_ip`, `request.host`,
+  `request.uri`, `status`, `request.headers.User-Agent` — массив, `request.tls.server_name`.
+  Предупреждения `http.handlers.reverse_proxy` («aborting with incomplete response» у gRPC-стримов
+  NetBird) — не события.
+- Страны в логе Caddy нет: правило `proxy-foreign-access` требует известную страну
+  (`attrs.country|regex: '^[A-Za-z]{2}$'`) — иначе оператор `not RU` совпал бы с пустым значением.
+  Это общее свойство матчера: `not X` истинен для отсутствующего поля, добавляйте проверку
+  на наличие.
+
+## Forgejo runner и OpenBao
+
+- `forgejo-runner` пишет logfmt в journald: `level=info msg="task N repo is org/repo …"` — старт
+  задачи, `level=error msg="failed to fetch task" error="unavailable: 502 Bad Gateway"` — сервер
+  Forgejo недоступен. Остальное (сети job'ов, poller) — шум.
+- OpenBao без включённого audit device — только служебный журнал (`SYSLOG_IDENTIFIER=bao`):
+  `… [INFO]  core: vault is unsealed`, `[WARN]`, `[ERROR]`. Кто что читал из хранилища — только
+  через audit device (`bao audit enable file …`), это отдельный источник.
+
 ## Proxmox Backup Server
 
 - Журнал аутентификации — `/var/log/proxmox-backup/api/auth.log`

@@ -10,6 +10,8 @@ detection:
   selection:
     action: proxy.access
     attrs.country: 'not RU'
+    # Без страны (Caddy, прокси без геолокации) — не «чужая страна», а неизвестно: не считаем.
+    attrs.country|regex: '^[A-Za-z]{2}$'
   threshold:
     kind: count
     count: 5

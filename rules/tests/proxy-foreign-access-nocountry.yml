@@ -1,0 +1,4 @@
+# Access-лог без страны (Caddy за NetBird/без геолокации): правило про «чужую страну» молчит.
+rule: a41c-net-076
+fixture: fixtures/events/proxy-access-nocountry.ndjson
+expect_incidents: 0

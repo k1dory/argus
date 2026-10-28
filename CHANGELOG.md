@@ -3,6 +3,14 @@
 Версия стека — в файле `VERSION`, схема ClickHouse версионируется миграциями
 в `clickhouse/migrations/` (журнал — таблица `argus.schema_migrations`).
 
+## 1.0.0-rc12 — 2026-10-28
+
+- `proxy-foreign-access` требует известную страну (`attrs.country|regex`): access-логи без
+  геолокации (Caddy, прокси без страны) больше не считаются «чужой страной» — оператор `not X`
+  совпадает с отсутствующим полем. Тест `rules/tests/proxy-foreign-access-nocountry.yml`.
+- `docs/integrations.md`, README: Proxmox VE (journald pvedaemon, `pveproxy/access.log`, ACL на
+  каталог), Caddy через `docker_logs`, Forgejo runner, OpenBao.
+
 ## 1.0.0-rc11 — 2026-10-28
 
 - **Правила для опубликованных сервисов** по access-логам reverse proxy (`action: proxy.access`,
