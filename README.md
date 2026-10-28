@@ -512,6 +512,7 @@ TOKEN=$(curl -sS -H "Authorization: Bearer $ARGUS_TRIAGE_ISSUER_TOKEN" \
   -d '{"incident_id":"INC-12","ttl_sec":1800}' https://argus/api/triage/sessions | jq -r .token)
 # 3. прочитать карточку и журнал источника за сутки
 curl -sS -H "Authorization: Bearer $TOKEN" https://argus/api/triage/context
+curl -sS -H "Authorization: Bearer $TOKEN" https://argus/api/triage/schema    # JSON Schema вердикта (argus-triage/v3), ETag/304
 curl -sS -H "Authorization: Bearer $TOKEN" 'https://argus/api/v1/log?log=ci&level=high&since=24h'
 # 4. сдать вердикт
 curl -sS -H "Authorization: Bearer $TOKEN" -d @verdict.json https://argus/api/triage/verdicts

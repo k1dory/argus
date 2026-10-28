@@ -43,6 +43,11 @@ type Schema = {
 
 const ROOT = schemaJson as unknown as Schema;
 
+/** Схема вердикта как есть — для GET /api/triage/schema: агент берёт актуальную версию
+ *  с сервера, а не копию в своих инструкциях. Версия — const поля schema_version. */
+export const VERDICT_SCHEMA: unknown = schemaJson;
+export const VERDICT_SCHEMA_VERSION = "argus-triage/v3";
+
 /* ===== Маленький валидатор подмножества JSON Schema 2020-12, которым
    написана схема вердикта: type, const, enum, pattern, min/maxLength,
    min/maxItems, uniqueItems, items, contains, required, properties,

@@ -3,7 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  badFreeText, badRunes, checkVerdict, code, plain, plainText, renderVerdictMarkdown, schemaValid, validateVerdictSchema, type VerdictDoc,
+  badFreeText, badRunes, checkVerdict, code, plain, plainText, renderVerdictMarkdown, schemaValid, validateVerdictSchema, VERDICT_SCHEMA, VERDICT_SCHEMA_VERSION, type VerdictDoc,
 } from "../src/lib/shared/triage-verdict";
 import { VERDICT_OK, verdictWith } from "./_verdict-fixture";
 
@@ -119,4 +119,11 @@ test("plain/plainText/code: второй рубеж против разметк�
   assert.equal(plain("-- line *em* _u_ `c` # h"), "\\-- line \\*em\\* \\_u\\_ \\`c\\` \\# h", "ведущий дефис экранирован — строка не станет линией");
   assert.equal(plain("//evil.example.org/x"), "\\[ссылка удалена\\]");
   assert.equal(code("a`b\u0001c"), "`abc`");
+});
+
+test("VERDICT_SCHEMA: схема для GET /api/triage/schema — та же, по которой проверяется вердикт, версия в const", () => {
+  const sch = VERDICT_SCHEMA as { $id?: string; properties?: Record<string, { const?: string }> };
+  assert.match(sch.$id ?? "", /argus-triage-verdict-v3/);
+  assert.equal(sch.properties?.schema?.const, VERDICT_SCHEMA_VERSION);
+  assert.equal(VERDICT_SCHEMA_VERSION, "argus-triage/v3");
 });
