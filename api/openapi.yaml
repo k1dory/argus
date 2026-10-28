@@ -410,6 +410,48 @@ paths:
         "429": { $ref: "#/components/responses/TooManyRequests" }
         "503": { $ref: "#/components/responses/StorageUnavailable" }
 
+  /api/triage/schema:
+    get:
+      tags: [triage]
+      summary: JSON Schema вердикта (argus-triage/v3)
+      description: |
+        Схема, по которой консоль проверяет тело `POST /api/triage/verdicts`. Агент разбора
+        получает её с того же сервера, которому отдаёт вердикт, и не держит копию в своих
+        инструкциях. Схема статична: `ETag` по содержимому, `304` на `If-None-Match`.
+      operationId: getTriageSchema
+      security:
+        - triageSession: []
+      parameters:
+        - in: header
+          name: If-None-Match
+          required: false
+          schema: { type: string }
+      responses:
+        "200":
+          description: Схема.
+          headers:
+            ETag:
+              schema: { type: string }
+            X-Argus-Schema-Version:
+              schema: { type: string }
+              example: argus-triage/v3
+            Cache-Control:
+              schema: { type: string }
+              example: private, max-age=3600
+          content:
+            application/schema+json:
+              schema:
+                type: object
+                description: JSON Schema (draft 2020-12) вердикта argus-triage/v3.
+        "304":
+          description: Схема не изменилась (`If-None-Match` совпал с `ETag`).
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: Не токен `triage-session`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
   /api/triage/sessions:
     post:
       tags: [triage]

@@ -3,6 +3,10 @@
 Версия стека — в файле `VERSION`, схема ClickHouse версионируется миграциями
 в `clickhouse/migrations/` (журнал — таблица `argus.schema_migrations`).
 
+## 1.0.0-rc25 — 2026-10-28
+
+- `GET /api/triage/schema` описан в `api/openapi.yaml` (тест соответствия спецификации и маршрутов в rc24 падал).
+
 ## 1.0.0-rc24 — 2026-10-28
 
 - **`GET /api/triage/schema`** — JSON Schema вердикта (`argus-triage/v3`) токену сессии
