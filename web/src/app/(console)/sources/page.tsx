@@ -17,7 +17,7 @@ import { requirePageSession } from "@/lib/auth";
 import { safeQuery } from "@/lib/clickhouse";
 import { eventsRecent, sourcesHealth } from "@/lib/argus-queries";
 import { SOURCE_ALIVE_LABELS } from "@/lib/shared/labels";
-import { formatRhythm, formatThreshold } from "@/lib/shared/source-health";
+import { describeThreshold, formatRhythm, RHYTHM_WINDOW_DAYS } from "@/lib/shared/source-health";
 import { fmtNum, formatAgo, formatTs } from "@/lib/shared/time";
 
 export const dynamic = "force-dynamic";
@@ -49,16 +49,16 @@ function SourcesBody({ health, events, source, ingestBase }: { health: Awaited<R
   return (
     <>
       <div className="grid grid-cols-2 gap-6 md:grid-cols-4">
-        <StatTile label="Источников за 7 сут" value={fmtNum(health.length)} />
+        <StatTile label={`Источников за ${RHYTHM_WINDOW_DAYS} сут`} value={fmtNum(health.length)} />
         <StatTile label="Живы (по ритму)" value={`${fmtNum(alive)} / ${fmtNum(health.length)}`} led={health.length === 0 ? "var(--status-warn)" : alive === health.length ? "var(--status-ok)" : "var(--status-warn)"} />
         <StatTile label="EPS за 60 с" value={fmtNum(eps)} />
         <StatTile label="Классов" value={fmtNum(classes.size)} />
       </div>
 
-      <Panel label="Коллекторы · источники за 7 суток, счётчики за час" meta={source ? "клик по источнику — фильтр ленты ниже" : undefined}>
+      <Panel label={`Коллекторы · источники за ${RHYTHM_WINDOW_DAYS} суток, счётчики за час`} meta={source ? "клик по источнику — фильтр ленты ниже" : undefined}>
         {health.length === 0 ? (
           <div className="space-y-2">
-            <p className="text-sm text-muted-foreground">За последние 7 суток событий нет.</p>
+            <p className="text-sm text-muted-foreground">За последние {RHYTHM_WINDOW_DAYS} суток событий нет.</p>
             <p className="text-sm text-muted-foreground">
               Направьте syslog/CEF на <span className="font-mono">:5514</span>, NetFlow на <span className="font-mono">:2055</span>, вебхуки на <span className="font-mono">{ingestBase}/ingest/&lt;тип&gt;</span> с заголовком <span className="font-mono">X-Argus-Token: …</span> — или прогоните записанный трафик командой <span className="font-mono">make replay</span>.
             </p>
@@ -74,7 +74,7 @@ function SourcesBody({ health, events, source, ingestBase }: { health: Awaited<R
                   <TableHead className="c-label text-right">EPS/60 с</TableHead>
                   <TableHead className="c-label text-right">ПДн, %</TableHead>
                   <TableHead className="c-label">Последний приём (UTC)</TableHead>
-                  <TableHead className="c-label">Ритм за 7 сут</TableHead>
+                  <TableHead className="c-label">Ритм за {RHYTHM_WINDOW_DAYS} сут</TableHead>
                   <TableHead className="c-label">Статус</TableHead>
                 </TableRow>
               </TableHeader>
@@ -94,9 +94,9 @@ function SourcesBody({ health, events, source, ingestBase }: { health: Awaited<R
                       <TableCell className="text-right font-mono text-xs">{fmtNum(h.eps_60s)}</TableCell>
                       <TableCell className="text-right font-mono text-xs">{h.pii_share > 0 ? <span className="text-[var(--status-warn)]">{fmtNum(h.pii_share, 1)} %</span> : "0 %"}</TableCell>
                       <TableCell className="font-mono text-xs whitespace-nowrap" title={formatAgo(h.last_ts, now)}>{formatTs(h.last_ts)}</TableCell>
-                      <TableCell className="font-mono text-xs whitespace-nowrap" title={`${fmtNum(h.events_window)} событий за 7 суток`}>{formatRhythm(h.rhythm_sec)}</TableCell>
+                      <TableCell className="font-mono text-xs whitespace-nowrap" title={`${fmtNum(h.events_window)} событий за ${RHYTHM_WINDOW_DAYS} суток; ритм — типичный разрыв между активными минутами`}>{formatRhythm(h.rhythm_sec)}</TableCell>
                       <TableCell>
-                        <span className="flex items-center gap-2 font-mono text-xs" title={`порог тишины для этого источника: ${formatThreshold(h.silence_threshold_sec)} (3 × ритм, не меньше 5 мин); с последнего события: ${formatThreshold(h.silent_for_sec)}`}>
+                        <span className="flex items-center gap-2 font-mono text-xs" title={describeThreshold(h.silence_threshold_sec, h.silent_for_sec)}>
                           <Led color={h.alive ? "var(--status-ok)" : "var(--status-err)"} />
                           {h.alive ? SOURCE_ALIVE_LABELS.alive : SOURCE_ALIVE_LABELS.silent}
                         </span>

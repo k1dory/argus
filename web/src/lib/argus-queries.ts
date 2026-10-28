@@ -1,7 +1,7 @@
 // Запросы ARGUS-контура: единая схема событий, инциденты, вердикты аналитика,
 // здоровье коллекторов. ReplacingMergeTree читаем через argMax по updated_at.
 import "server-only";
-import { isAlive, rhythmSec, RHYTHM_WINDOW_DAYS, silenceThresholdSec } from "./shared/source-health";
+import { isAlive, RHYTHM_QUANTILE, RHYTHM_WINDOW_DAYS, silenceThresholdSec } from "./shared/source-health";
 import crypto from "node:crypto";
 import { clampInt, clampPage } from "./shared/limits";
 import { chCommand, chQuery as chQueryRaw } from "./clickhouse";
@@ -294,9 +294,9 @@ export type SourceHealth = {
   last_ts: string;
   pii_share: number;
   alive: number;
-  /** Событий за окно ритма (7 суток) по heartbeat коллектора; источник мимо коллектора — за час. */
+  /** Событий за окно ритма (RHYTHM_WINDOW_DAYS) по heartbeat коллектора; источник мимо коллектора — за час. */
   events_window: number;
-  /** Ритм: секунд на одну активную минуту за окно; null — активная минута одна. */
+  /** Ритм: типичный разрыв между активными минутами, с (квантиль RHYTHM_QUANTILE); null — разрывов нет. */
   rhythm_sec: number | null;
   /** Порог тишины для этого источника, с (max(5 мин, 3 × ритм)). */
   silence_threshold_sec: number;
@@ -305,14 +305,17 @@ export type SourceHealth = {
 };
 
 export async function sourcesHealth(): Promise<SourceHealth[]> {
-  // Счётчики «за час», доля ПДн и класс — по таблице событий за последний час, как и
-  // прежде. Ритм (активные минуты за 7 суток) — по журналу heartbeat коллектора
-  // collector_health_log: одна строка на источник в минуту, а не полный скан events за
-  // неделю (сотни миллионов строк на каждую загрузку страницы). Источники, замолчавшие
-  // больше часа назад, берутся оттуда же; их класс и точное время последнего события —
-  // точечным запросом к events вокруг последней активной минуты (индекс по received_at).
-  type Hour = { source: string; source_class: string; events_1h: string; eps_60s: string; last_ts: string; last_sec: string; pii_share: string; now_sec: string };
-  type Rhythm = { source: string; events_window: string; active_minutes: string; first_sec: string; last_sec: string; now_sec: string };
+  // Счётчики «за час», доля ПДн и класс — по таблице событий за последний час. Ритм —
+  // по журналу heartbeat коллектора collector_health_log (одна строка на источник в
+  // минуту, ORDER BY (source, seen_at)): квантиль разрывов между активными минутами за
+  // RHYTHM_WINDOW_DAYS считается в ClickHouse, массивы минут в консоль не едут. Полный
+  // скан events за окно здесь недопустим — сотни миллионов строк на каждую загрузку.
+  // Источники, замолчавшие больше часа назад, берутся из того же журнала; их класс и
+  // точное время последнего события — точечным запросом к events вокруг последней
+  // активной минуты (minmax-индекс по received_at читает считанные гранулы).
+  type Num = number | string; // ClickHouse JSON: UInt32/Float64 приходят числами, count() — строкой
+  type Hour = { source: string; source_class: string; events_1h: Num; eps_60s: Num; last_ts: string; last_sec: Num; pii_share: Num | null; now_sec: Num };
+  type Rhythm = { source: string; events_window: Num; active_minutes: Num; gap_q: Num | null; last_sec: Num; now_sec: Num };
   const [hour, rhythm] = await Promise.all([
     chQuery<Hour>(
       `SELECT source, any(source_class) AS source_class, count() AS events_1h,
@@ -324,18 +327,17 @@ export async function sourcesHealth(): Promise<SourceHealth[]> {
     ),
     chQuery<Rhythm>(
       `SELECT source, sum(events_1m) AS events_window, countIf(events_1m > 0) AS active_minutes,
-              toUnixTimestamp(minIf(seen_at, events_1m > 0)) AS first_sec,
+              arrayReduce('quantileExactInclusive({q:Float64})', arraySlice(arrayDifference(arraySort(groupArrayIf(toUnixTimestamp(seen_at), events_1m > 0))), 2)) AS gap_q,
               toUnixTimestamp(maxIf(seen_at, events_1m > 0)) AS last_sec,
               toUnixTimestamp(now()) AS now_sec
-       FROM collector_health_log WHERE seen_at >= now() - INTERVAL ${RHYTHM_WINDOW_DAYS} DAY
+       FROM collector_health_log WHERE seen_at >= now() - INTERVAL {days:UInt32} DAY
        GROUP BY source HAVING active_minutes > 0`,
+      { q: RHYTHM_QUANTILE, days: RHYTHM_WINDOW_DAYS },
     ),
   ]);
   const byHour = new Map(hour.map((r) => [r.source, r]));
   const stale = rhythm.filter((r) => !byHour.has(r.source)).slice(0, 200);
-  // Класс и последнее событие замолчавших источников: окно ±15 минут вокруг последней
-  // активной минуты heartbeat — minmax-индекс по received_at читает считанные гранулы.
-  type Stale = { source: string; source_class: string; last_ts: string; last_sec: string };
+  type Stale = { source: string; source_class: string; last_ts: string; last_sec: Num };
   const staleRows = stale.length === 0 ? [] : await chQuery<Stale>(
     `SELECT source, any(source_class) AS source_class, max(received_at) AS last_ts, toUnixTimestamp(max(received_at)) AS last_sec
      FROM events WHERE ${stale.map((_, i) => `(source = {s${i}:String} AND received_at BETWEEN toDateTime({t${i}:UInt32}) - INTERVAL 15 MINUTE AND toDateTime({t${i}:UInt32}) + INTERVAL 15 MINUTE)`).join(" OR ")}
@@ -351,12 +353,14 @@ export async function sourcesHealth(): Promise<SourceHealth[]> {
     // Последнее событие: таблица событий точнее heartbeat (минутная гранулярность).
     const last = Number(h?.last_sec ?? st?.last_sec ?? rh?.last_sec ?? now);
     const lastTs = h?.last_ts ?? st?.last_ts ?? (rh ? new Date(Number(rh.last_sec) * 1000).toISOString().slice(0, 19).replace("T", " ") : "");
-    const active = Number(rh?.active_minutes ?? 0), span = rh ? Number(rh.last_sec) - Number(rh.first_sec) : 0;
-    const threshold = silenceThresholdSec(active, span);
+    // Одна активная минута — разрывов нет (quantile пустого массива — nan/null): ритм неизвестен.
+    const gapQ = rh?.gap_q == null ? NaN : Number(rh.gap_q);
+    const rhythmSec = Number.isFinite(gapQ) && gapQ > 0 ? Math.max(60, gapQ) : null;
+    const threshold = silenceThresholdSec(rhythmSec);
     return {
       source, source_class: h?.source_class ?? st?.source_class ?? "", last_ts: lastTs,
       events_1h: Number(h?.events_1h ?? 0), eps_60s: Number(h?.eps_60s ?? 0), pii_share: Number(h?.pii_share) || 0,
-      events_window: Number(rh?.events_window ?? h?.events_1h ?? 0), rhythm_sec: rhythmSec(active, span), silence_threshold_sec: threshold,
+      events_window: Number(rh?.events_window ?? h?.events_1h ?? 0), rhythm_sec: rhythmSec, silence_threshold_sec: threshold,
       silent_for_sec: Math.max(0, now - last), alive: isAlive(now, last, threshold) ? 1 : 0,
     };
   });

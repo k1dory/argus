@@ -914,15 +914,15 @@ make deploy                                # cosign verify + pull образов
 
 ## Тесты
 
-Пять слоёв, от быстрых к медленным:
+Пять слоёв, от быстрых к медленным. Цифры — число тестов на момент rc27.
 
-| Слой | Что проверяет | Как запустить |
-|---|---|---|
-| юнит | Go-модули (`collector`, `engine`, `policyd`, `mcp`, `triage`), шиппер на Rust, Rego-политики через встроенный OPA, чистые модули консоли `web/src/lib/shared/*` и маршруты `web/src/app/api/*` с подменённым ClickHouse | `make test`; `cd web && npm test` |
-| правила | правила корреляции на записанном трафике `fixtures/events/*.ndjson`, ожидания в `rules/tests/` | `./scripts/argus rules test` |
-| интеграция | живой ClickHouse: конкурентный claim вердикта агента (`web/tests/triage-claim-ch.test.ts`); без `ARGUS_TEST_CLICKHOUSE_URL` тест пропускается | `ARGUS_TEST_CLICKHOUSE_URL=http://localhost:8123 ARGUS_TEST_CLICKHOUSE_PASSWORD=… npm test` |
-| API-смоук | живой стенд: `GET /api/version`, приём NDJSON коллектором (`value`/`unit`, `identity.alias`), событие в `GET /api/v1/log`, сессия разбора по демо-инциденту, карточка, граница области, вердикт `argus-triage/v3` и его идемпотентный повтор, резолв алиаса и паспорт субъекта, запрет экспорта токену сессии | `make up-dev && make demo && ./scripts/api-smoke.sh` (параметры `ARGUS_URL`, `ARGUS_API_TOKEN`, `ARGUS_TRIAGE_ISSUER_TOKEN`, `ARGUS_INGEST_URL`, `ARGUS_INGEST_TOKEN`; по умолчанию — `.env.dev`) |
-| e2e | стек с нуля в compose (`argus-e2e`): replay → ≥ 7 инцидентов и вердиктов движка, `argus_ro` только читает, затем API-смоук; в CI — на push в `main` | `./scripts/e2e.sh` (`E2E_TIMEOUT`, сек) |
+| Слой | Сколько | Что проверяет | Как запустить |
+|---|---|---|---|
+| юнит | Go ≈ 480, консоль ≈ 270, шиппер 26, OPA 20 | Go-модули (`collector`, `engine`, `policyd`, `mcp`, `triage`): парсеры и нормализация, приёмники на реальных сокетах, жизненный цикл инцидентов, реагирование, уведомления через httptest и мини-SMTP, pull-коллекторы Falcon/S3 на имитации API, обогащение; шиппер на Rust; Rego-политики; консоль — чистые модули `web/src/lib/shared/*`, маршруты `web/src/app/api/*` с подменённым ClickHouse, аутентификация и RBAC на реальном файле `auth.json` | `make test`; `cd web && npm test` |
+| правила | 31 сценарий | правила корреляции на записанном трафике `fixtures/events/*.ndjson`, ожидания (число инцидентов, субъект, в том числе отрицательные) в `rules/tests/` | `./scripts/argus rules test` |
+| интеграция | 2 файла | живой ClickHouse: все миграции с нуля по порядку и повторно (идемпотентность), затем каждый SQL консоли на настоящем сервере — источники по ритму heartbeat (квантиль разрывов за 30 суток), инциденты, журнал и live-tail, поиск по индексам, модуль Wazuh, паспорт субъекта, записи аудита/исключений/комментариев (`web/tests/queries-ch.test.ts`); конкурентный claim вердикта агента (`web/tests/triage-claim-ch.test.ts`). Без `ARGUS_TEST_CLICKHOUSE_URL` оба пропускаются; в CI сервис `clickhouse` у job `web` | `docker run -d -p 8123:8123 -e CLICKHOUSE_DB=argus -e CLICKHOUSE_PASSWORD=x clickhouse/clickhouse-server:24.8`, затем `ARGUS_TEST_CLICKHOUSE_URL=http://localhost:8123 ARGUS_TEST_CLICKHOUSE_PASSWORD=x npm test` |
+| API-смоук | 13 шагов | живой стенд: `GET /api/version`, приём NDJSON коллектором (`value`/`unit`, `identity.alias`), событие в `GET /api/v1/log`, сессия разбора по демо-инциденту, карточка, граница области, вердикт `argus-triage/v3` и его идемпотентный повтор, резолв алиаса и паспорт субъекта, запрет экспорта токену сессии, живость источников `GET /api/sources` (статус по ритму), MCP за Caddy `:8445` (при `ARGUS_MCP_URL`) | `make up-dev && make demo && ./scripts/api-smoke.sh` (параметры `ARGUS_URL`, `ARGUS_API_TOKEN`, `ARGUS_TRIAGE_ISSUER_TOKEN`, `ARGUS_INGEST_URL`, `ARGUS_INGEST_TOKEN`, `ARGUS_MCP_URL`; по умолчанию — `.env.dev`) |
+| e2e | 1 сценарий | стек с нуля в compose (`argus-e2e`): replay → ≥ 7 инцидентов и вердиктов движка, `argus_ro` только читает, затем API-смоук; с плагином buildx поднимаются и `mcp` + `caddy` (шаг 13 — MCP за TLS); в CI — на push в `main` | `./scripts/e2e.sh` (`E2E_TIMEOUT`, сек) |
 
 ```sh
 make test          # cargo test + go vet/test (Rego-политики гоняются через встроенный OPA)
@@ -932,8 +932,15 @@ cd web && npm test && npm run lint && npm run typecheck   # консоль
 ./scripts/api-smoke.sh                                    # API консоли на живом стенде
 ```
 
-Спецификация REST API консоли — OpenAPI в `api/openapi.yaml`; консоль отдаёт её же как
-`/openapi.yaml`. Смоук и тесты маршрутов проверяют поведение, описанное в ней.
+Что покрыто слабо и проверяется только e2e или руками: страницы и компоненты консоли
+(`web/src/app`, `web/src/components` — только typecheck и eslint), `engine/internal/store`
+и `rules` (около 55–65 %), `cmd/*` модулей. Покрытие по пакетам: `go test -cover ./...` в
+модуле, `cd web && npx tsx --experimental-test-coverage --test tests/*.test.ts`.
+
+Спецификация REST API консоли — OpenAPI 3.1 в `api/openapi.yaml` (валидна по официальной
+схеме: swagger-parser, Redocly); консоль отдаёт её же как `/openapi.yaml`. Тест
+`web/tests/openapi.test.ts` следит, что каждый маршрут описан и копия совпадает с источником;
+смоук и тесты маршрутов проверяют описанное в ней поведение.
 
 ## Участие и безопасность
 

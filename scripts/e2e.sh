@@ -4,21 +4,32 @@
 #                                 argus_ro только читает, а API консоли прошёл scripts/api-smoke.sh
 # Переменные: REGISTRY_MIRROR (зеркало Docker Hub), E2E_TIMEOUT (сек, по умолчанию 240),
 # E2E_COMPOSE_OVERRIDE — дополнительный compose-файл (например, другие host-порты, чтобы
-# идти рядом с работающим стеком), тогда E2E_COLLECTOR_PORT / E2E_WEB_PORT — порты из него.
+# идти рядом с работающим стеком), тогда E2E_COLLECTOR_PORT / E2E_WEB_PORT / E2E_MCP_PORT — порты из него.
 # Стенд поднимается с дефолтами .env.dev + docker-compose.dev.yml (ARGUS_DEV=1).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
 export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-argus-e2e}"
 export ENGINE_POLL_INTERVAL=5s
 TIMEOUT="${E2E_TIMEOUT:-240}"
-COLLECTOR_PORT="${E2E_COLLECTOR_PORT:-8088}"; WEB_PORT="${E2E_WEB_PORT:-3001}"
+COLLECTOR_PORT="${E2E_COLLECTOR_PORT:-8088}"; WEB_PORT="${E2E_WEB_PORT:-3001}"; MCP_PORT="${E2E_MCP_PORT:-8445}"
 dc() { docker compose --env-file .env.dev -f docker-compose.yml -f docker-compose.dev.yml ${E2E_COMPOSE_OVERRIDE:+-f "$E2E_COMPOSE_OVERRIDE"} "$@"; }
 # shellcheck disable=SC2329  # вызывается через trap EXIT
-cleanup() { dc down -v --remove-orphans >/dev/null 2>&1 || true; }
+cleanup() { dc --profile mcp down -v --remove-orphans >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
 ./scripts/gen-sample.sh >/dev/null
-dc up -d --build clickhouse migrator collector engine web
+# Профиль mcp и Caddy — ради шага 13 смоука: MCP за TLS-фронтом с проверкой сетей
+# клиентов (caddy/entrypoint.sh добавляет шлюз Docker — иначе localhost получал 403).
+# Образ mcp собирается с именованным контекстом (BuildKit): без плагина buildx —
+# classic builder не умеет additional_contexts — стек поднимается без mcp/caddy, шаг 13 SKIP.
+MCP_URL=""
+if docker buildx version >/dev/null 2>&1; then
+  dc --profile mcp up -d --build clickhouse migrator collector engine web mcp caddy
+  MCP_URL="https://127.0.0.1:$MCP_PORT"
+else
+  echo "warn: docker buildx не установлен — mcp и caddy не поднимаются, шаг 13 смоука пропускается"
+  dc up -d --build clickhouse migrator collector engine web
+fi
 # Админ ClickHouse на стенде — из .env.dev; пароль через окружение, не argv.
 CLICKHOUSE_PASSWORD="$(grep -E '^CLICKHOUSE_PASSWORD=' .env.dev | cut -d= -f2-)"; export CLICKHOUSE_PASSWORD
 q() { dc exec -T -e CLICKHOUSE_PASSWORD clickhouse clickhouse-client --user argus --query "$1"; }
@@ -64,7 +75,7 @@ api_smoke() {
   for _ in $(seq 1 60); do curl -fsS "http://127.0.0.1:$WEB_PORT/api/version" >/dev/null 2>&1 && { ok=1; break; }; sleep 2; done
   [ "$ok" = 1 ] || { echo "FAIL: консоль не ответила на /api/version за 120 с"; dc logs --tail=50 web; exit 1; }
   echo "→ API-смоук (scripts/api-smoke.sh)"
-  ARGUS_URL="http://127.0.0.1:$WEB_PORT" ARGUS_INGEST_URL="http://127.0.0.1:$COLLECTOR_PORT" ARGUS_ENV_FILE=.env.dev ./scripts/api-smoke.sh || { dc logs --tail=50 web engine; exit 1; }
+  ARGUS_URL="http://127.0.0.1:$WEB_PORT" ARGUS_INGEST_URL="http://127.0.0.1:$COLLECTOR_PORT" ARGUS_MCP_URL="$MCP_URL" ARGUS_ENV_FILE=.env.dev ./scripts/api-smoke.sh || { dc logs --tail=50 web engine caddy mcp; exit 1; }
 }
 
 echo "→ жду коллектор"
