@@ -1,6 +1,7 @@
 // Запросы ARGUS-контура: единая схема событий, инциденты, вердикты аналитика,
 // здоровье коллекторов. ReplacingMergeTree читаем через argMax по updated_at.
 import "server-only";
+import { isAlive, rhythmSec, RHYTHM_WINDOW_DAYS, silenceThresholdSec } from "./shared/source-health";
 import crypto from "node:crypto";
 import { clampInt, clampPage } from "./shared/limits";
 import { chCommand, chQuery as chQueryRaw } from "./clickhouse";
@@ -293,19 +294,46 @@ export type SourceHealth = {
   last_ts: string;
   pii_share: number;
   alive: number;
+  /** Событий за окно ритма (7 суток). */
+  events_window: number;
+  /** Ритм: секунд на одну активную минуту за окно; null — активная минута одна. */
+  rhythm_sec: number | null;
+  /** Порог тишины для этого источника, с (max(5 мин, 3 × ритм)). */
+  silence_threshold_sec: number;
+  /** Секунд с последнего события на момент запроса. */
+  silent_for_sec: number;
 };
 
 export async function sourcesHealth(): Promise<SourceHealth[]> {
-  const rows = await chQuery<SourceHealth>(
-    `SELECT source, any(source_class) AS source_class, count() AS events_1h,
+  // Окно — 7 суток: в нём ритм источника (активные минуты) и источники, замолчавшие
+  // больше часа назад, — раньше они просто пропадали из списка. Счётчики «за час»
+  // и доля ПДн — по последнему часу, как и прежде.
+  type Row = { source: string; source_class: string; events_1h: string; eps_60s: string; last_ts: string; pii_share: string; events_window: string; active_minutes: string; first_sec: string; last_sec: string; now_sec: string };
+  const rows = await chQuery<Row>(
+    `SELECT source, any(source_class) AS source_class,
+            countIf(received_at >= now() - INTERVAL 1 HOUR) AS events_1h,
             countIf(received_at >= now() - INTERVAL 60 SECOND) AS eps_60s,
             max(received_at) AS last_ts,
-            round(100 * avg(pii), 1) AS pii_share,
-            if(max(received_at) >= now() - INTERVAL 5 MINUTE, 1, 0) AS alive
-     FROM events WHERE received_at >= now() - INTERVAL 1 HOUR
-     GROUP BY source ORDER BY events_1h DESC`,
+            round(100 * avgIf(pii, received_at >= now() - INTERVAL 1 HOUR), 1) AS pii_share,
+            count() AS events_window,
+            uniqExact(toStartOfMinute(received_at)) AS active_minutes,
+            toUnixTimestamp(min(received_at)) AS first_sec,
+            toUnixTimestamp(max(received_at)) AS last_sec,
+            toUnixTimestamp(now()) AS now_sec
+     FROM events WHERE received_at >= now() - INTERVAL ${RHYTHM_WINDOW_DAYS} DAY
+     GROUP BY source ORDER BY events_1h DESC, events_window DESC`,
   );
-  return rows.map((r) => ({ ...r, events_1h: Number(r.events_1h), eps_60s: Number(r.eps_60s), pii_share: Number(r.pii_share), alive: Number(r.alive) }));
+  return rows.map((r) => {
+    const active = Number(r.active_minutes), first = Number(r.first_sec), last = Number(r.last_sec), now = Number(r.now_sec);
+    const span = last - first;
+    const threshold = silenceThresholdSec(active, span);
+    return {
+      source: r.source, source_class: r.source_class, last_ts: r.last_ts,
+      events_1h: Number(r.events_1h), eps_60s: Number(r.eps_60s), pii_share: Number(r.pii_share) || 0,
+      events_window: Number(r.events_window), rhythm_sec: rhythmSec(active, span), silence_threshold_sec: threshold,
+      silent_for_sec: Math.max(0, now - last), alive: isAlive(now, last, threshold) ? 1 : 0,
+    };
+  });
 }
 
 export type EventRow = {
