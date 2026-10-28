@@ -34,6 +34,9 @@
   замолчавших источников — точечно по индексу `received_at`. Источники мимо коллектора
   (например, `wazuh.agents`) получают порог 5 минут. Плитки и подписи страницы и
   `SourceHealth` в OpenAPI приведены к новой семантике (7 суток, порог по ритму).
+- **`api/openapi.yaml` импортируется в Swagger.** Валидатор по официальной JSON-схеме OAS 3.1
+  (swagger-parser, Swagger Editor) отвергал спеку: у `info.license` не было `url`/`identifier`.
+  Теперь `identifier: AGPL-3.0-only`; неиспользуемая схема `Role` убрана.
 - `GET /api/triage/schema` не списывает бюджет сессии разбора (`uncharged`, как соседние
   маршруты протокола). `VERDICT_SCHEMA_VERSION` — алиас `VERDICT_SCHEMA_ID`, а не вторая
   копия строки. Док-комментарии `csvList`/`envList` в движке на своих местах.

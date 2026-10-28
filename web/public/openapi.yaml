@@ -44,7 +44,8 @@ info:
     на `npm run build`; тест `web/tests/openapi.test.ts` следит, чтобы копия и маршруты не
     расходились).
   license:
-    name: См. LICENSE в корне репозитория
+    name: AGPL-3.0-only
+    identifier: AGPL-3.0-only
 servers:
   - url: /
     description: Та же схема и хост, что у консоли (за Caddy — https://<host>:8443).
@@ -1249,10 +1250,6 @@ components:
     IncidentStatus:
       type: string
       enum: [new, escalated, in_progress, waiting_owner, observing, closed, false_positive]
-    Role:
-      type: string
-      enum: [viewer, analyst, admin]
-
     SourceHealth:
       type: object
       description: >-
