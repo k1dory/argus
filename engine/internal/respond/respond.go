@@ -178,6 +178,17 @@ type Responder struct {
 }
 
 // envList — <prefix>1..N: пустые пропускаются, ищем до 64.
+// csvList — список через запятую (INTERNAL_NETS), пустые элементы отбрасываются.
+func csvList(v string) []string {
+	var out []string
+	for _, x := range strings.Split(v, ",") {
+		if x = strings.TrimSpace(x); x != "" {
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
 func envList(prefix string) []string {
 	var out []string
 	for i := 1; i <= 64; i++ {
@@ -274,7 +285,9 @@ func New(cfg Config) *Responder {
 	}
 	r.cfg.HTTP = kept
 	var badAllow, badNever bool
-	r.allow, badAllow = r.parseCIDRs("allowlist", cfg.Allowlist)
+	// Свои сети из INTERNAL_NETS (те же, что у коллектора для attrs.scope) — в allowlist:
+	// белые блоки организации не должны блокироваться по ошибке оператора или правила.
+	r.allow, badAllow = r.parseCIDRs("allowlist", append(append([]string{}, cfg.Allowlist...), csvList(os.Getenv("INTERNAL_NETS"))...))
 	r.never, badNever = r.parseCIDRs("never_block", append(append([]string{}, cfg.NeverBlock...), envList("ARGUS_RESPOND_NEVER_BLOCK_")...))
 	r.trusted, _ = r.parseCIDRs("trusted_sources", append(append([]string{}, cfg.TrustedSources...), envList("ARGUS_RESPOND_TRUSTED_")...))
 	// В бой не стартуем, если можем заблокировать своих или не сможем снять блок:

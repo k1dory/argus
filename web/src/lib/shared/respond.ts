@@ -47,3 +47,24 @@ export function publicIpsFromChain(chain: string[]): string[] {
   }
   return [...out];
 }
+
+const IPV4_EXACT_RE = /^(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/;
+
+/** Строка цепочки: «HH:MM:SS  source  node  action  object» (колонки через два и
+ *  более пробела). Узел — наблюдатель (экспортёр NetFlow, хост агента), а не
+ *  участник: его адрес из кандидатов на блокировку убираем. */
+function stripNodeColumn(line: string): string {
+  const cols = line.split(/\s{2,}/);
+  if (cols.length < 4) return line;
+  return [...cols.slice(0, 2), ...cols.slice(3)].join("  ");
+}
+
+/** Кандидаты на блокировку из карточки инцидента. Если субъект — публичный
+ *  адрес (правила с group_by по src.ip/dst.ip: сканы, перебор), предлагается
+ *  только он: остальные адреса цепочки — наши цели и экспортёры. Иначе —
+ *  публичные адреса из цепочки без колонки узла. */
+export function blockCandidates(actor: string, chain: string[]): string[] {
+  const a = actor.trim();
+  if (IPV4_EXACT_RE.test(a)) return isNonRoutableIpv4(a) ? [] : [a];
+  return publicIpsFromChain(chain.map(stripNodeColumn));
+}

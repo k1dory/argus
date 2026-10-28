@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import net from "node:net";
-import { isNonRoutableIpv4, publicIpsFromChain } from "../src/lib/shared/respond";
+import { blockCandidates, isNonRoutableIpv4, publicIpsFromChain } from "../src/lib/shared/respond";
 import { isIncidentStatus } from "../src/lib/shared/incidents";
 
 test("publicIpsFromChain: публичные адреса из текста цепочки, частные и служебные — нет", () => {
@@ -62,4 +62,22 @@ test("net.isIP — проверка адреса из формы: IPv4/IPv6 пр
 test("isIncidentStatus: реальные статусы — да; toString/constructor/прочее — нет", () => {
   for (const s of ["new", "escalated", "in_progress", "waiting_owner", "observing", "closed", "false_positive"]) assert.ok(isIncidentStatus(s), s);
   for (const s of ["toString", "constructor", "__proto__", "hasOwnProperty", "valueOf", "", "NEW", undefined, null, 1, {}]) assert.ok(!isIncidentStatus(s), String(s));
+});
+
+test("blockCandidates: субъект-адрес — единственный кандидат; наши цели и экспортёр из цепочки не предлагаются", () => {
+  const chain = [
+    "08:22:27  netflow.core     172.16.0.1     flow                     185.25.9.138:9000",
+    "08:23:22  netflow.core     185.25.9.1     flow                     185.25.9.53:9000",
+  ];
+  assert.deepEqual(blockCandidates("94.154.43.7", chain), ["94.154.43.7"]);
+  assert.deepEqual(blockCandidates("10.0.0.5", chain), [], "частный субъект — блокировать нечего, цели не подставляются");
+});
+
+test("blockCandidates: субъект-логин — публичные адреса цепочки без колонки узла", () => {
+  const chain = [
+    "10:00:01  host.sshd        203.0.113.9    auth.ssh                 root from 198.51.100.7",
+    "10:00:02  host.sshd        203.0.113.9    auth.ssh                 root from 198.51.100.8",
+  ];
+  assert.deepEqual(blockCandidates("root", chain), ["198.51.100.7", "198.51.100.8"]);
+  assert.deepEqual(blockCandidates("root", ["Failed password from 203.0.113.7"]), ["203.0.113.7"], "строка без колонок — как раньше");
 });

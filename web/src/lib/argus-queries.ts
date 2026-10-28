@@ -697,7 +697,7 @@ export async function requestUnblockIp(ip: string, user: string, reason: string)
   return engineRespond(`${engineBase()}/respond/unblock`, { ip, user, reason }, "engine.unblock_ip");
 }
 
-export { publicIpsFromChain } from "./shared/respond";
+export { blockCandidates, publicIpsFromChain } from "./shared/respond";
 
 /* ===== Реагирование: режим IPS/IDS и журнал ответов ===== */
 

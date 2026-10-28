@@ -316,6 +316,7 @@ services:
       WAZUH_CERT_SHA256: ${WAZUH_CERT_SHA256:-}
       # Реагирование: ids | simulate | ips (переключается и в консоли), TTL автоблокировки
       ARGUS_RESPOND_MODE: ${ARGUS_RESPOND_MODE:-simulate}
+      INTERNAL_NETS: ${INTERNAL_NETS:-}                     # свои сети → allowlist обратного канала (не блокировать свои белые блоки)
       ARGUS_RESPOND_TTL: ${ARGUS_RESPOND_TTL:-1h}
       ARGUS_RESPOND_MANUAL_TTL: ${ARGUS_RESPOND_MANUAL_TTL:-24h}   # ручная блокировка из карточки; 0 — бессрочно
       ARGUS_RESPOND_ALLOWLIST_1: ${ARGUS_RESPOND_ALLOWLIST_1:-}
