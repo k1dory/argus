@@ -358,6 +358,7 @@ services:
       # файл перечитывается при изменении. Пусто — алиасы только из событий identity.alias и API.
       IDENTITIES_FILE: /etc/argus/identities.yml
       POLL_INTERVAL: ${ENGINE_POLL_INTERVAL:-30s}
+      ENGINE_BUFFER_MAX: ${ENGINE_BUFFER_MAX:-1000000}
       LISTEN_ADDR: ":8090"
       # Профили аналитика — argus.analyst.yml; секреты только через окружение.
       ARGUS_ANALYST_PROFILE: ${ARGUS_ANALYST_PROFILE:-mock}
