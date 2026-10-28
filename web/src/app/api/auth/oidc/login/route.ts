@@ -10,7 +10,7 @@ export async function GET(): Promise<Response> {
   const nonce = crypto.randomBytes(16).toString("base64url");
   const { verifier, challenge } = pkce();
   const jar = await cookies();
-  const opts = { httpOnly: true, sameSite: "lax" as const, secure: cookieSecure(), path: "/api/auth/oidc", maxAge: 600 };
+  const opts = { httpOnly: true, sameSite: "lax" as const, secure: cookieSecure(), path: "/api/auth/oidc", maxAge: 900 };
   jar.set("oidc_state", state, opts);
   jar.set("oidc_nonce", nonce, opts);
   jar.set("oidc_verifier", verifier, opts);

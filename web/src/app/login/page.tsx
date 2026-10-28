@@ -37,7 +37,7 @@ export default async function LoginPage({ searchParams }: PageProps<"/login">) {
               </Button>
               {ssoError && (
                 <p role="alert" className="mt-3 text-sm text-destructive">
-                  {ssoError === "denied" ? "IdP не подтвердил вход или группа не сопоставлена роли ARGUS" : "SSO: состояние сессии не совпало, попробуйте ещё раз"}
+                  {ssoError === "denied" ? "IdP не подтвердил вход или группа не сопоставлена роли ARGUS" : `SSO: состояние входа не найдено. Начните вход с адреса ${new URL(oidcConfig()!.redirectUrl).origin} и завершите его за 15 минут`}
                 </p>
               )}
             </div>

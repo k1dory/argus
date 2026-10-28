@@ -104,6 +104,14 @@ export async function authUrl(cfg: OidcConfig, state: string, nonce: string, cha
   return u.toString();
 }
 
+/** Абсолютный адрес консоли для редиректов из OIDC-маршрутов. За прокси
+ *  Next.js подставляет в req.url свой адрес прослушивания (http://0.0.0.0:3000),
+ *  поэтому origin берётся не из запроса, а из OIDC_REDIRECT_URL — это и есть
+ *  внешний адрес, с которого IdP вернул браузер. */
+export function consoleUrl(cfg: Pick<OidcConfig, "redirectUrl">, path: string): string {
+  return new URL(path, cfg.redirectUrl).toString();
+}
+
 export type OidcUser = { name: string; role: Role; groups: string[] };
 
 export async function exchange(cfg: OidcConfig, code: string, verifier: string, nonce: string): Promise<OidcUser> {

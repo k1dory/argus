@@ -1,7 +1,7 @@
 import { cookies } from "next/headers";
 import { createSession, recordLoginFailure, recordSsoLogin } from "@/lib/auth";
 import { audit } from "@/lib/argus-queries";
-import { exchange, oidcConfig } from "@/lib/oidc";
+import { consoleUrl, exchange, oidcConfig } from "@/lib/oidc";
 
 export async function GET(req: Request): Promise<Response> {
   const cfg = oidcConfig();
@@ -15,8 +15,13 @@ export async function GET(req: Request): Promise<Response> {
   const verifier = jar.get("oidc_verifier")?.value ?? "";
   for (const c of ["oidc_state", "oidc_nonce", "oidc_verifier"]) jar.delete({ name: c, path: "/api/auth/oidc" });
   if (!code || !state || state !== expected) {
-    await audit("sso", "session.login.failed", "sso", "state не совпал");
-    return Response.redirect(new URL("/login?sso=state", url.origin), 302);
+    // Нет cookie — вход начат с другого адреса, чем OIDC_REDIRECT_URL (cookie привязана
+    // к хосту), или истёк срок (OIDC_STATE_TTL); не совпал — параллельный вход в другой вкладке.
+    const why = !expected
+      ? `cookie oidc_state нет: вход начат не с ${new URL(cfg.redirectUrl).origin} или истёк`
+      : !code || !state ? "IdP вернул ответ без code/state" : "state не совпал (параллельный вход?)";
+    await audit("sso", "session.login.failed", "sso", why);
+    return Response.redirect(consoleUrl(cfg, "/login?sso=state"), 302);
   }
   try {
     // user.name уже с префиксом sso: — отдельное пространство имён (см. oidc.ts)
@@ -24,11 +29,11 @@ export async function GET(req: Request): Promise<Response> {
     await createSession(user.name, user.role, true);
     await recordSsoLogin(user.name, user.role);
     await audit(user.name, "session.login", user.name, `sso · ${user.role} · groups: ${user.groups.join(",")}`);
-    return Response.redirect(new URL("/", url.origin), 302);
+    return Response.redirect(consoleUrl(cfg, "/"), 302);
   } catch (e) {
     await recordLoginFailure("sso");
     await audit("sso", "session.login.failed", "sso", e instanceof Error ? e.message.slice(0, 200) : "ошибка обмена кода");
     console.error("oidc callback:", e instanceof Error ? e.message : e);
-    return Response.redirect(new URL("/login?sso=denied", url.origin), 302);
+    return Response.redirect(consoleUrl(cfg, "/login?sso=denied"), 302);
   }
 }

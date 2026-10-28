@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mapRole, ssoUserName, SSO_PREFIX } from "../src/lib/oidc";
+import { consoleUrl, mapRole, ssoUserName, SSO_PREFIX } from "../src/lib/oidc";
 
 test("ssoUserName: префикс sso: ровно один раз, нижний регистр, обрезка пробелов и длины", () => {
   assert.equal(SSO_PREFIX, "sso:");
@@ -37,4 +37,11 @@ test("mapRole: сильнейшая из совпавших; без совпад
   assert.equal(mapRole(["argus-admins"], { ...cfg, defaultRole: "viewer" }), "admin", "совпадение сильнее default");
   assert.equal(mapRole(["Argus-Admins"], cfg), null, "имена групп сравниваются точно, без приведения регистра");
   assert.equal(mapRole(["x"], { groups: { admin: [], analyst: [], viewer: [] }, defaultRole: null }), null, "пустые списки никого не пускают");
+});
+
+test("consoleUrl: редиректы строятся от origin OIDC_REDIRECT_URL, а не от адреса прослушивания Next", () => {
+  const cfg = { redirectUrl: "https://192.168.0.170:8443/api/auth/oidc/callback" };
+  assert.equal(consoleUrl(cfg, "/login?sso=state"), "https://192.168.0.170:8443/login?sso=state");
+  assert.equal(consoleUrl(cfg, "/"), "https://192.168.0.170:8443/");
+  assert.equal(consoleUrl({ redirectUrl: "https://argus.corp.local/api/auth/oidc/callback" }, "/login?sso=denied"), "https://argus.corp.local/login?sso=denied");
 });
