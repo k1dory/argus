@@ -16,11 +16,11 @@ import {
   requestReanalyze,
   requestBlockIp,
   requestUnblockIp,
+  blockCandidatesFor,
   saveTriageVerdict,
   triageVerdictClaim,
 } from "./argus-queries";
 import { isIncidentStatus } from "./shared/incidents";
-import { blockCandidates } from "./shared/respond";
 
 const INCIDENT_ID_RE = /^INC-\d{1,9}$/;
 const FINAL_STATUSES = new Set(["closed", "false_positive"]);
@@ -194,7 +194,7 @@ export async function blockIpAction(_prev: FormState, formData: FormData): Promi
     return { error: shortError("block_ip.incident", err) };
   }
   if (!inc) return { error: "Инцидент не найден" };
-  const candidates = blockCandidates(inc.actor_name, inc.chain);
+  const candidates = blockCandidatesFor(inc);
   if (!candidates.includes(ip)) return { error: "Адрес не относится к этому инциденту — блокировать можно только адреса из его цепочки" };
   // Аудит строго ДО вызова движка (как в unblock): блокировка без записи
   // «кто и почему» недопустима; результат — второй записью.

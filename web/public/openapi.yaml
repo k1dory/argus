@@ -1255,7 +1255,10 @@ components:
 
     SourceHealth:
       type: object
-      required: [source, source_class, events_1h, eps_60s, last_ts, pii_share, alive]
+      description: >-
+        Источник, от которого были события за последние 7 суток. Счётчики за час — по
+        таблице событий, ритм — по heartbeat коллектора (активные минуты за 7 суток).
+      required: [source, source_class, events_1h, eps_60s, last_ts, pii_share, alive, events_window, rhythm_sec, silence_threshold_sec, silent_for_sec]
       properties:
         source: { type: string }
         source_class: { type: string }
@@ -1268,7 +1271,22 @@ components:
         alive:
           type: integer
           enum: [0, 1]
-          description: 1 — был приём за последние 5 минут.
+          description: >-
+            1 — тишина не дольше порога источника (silence_threshold_sec = max(5 мин,
+            3 × ритм)); непрерывный источник молчит через 5 минут, редкий — когда
+            пауза втрое длиннее обычной.
+        events_window:
+          type: integer
+          description: Событий за окно ритма (7 суток).
+        rhythm_sec:
+          type: [number, "null"]
+          description: Ритм — секунд на одну активную минуту за окно; null — активная минута одна.
+        silence_threshold_sec:
+          type: integer
+          description: Порог тишины для этого источника, секунд.
+        silent_for_sec:
+          type: integer
+          description: Секунд с последнего события на момент запроса.
 
     SeriesPoint:
       type: object

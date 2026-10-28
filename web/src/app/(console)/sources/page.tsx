@@ -49,16 +49,16 @@ function SourcesBody({ health, events, source, ingestBase }: { health: Awaited<R
   return (
     <>
       <div className="grid grid-cols-2 gap-6 md:grid-cols-4">
-        <StatTile label="Источников за час" value={fmtNum(health.length)} />
-        <StatTile label="Живы (5 мин)" value={`${fmtNum(alive)} / ${fmtNum(health.length)}`} led={health.length === 0 ? "var(--status-warn)" : alive === health.length ? "var(--status-ok)" : "var(--status-warn)"} />
+        <StatTile label="Источников за 7 сут" value={fmtNum(health.length)} />
+        <StatTile label="Живы (по ритму)" value={`${fmtNum(alive)} / ${fmtNum(health.length)}`} led={health.length === 0 ? "var(--status-warn)" : alive === health.length ? "var(--status-ok)" : "var(--status-warn)"} />
         <StatTile label="EPS за 60 с" value={fmtNum(eps)} />
         <StatTile label="Классов" value={fmtNum(classes.size)} />
       </div>
 
-      <Panel label="Коллекторы · события за час по источнику" meta={source ? "клик по источнику — фильтр ленты ниже" : undefined}>
+      <Panel label="Коллекторы · источники за 7 суток, счётчики за час" meta={source ? "клик по источнику — фильтр ленты ниже" : undefined}>
         {health.length === 0 ? (
           <div className="space-y-2">
-            <p className="text-sm text-muted-foreground">За последний час событий нет.</p>
+            <p className="text-sm text-muted-foreground">За последние 7 суток событий нет.</p>
             <p className="text-sm text-muted-foreground">
               Направьте syslog/CEF на <span className="font-mono">:5514</span>, NetFlow на <span className="font-mono">:2055</span>, вебхуки на <span className="font-mono">{ingestBase}/ingest/&lt;тип&gt;</span> с заголовком <span className="font-mono">X-Argus-Token: …</span> — или прогоните записанный трафик командой <span className="font-mono">make replay</span>.
             </p>

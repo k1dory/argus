@@ -7,6 +7,7 @@ import Module from "node:module";
 import path from "node:path";
 import os from "node:os";
 import fs from "node:fs";
+import { blockCandidates } from "../src/lib/shared/respond";
 import { ResponseCookies } from "next/dist/compiled/@edge-runtime/cookies";
 
 export type AuditEntry = { user: string; action: string; target: string; detail: string };
@@ -16,6 +17,7 @@ export type QueryMocks = {
   audit: (user: string, action: string, target: string, detail?: string, opts?: { strict?: boolean }) => Promise<void>;
   incidentGet: (id: string) => Promise<Record<string, unknown> | null>;
   requestBlockIp: (...args: unknown[]) => Promise<{ error?: string; results?: { executor: string; ok: boolean; detail: string }[] }>;
+  blockCandidatesFor: (inc: { actor_name: string; chain: string[] }) => string[];
   requestUnblockIp: (...args: unknown[]) => Promise<{ error?: string; results?: { executor: string; ok: boolean; detail: string }[] }>;
   requestReanalyze: (id: string) => Promise<string | null>;
   addException: (...args: unknown[]) => Promise<void>;
@@ -111,6 +113,7 @@ export function installNextMocks(): Mocks {
     },
     incidentGet: async () => null,
     requestBlockIp: async () => ({ error: "движок недоступен" }),
+    blockCandidatesFor: (inc) => blockCandidates(inc.actor_name, inc.chain),
     requestUnblockIp: async () => ({ error: "движок недоступен" }),
     requestReanalyze: async () => "движок недоступен",
     addException: async () => undefined,
