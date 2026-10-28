@@ -535,6 +535,12 @@ func build(d eval.Detection, now time.Time) *Incident {
 	if inc.Level == "critical" {
 		inc.Status = StatusEscalated // критичное сразу эскалируется дежурному
 	}
+	// Правило, сгруппированное по адресу (src.ip / dst.ip): субъект инцидента — сам адрес,
+	// а не логин из первого события (при подборе это «root» или «admin», и карточка
+	// называла атакующим перебираемую учётку). Перебранные логины остаются в цепочке.
+	if gb := d.Rule.GroupBy(); (gb == "src.ip" || gb == "dst.ip") && d.Key != "" && d.Key != "-" {
+		inc.ActorName = d.Key
+	}
 	srcSet := map[string]bool{}
 	for _, e := range d.Events {
 		srcSet[e.Source] = true
