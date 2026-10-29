@@ -75,6 +75,11 @@ type Config struct {
 			Format    string `yaml:"format"`     // waf-audit | lines
 			Source    string `yaml:"source"`     // метка для health/metrics
 			FromStart bool   `yaml:"from_start"` // читать с начала, а не с конца
+			// Node — узел для событий, в которых отправитель его не назвал (Coraza в
+			// error-логе пишет адрес контейнера, не имя); Attrs — постоянные атрибуты
+			// файла (container: имя контейнера WAF). Пустые значения не ставятся.
+			Node  string            `yaml:"node"`
+			Attrs map[string]string `yaml:"attrs"`
 		} `yaml:"files"`
 	} `yaml:"listeners"`
 	Sources   []normalize.SourceRule `yaml:"sources"`
@@ -134,6 +139,47 @@ func loadConfig(path string) (Config, error) {
 		c.Batch.PendingBytes = sink.DefaultPendingBytes
 	}
 	return c, nil
+}
+
+func firstNonEmpty(v ...string) string {
+	for _, s := range v {
+		if s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+// mergeAttrs — постоянные атрибуты источника (attrs: в collector.yml): только
+// непустые значения и только там, где событие их не назвало само.
+func mergeAttrs(e *model.Event, attrs map[string]string) {
+	for k, v := range attrs {
+		k, v = strings.TrimSpace(k), strings.TrimSpace(v)
+		if k == "" || v == "" || e.Attrs[k] != "" {
+			continue
+		}
+		if e.Attrs == nil {
+			e.Attrs = map[string]string{}
+		}
+		e.Attrs[k] = v
+	}
+}
+
+// attrsFromStructured — SD-элемент «argus» в заголовке RFC 5424 → атрибуты события:
+// так агент на хосте передаёт то, чего нет в строке лога (имя контейнера,
+// под, сервис). Параметры других SD-элементов не трогаются; своё значение
+// события важнее.
+func attrsFromStructured(e *model.Event, sd map[string]string) {
+	for k, v := range sd {
+		name, ok := strings.CutPrefix(k, "argus.")
+		if !ok || name == "" || v == "" || e.Attrs[name] != "" {
+			continue
+		}
+		if e.Attrs == nil {
+			e.Attrs = map[string]string{}
+		}
+		e.Attrs[name] = v
+	}
 }
 
 func env(key, def string) string {
@@ -305,8 +351,14 @@ func main() {
 			l, _ := parse.ParseLEEF(line)
 			e = norm.FromLEEF(l, sl, line)
 		case parse.IsWAFErrorLine(line):
-			// error-лог ModSecurity (Apache/nginx) или Coraza (в т.ч. JSON-лог Caddy)
-			wf, ok := parse.ParseWAFErrorLine(line)
+			// error-лог ModSecurity (Apache/nginx) или Coraza (в т.ч. JSON-лог Caddy).
+			// Строка может прийти в обёртке syslog (агент на хосте добавляет заголовок с
+			// именем хоста) — тогда разбирается текст после заголовка.
+			wafText := line
+			if sl.Format != "raw" && parse.IsWAFErrorLine(sl.Message) {
+				wafText = sl.Message
+			}
+			wf, ok := parse.ParseWAFErrorLine(wafText)
 			if !ok {
 				e = norm.FromSyslog(sl, line)
 				break
@@ -315,8 +367,9 @@ func main() {
 				return model.Event{}, false // промежуточная строка Warning по одному правилу
 			}
 			e = norm.FromWAF(wf, line)
+			// Узел — от отправителя: hostname syslog, node: файла; последним — адрес сервера WAF.
 			if e.Node == "" {
-				e.Node = sl.Hostname
+				e.Node = firstNonEmpty(sl.Hostname, peer.Node, e.Attrs["server_addr"])
 			}
 		default:
 			if sq, ok := parse.ParseSquid(sl.Message, sl.Hostname); ok {
@@ -332,8 +385,9 @@ func main() {
 			}
 		}
 		if e.Node == "" {
-			e.Node = peer.Addr
+			e.Node = firstNonEmpty(peer.Node, peer.Addr)
 		}
+		attrsFromStructured(&e, sl.Structured)
 		e.Attrs["peer"] = peer.Addr
 		if peer.CN != "" {
 			e.Attrs["peer_cn"] = peer.CN
@@ -360,11 +414,22 @@ func main() {
 		if fcfg.Format == "waf-audit" {
 			handle = func(line string) {
 				if wf, ok := parse.ParseWAFAudit([]byte(line)); ok {
-					emit(norm.FromWAF(wf, line), "file:"+src, "file")
+					e := norm.FromWAF(wf, line)
+					if e.Node == "" {
+						e.Node = firstNonEmpty(fcfg.Node, e.DstIP, src)
+					}
+					mergeAttrs(&e, fcfg.Attrs)
+					emit(e, "file:"+src, "file")
 				}
 			}
 		} else {
-			handle = func(line string) { lines(line, listen.Peer{Addr: src, Transport: "file"}) }
+			peer := listen.Peer{Addr: src, Transport: "file", Node: fcfg.Node}
+			handle = func(line string) {
+				if e, ok := parseLine(line, peer); ok {
+					mergeAttrs(&e, fcfg.Attrs)
+					emit(e, "syslog", peer.Transport)
+				}
+			}
 		}
 		go (&listen.TailFile{Path: fcfg.Path, Source: src, FromStart: fcfg.FromStart, Handle: handle}).Run(ctx)
 	}

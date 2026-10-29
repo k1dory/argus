@@ -458,6 +458,15 @@ Coraza под Caddy/nginx) и **error-лог** (`ModSecurity: …` в nginx/Apac
 Витрина — дашборд «WAF · ModSecurity / Coraza». Coraza для Caddy: модуль `coraza-caddy`,
 директива `SecAuditLogFormat JSON` и `SecAuditLog /var/log/caddy/coraza_audit.log`.
 
+Узел события WAF — имя сервера: `server_id` audit-лога или `[hostname "…"]` error-лога, если там
+имя (ModSecurity под nginx). Coraza пишет в `[hostname]` локальный адрес сокета, внутри Docker —
+адрес контейнера: он уходит в `dst_ip` и `attrs.server_addr`, а узел берётся у отправителя —
+имя хоста из заголовка syslog, `node:` файлового источника (`WAF_NODE`) или, если ничего нет,
+тот же адрес. Имя контейнера лог не содержит: для файла — `attrs: {container: …}`
+(`WAF_CONTAINER`), для агента на хосте — SD-элемент RFC 5424 `[argus container="caddy"]`
+в заголовке строки: параметры элемента `argus` становятся атрибутами события (роль `argus_agent`
+так и отправляет строки `Coraza:` из `docker_logs` в `/ingest/syslog`).
+
 ## Вебхуки и подключение агента разбора
 
 ARGUS не знает, какой агент или трекер стоит снаружи. Любой раннер — Claude Code,

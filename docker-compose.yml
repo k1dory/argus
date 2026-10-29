@@ -260,6 +260,8 @@ services:
       WAF_AUDIT_LOG: ${WAF_AUDIT_LOG:-}
       WAF_ERROR_LOG: ${WAF_ERROR_LOG:-}
       WAF_FROM_START: ${WAF_FROM_START:-false}
+      WAF_NODE: ${WAF_NODE:-}                               # имя хоста WAF в событиях (Coraza пишет адрес контейнера)
+      WAF_CONTAINER: ${WAF_CONTAINER:-}                     # имя контейнера WAF → attrs.container
       # Pull-источники (collector.yml): CrowdStrike Falcon Streaming API, S3-бакеты аудита
       FALCON_BASE_URL: ${FALCON_BASE_URL:-https://api.crowdstrike.com}
       FALCON_CLIENT_ID: ${FALCON_CLIENT_ID:-}

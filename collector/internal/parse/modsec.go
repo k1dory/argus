@@ -20,6 +20,7 @@ type WAF struct {
 	Method      string
 	URI         string
 	Host        string // заголовок Host
+	ServerName  string // [hostname "…"] error-лога: имя сервера (ModSecurity) или локальный адрес сокета (Coraza)
 	UserAgent   string
 	Status      int
 	EngineMode  string // On | DetectionOnly | Off
@@ -229,7 +230,7 @@ func ParseWAFErrorLine(line string) (WAF, bool) {
 		case "tag":
 			r.Tags = append(r.Tags, v)
 		case "hostname":
-			w.Host = v
+			w.Host, w.ServerName = v, v
 		case "uri":
 			w.URI = v
 		case "unique_id":

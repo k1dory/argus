@@ -88,3 +88,29 @@ func TestParseWAFErrorLineSpoofingAndEscapes(t *testing.T) {
 		t.Fatalf("redirect: %+v", w)
 	}
 }
+
+// [hostname "…"] error-лога — ServerName (и Host для совместимости); Coraza пишет туда
+// адрес сокета. Строка в обёртке RFC 5424 от агента: имя хоста и SD argus в заголовке,
+// JSON Caddy — в сообщении, и его разбирает тот же парсер.
+func TestWAFErrorLineServerNameAndSyslogWrap(t *testing.T) {
+	msg := `{"level":"error","ts":1761727244.5,"logger":"http.handlers.waf","msg":"[client \"93.123.109.247\"] Coraza: Access denied with code 403 (phase 2). [file \"@owasp_crs/REQUEST-949-BLOCKING-EVALUATION.conf\"] [line \"1\"] [id \"949110\"] [msg \"Inbound Anomaly Score Exceeded (Total Score: 5)\"] [severity \"emergency\"] [hostname \"172.19.0.4\"] [uri \"/.env\"] [unique_id \"abc\"]"}`
+	w, ok := ParseWAFErrorLine(msg)
+	if !ok || w.ServerName != "172.19.0.4" || w.Host != "172.19.0.4" || w.ClientIP != "93.123.109.247" || !w.Final {
+		t.Fatalf("%+v", w)
+	}
+	line := `<134>1 2026-10-29T08:40:44.123Z waf-01 caddy - - [argus container="caddy-waf"] ` + msg
+	sl, err := ParseSyslog(line)
+	if err != nil || sl.Format != "rfc5424" || sl.Hostname != "waf-01" || sl.Structured["argus.container"] != "caddy-waf" {
+		t.Fatalf("%+v %v", sl, err)
+	}
+	if !IsWAFErrorLine(sl.Message) {
+		t.Fatal("сообщение после заголовка — строка WAF")
+	}
+	if w2, ok := ParseWAFErrorLine(sl.Message); !ok || w2.ServerName != "172.19.0.4" || w2.Rules[0].ID != "949110" {
+		t.Fatalf("%+v", w2)
+	}
+	// Та же строка целиком (с заголовком) парсеру не по зубам: кавычки внутри JSON экранированы.
+	if w3, ok := ParseWAFErrorLine(line); ok && w3.ServerName != "" {
+		t.Fatalf("ожидался пустой hostname при разборе строки с заголовком, получено %+v", w3)
+	}
+}

@@ -219,3 +219,44 @@ func TestPrometheusAggregateHidesSources(t *testing.T) {
 		t.Errorf("полная версия без источников: %q", fullM)
 	}
 }
+
+func TestMergeAttrsAndStructured(t *testing.T) {
+	e := model.Event{Attrs: map[string]string{"container": "own"}}
+	mergeAttrs(&e, map[string]string{"container": "cfg", "node_role": " waf ", "empty": "", " ": "x"})
+	if e.Attrs["container"] != "own" || e.Attrs["node_role"] != "waf" || len(e.Attrs) != 2 {
+		t.Fatalf("mergeAttrs: %+v", e.Attrs)
+	}
+	var nilAttrs model.Event
+	mergeAttrs(&nilAttrs, map[string]string{"container": "caddy"})
+	if nilAttrs.Attrs["container"] != "caddy" {
+		t.Fatalf("nil attrs: %+v", nilAttrs.Attrs)
+	}
+	attrsFromStructured(&e, map[string]string{"argus.container": "sd", "argus.pod": "p1", "argus.": "x", "meta.ip": "1.1.1.1", "argus.empty": ""})
+	if e.Attrs["container"] != "own" || e.Attrs["pod"] != "p1" || e.Attrs["ip"] != "" || len(e.Attrs) != 3 {
+		t.Fatalf("attrsFromStructured: %+v", e.Attrs)
+	}
+	attrsFromStructured(&e, nil)
+}
+
+func TestFileSourceNodeAndAttrsFromEnv(t *testing.T) {
+	t.Setenv("WAF_ERROR_LOG", "/logs/waf/caddy.log")
+	t.Setenv("WAF_NODE", "waf-01")
+	t.Setenv("WAF_CONTAINER", "caddy-waf")
+	cfg, err := loadConfig("../../collector.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, f := range cfg.Listeners.Files {
+		if f.Path != "/logs/waf/caddy.log" {
+			continue
+		}
+		found = true
+		if f.Node != "waf-01" || f.Attrs["container"] != "caddy-waf" {
+			t.Fatalf("file source: %+v", f)
+		}
+	}
+	if !found {
+		t.Fatalf("источник WAF_ERROR_LOG не найден: %+v", cfg.Listeners.Files)
+	}
+}
