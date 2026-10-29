@@ -918,7 +918,7 @@ make deploy                                # cosign verify + pull образов
 
 | Слой | Сколько | Что проверяет | Как запустить |
 |---|---|---|---|
-| юнит | Go 489, консоль 332, шиппер 26, OPA 20 | Go-модули (`collector`, `engine`, `policyd`, `mcp`, `triage`): парсеры и нормализация, приёмники на реальных сокетах, правила корреляции (каждый оператор и ветка валидации), жизненный цикл инцидентов, реагирование, уведомления и шторм через httptest и мини-SMTP, pull-коллекторы Falcon/S3 на имитации API, обогащение; `main()` коллектора и policyd запускаются в процессе целиком (конфиг с `${ENV}`, приёмники, spool, `/healthz`, `/metrics`, SIGTERM), раунд policyd — на имитации Wazuh API с настоящим Rego; шиппер на Rust; Rego-политики; консоль — чистые модули `web/src/lib/shared/*`, все маршруты `web/src/app/api/*` с подменённым ClickHouse по схемам OpenAPI, OIDC-вход с проверкой `id_token` по JWKS, аутентификация и RBAC на реальном файле `auth.json`, каждая страница и компонент консоли с ролями, пустыми состояниями, 404 и недоступным хранилищем | `make test`; `cd web && npm test` |
+| юнит | Go 531, консоль 354, шиппер 26, OPA 20 | Go-модули (`collector`, `engine`, `policyd`, `mcp`, `triage`): парсеры и нормализация, приёмники на реальных сокетах, правила корреляции (каждый оператор и ветка валидации), жизненный цикл инцидентов, реагирование, уведомления и шторм через httptest и мини-SMTP, pull-коллекторы Falcon/S3 на имитации API, обогащение; `main()` коллектора и policyd запускаются в процессе целиком (конфиг с `${ENV}`, приёмники, spool, `/healthz`, `/metrics`, SIGTERM), раунд policyd — на имитации Wazuh API с настоящим Rego; шиппер на Rust; Rego-политики; консоль — чистые модули `web/src/lib/shared/*`, все маршруты `web/src/app/api/*` с подменённым ClickHouse по схемам OpenAPI, OIDC-вход с проверкой `id_token` по JWKS, аутентификация и RBAC на реальном файле `auth.json`, каждая страница и компонент консоли с ролями, пустыми состояниями, 404 и недоступным хранилищем | `make test`; `cd web && npm test` |
 | правила | 31 сценарий | правила корреляции на записанном трафике `fixtures/events/*.ndjson`, ожидания (число инцидентов, субъект, в том числе отрицательные) в `rules/tests/` | `./scripts/argus rules test` |
 | интеграция | 3 файла | живой ClickHouse: все миграции с нуля по порядку и повторно (идемпотентность), затем каждый SQL консоли (`web/tests/queries-ch.test.ts`) и каждый запрос хранилища движка — события и курсор, инциденты и журнал состояний, ответы, исключения, отчёт о рисках, паспорт, доставки вебхуков (`engine/internal/store/live_test.go`); конкурентный claim вердикта агента (`web/tests/triage-claim-ch.test.ts`). Без `ARGUS_TEST_CLICKHOUSE_URL` пропускаются; в CI сервис `clickhouse` у job `go` и `web` | `docker run -d -p 8123:8123 -e CLICKHOUSE_DB=argus -e CLICKHOUSE_PASSWORD=x clickhouse/clickhouse-server:24.8`, затем `ARGUS_TEST_CLICKHOUSE_URL=http://localhost:8123 ARGUS_TEST_CLICKHOUSE_PASSWORD=x npm test` (консоль) и то же окружение для `go test ./internal/store/` в `engine` |
 | API-смоук | 13 шагов | живой стенд: `GET /api/version`, приём NDJSON коллектором (`value`/`unit`, `identity.alias`), событие в `GET /api/v1/log`, сессия разбора по демо-инциденту, карточка, граница области, вердикт `argus-triage/v3` и его идемпотентный повтор, резолв алиаса и паспорт субъекта, запрет экспорта токену сессии, живость источников `GET /api/sources` (статус по ритму), MCP за Caddy `:8445` (при `ARGUS_MCP_URL`) | `make up-dev && make demo && ./scripts/api-smoke.sh` (параметры `ARGUS_URL`, `ARGUS_API_TOKEN`, `ARGUS_TRIAGE_ISSUER_TOKEN`, `ARGUS_INGEST_URL`, `ARGUS_INGEST_TOKEN`, `ARGUS_MCP_URL`; по умолчанию — `.env.dev`) |
@@ -932,14 +932,13 @@ cd web && npm test && npm run lint && npm run typecheck   # консоль
 ./scripts/api-smoke.sh                                    # API консоли на живом стенде
 ```
 
-Покрытие на rc27: движок — `rules` 99,7 %, `store` 89 %, `cmd/engine` 74 % (без покрытия
-только циклы `run`/`loop`/`pollEvents` — их проверяет e2e); коллектор — `pull` 98 %,
-`cmd/collector` 79 %, `listen` 69 %, `sink` 76 %; policyd — `cmd` 84 %, остальное 84–98 %;
-`mcp` 75 %; консоль — 84 % операторов, страницы 88–100 %, компоненты 87 %. Слабее прочих:
-`collector/internal/listen` (TLS-ветки и лимиты соединений), `engine/internal/incidents` 80 %,
-клиентская логика live-tail в `event-feed.tsx` и корневой `app/layout.tsx` (`next/font`),
-страницы паспорта `actors/*` 26–55 %. Посмотреть: `go test -cover ./...` в модуле,
-`cd web && npx c8 --include 'src/**' npm test`.
+Покрытие на rc27: движок — `rules` 99,7 %, `incidents` 99 %, `store` 89 %, `cmd/engine` 74 %
+(без покрытия только циклы `run`/`loop`/`pollEvents` — их проверяет e2e); коллектор — `pull` 98 %,
+`listen` 94 %, `sink` 91 %, `cmd/collector` 79 %; policyd — 84–98 %; `mcp` 90 %; консоль —
+88 % операторов, страницы 88–100 %, компоненты 87 %. Слабее прочих: обработчики кликов в
+клиентских компонентах (`event-feed.tsx`, `download-button.tsx` — их чистая логика вынесена в
+`lib/shared/tail-poll.ts` и `download.ts` и покрыта), корневой `app/layout.tsx` (`next/font`),
+`main()` движка. Посмотреть: `go test -cover ./...` в модуле, `cd web && npx c8 --include 'src/**' npm test`.
 
 Спецификация REST API консоли — OpenAPI 3.1 в `api/openapi.yaml` (валидна по официальной
 схеме: swagger-parser, Redocly); консоль отдаёт её же как `/openapi.yaml`. Тест
