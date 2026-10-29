@@ -2,7 +2,8 @@
 # api-smoke.sh — сквозная проверка API консоли на живом стенде (make up-dev + make demo):
 # версия → приём NDJSON коллектором → событие видно в GET /api/v1/log → сессия разбора
 # по демо-инциденту → карточка → граница области → вердикт argus-triage/v3 (и его
-# идемпотентный повтор) → резолв алиаса и паспорт субъекта → экспорт закрыт токену сессии.
+# идемпотентный повтор) → резолв алиаса и паспорт субъекта → экспорт закрыт токену сессии
+# → живость источников (/api/sources) → MCP за Caddy (при ARGUS_MCP_URL).
 #
 #   ./scripts/api-smoke.sh                       # стенд make up-dev: дефолты из .env.dev
 #   ARGUS_URL=https://argus:8443 ARGUS_API_TOKEN=… ARGUS_TRIAGE_ISSUER_TOKEN=… \
@@ -198,6 +199,36 @@ if [ -n "$TRIAGE_TOKEN" ]; then
   code=$(req DELETE "$ARGUS_URL/api/triage/sessions" "$TRIAGE_TOKEN")
   [ "$code" = 204 ] || echo "warn: DELETE /api/triage/sessions → $code"
 else skip 11 "нет сессии"; fi
+
+# ── 12. живость источников: источники за 7 суток, статус по ритму ─────────────
+code=$(req GET "$ARGUS_URL/api/sources" "$ARGUS_API_TOKEN")
+if [ "$code" = 200 ] && [ "$(jget '.sources | type')" = array ]; then
+  n=$(jget '.sources | length'); alive=$(jget '[.sources[] | select(.alive == 1)] | length')
+  if [ "$(jget '[.sources[] | select(.source == "telemetry.smoke")] | length')" -ge 1 ]; then
+    # Приём шага 2 только что прошёл: источник смоука обязан быть живым и с полями ритма.
+    fields=$(jget '.sources[] | select(.source == "telemetry.smoke") | [.alive, .silence_threshold_sec, .silent_for_sec, .events_window] | map(type) | join(",")')
+    smoke_alive=$(jget '.sources[] | select(.source == "telemetry.smoke") | .alive')
+    if [ "$fields" = number,number,number,number ] && [ "$smoke_alive" = 1 ]; then pass 12 "GET /api/sources → 200: источников $n, живых $alive; telemetry.smoke жив, поля ритма на месте"
+    else fail 12 "GET /api/sources: telemetry.smoke alive=$smoke_alive, типы полей ритма: $fields"; fi
+  else pass 12 "GET /api/sources → 200: источников $n, живых $alive (источник смоука ещё не в списке)"; fi
+else fail 12 "GET /api/sources → $code: $(snippet)"; fi
+
+# ── 13. MCP за Caddy (:8445): инициализация Streamable HTTP с bearer ────────────
+# Только при ARGUS_MCP_URL (например https://127.0.0.1:8445) — профиль compose mcp
+# на стенде e2e не поднимается. Токен — ARGUS_MCP_HTTP_TOKEN (окружение или .env).
+ARGUS_MCP_URL="${ARGUS_MCP_URL:-}"; ARGUS_MCP_HTTP_TOKEN="${ARGUS_MCP_HTTP_TOKEN:-$(envget ARGUS_MCP_HTTP_TOKEN)}"
+if [ -n "$ARGUS_MCP_URL" ] && [ -n "$ARGUS_MCP_HTTP_TOKEN" ]; then
+  printf 'header = "Authorization: Bearer %s"\n' "$ARGUS_MCP_HTTP_TOKEN" >"$TMP/mcp.cfg"
+  code=$(curl -ksS --max-time 30 -o "$BODY" -w '%{http_code}' -X POST -K "$TMP/mcp.cfg" \
+    -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
+    --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"api-smoke","version":"1"}}}' \
+    "${ARGUS_MCP_URL%/}/mcp" || echo 000)
+  if [ "$code" = 200 ] && grep -q '"serverInfo"' "$BODY"; then pass 13 "POST $ARGUS_MCP_URL/mcp initialize → 200, сервер $(tr -d '\n' <"$BODY" | grep -o '"serverInfo":{[^}]*}' | head -1)"
+  else
+    nocode=$(curl -ksS --max-time 15 -o /dev/null -w '%{http_code}' -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' "${ARGUS_MCP_URL%/}/mcp" || echo 000)
+    fail 13 "MCP initialize → $code (без bearer → $nocode; 403 от Caddy — адрес клиента не в MCP_ALLOWED_NETS): $(snippet)"
+  fi
+else skip 13 "ARGUS_MCP_URL не задан — MCP за Caddy не проверяется"; fi
 
 if [ "$FAILS" = 0 ]; then echo "api-smoke: все шаги пройдены"; exit 0; fi
 echo "api-smoke: провалено шагов — $FAILS"; exit 1

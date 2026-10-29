@@ -2,6 +2,7 @@ package pull
 
 import (
 	"bufio"
+	"compress/gzip"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -194,8 +195,20 @@ func (s *S3) fetch(ctx context.Context, key string) (int, error) {
 		return 0, err
 	}
 	defer resp.Body.Close()
+	// Экспорт в бакет бывает сжатым (*.json.gz): распознаём по магическим байтам,
+	// а не по имени ключа — иначе такой объект молча давал бы 0 событий.
+	br := bufio.NewReader(resp.Body)
+	var body io.Reader = br
+	if magic, err := br.Peek(2); err == nil && magic[0] == 0x1f && magic[1] == 0x8b {
+		gz, err := gzip.NewReader(br)
+		if err != nil {
+			return 0, fmt.Errorf("gzip %s: %w", key, err)
+		}
+		defer gz.Close()
+		body = gz
+	}
 	n := 0
-	sc := bufio.NewScanner(resp.Body)
+	sc := bufio.NewScanner(body)
 	sc.Buffer(make([]byte, 1<<20), 32<<20)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())

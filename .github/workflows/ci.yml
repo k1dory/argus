@@ -21,6 +21,18 @@ jobs:
     strategy:
       matrix:
         module: [collector, engine, policyd, mcp, triage]
+    # Живой ClickHouse для engine/internal/store (live_test.go): все миграции
+    # с нуля и каждый запрос хранилища на настоящей базе. Без переменной
+    # ARGUS_TEST_CLICKHOUSE_URL эти тесты пропускаются.
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:24.8
+        env:
+          CLICKHOUSE_DB: argus
+          CLICKHOUSE_USER: default
+          CLICKHOUSE_PASSWORD: ci-only
+        ports:
+          - 8123:8123
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
@@ -31,6 +43,9 @@ jobs:
         run: |
           cd ${{ matrix.module }} && test -z "$(gofmt -l .)" || { gofmt -l .; echo 'gofmt: файлы не отформатированы'; exit 1; }
       - name: vet + test (с детектором гонок)
+        env:
+          ARGUS_TEST_CLICKHOUSE_URL: http://localhost:8123
+          ARGUS_TEST_CLICKHOUSE_PASSWORD: ci-only
         run: cd ${{ matrix.module }} && go vet ./... && go test -race -count=1 ./...
       - name: govulncheck (блокирующий)
         run: cd ${{ matrix.module }} && go run golang.org/x/vuln/cmd/govulncheck@latest ./...
@@ -59,7 +74,8 @@ jobs:
 
   web:
     runs-on: ubuntu-latest
-    # Живой ClickHouse для triage-claim-ch.test.ts: реальная конкурентность claim вердикта.
+    # Живой ClickHouse для queries-ch.test.ts (все миграции + каждый запрос консоли)
+    # и triage-claim-ch.test.ts (реальная конкурентность claim вердикта).
     services:
       clickhouse:
         image: clickhouse/clickhouse-server:24.8

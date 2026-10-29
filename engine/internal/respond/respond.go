@@ -177,7 +177,6 @@ type Responder struct {
 	wzTokExp   time.Time
 }
 
-// envList — <prefix>1..N: пустые пропускаются, ищем до 64.
 // csvList — список через запятую (INTERNAL_NETS), пустые элементы отбрасываются.
 func csvList(v string) []string {
 	var out []string
@@ -189,6 +188,7 @@ func csvList(v string) []string {
 	return out
 }
 
+// envList — <prefix>1..N: пустые пропускаются, ищем до 64.
 func envList(prefix string) []string {
 	var out []string
 	for i := 1; i <= 64; i++ {

@@ -448,6 +448,7 @@ services:
       ENGINE_URL: http://engine:8090
       ENGINE_TOKEN: ${ENGINE_TOKEN:?ENGINE_TOKEN не задан — ./scripts/argus init}
       COLLECTOR_URL: http://collector:8088
+      INTERNAL_NETS: ${INTERNAL_NETS:-}                     # свои сети: карточка инцидента не предлагает их к блокировке
       INGEST_PUBLIC_URL: ${INGEST_PUBLIC_URL:-}
       CONSOLE_HOST: ${CONSOLE_HOST:-localhost}
       # Запросы панелей дашбордов — от read-only пользователя (readonly=1, лимиты CONST)
@@ -553,8 +554,13 @@ services:
       CONSOLE_HOST: ${CONSOLE_HOST:-localhost}
       # "internal" (свой CA Caddy) или "/certs/console.crt /certs/console.key"
       CONSOLE_TLS: ${CONSOLE_TLS:-internal}
-      MCP_ALLOWED_NETS: ${MCP_ALLOWED_NETS:-127.0.0.1/32}
+      # Сети клиентов MCP (:8445). Список через пробел или запятую; entrypoint
+      # проверяет каждый элемент и добавляет шлюз Docker (локальные клиенты приходят
+      # с него) — опечатка здесь не уронит консоль и вебхуки (caddy/entrypoint.sh).
+      MCP_ALLOWED_NETS: ${MCP_ALLOWED_NETS:-}
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
     volumes:
+      - ./caddy/entrypoint.sh:/entrypoint.sh:ro
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - ./caddy/certs:/certs:ro
       - caddy-data:/data       # CA, сертификаты, access.log

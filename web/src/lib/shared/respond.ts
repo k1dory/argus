@@ -50,21 +50,50 @@ export function publicIpsFromChain(chain: string[]): string[] {
 
 const IPV4_EXACT_RE = /^(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/;
 
-/** Строка цепочки: «HH:MM:SS  source  node  action  object» (колонки через два и
- *  более пробела). Узел — наблюдатель (экспортёр NetFlow, хост агента), а не
- *  участник: его адрес из кандидатов на блокировку убираем. */
+function ipv4ToInt(ip: string): number | null {
+  if (!IPV4_EXACT_RE.test(ip)) return null;
+  return ip.split(".").reduce((acc, o) => acc * 256 + Number(o), 0);
+}
+
+/** Адрес входит в сеть «a.b.c.d/len» (или равен адресу без маски). Неразборчивая
+ *  запись сети — false: список INTERNAL_NETS приходит из .env и может быть пустым. */
+export function ipv4InCidr(ip: string, cidr: string): boolean {
+  const [net, lenRaw] = cidr.trim().split("/");
+  const a = ipv4ToInt(ip), n = ipv4ToInt(net);
+  if (a === null || n === null) return false;
+  const len = lenRaw === undefined ? 32 : Number(lenRaw);
+  if (!Number.isInteger(len) || len < 0 || len > 32) return false;
+  if (len === 0) return true;
+  const mask = (0xffffffff << (32 - len)) >>> 0;
+  return ((a & mask) >>> 0) === ((n & mask) >>> 0);
+}
+
+/** Строка цепочки движка: «HH:MM:SS  source(16) node(14) action(24) detail» —
+ *  фиксированные колонки через один пробел (engine/internal/incidents, cut/%-Ns).
+ *  Узел — наблюдатель (экспортёр NetFlow, хост агента), а не участник: его
+ *  колонку из кандидатов на блокировку убираем. Если ширина не сходится (строка
+ *  не от движка) — колонки по двум и более пробелам, как в свободном тексте. */
+const CHAIN_TS_RE = /^\d\d:\d\d:\d\d  /;
+const NODE_COL_START = 27, NODE_COL_END = 41; // 8 (ts) + 2 + 16 (source) + 1 … + 14 (node)
 function stripNodeColumn(line: string): string {
+  if (CHAIN_TS_RE.test(line) && line.length > NODE_COL_END && line[NODE_COL_START - 1] === " " && line[NODE_COL_END] === " ") {
+    return line.slice(0, NODE_COL_START - 1) + "  " + line.slice(NODE_COL_END + 1);
+  }
   const cols = line.split(/\s{2,}/);
   if (cols.length < 4) return line;
   return [...cols.slice(0, 2), ...cols.slice(3)].join("  ");
 }
 
-/** Кандидаты на блокировку из карточки инцидента. Если субъект — публичный
- *  адрес (правила с group_by по src.ip/dst.ip: сканы, перебор), предлагается
- *  только он: остальные адреса цепочки — наши цели и экспортёры. Иначе —
- *  публичные адреса из цепочки без колонки узла. */
-export function blockCandidates(actor: string, chain: string[]): string[] {
+/** Кандидаты на блокировку из карточки инцидента.
+ *  - Субъект — публичный адрес (правила с group_by по src.ip/dst.ip: сканы, перебор
+ *    снаружи): предлагается только он — остальные адреса цепочки наши цели и экспортёры.
+ *  - Субъект — свой адрес (частный или из ownNets = INTERNAL_NETS: исходящие правила —
+ *    маячок, DNS-туннель, запрет egress) или логин: публичные адреса цепочки без колонки
+ *    узла и без собственных сетей — то, куда стучит заражённый хост.
+ *  Без INTERNAL_NETS своими считаются только частные диапазоны (как attrs.scope у коллектора). */
+export function blockCandidates(actor: string, chain: string[], ownNets: readonly string[] = []): string[] {
+  const own = (ip: string) => isNonRoutableIpv4(ip) || ownNets.some((n) => ipv4InCidr(ip, n));
   const a = actor.trim();
-  if (IPV4_EXACT_RE.test(a)) return isNonRoutableIpv4(a) ? [] : [a];
-  return publicIpsFromChain(chain.map(stripNodeColumn));
+  if (IPV4_EXACT_RE.test(a) && !own(a)) return [a];
+  return publicIpsFromChain(chain.map(stripNodeColumn)).filter((ip) => !own(ip));
 }
