@@ -10,17 +10,20 @@ import (
 // WAF — разобранная транзакция ModSecurity v3 или Coraza (Caddy/nginx):
 // запрос, ответ, режим движка и сработавшие правила CRS.
 type WAF struct {
-	Product     string // modsecurity | coraza
-	Time        string // как в логе (RFC3339 или "13/Sep/2026:12:00:00 +0000")
-	ClientIP    string
-	ClientPort  int
-	HostIP      string
-	HostPort    int
-	ServerID    string // hostname из producer/server_id
-	Method      string
-	URI         string
-	Host        string // заголовок Host
-	ServerName  string // [hostname "…"] error-лога: имя сервера (ModSecurity) или локальный адрес сокета (Coraza)
+	Product    string // modsecurity | coraza
+	Time       string // как в логе (RFC3339 или "13/Sep/2026:12:00:00 +0000")
+	ClientIP   string
+	ClientPort int
+	HostIP     string
+	HostPort   int
+	ServerID   string // hostname из producer/server_id
+	Method     string
+	URI        string
+	Host       string // заголовок Host
+	// ServerName — [hostname "…"] error-лога. Значение не доверенное: у ModSecurity
+	// под Apache/nginx это заголовок Host запроса (r->hostname, headers_in.server),
+	// у Coraza — локальный адрес сокета. Узлом события не бывает никогда.
+	ServerName  string
 	UserAgent   string
 	Status      int
 	EngineMode  string // On | DetectionOnly | Off
@@ -230,7 +233,7 @@ func ParseWAFErrorLine(line string) (WAF, bool) {
 		case "tag":
 			r.Tags = append(r.Tags, v)
 		case "hostname":
-			w.Host, w.ServerName = v, v
+			w.ServerName = v
 		case "uri":
 			w.URI = v
 		case "unique_id":

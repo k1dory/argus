@@ -22,8 +22,9 @@ listeners:
   #   waf-audit — SecAuditLogFormat JSON (ModSecurity v3, Coraza); lines — error-лог
   #   nginx/Apache с «ModSecurity: …» или JSON-лог Caddy с «Coraza: …».
   files:
-  #   node — имя хоста WAF для событий, где лог его не называет (Coraza пишет в
-  #   [hostname] адрес контейнера; он уходит в dst_ip и attrs.server_addr);
+  #   node — имя хоста WAF (WAF_NODE): узел событий файла, если отправитель его
+  #   не назвал; [hostname] error-лога узлом не бывает — у ModSecurity это Host
+  #   от клиента, у Coraza адрес контейнера (уходит в dst_ip и attrs.server_addr);
   #   attrs — постоянные атрибуты файла, напр. container: имя контейнера WAF.
     - path: "${WAF_AUDIT_LOG:-}"        # напр. /logs/waf/modsec_audit.log (WAF_LOG_DIR → /logs/waf)
       format: waf-audit

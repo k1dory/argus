@@ -410,12 +410,13 @@ func (n *Normalizer) FromWAF(w parse.WAF, raw string) model.Event {
 		Source: "waf." + firstNonEmpty(w.Product, "modsecurity"), SourceClass: "waf",
 		Vendor: map[string]string{"coraza": "Coraza", "modsecurity": "OWASP"}[w.Product], Product: w.Product,
 		Action: "http.request", Outcome: "allow", ActorName: w.ClientIP, ActorKind: "unknown",
-		// Node — имя сервера WAF: server_id audit-лога или [hostname] error-лога, если там
-		// имя. Coraza пишет в [hostname] локальный адрес сокета (внутри Docker — адрес
-		// контейнера): адрес — в dst_ip и attrs.server_addr, а узел остаётся пустым, его
-		// заполняет отправитель (hostname syslog, node: файлового источника). Заголовок
-		// Host узлом не бывает: его присылает клиент.
-		Object: strings.TrimSpace(w.Method + " " + w.URI), Node: wafNode(w),
+		// Node — только server_id audit-лога: его задаёт оператор в конфиге WAF.
+		// [hostname] error-лога и заголовок Host присылает клиент (у ModSecurity под
+		// Apache/nginx [hostname] — это Host запроса), узлом они не бывают: IP из
+		// [hostname] — в dst_ip и attrs.server_addr, имя — в attrs.http_host. Узел
+		// окончательно выбирает коллектор (cmd/collector wafNode): отправитель →
+		// node: источника → server_id → адрес сервера → адрес отправителя.
+		Object: strings.TrimSpace(w.Method + " " + w.URI), Node: w.ServerID,
 		SessionID: w.UniqueID, SrcIP: w.ClientIP, SrcPort: uint16(w.ClientPort), DstIP: w.HostIP, DstPort: uint16(w.HostPort),
 		Proto: "tcp", Raw: raw, Attrs: map[string]string{},
 	}
@@ -424,6 +425,9 @@ func (n *Normalizer) FromWAF(w parse.WAF, raw string) model.Event {
 		if e.DstIP == "" {
 			e.DstIP = addr
 		}
+	}
+	if _, isAddr := hostAddr(w.ServerName); !isAddr && strings.TrimSpace(w.ServerName) != "" {
+		e.Attrs["http_host"] = strings.TrimSpace(w.ServerName) // от клиента: справочно, не узел
 	}
 	if e.Vendor == "" {
 		e.Vendor = "OWASP"
@@ -491,19 +495,6 @@ func (n *Normalizer) FromWAF(w parse.WAF, raw string) model.Event {
 	}
 	e.Ensure()
 	return e
-}
-
-// wafNode — имя сервера WAF без адресов: server_id audit-лога, иначе [hostname]
-// error-лога, если это имя, а не IP (с портом или без). Заголовок Host (w.Host из
-// audit-лога) узлом не бывает: его присылает клиент.
-func wafNode(w parse.WAF) string {
-	if w.ServerID != "" {
-		return w.ServerID
-	}
-	if _, isAddr := hostAddr(w.ServerName); !isAddr {
-		return w.ServerName
-	}
-	return ""
 }
 
 // wafServerAddr — адрес сервера WAF: host_ip audit-лога или адрес из [hostname].

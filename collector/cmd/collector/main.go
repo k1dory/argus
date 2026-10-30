@@ -165,20 +165,136 @@ func mergeAttrs(e *model.Event, attrs map[string]string) {
 	}
 }
 
-// attrsFromStructured — SD-элемент «argus» в заголовке RFC 5424 → атрибуты события:
-// так агент на хосте передаёт то, чего нет в строке лога (имя контейнера,
-// под, сервис). Параметры других SD-элементов не трогаются; своё значение
-// события важнее.
+// parseSyslogLine — одна строка syslog/файла/HTTP в событие: CEF, LEEF, WAF
+// error-лог, вендорные разборщики, иначе syslog. Происхождение (peer, peer_cn,
+// scope) ставит только коллектор; в конце — повторная чистка значений, записанных
+// после Ensure нормализатора.
+func parseSyslogLine(norm *normalize.Normalizer, line string, peer listen.Peer) (model.Event, bool) {
+	sl, _ := parse.ParseSyslog(line)
+	var e model.Event
+	switch {
+	case hasCEF(line):
+		c, _ := parse.ParseCEF(line)
+		e = norm.FromCEF(c, sl, line)
+	case hasLEEF(line):
+		l, _ := parse.ParseLEEF(line)
+		e = norm.FromLEEF(l, sl, line)
+	case parse.IsWAFErrorLine(line):
+		// error-лог ModSecurity (Apache/nginx) или Coraza (в т.ч. JSON-лог Caddy).
+		// Строка может прийти в обёртке syslog (агент на хосте добавляет заголовок с
+		// именем хоста) — тогда разбирается текст после заголовка.
+		wafText := line
+		if sl.Format != "raw" && parse.IsWAFErrorLine(sl.Message) {
+			wafText = sl.Message
+		}
+		wf, ok := parse.ParseWAFErrorLine(wafText)
+		if !ok {
+			e = norm.FromSyslog(sl, line)
+			break
+		}
+		if !wf.Final {
+			return model.Event{}, false // промежуточная строка Warning по одному правилу
+		}
+		e = norm.FromWAF(wf, line)
+		wafNode(&e, sl.Hostname, peer)
+	default:
+		if sq, ok := parse.ParseSquid(sl.Message, sl.Hostname); ok {
+			e = sq
+		} else if jk, ok := parse.ParseJenkins(sl.Message, sl.Hostname); ok {
+			e = jk
+		} else if mt, ok := parse.ParseMikroTik(sl); ok {
+			e = mt
+		} else if vr, ok := parse.ParseVRP(sl); ok {
+			e = vr
+		} else {
+			e = norm.FromSyslog(sl, line)
+		}
+	}
+	if e.Node == "" {
+		e.Node = firstNonEmpty(peer.Node, peer.Addr)
+	}
+	attrsFromStructured(&e, sl.Structured)
+	// Происхождение ставит только коллектор: peer — адрес соединения, peer_cn — только
+	// из проверенного клиентского сертификата, scope считает emit по адресам.
+	if e.Attrs == nil {
+		e.Attrs = map[string]string{}
+	}
+	e.Attrs["peer"] = peer.Addr
+	if peer.CN != "" {
+		e.Attrs["peer_cn"] = peer.CN
+	} else {
+		delete(e.Attrs, "peer_cn")
+	}
+	delete(e.Attrs, "scope")
+	// Узел из заголовка syslog и атрибуты SD пишутся после Ensure нормализатора:
+	// повторная чистка — управляющие символы, ANSI и потолок длины.
+	e.Sanitize()
+	return e, true
+}
+
+// wafAuditEvent — транзакция audit-лога из POST /ingest/modsecurity: тот же
+// выбор узла, что у файла и error-лога, и чистка после него.
+func wafAuditEvent(norm *normalize.Normalizer, obj json.RawMessage, peer listen.Peer) (model.Event, bool) {
+	wf, ok := parse.ParseWAFAudit(obj)
+	if !ok {
+		return model.Event{}, false
+	}
+	e := norm.FromWAF(wf, string(obj))
+	wafNode(&e, "", peer)
+	e.Sanitize()
+	return e, true
+}
+
+// wafNode — узел события WAF, одно правило для error-лога, файла audit и
+// POST /ingest/modsecurity:
+//  1. имя хоста из заголовка syslog (агент на хосте WAF знает своё имя);
+//  2. node: источника (WAF_NODE) — оператор назвал хост явно;
+//  3. server_id audit-лога — тоже задаёт оператор в конфиге WAF, но для многих
+//     серверов он один и тот же или пуст, поэтому ниже явного имени;
+//  4. адрес сервера (host_ip audit-лога или IP из [hostname]) — разные серверы
+//     дают разные узлы, на этом держится правило waf-scanner-multihost;
+//  5. адрес отправителя.
+//
+// [hostname] error-лога и заголовок Host присылает клиент: узлом они не бывают
+// (FromWAF кладёт имя в attrs.http_host).
+func wafNode(e *model.Event, senderHost string, peer listen.Peer) {
+	e.Node = firstNonEmpty(strings.TrimSpace(senderHost), strings.TrimSpace(peer.Node), e.Node,
+		e.Attrs["server_addr"], e.DstIP, peer.Addr)
+}
+
+// sdAttrKeys — параметры SD-элемента «argus», которые агент на хосте может
+// передать в заголовке RFC 5424: то, чего нет в строке лога. Остальное —
+// происхождение (peer, peer_cn, transport, scope, server_addr…) — ставит только
+// коллектор; иначе любой отправитель syslog подделал бы его.
+var sdAttrKeys = map[string]bool{"container": true, "pod": true, "namespace": true, "service": true}
+
+// sdAttrMax — потолок значения из SD: имена контейнеров и подов короче 253 байт.
+const sdAttrMax = 253
+
+// attrsFromStructured — разрешённые параметры SD-элемента «argus» → атрибуты
+// события. Значение чистится и режется (обрезка — attrs.truncated=1); своё
+// значение события важнее.
 func attrsFromStructured(e *model.Event, sd map[string]string) {
 	for k, v := range sd {
 		name, ok := strings.CutPrefix(k, "argus.")
-		if !ok || name == "" || v == "" || e.Attrs[name] != "" {
+		if !ok || !sdAttrKeys[name] {
+			continue
+		}
+		v, cut := model.Clean(strings.TrimSpace(v))
+		if len(v) > sdAttrMax {
+			v = strings.ToValidUTF8(v[:sdAttrMax], "")
+			cut = true
+		}
+		if v == "" || e.Attrs[name] != "" {
 			continue
 		}
 		if e.Attrs == nil {
 			e.Attrs = map[string]string{}
 		}
 		e.Attrs[name] = v
+		if cut {
+			e.Attrs["truncated"] = "1"
+		}
 	}
 }
 
@@ -340,60 +456,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	parseLine := func(line string, peer listen.Peer) (model.Event, bool) {
-		sl, _ := parse.ParseSyslog(line)
-		var e model.Event
-		switch {
-		case hasCEF(line):
-			c, _ := parse.ParseCEF(line)
-			e = norm.FromCEF(c, sl, line)
-		case hasLEEF(line):
-			l, _ := parse.ParseLEEF(line)
-			e = norm.FromLEEF(l, sl, line)
-		case parse.IsWAFErrorLine(line):
-			// error-лог ModSecurity (Apache/nginx) или Coraza (в т.ч. JSON-лог Caddy).
-			// Строка может прийти в обёртке syslog (агент на хосте добавляет заголовок с
-			// именем хоста) — тогда разбирается текст после заголовка.
-			wafText := line
-			if sl.Format != "raw" && parse.IsWAFErrorLine(sl.Message) {
-				wafText = sl.Message
-			}
-			wf, ok := parse.ParseWAFErrorLine(wafText)
-			if !ok {
-				e = norm.FromSyslog(sl, line)
-				break
-			}
-			if !wf.Final {
-				return model.Event{}, false // промежуточная строка Warning по одному правилу
-			}
-			e = norm.FromWAF(wf, line)
-			// Узел — от отправителя: hostname syslog, node: файла; последним — адрес сервера WAF.
-			if e.Node == "" {
-				e.Node = firstNonEmpty(sl.Hostname, peer.Node, e.Attrs["server_addr"])
-			}
-		default:
-			if sq, ok := parse.ParseSquid(sl.Message, sl.Hostname); ok {
-				e = sq
-			} else if jk, ok := parse.ParseJenkins(sl.Message, sl.Hostname); ok {
-				e = jk
-			} else if mt, ok := parse.ParseMikroTik(sl); ok {
-				e = mt
-			} else if vr, ok := parse.ParseVRP(sl); ok {
-				e = vr
-			} else {
-				e = norm.FromSyslog(sl, line)
-			}
-		}
-		if e.Node == "" {
-			e.Node = firstNonEmpty(peer.Node, peer.Addr)
-		}
-		attrsFromStructured(&e, sl.Structured)
-		e.Attrs["peer"] = peer.Addr
-		if peer.CN != "" {
-			e.Attrs["peer_cn"] = peer.CN
-		}
-		return e, true
-	}
+	parseLine := func(line string, peer listen.Peer) (model.Event, bool) { return parseSyslogLine(norm, line, peer) }
 	lines := func(line string, peer listen.Peer) {
 		if e, ok := parseLine(line, peer); ok {
 			emit(e, "syslog", peer.Transport)
@@ -415,10 +478,9 @@ func main() {
 			handle = func(line string) {
 				if wf, ok := parse.ParseWAFAudit([]byte(line)); ok {
 					e := norm.FromWAF(wf, line)
-					if e.Node == "" {
-						e.Node = firstNonEmpty(fcfg.Node, e.DstIP, src)
-					}
+					wafNode(&e, "", listen.Peer{Addr: src, Transport: "file", Node: fcfg.Node})
 					mergeAttrs(&e, fcfg.Attrs)
+					e.Sanitize()
 					emit(e, "file:"+src, "file")
 				}
 			}
@@ -427,6 +489,7 @@ func main() {
 			handle = func(line string) {
 				if e, ok := parseLine(line, peer); ok {
 					mergeAttrs(&e, fcfg.Attrs)
+					e.Sanitize()
 					emit(e, "syslog", peer.Transport)
 				}
 			}
@@ -509,12 +572,8 @@ func main() {
 		Token: cfg.Listeners.HTTP.Token, K8sCluster: cfg.K8s.Cluster,
 		EmitBatch: emitHTTPBatch,
 		ParseLine: parseLine,
-		ParseWAFAudit: func(obj json.RawMessage) (model.Event, bool) {
-			wf, ok := parse.ParseWAFAudit(obj)
-			if !ok {
-				return model.Event{}, false
-			}
-			return norm.FromWAF(wf, string(obj)), true
+		ParseWAFAudit: func(obj json.RawMessage, peer listen.Peer) (model.Event, bool) {
+			return wafAuditEvent(norm, obj, peer)
 		},
 		Health: func() any {
 			return map[string]any{"status": "ok", "events_total": st.total.Load(), "dropped": st.dropped.Load(),

@@ -25,8 +25,8 @@ type HTTPHandlers struct {
 	EmitBatch     func(context.Context, []model.Event) error // подтверждает запрос после записи на диск
 	Lines         LineHandler
 	ParseLine     func(string, Peer) (model.Event, bool)
-	WAFAudit      func(json.RawMessage) bool // транзакция ModSecurity/Coraza в JSON
-	ParseWAFAudit func(json.RawMessage) (model.Event, bool)
+	WAFAudit      func(json.RawMessage) bool                      // транзакция ModSecurity/Coraza в JSON
+	ParseWAFAudit func(json.RawMessage, Peer) (model.Event, bool) // peer — для узла по умолчанию
 	Health        func() any
 	Metrics       func(full bool) string // full — с именами источников (по токену)
 }
@@ -154,9 +154,10 @@ func (h *HTTPHandlers) Mux() http.Handler {
 			objs = append(objs, obj)
 		}
 		if h.ParseWAFAudit != nil {
+			peer := Peer{Addr: remoteHost(r), Transport: "http"}
 			events := make([]model.Event, 0, len(objs))
 			for _, o := range objs {
-				if e, ok := h.ParseWAFAudit(o); ok {
+				if e, ok := h.ParseWAFAudit(o, peer); ok {
 					events = append(events, e)
 				}
 			}

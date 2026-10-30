@@ -10,7 +10,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/devitex-soft/argus/collector/internal/listen"
 	"github.com/devitex-soft/argus/collector/internal/model"
+	"github.com/devitex-soft/argus/collector/internal/normalize"
 	"github.com/devitex-soft/argus/collector/internal/sink"
 )
 
@@ -231,11 +233,120 @@ func TestMergeAttrsAndStructured(t *testing.T) {
 	if nilAttrs.Attrs["container"] != "caddy" {
 		t.Fatalf("nil attrs: %+v", nilAttrs.Attrs)
 	}
-	attrsFromStructured(&e, map[string]string{"argus.container": "sd", "argus.pod": "p1", "argus.": "x", "meta.ip": "1.1.1.1", "argus.empty": ""})
-	if e.Attrs["container"] != "own" || e.Attrs["pod"] != "p1" || e.Attrs["ip"] != "" || len(e.Attrs) != 3 {
-		t.Fatalf("attrsFromStructured: %+v", e.Attrs)
+	attrsFromStructured(&e, map[string]string{"argus.container": "sd", "argus.pod": "p1", "argus.": "x", "meta.ip": "1.1.1.1", "argus.empty": "",
+		"argus.peer_cn": "trusted-agent", "argus.scope": "internal", "argus.transport": "tls", "argus.server_addr": "1.2.3.4", "argus.namespace": "ns", "argus.service": "web"})
+	if e.Attrs["container"] != "own" || e.Attrs["pod"] != "p1" || e.Attrs["namespace"] != "ns" || e.Attrs["service"] != "web" || len(e.Attrs) != 5 {
+		t.Fatalf("attrsFromStructured: только белый список: %+v", e.Attrs)
 	}
 	attrsFromStructured(&e, nil)
+}
+
+func strs(n int, c string) string { return strings.Repeat(c, n) }
+
+// SD-элемент argus от любого отправителя syslog не подделывает происхождение:
+// peer_cn — только из сертификата, scope считает коллектор, transport ставит emit.
+func TestParseSyslogLineSDCannotForgeProvenance(t *testing.T) {
+	n := &normalize.Normalizer{}
+	line := `<134>1 2026-10-29T08:40:44Z host1 app - - [argus peer_cn="trusted-agent" scope="internal" transport="tls" peer="10.9.9.9" container="caddy"] hello`
+	e, ok := parseSyslogLine(n, line, listen.Peer{Addr: "203.0.113.7", Transport: "udp"})
+	if !ok {
+		t.Fatal("строка не принята")
+	}
+	if _, has := e.Attrs["peer_cn"]; has {
+		t.Fatalf("peer_cn без клиентского сертификата: %+v", e.Attrs)
+	}
+	if e.Attrs["scope"] != "" || e.Attrs["transport"] != "" || e.Attrs["peer"] != "203.0.113.7" || e.Attrs["container"] != "caddy" {
+		t.Fatalf("происхождение от отправителя: %+v", e.Attrs)
+	}
+	e, _ = parseSyslogLine(n, line, listen.Peer{Addr: "203.0.113.7", Transport: "tls", CN: "agent-01"})
+	if e.Attrs["peer_cn"] != "agent-01" {
+		t.Fatalf("peer_cn из сертификата: %+v", e.Attrs)
+	}
+}
+
+// Значения, записанные после Ensure нормализатора (атрибут из SD и узел из
+// заголовка syslog), проходят чистку: без ESC/BEL, с потолком длины и пометкой.
+func TestParseSyslogLineSanitizesLateWrites(t *testing.T) {
+	n := &normalize.Normalizer{}
+	evil := "\x1b]8;;http://x\x07" + strs(9000, "a")
+	line := `<134>1 2026-10-29T08:40:44Z host1 app - - [argus container="` + evil + `"] hello`
+	e, _ := parseSyslogLine(n, line, listen.Peer{Addr: "203.0.113.7", Transport: "udp"})
+	c := e.Attrs["container"]
+	if strings.ContainsAny(c, "\x1b\x07") || len(c) > sdAttrMax || e.Attrs["truncated"] != "1" {
+		t.Fatalf("container не очищен: len=%d truncated=%q %q", len(c), e.Attrs["truncated"], c[:min(len(c), 40)])
+	}
+	// WAF-строка в обёртке syslog: узел — hostname заголовка, тоже после Ensure.
+	host := "waf\x1b[31m" + strs(9000, "h")
+	waf := `<134>1 2026-10-29T08:40:44Z ` + host + ` caddy - - - {"level":"error","logger":"http.handlers.waf","msg":"[client \"93.123.109.247\"] Coraza: Access denied with code 403 (phase 2). [file \"x\"] [id \"949110\"] [msg \"Inbound Anomaly Score Exceeded (Total Score: 5)\"] [severity \"emergency\"] [hostname \"172.19.0.4\"] [uri \"/.env\"]"}`
+	e, ok := parseSyslogLine(n, waf, listen.Peer{Addr: "203.0.113.7", Transport: "udp"})
+	if !ok || e.SourceClass != "waf" {
+		t.Fatalf("WAF-строка: ok=%v %+v", ok, e)
+	}
+	if strings.ContainsRune(e.Node, 0x1b) || len(e.Node) > model.MaxFieldLen || e.Attrs["truncated"] != "1" {
+		t.Fatalf("узел не очищен: len=%d truncated=%q", len(e.Node), e.Attrs["truncated"])
+	}
+}
+
+// Узел события WAF: отправитель → node: источника → server_id → адрес сервера →
+// адрес отправителя. [hostname]/Host от клиента узлом не бывает.
+func TestWAFNodeOrder(t *testing.T) {
+	n := &normalize.Normalizer{}
+	coraza := `{"level":"error","logger":"http.handlers.waf","msg":"[client \"93.123.109.247\"] Coraza: Access denied with code 403 (phase 2). [file \"x\"] [id \"949110\"] [msg \"Inbound Anomaly Score Exceeded (Total Score: 5)\"] [severity \"emergency\"] [hostname \"172.19.0.4\"] [uri \"/.env\"]"}`
+	nginx := `2026/09/13 12:00:03 [error] 31#31: *7 [client 203.0.113.200] ModSecurity: Access denied with code 403 (phase 2). [file "/x.conf"] [id "949110"] [msg "Inbound Anomaly Score Exceeded"] [severity "2"] [hostname "dc01.corp"] [uri "/"] [unique_id "1"]`
+	for _, tc := range []struct {
+		name, line string
+		peer       listen.Peer
+		want       string
+	}{
+		{"coraza в файле с WAF_NODE", coraza, listen.Peer{Addr: "waf.error", Transport: "file", Node: "waf-01"}, "waf-01"},
+		{"coraza в файле без WAF_NODE — адрес сервера", coraza, listen.Peer{Addr: "waf.error", Transport: "file"}, "172.19.0.4"},
+		{"coraza от агента: hostname syslog важнее node:", `<134>1 2026-10-29T08:40:44Z waf-host caddy - - [argus container="caddy"] ` + coraza, listen.Peer{Addr: "10.0.0.5", Transport: "tls", Node: "cfg-node"}, "waf-host"},
+		{"атакующий Host: dc01.corp, без WAF_NODE — адрес отправителя", nginx, listen.Peer{Addr: "10.0.0.7", Transport: "udp"}, "10.0.0.7"},
+		{"атакующий Host: dc01.corp, WAF_NODE перебивает", nginx, listen.Peer{Addr: "nginx.error", Transport: "file", Node: "nginx-01"}, "nginx-01"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e, ok := parseSyslogLine(n, tc.line, tc.peer)
+			if !ok || e.SourceClass != "waf" {
+				t.Fatalf("не WAF: ok=%v %+v", ok, e)
+			}
+			if e.Node != tc.want {
+				t.Fatalf("узел %q, ожидалось %q (attrs %+v)", e.Node, tc.want, e.Attrs)
+			}
+			if e.Node == "dc01.corp" {
+				t.Fatal("заголовок Host атакующего стал узлом")
+			}
+		})
+	}
+}
+
+// POST /ingest/modsecurity: audit без server_id получает узел по host_ip, так что
+// три сервера дают три разных узла (правило waf-scanner-multihost, distinct node).
+func TestWAFAuditHTTPNodeDistinct(t *testing.T) {
+	n := &normalize.Normalizer{}
+	nodes := map[string]bool{}
+	for _, ip := range []string{"10.0.10.11", "10.0.10.12", "10.0.10.13"} {
+		obj := `{"transaction":{"timestamp":"2026-09-13T12:00:02Z","client_ip":"198.51.100.77","host_ip":"` + ip + `","host_port":443,"request":{"method":"GET","uri":"/.git/config","headers":{"host":"dc01.corp"}},"response":{"status":403},"producer":{"connector":"coraza-caddy","rule_engine":"On"},"messages":[{"message":"x","data":{"id":930130,"msg":"Restricted File Access","severity":"critical","tags":["attack-lfi"]}}]}}`
+		e, ok := wafAuditEvent(n, []byte(obj), listen.Peer{Addr: "203.0.113.50", Transport: "http"})
+		if !ok {
+			t.Fatal("audit не разобран")
+		}
+		if e.Node != ip {
+			t.Fatalf("узел %q, ожидался host_ip %q", e.Node, ip)
+		}
+		nodes[e.Node] = true
+	}
+	if len(nodes) != 3 {
+		t.Fatalf("узлов %d, нужно 3: %v", len(nodes), nodes)
+	}
+	// server_id задан оператором — он узел; без адресов вообще — адрес отправителя.
+	e, _ := wafAuditEvent(n, []byte(`{"transaction":{"server_id":"waf-01","host_ip":"10.0.10.11","client_ip":"1.2.3.4","request":{"uri":"/"},"response":{"status":200}}}`), listen.Peer{Addr: "203.0.113.50"})
+	if e.Node != "waf-01" {
+		t.Fatalf("server_id: %q", e.Node)
+	}
+	e, _ = wafAuditEvent(n, []byte(`{"transaction":{"client_ip":"1.2.3.4","request":{"uri":"/"},"response":{"status":200}}}`), listen.Peer{Addr: "203.0.113.50"})
+	if e.Node != "203.0.113.50" {
+		t.Fatalf("без адресов — отправитель: %q", e.Node)
+	}
 }
 
 func TestFileSourceNodeAndAttrsFromEnv(t *testing.T) {

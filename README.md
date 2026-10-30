@@ -450,7 +450,9 @@ Coraza под Caddy/nginx) и **error-лог** (`ModSecurity: …` в nginx/Apac
 `WAF_ERROR_LOG`; для агентов без файлового доступа — `POST /ingest/modsecurity` (JSON, NDJSON или
 массив). В единой схеме: `source_class=waf`, `action=http.attack`, `outcome=deny|allow` (заблокировано
 или только замечено: DetectionOnly, либо score не набран), атрибуты `category` (sqli, xss, rce, lfi…),
-`rule_ids`, `anomaly_score`, `status`, `engine_mode`, `host`, `method`, `user_agent`.
+`rule_ids`, `anomaly_score`, `status`, `engine_mode`, `host` (заголовок Host из audit-лога), `http_host`
+(`[hostname]` error-лога, если там имя), `server_addr`, `method`, `user_agent`. `host` и `http_host`
+присылает клиент: это справка, не узел и не основание для автоблокировки.
 Правила `rules/waf-*.yml`: серия атак с адреса, сканер по нескольким хостам, критичный RCE/LFI
 с высоким score — эти три с `respond`; «атака дошла до приложения» (детект + 5xx) — без автоответа,
 её разбирает человек. Из error-лога событием считается итоговая строка транзакции (Access denied
@@ -458,14 +460,20 @@ Coraza под Caddy/nginx) и **error-лог** (`ModSecurity: …` в nginx/Apac
 Витрина — дашборд «WAF · ModSecurity / Coraza». Coraza для Caddy: модуль `coraza-caddy`,
 директива `SecAuditLogFormat JSON` и `SecAuditLog /var/log/caddy/coraza_audit.log`.
 
-Узел события WAF — имя сервера: `server_id` audit-лога или `[hostname "…"]` error-лога, если там
-имя (ModSecurity под nginx). Coraza пишет в `[hostname]` локальный адрес сокета, внутри Docker —
-адрес контейнера: он уходит в `dst_ip` и `attrs.server_addr`, а узел берётся у отправителя —
-имя хоста из заголовка syslog, `node:` файлового источника (`WAF_NODE`) или, если ничего нет,
-тот же адрес. Имя контейнера лог не содержит: для файла — `attrs: {container: …}`
-(`WAF_CONTAINER`), для агента на хосте — SD-элемент RFC 5424 `[argus container="caddy"]`
-в заголовке строки: параметры элемента `argus` становятся атрибутами события (роль `argus_agent`
-так и отправляет строки `Coraza:` из `docker_logs` в `/ingest/syslog`).
+Узел события WAF коллектор выбирает одинаково для error-лога, файла audit и
+`POST /ingest/modsecurity`: имя хоста из заголовка syslog (агент на хосте WAF) → `node:` источника
+(`WAF_NODE`) → `server_id` audit-лога → адрес сервера (`host_ip` audit-лога или IP из `[hostname]`)
+→ адрес отправителя. `[hostname "…"]` error-лога узлом не бывает никогда: у ModSecurity под
+Apache/nginx это заголовок Host запроса, его подставляет клиент, а Coraza пишет туда локальный
+адрес сокета (внутри Docker — адрес контейнера). IP оттуда уходит в `dst_ip` и `attrs.server_addr`,
+имя — в `attrs.http_host`. Разные серверы без `server_id` дают разные узлы по адресу — на этом
+держится правило «сканер по нескольким хостам».
+
+Имени контейнера в логе нет: для файла — `attrs: {container: …}` (`WAF_CONTAINER`), для агента на
+хосте — SD-элемент RFC 5424 `[argus container="caddy"]` в заголовке строки. Из SD-элемента `argus`
+принимаются только `container`, `pod`, `namespace`, `service` (не длиннее 253 байт, с очисткой
+управляющих символов); происхождение — `peer`, `peer_cn`, `transport`, `scope`, `server_addr` —
+ставит только коллектор, `peer_cn` — только из проверенного клиентского сертификата.
 
 ## Вебхуки и подключение агента разбора
 

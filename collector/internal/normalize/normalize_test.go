@@ -99,9 +99,10 @@ func TestFromWAF(t *testing.T) {
 	}
 }
 
-// Узел события WAF — имя сервера, а не адрес: Coraza в [hostname] error-лога пишет
-// локальный адрес сокета (в Docker — контейнера), он уходит в dst_ip/server_addr,
-// узел заполняет отправитель. ModSecurity под nginx называет имя — оно и есть узел.
+// FromWAF ставит узлом только server_id (его задаёт оператор). [hostname]
+// error-лога присылает клиент (у ModSecurity под Apache/nginx это заголовок
+// Host): IP — в dst_ip/server_addr, имя — в attrs.http_host, узлом не бывает.
+// Окончательный узел выбирает коллектор (cmd/collector wafNode).
 func TestFromWAFNodeIsNameNotAddress(t *testing.T) {
 	n := &Normalizer{}
 	base := parse.WAF{Product: "coraza", ClientIP: "93.123.109.247", Method: "GET", URI: "/", Final: true, MaxSeverity: -1}
@@ -110,15 +111,17 @@ func TestFromWAFNodeIsNameNotAddress(t *testing.T) {
 		serverID, serverName string
 		hostIP               string
 		wantNode, wantAddr   string
+		wantHTTPHost         string
 	}{
-		{"coraza: адрес контейнера с портом", "", "172.19.0.4:443", "", "", "172.19.0.4"},
-		{"coraza: адрес без порта", "", "172.19.0.4", "", "", "172.19.0.4"},
-		{"coraza: IPv6 в скобках", "", "[fd00::4]:443", "", "", "fd00::4"},
-		{"modsecurity nginx: имя сервера", "", "web-01", "", "web-01", ""},
-		{"имя с портом", "", "web-01:8443", "", "web-01:8443", ""},
-		{"audit: server_id важнее", "waf-01", "172.19.0.4", "10.0.10.12", "waf-01", "10.0.10.12"},
-		{"audit: host_ip без server_id — узел пуст", "", "", "10.0.10.12", "", "10.0.10.12"},
-		{"ничего не названо", "", "", "", "", ""},
+		{"coraza: адрес контейнера с портом", "", "172.19.0.4:443", "", "", "172.19.0.4", ""},
+		{"coraza: адрес без порта", "", "172.19.0.4", "", "", "172.19.0.4", ""},
+		{"coraza: IPv6 в скобках", "", "[fd00::4]:443", "", "", "fd00::4", ""},
+		{"modsecurity: [hostname] — Host от клиента, не узел", "", "web-01", "", "", "", "web-01"},
+		{"атакующий подставил Host: dc01.corp", "", "dc01.corp", "", "", "", "dc01.corp"},
+		{"имя с портом", "", "web-01:8443", "", "", "", "web-01:8443"},
+		{"audit: server_id — узел", "waf-01", "172.19.0.4", "10.0.10.12", "waf-01", "10.0.10.12", ""},
+		{"audit: host_ip без server_id — узел пуст", "", "", "10.0.10.12", "", "10.0.10.12", ""},
+		{"ничего не названо", "", "", "", "", "", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			w := base
@@ -130,8 +133,11 @@ func TestFromWAFNodeIsNameNotAddress(t *testing.T) {
 			if e.Attrs["server_addr"] != tc.wantAddr || e.DstIP != tc.wantAddr {
 				t.Fatalf("server_addr %q / dst_ip %q, ожидалось %q", e.Attrs["server_addr"], e.DstIP, tc.wantAddr)
 			}
+			if e.Attrs["http_host"] != tc.wantHTTPHost {
+				t.Fatalf("http_host %q, ожидалось %q", e.Attrs["http_host"], tc.wantHTTPHost)
+			}
 			if e.Attrs["host"] != "shop.example.org" {
-				t.Fatalf("attrs.host — заголовок Host как был: %+v", e.Attrs)
+				t.Fatalf("attrs.host — заголовок Host audit-лога как был: %+v", e.Attrs)
 			}
 		})
 	}

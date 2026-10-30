@@ -44,7 +44,7 @@ func TestParseWAFAuditCoraza(t *testing.T) {
 func TestParseWAFErrorLineNginxAndCaddy(t *testing.T) {
 	nginx := `2026/09/13 12:00:03 [error] 31#31: *7 [client 203.0.113.200] ModSecurity: Access denied with code 403 (phase 2). Matched "Operator ` + "`" + `PmFromFile' with parameter ` + "`" + `unix-shell.data' against variable ` + "`" + `ARGS:cmd' (Value: ` + "`" + `;cat /etc/passwd' ) [file "/etc/modsecurity/crs/rules/REQUEST-932-APPLICATION-ATTACK-RCE.conf"] [line "78"] [id "932160"] [rev ""] [msg "Remote Command Execution: Unix Shell Code Found"] [data "Matched Data: cat /etc/passwd found within ARGS:cmd"] [severity "2"] [ver "OWASP_CRS/3.3.5"] [maturity "0"] [accuracy "0"] [tag "application-multi"] [tag "attack-rce"] [tag "paranoia-level/1"] [hostname "shop.corp.local"] [uri "/cgi-bin/test.cgi"] [unique_id "1789300803"] [ref "o0,5v13,14t:urlDecodeUni,t:cmdLine"], client: 203.0.113.200, server: shop.corp.local`
 	w, ok := ParseWAFErrorLine(nginx)
-	if !ok || w.Product != "modsecurity" || w.ClientIP != "203.0.113.200" || w.Status != 403 || w.Host != "shop.corp.local" || w.URI != "/cgi-bin/test.cgi" {
+	if !ok || w.Product != "modsecurity" || w.ClientIP != "203.0.113.200" || w.Status != 403 || w.ServerName != "shop.corp.local" || w.Host != "" || w.URI != "/cgi-bin/test.cgi" {
 		t.Fatalf("nginx: ok=%v %+v", ok, w)
 	}
 	if len(w.Rules) != 1 || w.Rules[0].ID != "932160" || w.Rules[0].Severity != 2 || w.Categories[0] != "rce" || w.EngineMode != "On" {
@@ -52,7 +52,7 @@ func TestParseWAFErrorLineNginxAndCaddy(t *testing.T) {
 	}
 	caddy := `{"level":"error","ts":1789300804.1,"logger":"http.handlers.waf","msg":"[client \"192.0.2.44\"] Coraza: Warning. Matched \"Operator ` + "`" + `Rx' with parameter ` + "`" + `(?i)(?:\\.\\./)'\" [file \"@owasp_crs/REQUEST-930-APPLICATION-ATTACK-LFI.conf\"] [line \"12\"] [id \"930100\"] [msg \"Path Traversal Attack (/../) or (/.../)\"] [data \"\"] [severity \"critical\"] [tag \"attack-lfi\"] [tag \"paranoia-level/1\"] [hostname \"api.corp.local\"] [uri \"/v1/export\"] [unique_id \"c0ffee\"]","request_id":"abc"}`
 	w, ok = ParseWAFErrorLine(caddy)
-	if !ok || w.Product != "coraza" || w.ClientIP != "192.0.2.44" || w.Status != 0 || w.Host != "api.corp.local" || w.Rules[0].ID != "930100" || w.Rules[0].Severity != 2 || w.Categories[0] != "lfi" {
+	if !ok || w.Product != "coraza" || w.ClientIP != "192.0.2.44" || w.Status != 0 || w.ServerName != "api.corp.local" || w.Host != "" || w.Rules[0].ID != "930100" || w.Rules[0].Severity != 2 || w.Categories[0] != "lfi" {
 		t.Fatalf("caddy: ok=%v %+v", ok, w)
 	}
 	if _, ok := ParseWAFErrorLine("plain syslog line without waf"); ok {
@@ -89,13 +89,13 @@ func TestParseWAFErrorLineSpoofingAndEscapes(t *testing.T) {
 	}
 }
 
-// [hostname "…"] error-лога — ServerName (и Host для совместимости); Coraza пишет туда
+// [hostname "…"] error-лога — только ServerName (не Host и не узел); Coraza пишет туда
 // адрес сокета. Строка в обёртке RFC 5424 от агента: имя хоста и SD argus в заголовке,
 // JSON Caddy — в сообщении, и его разбирает тот же парсер.
 func TestWAFErrorLineServerNameAndSyslogWrap(t *testing.T) {
 	msg := `{"level":"error","ts":1761727244.5,"logger":"http.handlers.waf","msg":"[client \"93.123.109.247\"] Coraza: Access denied with code 403 (phase 2). [file \"@owasp_crs/REQUEST-949-BLOCKING-EVALUATION.conf\"] [line \"1\"] [id \"949110\"] [msg \"Inbound Anomaly Score Exceeded (Total Score: 5)\"] [severity \"emergency\"] [hostname \"172.19.0.4\"] [uri \"/.env\"] [unique_id \"abc\"]"}`
 	w, ok := ParseWAFErrorLine(msg)
-	if !ok || w.ServerName != "172.19.0.4" || w.Host != "172.19.0.4" || w.ClientIP != "93.123.109.247" || !w.Final {
+	if !ok || w.ServerName != "172.19.0.4" || w.Host != "" || w.ClientIP != "93.123.109.247" || !w.Final {
 		t.Fatalf("%+v", w)
 	}
 	line := `<134>1 2026-10-29T08:40:44.123Z waf-01 caddy - - [argus container="caddy-waf"] ` + msg
