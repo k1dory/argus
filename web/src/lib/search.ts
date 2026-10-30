@@ -17,8 +17,12 @@ type FieldDef = { col: string; kind: Kind; label: string; facet?: boolean };
 type IndexDef = {
   table: string;
   tsCol: string;
-  /** Где ищется свободный текст */
-  haystack: string;
+  /** Свободный текст: подстрока без учёта регистра в любом из полей fields.
+   *  index — выражение n-граммного индекса idx_text (миграция 0030): по нему
+   *  отсекаются гранулы, где нужной подстроки заведомо нет. Выражение должно
+   *  совпадать с миграцией символ в символ и не содержать строковых констант:
+   *  новый анализатор ClickHouse 24.8 не сопоставляет индекс на concat(x, ' ', y). */
+  text: { fields: string[]; index: string };
   fields: Record<string, FieldDef>;
   /** Колонки таблицы результатов (в порядке вывода) */
   columns: { key: string; label: string }[];
@@ -35,7 +39,7 @@ export const INDEXES: Record<IndexKey, IndexDef> = {
   alerts: {
     table: "wazuh_alerts",
     tsCol: "timestamp",
-    haystack: "raw",
+    text: { fields: ["raw"], index: "lowerUTF8(raw)" },
     fields: {
       agent: { col: "agent_name", kind: "exact", label: "агент", facet: true },
       "agent.id": { col: "agent_id", kind: "exact", label: "id агента" },
@@ -67,7 +71,10 @@ export const INDEXES: Record<IndexKey, IndexDef> = {
   events: {
     table: "events",
     tsCol: "ts",
-    haystack: "concat(raw, ' ', actor_name, ' ', object, ' ', node, ' ', src_ip, ' ', dst_ip, ' ', action, ' ', toString(attrs))",
+    text: {
+      fields: ["raw", "actor_name", "object", "node", "src_ip", "dst_ip", "action", "toString(attrs)"],
+      index: "lowerUTF8(concat(raw, actor_name, object, node, src_ip, dst_ip, action, toString(attrs)))",
+    },
     fields: {
       source: { col: "source", kind: "exact", label: "источник", facet: true },
       class: { col: "source_class", kind: "exact", label: "класс", facet: true },
@@ -130,11 +137,21 @@ export type SearchInput = {
 
 export type SearchResult = {
   rows: Record<string, unknown>[];
+  /** Сумма гистограммы; если гистограмма не посчиталась — нижняя граница по странице. */
   total: number;
+  /** false — total нижняя граница (гистограмма не уложилась в свой бюджет). */
+  total_exact: boolean;
   page: number;
   pageSize: number;
   series: SeriesPoint[];
   facets: { field: string; label: string; values: { value: string; count: number }[] }[];
+  /** По скольким последним совпадениям посчитаны фасеты; FACET_SAMPLE — выборка
+   *  полная, счётчики приблизительные; null — фасеты не считались. */
+  facets_sample: number | null;
+  /** Части ответа, не посчитанные за свой бюджет: series (и итог), facets. */
+  incomplete: ("series" | "facets")[];
+  /** Почему часть ответа неполная — для показа рядом с результатами. */
+  notice: string | null;
   error: string | null;
   ms: number;
 };
@@ -148,6 +165,16 @@ const DT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/;
 /** Серверные лимиты на поисковые запросы: консольный пользователь без квот,
  *  а поиск по raw за 30 дней — полный скан. */
 export const SEARCH_SETTINGS = { max_execution_time: 20, max_memory_usage: 2_000_000_000, max_result_rows: 20000, result_overflow_mode: "break" } as const;
+/** Гистограмма и фасеты — свой, более короткий бюджет: страница результатов
+ *  важнее, и без них она всё равно показывается (search, страница /search). */
+export const SERIES_SETTINGS = { ...SEARCH_SETTINGS, max_execution_time: 15 } as const;
+export const FACETS_SETTINGS = { ...SEARCH_SETTINGS, max_execution_time: 10 } as const;
+/** Фасеты считаются по последним FACET_SAMPLE совпадениям (чтение в порядке ts
+ *  с ранней остановкой), а не по всему окну: для частого слова полный подсчёт
+ *  значений полей — это полный скан, который и упирался в таймаут. */
+export const FACET_SAMPLE = 10_000;
+/** Короче — индекс n-грамм (n = 4 байта) не помогает, условие не добавляется. */
+const NGRAM_MIN_BYTES = 4;
 
 export function clampPage(v: string | number | undefined): number {
   return clampInt(v, 1, MAX_PAGE, 1);
@@ -202,6 +229,15 @@ export function buildWhere(input: SearchInput): Built {
   const terms = parseQuery(input.q.slice(0, MAX_QUERY_LEN));
   if (terms.length > MAX_TERMS) errors.push(`слишком много условий: ${terms.length}, максимум ${MAX_TERMS}`);
   for (const t of terms.slice(0, MAX_TERMS)) {
+    if (t.field === null) {
+      const { exact, prefilter } = freeTextCondition(def, t.value, p);
+      // Предфильтр по индексу — только у положительного условия и после точной
+      // проверки: при коротком замыкании AND строка индекса считается лишь там,
+      // где подстрока уже нашлась (на частом слове это дешевле, чем наоборот).
+      if (t.negate) conds.push(`NOT (${exact})`);
+      else conds.push(exact, ...prefilter);
+      continue;
+    }
     const c = termCondition(def, t, p, errors);
     if (c) conds.push(t.negate ? `NOT (${c})` : c);
   }
@@ -221,10 +257,36 @@ function bindCondition(def: IndexDef, bind: { actors: string[]; nodes: string[] 
 
 const NUM_OPS: Record<Op, string> = { "=": "=", "!=": "!=", ">": ">", ">=": ">=", "<": "<", "<=": "<=" };
 
+const utf8Bytes = (s: string) => new TextEncoder().encode(s).length;
+const likeEscape = (s: string) => s.replace(/[\\%_]/g, "\\$&");
+
+/** Свободный текст. Смысл прежний: подстрока без учёта регистра где угодно в
+ *  записи (поля склеены через пробел). Слово без пробелов целиком лежит в одном
+ *  поле, поэтому проверяется по полям через OR — без склейки строки на каждую
+ *  запись. Фраза с пробелами может пересекать границу полей — для неё точная
+ *  проверка по склейке, как раньше.
+ *  prefilter — условия на выражение индекса idx_text (LIKE '%кусок%'): каждый
+ *  кусок фразы без пробелов обязан быть подстрокой склейки полей без
+ *  разделителей, так что предфильтр не теряет ни одной записи, а гранулы без
+ *  нужных n-грамм не читаются. У поиска по одному полю (raw алертов) кусок —
+ *  вся фраза. */
+export function freeTextCondition(def: IndexDef, value: string, p: (v: string | number, type: string) => string): { exact: string; prefilter: string[] } {
+  const needle = p(value, "String");
+  const single = def.text.fields.length === 1;
+  const pieces = single ? [value] : value.split(/\s+/).filter(Boolean);
+  const exact = single
+    ? `positionCaseInsensitiveUTF8(${def.text.fields[0]}, ${needle}) > 0`
+    : pieces.length === 1
+      ? `(${def.text.fields.map((f) => `positionCaseInsensitiveUTF8(${f}, ${needle}) > 0`).join(" OR ")})`
+      : `positionCaseInsensitiveUTF8(concat(${def.text.fields.join(", ' ', ")}), ${needle}) > 0`;
+  const prefilter = pieces
+    .filter((piece) => utf8Bytes(piece) >= NGRAM_MIN_BYTES)
+    .map((piece) => `${def.text.index} LIKE concat('%', lowerUTF8(${p(likeEscape(piece), "String")}), '%')`);
+  return { exact, prefilter };
+}
+
 function termCondition(def: IndexDef, t: Term, p: (v: string | number, type: string) => string, errors: string[]): string | null {
-  if (t.field === null) {
-    return `positionCaseInsensitiveUTF8(${def.haystack}, ${p(t.value, "String")}) > 0`;
-  }
+  if (t.field === null) return null; // свободный текст — freeTextCondition
   let f = def.fields[t.field];
   let mapKey: string | null = null;
   if (!f && t.field.startsWith("attr.") && def.fields.attr) {
@@ -286,15 +348,20 @@ function termCondition(def: IndexDef, t: Term, p: (v: string | number, type: str
   }
 }
 
-/** Фасеты одним сканом: пары (поле, значение) через arrayJoin в подзапросе
- *  (arrayJoin в SELECT подменил бы колонки и в WHERE), LIMIT 6 BY field. */
+/** Фасеты по последним {fsample} совпадениям: внутренний запрос читает в порядке
+ *  ts с ранней остановкой (как страница результатов), пары (поле, значение) —
+ *  через arrayJoin уже по этой выборке, а не по всему окну. sample — сколько
+ *  совпадений попало в выборку: меньше FACET_SAMPLE — счётчики точные. */
 function facetsSql(def: IndexDef, where: string): string {
   const pairs = Object.entries(def.fields).filter(([, f]) => f.facet);
+  const cols = [...new Set(pairs.map(([, f]) => f.col))];
   const scalars = pairs.filter(([, f]) => f.kind !== "array").map(([name, f]) => `('${name}', toString(${f.col}))`);
   const arrays = pairs.filter(([, f]) => f.kind === "array").map(([name, f]) => `arrayMap(x -> ('${name}', toString(x)), ${f.col})`);
   const tuples = `arrayConcat([${scalars.join(", ")}]${arrays.map((a) => `, ${a}`).join("")})`;
-  return `SELECT fv.1 AS field, fv.2 AS value, count() AS count
-          FROM (SELECT arrayJoin(${tuples}) AS fv FROM ${def.table} WHERE ${where})
+  return `SELECT fv.1 AS field, fv.2 AS value, count() AS count, max(sample_n) AS sample
+          FROM (SELECT arrayJoin(${tuples}) AS fv, sample_n
+                FROM (SELECT ${cols.join(", ")}, count() OVER () AS sample_n
+                      FROM (SELECT ${cols.join(", ")} FROM ${def.table} WHERE ${where} ORDER BY ${def.tsCol} DESC LIMIT {fsample:UInt32})))
           WHERE value != '' GROUP BY field, value ORDER BY count DESC LIMIT 6 BY field`;
 }
 
@@ -311,62 +378,146 @@ export function searchErrorMessage(e: unknown): string {
   return "хранилище недоступно или запрос отклонён — подробности в логе консоли";
 }
 
-export async function search(input: SearchInput): Promise<SearchResult> {
+export type Facet = SearchResult["facets"][number];
+
+/** Подготовленный поиск: условие уже собрано, части выполняются независимо. */
+export type SearchPlan = {
+  input: SearchInput;
+  def: IndexDef;
+  page: number;
+  offset: number;
+  where: string;
+  params: Record<string, string | number>;
+  bucketMinutes: number;
+};
+
+/** Разбор запроса без обращения к хранилищу: ошибка — в empty.error. */
+export function planSearch(input: SearchInput): { plan: SearchPlan | null; empty: SearchResult } {
   const def = INDEXES[input.index];
-  const built = buildWhere(input);
   const page = clampPage(input.page);
-  const empty: SearchResult = { rows: [], total: 0, page, pageSize: PAGE_SIZE, series: [], facets: [], error: built.error, ms: 0 };
-  if (input.index === "alerts" && !wazuhEnabled()) return { ...empty, error: WAZUH_DISABLED_ERROR };
-  if (built.error) return empty;
-  const started = Date.now();
-  const { where, params, bucketMinutes } = built;
-  const offset = (page - 1) * PAGE_SIZE;
+  const empty: SearchResult = { rows: [], total: 0, total_exact: true, page, pageSize: PAGE_SIZE, series: [], facets: [], facets_sample: null, incomplete: [], notice: null, error: null, ms: 0 };
+  if (input.index === "alerts" && !wazuhEnabled()) return { plan: null, empty: { ...empty, error: WAZUH_DISABLED_ERROR } };
+  const built = buildWhere(input);
+  if (built.error) return { plan: null, empty: { ...empty, error: built.error } };
+  return { plan: { input, def, page, offset: (page - 1) * PAGE_SIZE, where: built.where, params: built.params, bucketMinutes: built.bucketMinutes }, empty };
+}
+
+/** Страница результатов: ORDER BY ts DESC LIMIT — ClickHouse читает в порядке
+ *  ключа сортировки и останавливается, как только страница набрана. */
+export function searchRows(plan: SearchPlan): Promise<Record<string, unknown>[]> {
+  const { def, where, params, offset } = plan;
+  return chQuery<Record<string, unknown>>(
+    `SELECT ${def.select} FROM ${def.table} WHERE ${where} ORDER BY ${def.tsCol} DESC LIMIT {limit:UInt32} OFFSET {offset:UInt32}`,
+    { ...params, limit: PAGE_SIZE, offset },
+    SEARCH_SETTINGS,
+  );
+}
+
+/** Гистограмма по уровням; её сумма — итог total. Для частого слова за длинный
+ *  интервал это полный скан — у неё свой бюджет SERIES_SETTINGS. */
+export async function searchSeries(plan: SearchPlan): Promise<SeriesPoint[]> {
+  const { def, where, params, bucketMinutes } = plan;
   const th = def.severity.thresholds;
   const sevCol = def.severity.col;
-  const facetFields = Object.entries(def.fields).filter(([, f]) => f.facet);
+  const series = await chQuery<SeriesPoint>(
+    `SELECT toString(toStartOfInterval(${def.tsCol}, INTERVAL {bucket:UInt32} MINUTE)) AS bucket,
+            countIf(${sevCol} < {high:UInt8}) AS low,
+            countIf(${sevCol} >= {high:UInt8} AND ${sevCol} < {critical:UInt8}) AS high,
+            countIf(${sevCol} >= {critical:UInt8}) AS critical
+     FROM ${def.table} WHERE ${where} GROUP BY bucket ORDER BY bucket`,
+    { ...params, bucket: bucketMinutes, high: th.high, critical: th.critical },
+    SERIES_SETTINGS,
+  );
+  return series.map((s) => ({ ...s, low: Number(s.low), high: Number(s.high), critical: Number(s.critical) }));
+}
 
-  try {
-    const [rows, series, facetRows] = await Promise.all([
-      chQuery<Record<string, unknown>>(
-        `SELECT ${def.select} FROM ${def.table} WHERE ${where} ORDER BY ${def.tsCol} DESC LIMIT {limit:UInt32} OFFSET {offset:UInt32}`,
-        { ...params, limit: PAGE_SIZE, offset },
-        SEARCH_SETTINGS,
-      ),
-      chQuery<SeriesPoint>(
-        `SELECT toString(toStartOfInterval(${def.tsCol}, INTERVAL {bucket:UInt32} MINUTE)) AS bucket,
-                countIf(${sevCol} < {high:UInt8}) AS low,
-                countIf(${sevCol} >= {high:UInt8} AND ${sevCol} < {critical:UInt8}) AS high,
-                countIf(${sevCol} >= {critical:UInt8}) AS critical
-         FROM ${def.table} WHERE ${where} GROUP BY bucket ORDER BY bucket`,
-        { ...params, bucket: bucketMinutes, high: th.high, critical: th.critical },
-        SEARCH_SETTINGS,
-      ),
-      input.facets === false
-        ? Promise.resolve([] as { field: string; value: string; count: number }[])
-        : chQuery<{ field: string; value: string; count: number }>(facetsSql(def, where), params, SEARCH_SETTINGS).catch(
-            () => [] as { field: string; value: string; count: number }[],
-          ),
-    ]);
-    const normalized = series.map((s) => ({ ...s, low: Number(s.low), high: Number(s.high), critical: Number(s.critical) }));
-    const total = normalized.reduce((n, s) => n + s.low + s.high + s.critical, 0); // итог — сумма гистограммы, без отдельного count()
-    return {
-      rows,
-      total,
-      page,
-      pageSize: PAGE_SIZE,
-      series: normalized,
-      facets: input.facets === false ? [] : facetFields.map(([name, f]) => ({
-        field: name,
-        label: f.label,
-        values: facetRows.filter((r) => r.field === name).map((r) => ({ value: r.value, count: Number(r.count) })),
-      })),
-      error: null,
-      ms: Date.now() - started,
-    };
-  } catch (e) {
-    console.error("search:", e instanceof Error ? e.message : e);
-    return { ...empty, error: searchErrorMessage(e) };
+export const seriesTotal = (series: SeriesPoint[]): number => series.reduce((n, s) => n + s.low + s.high + s.critical, 0);
+
+/** Фасеты по последним FACET_SAMPLE совпадениям; sample — размер выборки. */
+export async function searchFacets(plan: SearchPlan): Promise<{ facets: Facet[]; sample: number }> {
+  const { def, where, params } = plan;
+  const rows = await chQuery<{ field: string; value: string; count: number; sample: number }>(facetsSql(def, where), { ...params, fsample: FACET_SAMPLE }, FACETS_SETTINGS);
+  const sample = rows.reduce((m, r) => Math.max(m, Number(r.sample)), 0);
+  const facets = Object.entries(def.fields)
+    .filter(([, f]) => f.facet)
+    .map(([name, f]) => ({ field: name, label: f.label, values: rows.filter((r) => r.field === name).map((r) => ({ value: r.value, count: Number(r.count) })) }));
+  return { facets, sample };
+}
+
+/** Итог, когда гистограмма не посчиталась: нижняя граница по странице — пейджер
+ *  предлагает следующую страницу, пока текущая полная. */
+export function lowerBoundTotal(plan: SearchPlan, rows: number): number {
+  return plan.offset + rows + (rows === PAGE_SIZE ? 1 : 0);
+}
+
+/** Поиск целиком для API: страница обязательна (её ошибка — ошибка ответа),
+ *  гистограмма и фасеты — по возможности. Не уложились в свой бюджет —
+ *  ответ всё равно 200: incomplete называет недостающие части, notice — почему,
+ *  total тогда нижняя граница (total_exact=false). */
+export async function search(input: SearchInput): Promise<SearchResult> {
+  const { plan, empty } = planSearch(input);
+  if (!plan) return empty;
+  const started = Date.now();
+  const wantFacets = input.facets !== false;
+  const [rowsR, seriesR, facetsR] = await Promise.allSettled([
+    searchRows(plan),
+    searchSeries(plan),
+    wantFacets ? searchFacets(plan) : Promise.resolve({ facets: [] as Facet[], sample: 0 }),
+  ]);
+  if (rowsR.status === "rejected") {
+    console.error("search:", rowsR.reason instanceof Error ? rowsR.reason.message : rowsR.reason);
+    return { ...empty, error: searchErrorMessage(rowsR.reason) };
   }
+  const rows = rowsR.value;
+  const incomplete: SearchResult["incomplete"] = [];
+  const notes: string[] = [];
+  let series: SeriesPoint[] = [];
+  let total: number;
+  let totalExact = true;
+  if (seriesR.status === "fulfilled") {
+    series = seriesR.value;
+    total = seriesTotal(series); // итог — сумма гистограммы, без отдельного count()
+  } else {
+    console.error("search series:", seriesR.reason instanceof Error ? seriesR.reason.message : seriesR.reason);
+    incomplete.push("series");
+    notes.push(`распределение и итог не посчитаны: ${partErrorMessage(seriesR.reason, SERIES_SETTINGS.max_execution_time)}`);
+    total = lowerBoundTotal(plan, rows.length);
+    totalExact = false;
+  }
+  let facets: Facet[] = [];
+  let facetsSample: number | null = null;
+  if (wantFacets) {
+    if (facetsR.status === "fulfilled") {
+      facets = facetsR.value.facets;
+      facetsSample = facetsR.value.sample;
+    } else {
+      console.error("search facets:", facetsR.reason instanceof Error ? facetsR.reason.message : facetsR.reason);
+      incomplete.push("facets");
+      notes.push(`поля не посчитаны: ${partErrorMessage(facetsR.reason, FACETS_SETTINGS.max_execution_time)}`);
+    }
+  }
+  return {
+    rows,
+    total,
+    total_exact: totalExact,
+    page: plan.page,
+    pageSize: PAGE_SIZE,
+    series,
+    facets,
+    facets_sample: facetsSample,
+    incomplete,
+    notice: notes.length ? notes.join("; ") : null,
+    error: null,
+    ms: Date.now() - started,
+  };
+}
+
+/** Причина для части страницы (гистограмма, фасеты) — с её собственным бюджетом. */
+export function partErrorMessage(e: unknown, seconds: number): string {
+  const code = e instanceof ClickHouseError ? e.code : null;
+  if (code === CH_TIMEOUT_EXCEEDED) return `не уложились в ${seconds} с — сузьте интервал или добавьте поле`;
+  if (code === CH_MEMORY_LIMIT_EXCEEDED) return "не хватило памяти — сузьте интервал";
+  return "хранилище не ответило — подробности в логе консоли";
 }
 
 /** Выгрузка для отчёта: до 10 000 строк без пагинации. */
