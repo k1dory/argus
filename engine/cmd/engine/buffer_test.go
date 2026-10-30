@@ -195,3 +195,65 @@ func actions(evs []*model.Event) string {
 	}
 	return strings.Join(out, ",")
 }
+
+// Источник может прислать старое событие сейчас или событие с часами в будущем
+// давно. Ни source ts, ни позиция в срезе не определяют срок жизни в памяти.
+func TestTrimBufferAgeUsesReceiptTime(t *testing.T) {
+	now := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
+	cut := now.Add(-10 * time.Minute)
+	delayed := &model.Event{Action: "delayed", TS: model.FormatTS(now.Add(-24 * time.Hour)), ReceivedAt: now}
+	old := &model.Event{Action: "future-clock", TS: model.FormatTS(now.Add(time.Hour)), ReceivedAt: cut.Add(-time.Second)}
+	boundary := &model.Event{Action: "boundary", TS: model.FormatTS(now), ReceivedAt: cut}
+	missing := &model.Event{Action: "no-receipt", TS: model.FormatTS(now.Add(-24 * time.Hour))}
+	for _, input := range [][]*model.Event{
+		{delayed, old, boundary, missing},
+		{old, missing, boundary, delayed},
+	} {
+		kept, evicted := trimBuffer(input, cut, 0)
+		got := map[*model.Event]bool{}
+		for _, e := range kept {
+			got[e] = true
+		}
+		if evicted != 0 || len(kept) != 3 || got[old] || !got[delayed] || !got[boundary] || !got[missing] {
+			t.Fatalf("возраст по received_at, граничная секунда включительно: kept=%s cap-evicted=%d", actions(kept), evicted)
+		}
+	}
+}
+
+// Событие молчания может одновременно быть кандидатом другого правила.
+// Переполнение общего буфера и поздний старый лог не должны ни забыть тихий
+// узел, ни сделать говорящий узел тихим, ни придумать ранее неизвестный узел.
+func TestHostSilenceSurvivesMixedCandidatesAndDelayedReceipt(t *testing.T) {
+	telemetryCount := strings.ReplaceAll(netflowCountYML, "source.class: netflow", "source.class: telemetry")
+	telemetryCount = strings.ReplaceAll(telemetryCount, "id: t-flows", "id: t-telemetry")
+	rs := []*rules.Rule{loadTestRule(t, hostSilenceYML), loadTestRule(t, netflowCountYML), loadTestRule(t, telemetryCount)}
+	now := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
+	e := &engine{bufferMax: 4, absence: eval.NewAbsenceState(0)}
+	event := func(node string, ts, recv time.Time) *model.Event {
+		return &model.Event{Node: node, SourceClass: "telemetry", TS: model.FormatTS(ts), ReceivedAt: recv}
+	}
+	quiet := event("quiet", now.Add(-15*time.Minute), now.Add(-15*time.Minute))
+	active := event("active", now.Add(-time.Minute), now.Add(-time.Minute))
+	buffer, _ := e.ingest(context.Background(), rs, []*model.Event{quiet, active}, nil)
+	if len(buffer) != 2 {
+		t.Fatal("контроль: телеметрия должна попасть и в общий буфер кандидатов")
+	}
+	for page := 0; page < 3; page++ {
+		var flows []*model.Event
+		for i := 0; i < 10; i++ {
+			flows = append(flows, &model.Event{SourceClass: "netflow", TS: model.FormatTS(now), ReceivedAt: now, SrcIP: "10.0.0.1"})
+		}
+		buffer, _ = e.ingest(context.Background(), rs, flows, buffer)
+	}
+	for _, ev := range buffer {
+		if ev == quiet || ev == active {
+			t.Fatal("контроль: исходная телеметрия должна быть вытеснена")
+		}
+	}
+	late := event("quiet", now.Add(-24*time.Hour), now)
+	buffer, _ = e.ingest(context.Background(), rs, []*model.Event{late}, buffer)
+	detections, _ := eval.Evaluate(eval.Input{Rules: rs, Events: buffer, Absence: e.absence, Now: now})
+	if !silenceFired(detections, "quiet") || silenceFired(detections, "active") || len(detections) != 1 || e.absence.Len() != 2 {
+		t.Fatalf("только ранее наблюдавшийся тихий узел должен сработать: groups=%d detections=%+v", e.absence.Len(), detections)
+	}
+}

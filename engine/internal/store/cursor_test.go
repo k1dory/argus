@@ -2,11 +2,15 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -231,5 +235,130 @@ func TestFinishSlice(t *testing.T) {
 	// средняя страница (не меньше четверти LIMIT) — ширина не меняется
 	if next = finishSlice(StartCursor(now.Add(-time.Hour)), adv, 50, 100, now.Add(-55*time.Minute), now); next.Step != sliceDefault {
 		t.Fatalf("ширина без изменений: %v", next.Step)
+	}
+}
+
+// Эмулятор SQL-границ EventsSince: фильтрует по переданным DateTime/event_id,
+// сортирует и применяет LIMIT. Нужен для проверки всей цепочки, а не только
+// advanceCursor: finishSlice тоже может потерять дедупликацию и поздний лог.
+func cursorHTTPStore(t *testing.T, rows []eventRow) (*ClickHouse, func(eventRow)) {
+	t.Helper()
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query()
+		at, err := time.Parse("2006-01-02 15:04:05", query.Get("param_cursor"))
+		if err != nil {
+			t.Error(err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		upto, err := time.Parse("2006-01-02 15:04:05", query.Get("param_upto"))
+		if err != nil || !upto.After(at) || upto.Sub(at) > sliceMax {
+			t.Errorf("запрос обязан иметь ограниченное непустое окно: from=%v to=%v err=%v", at, upto, err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		hash, _ := strconv.ParseUint(query.Get("param_hash"), 10, 64)
+		limit, _ := strconv.Atoi(query.Get("param_limit"))
+		mu.Lock()
+		var selected []eventRow
+		for _, row := range rows {
+			if !row.ReceivedAt.Before(at) && row.ReceivedAt.Before(upto) && (row.ReceivedAt.After(at) || row.Hash >= hash) {
+				selected = append(selected, row)
+			}
+		}
+		mu.Unlock()
+		sort.Slice(selected, func(i, j int) bool {
+			if selected[i].ReceivedAt.Equal(selected[j].ReceivedAt) {
+				return selected[i].Hash < selected[j].Hash
+			}
+			return selected[i].ReceivedAt.Before(selected[j].ReceivedAt)
+		})
+		if limit > 0 && len(selected) > limit {
+			selected = selected[:limit]
+		}
+		for _, row := range selected {
+			if err := json.NewEncoder(w).Encode(map[string]any{
+				"ts": row.Event.TS, "action": row.Event.Action, "event_id": row.Hash,
+				"received_str": row.ReceivedAt.Format("2006-01-02 15:04:05"),
+			}); err != nil {
+				t.Error(err)
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return New(srv.URL, "argus", "", ""), func(row eventRow) {
+		mu.Lock()
+		defer mu.Unlock()
+		rows = append(rows, row)
+	}
+}
+
+// Регрессия PR7: advanceCursor сбрасывает Hash для повторного чтения секунды,
+// но finishSlice перепрыгивает через неё и очищает Seen. Проверка через
+// EventsSince показывает потерю поздней строки с меньшим ключом после LIMIT.
+func TestEventsSinceRereadsLastSecondAfterBurst(t *testing.T) {
+	at := time.Now().UTC().Add(-time.Minute).Truncate(time.Second)
+	makeRow := func(h uint64) eventRow {
+		return eventRow{Event: &model.Event{TS: model.FormatTS(at), Action: fmt.Sprintf("raw-%d", h)}, ReceivedAt: at, Hash: h}
+	}
+	c, insert := cursorHTTPStore(t, []eventRow{makeRow(10), makeRow(20), makeRow(30)})
+	cur := StartCursor(at)
+	cur.Step = time.Hour // последний срез текущего опроса
+	events, cur, err := c.EventsSince(context.Background(), cur, 3)
+	if err != nil || len(events) != 3 || !cur.More {
+		t.Fatalf("начальная полная страница: events=%v cursor=%+v err=%v", hashes(events), cur, err)
+	}
+	events, cur, err = c.EventsSince(context.Background(), cur, 3)
+	if err != nil || len(events) != 0 || cur.More {
+		t.Fatalf("страница дочитана; повторный граничный ключ не выдаётся: events=%v cursor=%+v err=%v", hashes(events), cur, err)
+	}
+	insert(makeRow(5)) // INSERT с received_at той же секунды завершился после чтения
+	events, _, err = c.EventsSince(context.Background(), cur, 100)
+	if err != nil || len(events) != 1 || events[0].Action != "raw-5" {
+		t.Fatalf("поздняя строка с меньшим ключом потеряна после finishSlice: events=%v cursor=%+v err=%v", hashes(events), cur, err)
+	}
+}
+
+// Верх среза исключительный, низ следующего включительный. Дырки расширяют
+// окно, но не должны пропускать записи на стыках или выдавать их повторно.
+func TestEventsSinceEmptySlicesAndBoundaries(t *testing.T) {
+	base := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Second)
+	var rows []eventRow
+	for i, delta := range []time.Duration{5 * time.Minute, 5*time.Minute + time.Second, 35 * time.Minute, 95 * time.Minute} {
+		at := base.Add(delta)
+		rows = append(rows, eventRow{Event: &model.Event{TS: model.FormatTS(at.Add(-24 * time.Hour)), Action: fmt.Sprintf("boundary-%d", i)}, ReceivedAt: at, Hash: uint64(i + 1)})
+	}
+	c, _ := cursorHTTPStore(t, rows)
+	cur := StartCursor(base)
+	seen := map[string]int{}
+	finished := false
+	for page := 0; page < 32; page++ {
+		events, next, err := c.EventsSince(context.Background(), cur, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if page == 0 && (len(events) != 0 || !next.At.Equal(base.Add(5*time.Minute))) {
+			t.Fatalf("пустой первый срез должен дойти до исключённой граничной секунды: events=%v cursor=%+v", hashes(events), next)
+		}
+		for _, e := range events {
+			seen[e.Action]++
+		}
+		if next.More && !next.At.After(cur.At) {
+			t.Fatalf("неполная страница в прошлом обязана продвигать курсор: before=%+v after=%+v", cur, next)
+		}
+		cur = next
+		if !cur.More {
+			finished = true
+			break
+		}
+	}
+	if !finished || len(seen) != len(rows) {
+		t.Fatalf("догон не завершён или граничные события потеряны: finished=%v seen=%v", finished, seen)
+	}
+	for _, r := range rows {
+		if seen[r.Event.Action] != 1 {
+			t.Fatalf("каждое событие ровно один раз: %v", seen)
+		}
 	}
 }

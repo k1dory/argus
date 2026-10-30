@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -71,7 +72,7 @@ func TestLiveCatchupSlicesAndEventID(t *testing.T) {
 	base := time.Now().UTC().Add(-3 * time.Hour).Truncate(time.Second)
 	// пара с разным raw в одной секунде
 	if _, err := c.do(ctx, fmt.Sprintf(`INSERT INTO events (ts, received_at, source, action, attrs, raw) VALUES
-		('%[1]s', '%[1]s', '%[2]s', 'dup', map('id','dup-a'), 'raw-A'), ('%[1]s', '%[1]s', '%[2]s', 'dup', map('id','dup-b'), 'raw-B')`,
+		('%[1]s', '%[1]s', '%[2]s', 'dup', map('id','dup'), 'raw-A'), ('%[1]s', '%[1]s', '%[2]s', 'dup', map('id','dup'), 'raw-B')`,
 		base.Format("2006-01-02 15:04:05"), src), nil, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -110,16 +111,94 @@ func TestLiveCatchupSlicesAndEventID(t *testing.T) {
 			break
 		}
 	}
-	if len(seen) != 12002 {
-		t.Fatalf("прочитано %d уникальных строк из 12002 за %d запросов", len(seen), queries)
+	if len(seen) != 12001 {
+		t.Fatalf("прочитано %d уникальных id из 12001 за %d запросов", len(seen), queries)
 	}
 	for id, n := range seen {
-		if n != 1 {
+		want := 1
+		if id == "dup" {
+			want = 2 // эти события различает только raw, а не action/attrs/ts
+		}
+		if n != want {
 			t.Fatalf("строка %s отдана %d раз", id, n)
 		}
 	}
-	if seen["dup-a"] != 1 || seen["dup-b"] != 1 {
-		t.Fatalf("пара с разным raw: %v %v", seen["dup-a"], seen["dup-b"])
-	}
 	t.Logf("12002 строки за %d запросов, курсор %v, срез %v", queries, cur.At, cur.Step)
+}
+
+// Все поля, кроме raw, одинаковы. Маленький LIMIT заставляет курсор пройти
+// несколько страниц одной секунды; raw не передаётся движку, но участвует в
+// event_id и поэтому не может быть заменён пустым алиасом в SELECT.
+func TestLiveCatchupRawOnlyPages(t *testing.T) {
+	c := catchupLiveStore(t)
+	ctx := context.Background()
+	src := "catchup.raw." + liveSuffix(t)
+	at := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	params := map[string]string{"s": src, "at": at.Format("2006-01-02 15:04:05")}
+	if _, err := c.do(ctx, `INSERT INTO events (ts, received_at, source, action, attrs, raw)
+		SELECT toDateTime64({at:String}, 3, 'UTC'), toDateTime({at:String}, 'UTC'), {s:String}, 'raw-only', map('same', 'value'), concat('raw-', toString(number)) FROM numbers(8)`, nil, params); err != nil {
+		t.Fatal(err)
+	}
+	cur := StartCursor(at)
+	cur.Step = time.Second
+	count := 0
+	for page := 0; page < 20; page++ {
+		events, next, err := c.EventsSince(ctx, cur, 3)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range events {
+			if e.Source == src {
+				count++
+				if e.Raw != "" {
+					t.Fatal("raw не должен загружаться в движок")
+				}
+			}
+		}
+		cur = next
+		if cur.At.After(at) {
+			break
+		}
+	}
+	if count != 8 || !cur.At.After(at) {
+		t.Fatalf("8 raw-only событий должны быть прочитаны один раз, курсор должен продвинуться: count=%d cursor=%+v", count, cur)
+	}
+}
+
+// На одной грануле EXPLAIN с именем индекса ничего не доказывает. Здесь две
+// группы idx_received_at (GRANULARITY 4): окно в минуту должно прочитать лишь
+// часть гранул, даже без условия по ts из первичного ключа.
+func TestLiveCatchupReceivedAtIndexPrunes(t *testing.T) {
+	c := catchupLiveStore(t)
+	ctx := context.Background()
+	src := "catchup.index." + liveSuffix(t)
+	base := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Second)
+	params := map[string]string{"s": src, "at": base.Format("2006-01-02 15:04:05")}
+	if _, err := c.do(ctx, `INSERT INTO events (ts, received_at, source, action)
+		SELECT toDateTime64({at:String}, 3, 'UTC') + number, toDateTime({at:String}, 'UTC') + toUInt32(number), {s:String}, 'index-fixture' FROM numbers(65536)`, nil, params); err != nil {
+		t.Fatal(err)
+	}
+	params["from"] = base.Add(time.Hour).Format("2006-01-02 15:04:05")
+	params["to"] = base.Add(time.Hour + time.Minute).Format("2006-01-02 15:04:05")
+	query := `SELECT ` + eventsSelectColumns() + `, event_id FROM events
+		WHERE received_at >= {from:DateTime} AND received_at < {to:DateTime}
+		ORDER BY received_at, event_id LIMIT 1000`
+	plan, err := c.do(ctx, "EXPLAIN indexes = 1 "+query+" FORMAT TSV", nil, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := regexp.MustCompile(`(?s)Name: idx_received_at\b.*?Granules:\s*(\d+)\s*/\s*(\d+)`).FindStringSubmatch(string(plan))
+	if len(m) != 3 {
+		t.Fatalf("idx_received_at не применён:\n%s", plan)
+	}
+	selected, _ := strconv.Atoi(m[1])
+	total, _ := strconv.Atoi(m[2])
+	if selected == 0 || selected >= total {
+		t.Fatalf("минутный срез обязан отсечь гранулы, содержащие остальной хвост:\n%s", plan)
+	}
+	out, err := c.do(ctx, `SELECT count() FROM events WHERE source = {s:String}
+		AND received_at >= {from:DateTime} AND received_at < {to:DateTime} FORMAT TSV`, nil, params)
+	if err != nil || strings.TrimSpace(string(out)) != "60" {
+		t.Fatalf("минутное окно должно сохранить 60 событий: count=%q err=%v", out, err)
+	}
 }
