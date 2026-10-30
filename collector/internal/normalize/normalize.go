@@ -30,6 +30,11 @@ type Normalizer struct {
 	// свои, external — обе чужие (транзит). Пусто — RFC 1918, 100.64/10, loopback,
 	// link-local; свои белые блоки добавляются через INTERNAL_NETS.
 	InternalNets []netip.Prefix
+	// NATAddrs — внешние адреса NAT (FLOW_NAT_ADDRS). Поток с таким адресом — копия
+	// уже учтённого потока изнутри, снятая экспортёром после трансляции:
+	// attrs.post_nat=1, правила по исходящему трафику его пропускают, чтобы один
+	// и тот же разговор не давал второго инцидента на адрес NAT.
+	NATAddrs []netip.Prefix
 }
 
 var defaultInternalNets = func() []netip.Prefix {
@@ -39,6 +44,23 @@ var defaultInternalNets = func() []netip.Prefix {
 	}
 	return out
 }()
+
+func (n *Normalizer) inPrefixes(nets []netip.Prefix, ip string) bool {
+	if len(nets) == 0 {
+		return false
+	}
+	a, err := netip.ParseAddr(ip)
+	if err != nil {
+		return false
+	}
+	a = a.Unmap()
+	for _, p := range nets {
+		if p.Contains(a) {
+			return true
+		}
+	}
+	return false
+}
 
 // IsInternal — адрес из своих сетей (InternalNets или умолчания).
 func (n *Normalizer) IsInternal(ip string) bool {
@@ -246,6 +268,14 @@ func (n *Normalizer) FromFlow(f parse.Flow, source, exporter string) model.Event
 		e.Attrs["duration_ms"] = strconv.FormatInt(end.Sub(f.Start).Milliseconds(), 10)
 	}
 	e.Attrs["scope"] = n.FlowScope(f.SrcIP, f.DstIP)
+	// Средний размер пакета: запрос DNS — до ~100 байт, пакеты по 1200+ на порт 53
+	// — это уже не DNS (QUIC, VPN), что бы ни было написано в номере порта.
+	if f.Packets > 0 {
+		e.Attrs["avg_pkt"] = strconv.FormatUint(f.Bytes/f.Packets, 10)
+	}
+	if n.inPrefixes(n.NATAddrs, f.SrcIP) || n.inPrefixes(n.NATAddrs, f.DstIP) {
+		e.Attrs["post_nat"] = "1"
+	}
 	if f.Proto == 6 {
 		if fl := parse.TCPFlagsString(f.TCPFlags); fl != "" {
 			e.Attrs["tcp_flags"] = fl

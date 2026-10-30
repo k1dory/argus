@@ -42,6 +42,26 @@ func TestFlowScopeAndFlags(t *testing.T) {
 	if _, ok := udp.Attrs["tcp_flags"]; ok || udp.Attrs["syn_only"] != "" {
 		t.Fatalf("udp flow attrs: %+v", udp.Attrs)
 	}
+	if udp.Attrs["avg_pkt"] != "0" {
+		t.Fatalf("avg_pkt без байт: %+v", udp.Attrs)
+	}
+	quic := n.FromFlow(parse.Flow{SrcIP: "192.168.13.14", DstIP: "172.235.1.1", DstPort: 53, Proto: 17, Packets: 3, Bytes: 3936}, "netflow.lan", "192.168.0.1")
+	if quic.Attrs["avg_pkt"] != "1312" || quic.Attrs["post_nat"] != "" {
+		t.Fatalf("avg_pkt: %+v", quic.Attrs)
+	}
+	nopk := n.FromFlow(parse.Flow{SrcIP: "192.168.13.14", DstIP: "172.235.1.1", DstPort: 53, Proto: 17}, "netflow.lan", "192.168.0.1")
+	if _, ok := nopk.Attrs["avg_pkt"]; ok {
+		t.Fatalf("avg_pkt без пакетов: %+v", nopk.Attrs)
+	}
+	n.NATAddrs = []netip.Prefix{netip.MustParsePrefix("185.25.9.57/32")}
+	nat := n.FromFlow(parse.Flow{SrcIP: "185.25.9.57", DstIP: "172.235.1.1", DstPort: 53, Proto: 17, Packets: 3, Bytes: 3936}, "netflow.core", "185.25.9.1")
+	if nat.Attrs["post_nat"] != "1" || nat.Attrs["scope"] != "outbound" {
+		t.Fatalf("post_nat: %+v", nat.Attrs)
+	}
+	back := n.FromFlow(parse.Flow{SrcIP: "172.235.1.1", DstIP: "185.25.9.57", SrcPort: 53, Proto: 17, Packets: 1, Bytes: 1300}, "netflow.core", "185.25.9.1")
+	if back.Attrs["post_nat"] != "1" {
+		t.Fatalf("post_nat ответ: %+v", back.Attrs)
+	}
 	if parse.TCPFlagsString(0) != "" || parse.TCPFlagsString(0x11) != "AF" {
 		t.Fatalf("flags string")
 	}

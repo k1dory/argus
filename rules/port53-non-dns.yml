@@ -1,0 +1,34 @@
+# Не-DNS трафик на порт 53: UDP-потоки к внешним адресам, где средний пакет больше
+# 600 байт. Запрос DNS — до ~100 байт (с EDNS чуть больше); пакеты по 1200–1300 байт
+# — это QUIC или VPN, выбравшие порт 53, потому что его реже режут. Почерк клиентов
+# обхода блокировок (Psiphon и подобные): перебор десятков облачных VPS по портам
+# 53, 443, 554, 22, 179. По NetFlow имени запроса не видно, поэтому правило судит
+# только по размеру — настоящий DNS-туннель ловит dns-tunnel по журналу резолвера.
+title: "Network: non-DNS traffic on port 53"
+id: a41c-c2-017
+level: low
+tags: [attack.command_and_control, attack.t1572, attack.t1571]
+
+# attrs.avg_pkt — средний размер пакета потока (bytes/packets), ставит коллектор.
+# attrs.post_nat — копия потока после NAT (FLOW_NAT_ADDRS): тот же разговор уже
+# учтён по внутреннему адресу, второй инцидент на адрес NAT не нужен.
+detection:
+  selection:
+    source.class: netflow
+    attrs.scope: outbound
+    dst.port: 53
+    proto: udp
+    attrs.avg_pkt: '> 600'
+    attrs.post_nat: 'not 1'
+  threshold:
+    count: 5
+    window: 15m
+    group_by: src.ip
+  condition: selection and threshold
+
+# Нарушение политики, а не атака: инцидент — список машин с таким клиентом.
+# Сутки без новых потоков — закрывается сам; новый сеанс заведёт новый.
+auto_close: 24h
+
+analyst:
+  profile: on-prem-strict
