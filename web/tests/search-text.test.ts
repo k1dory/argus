@@ -1,7 +1,7 @@
 // Свободный текст поиска: точная проверка подстроки (смысл прежний) плюс
 // предфильтр по n-граммному индексу idx_text (миграция 0030); разбор ответа
 // поиска на страницу, гистограмму и фасеты с независимыми бюджетами.
-import { test } from "node:test";
+import { afterEach, test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import path from "node:path";
@@ -82,6 +82,8 @@ test("поле + текст: условие поля не меняется, те
 /* ===== search(): страница, гистограмма, фасеты ===== */
 
 type Reply = { status?: number; body: string; code?: number };
+const originalFetch = globalThis.fetch;
+afterEach(() => { globalThis.fetch = originalFetch; });
 function mockClickHouse(handler: (sql: string) => Reply): string[] {
   const seen: string[] = [];
   globalThis.fetch = (async (_url: URL | string, init?: RequestInit) => {
@@ -135,10 +137,44 @@ test("гистограмма не уложилась: страница есть,
   assert.equal(r.error, null);
   assert.equal(r.rows.length, PAGE_SIZE);
   assert.equal(r.total_exact, false);
-  assert.equal(r.total, 2 * PAGE_SIZE + PAGE_SIZE + 1, "страница полная — пейджер предлагает следующую");
+  assert.equal(r.total, 3 * PAGE_SIZE, "полная страница подтверждает только полученные строки, а не наличие следующей");
   assert.deepEqual(r.series, []);
   assert.deepEqual(r.incomplete, ["series"]);
   assert.match(r.notice ?? "", /не уложились в 15 с/);
+});
+
+for (const [page, n, want] of [[1, PAGE_SIZE, PAGE_SIZE], [3, 4, 2 * PAGE_SIZE + 4], [100, 0, 0]] as const) {
+  test(`таймаут распределения: нижняя граница для page=${page}, rows=${n} не выдумывает строки`, async () => {
+    mockClickHouse((sql) => isRows(sql) ? { body: rowsBody(n) } : isSeries(sql) ? timeout() : { body: "" });
+    const r = await search({ index: "events", q: "sshd", range: "30d", page });
+    assert.equal(r.total, want, `page=${page}, rows=${n}`);
+    assert.equal(r.total_exact, false);
+    assert.equal(r.error, null);
+    assert.deepEqual(r.incomplete, ["series"]);
+  });
+}
+
+test("оба вспомогательных запроса истекли: результаты сохранены, выборка фасетов неизвестна", async () => {
+  mockClickHouse((sql) => isRows(sql) ? { body: rowsBody(4) } : timeout());
+  const r = await search({ index: "events", q: "sshd", range: "30d", page: 1 });
+  assert.equal(r.error, null);
+  assert.equal(r.rows.length, 4);
+  assert.equal(r.total, 4);
+  assert.equal(r.total_exact, false);
+  assert.equal(r.facets_sample, null);
+  assert.deepEqual(r.facets, []);
+  assert.deepEqual(r.series, []);
+  assert.deepEqual(r.incomplete, ["series", "facets"]);
+});
+
+test("пустая успешная выборка фасетов — 0, отключённая — null", async () => {
+  mockClickHouse(() => ({ body: "" }));
+  const r = await search({ index: "events", q: "sshd", range: "24h", page: 1 });
+  assert.equal(r.facets_sample, 0);
+  assert.equal(r.total_exact, true);
+  assert.equal(r.total, 0);
+  assert.deepEqual(r.incomplete, []);
+  assert.equal(r.notice, null);
 });
 
 test("фасеты не уложились: отдельно от страницы и итога", async () => {

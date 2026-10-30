@@ -49,7 +49,7 @@ const FIXTURE: Ev[] = [
   { raw: "promo 50%_off it's here", object: "/var/www/шаблон.html" },
   // Фраза через границу полей: «deploy» в конце raw, «hostgroup» — субъект.
   { raw: "job finished by deploy", actor_name: "hostgroup", severity: 9 },
-  { raw: "nothing interesting here", node: "db-02" },
+  { raw: "nothing interesting here; ёж 龍 🦔 path dir\\logs\\auth 50aaoff", node: "db-02" },
 ];
 
 async function insertFixture(): Promise<void> {
@@ -101,6 +101,11 @@ test("свободный текст: те же совпадения, что у �
       ["web-01", 1],
       ["nosuchthing-zz", 0],
       ["22", 1], // короче 4 байт — без предфильтра по индексу, поиск тот же
+      ["ЁЖ", 1], // 2 символа / 4 байта: точная проверка и LIKE должны совпасть
+      ["龍", 1], // один 3-байтовый символ, без ускоряющего предфильтра
+      ["🦔", 1], // один 4-байтовый символ
+      ["dir\\logs\\auth", 1], // обратная косая черта в параметре LIKE
+      ["50aaoff", 1], // не должен совпасть с буквальным 50%_off из другой строки
     ];
     for (const [qv, want] of cases) {
       const term = /\s/.test(qv) ? `"${qv}"` : qv;
@@ -149,5 +154,33 @@ test("свободный текст: те же совпадения, что у �
     assert.equal(r.error, null);
     assert.equal(r.rows.length, 1);
     assert.equal(r.rows[0].raw, undefined, "raw=0 — без исходной строки");
+  });
+
+  await t.test("EXPLAIN отсекает гранулы, а фасеты берут только последние 10000 совпадений", async () => {
+    const source = `${SRC}.granules`;
+    // Четыре гранулы: редкое слово только в последней строке, а последние
+    // 10000 событий отличаются node. Это проверяет реальное отсечение и
+    // выборку, которых fixture из шести строк/одной гранулы не доказывает.
+    await ch().chCommand(`INSERT INTO events (ts, source, source_class, node, action, raw)
+      SELECT now64(3) - INTERVAL 1 HOUR + toIntervalMillisecond(number), '${source}', 'syslog',
+        if(number >= 22768, 'newest-sample', 'outside-sample'), 'fixture',
+        if(number = 32767, 'zxqrare1token', 'ordinary log line')
+      FROM numbers(32768)`);
+    const b = s().buildWhere({ index: "events", q: `source:"${source}" zxqrare1token`, range: "24h", page: 1 });
+    assert.equal(b.error, null);
+    const plan = await ch().chQuery<{ explain: string }>(`EXPLAIN indexes = 1 SELECT count() FROM events WHERE ${b.where}`, b.params);
+    const text = plan.map((r) => r.explain).join("\n");
+    const pruning = /Name: idx_text\b[\s\S]*?Granules:\s*(\d+)\s*\/\s*(\d+)/.exec(text);
+    assert.ok(pruning, `idx_text должен участвовать в плане:\n${text}`);
+    assert.ok(Number(pruning[1]) > 0 && Number(pruning[1]) < Number(pruning[2]), `индекс должен отсекать гранулы, сохраняя гранулу с совпадением:\n${text}`);
+    const hits = await ch().chQuery<{ n: string }>(`SELECT count() AS n FROM events WHERE ${b.where}`, b.params);
+    assert.equal(Number(hits[0].n), 1);
+    const sampled = await s().search({ index: "events", q: `source:"${source}"`, range: "24h", page: 1 });
+    assert.equal(sampled.error, null);
+    assert.equal(sampled.total, 32768);
+    assert.equal(sampled.total_exact, true);
+    assert.equal(sampled.facets_sample, 10000);
+    assert.deepEqual(sampled.facets.find((f) => f.field === "node")?.values, [{ value: "newest-sample", count: 10000 }]);
+    assert.ok(sampled.facets_sample < sampled.total, "выборка не должна называться полным распределением");
   });
 });
