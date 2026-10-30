@@ -117,9 +117,13 @@ export class IncidentWorkflowError extends Error {}
 export async function incidentTransition(input: {
   id: string; kind: "take" | "assign" | "status"; status?: IncidentStatus; owner?: string; reason?: string; actor: string; role: "viewer" | "analyst" | "admin";
 }): Promise<void> {
-  const r = await fetch(`${engineBase()}/incidents/${encodeURIComponent(input.id)}/workflow`, {
+  // id — в пути, не в теле: движок разбирает тело с DisallowUnknownFields
+  // (workflowRequest: actor, role, kind, status, owner, reason), и лишнее поле
+  // превращало каждое «Взять», «Назначить» и смену статуса в 400.
+  const { id, ...body } = input;
+  const r = await fetch(`${engineBase()}/incidents/${encodeURIComponent(id)}/workflow`, {
     method: "POST", cache: "no-store", headers: engineHeaders(), signal: AbortSignal.timeout(ENGINE_TIMEOUT_MS),
-    body: JSON.stringify(input),
+    body: JSON.stringify(body),
   });
   if (!r.ok) {
     const body = await r.json().catch(() => ({})) as { error?: string };
