@@ -300,7 +300,7 @@ export type SourceHealth = {
   alive: number;
   /** Событий за окно ритма (RHYTHM_WINDOW_DAYS) по heartbeat коллектора; источник мимо коллектора — за час. */
   events_window: number;
-  /** Ритм: типичный разрыв между активными минутами, с (квантиль RHYTHM_QUANTILE); null — разрывов нет. */
+  /** Ритм: типичный разрыв между пачками событий, с (взвешенный по длительности квантиль RHYTHM_QUANTILE); null — мало данных. */
   rhythm_sec: number | null;
   /** Порог тишины для этого источника, с (max(5 мин, 3 × ритм)). */
   silence_threshold_sec: number;
@@ -308,19 +308,41 @@ export type SourceHealth = {
   silent_for_sec: number;
 };
 
-export async function sourcesHealth(): Promise<SourceHealth[]> {
-  // Счётчики «за час», доля ПДн и класс — по таблице событий за последний час. Ритм —
-  // по журналу heartbeat коллектора collector_health_log (одна строка на источник в
-  // минуту, ORDER BY (source, seen_at)): квантиль разрывов между активными минутами за
-  // RHYTHM_WINDOW_DAYS считается в ClickHouse, массивы минут в консоль не едут. Полный
-  // скан events за окно здесь недопустим — сотни миллионов строк на каждую загрузку.
-  // Источники, замолчавшие больше часа назад, берутся из того же журнала; их класс и
-  // точное время последнего события — точечным запросом к events вокруг последней
-  // активной минуты (minmax-индекс по received_at читает считанные гранулы).
+/** Сколько замолчавших источников (тише часа) показывать; остальные — счётчиком omitted. */
+export const STALE_SOURCES_LIMIT = 2000;
+
+export type SourcesReport = {
+  sources: SourceHealth[];
+  /** Замолчавших источников сверх STALE_SOURCES_LIMIT (самые давно молчащие), в sources не вошли. */
+  omitted: number;
+};
+
+/** Ритм по журналу heartbeat (collector_health_log) — единственное место расчёта, тесты гоняют его на живом ClickHouse.
+ *  Разрывы между соседними активными минутами (минутами с событиями) за окно; самый длинный разрыв отбрасывается —
+ *  одиночный сбой или простой не растягивает ритм непрерывного источника на месяц; квантиль RHYTHM_QUANTILE
+ *  взвешен длительностью разрыва: это доля времени, а не доля разрывов. Поэтому у пачечного источника (CI 15 минут
+ *  раз в сутки: 14 разрывов по минуте и один суточный) ритм — сутки, а не минута, как у квантиля по числу разрывов.
+ *  Меньше двух разрывов — 0 (мало данных). */
+const RHYTHM_GAPS = `arrayPopBack(arraySort(arrayMap(x -> toUInt64(x), arraySlice(arrayDifference(arraySort(groupArrayIf(toUnixTimestamp(seen_at), events_1m > 0))), 2))))`;
+
+export async function sourcesHealthReport(): Promise<SourcesReport> {
+  // Счётчики «за час», доля ПДн и класс — по таблице событий за последний час
+  // (minmax-индекс по received_at). Ритм — по журналу heartbeat коллектора
+  // collector_health_log (строка на источник в минуту, ORDER BY (source, seen_at)):
+  // квантиль считается в ClickHouse, массивы минут в консоль не едут.
+  // Замолчавшие источники — по агрегатной проекции events p_source_last (миграция
+  // 0029: строка на источник в каждом парте), поэтому в списке остаются и те, кто
+  // пишет в events мимо коллектора и heartbeat не имеет (телеметрия движка
+  // argus.system): упавший движок виден как «молчит», а не пропадает через час.
+  // Скан сырых events за окно здесь недопустим — сотни миллионов строк на каждую
+  // загрузку; force_optimize_projection превращает отсутствие проекции (миграция
+  // ещё идёт) в ошибку, и тогда список строится по heartbeat, как в rc27.
   type Num = number | string; // ClickHouse JSON: UInt32/Float64 приходят числами, count() — строкой
   type Hour = { source: string; source_class: string; events_1h: Num; eps_60s: Num; last_ts: string; last_sec: Num; pii_share: Num | null; now_sec: Num };
-  type Rhythm = { source: string; events_window: Num; active_minutes: Num; gap_q: Num | null; last_sec: Num; now_sec: Num };
-  const [hour, rhythm] = await Promise.all([
+  type Rhythm = { source: string; events_window: Num; gap_q: Num | null; last_sec: Num; now_sec: Num };
+  type Stale = { source: string; source_class: string; last_ts: string; last_sec: Num; stale_total: Num };
+  const days = RHYTHM_WINDOW_DAYS;
+  const [hour, rhythm, staleRows] = await Promise.all([
     chQuery<Hour>(
       `SELECT source, any(source_class) AS source_class, count() AS events_1h,
               countIf(received_at >= now() - INTERVAL 60 SECOND) AS eps_60s,
@@ -330,34 +352,55 @@ export async function sourcesHealth(): Promise<SourceHealth[]> {
        GROUP BY source ORDER BY events_1h DESC`,
     ),
     chQuery<Rhythm>(
-      `SELECT source, sum(events_1m) AS events_window, countIf(events_1m > 0) AS active_minutes,
-              arrayReduce('quantileExactInclusive({q:Float64})', arraySlice(arrayDifference(arraySort(groupArrayIf(toUnixTimestamp(seen_at), events_1m > 0))), 2)) AS gap_q,
-              toUnixTimestamp(maxIf(seen_at, events_1m > 0)) AS last_sec,
-              toUnixTimestamp(now()) AS now_sec
-       FROM collector_health_log WHERE seen_at >= now() - INTERVAL {days:UInt32} DAY
-       GROUP BY source HAVING active_minutes > 0`,
-      { q: RHYTHM_QUANTILE, days: RHYTHM_WINDOW_DAYS },
+      `SELECT source, events_window, arrayReduce('quantileExactWeighted({q:Float64})', gaps, gaps) AS gap_q, last_sec, now_sec
+       FROM (
+         SELECT source, sum(events_1m) AS events_window, ${RHYTHM_GAPS} AS gaps,
+                toUnixTimestamp(maxIf(seen_at, events_1m > 0)) AS last_sec, toUnixTimestamp(now()) AS now_sec
+         FROM collector_health_log WHERE seen_at >= now() - INTERVAL {days:UInt32} DAY
+         GROUP BY source HAVING countIf(events_1m > 0) > 0
+       )`,
+      { q: RHYTHM_QUANTILE, days },
     ),
+    chQuery<Stale>(
+      `SELECT source, any(source_class) AS source_class, max(received_at) AS last_ts,
+              toUnixTimestamp(max(received_at)) AS last_sec, count() OVER () AS stale_total
+       FROM events GROUP BY source
+       HAVING last_ts >= now() - INTERVAL {days:UInt32} DAY AND last_ts < now() - INTERVAL 1 HOUR
+       ORDER BY last_ts DESC, source LIMIT {lim:UInt32}
+       SETTINGS force_optimize_projection = 1`,
+      { days, lim: STALE_SOURCES_LIMIT },
+    ).catch((err: unknown) => {
+      console.error("sourcesHealth: проекция p_source_last недоступна, замолчавшие — по heartbeat:", err instanceof Error ? err.message : err);
+      return null;
+    }),
   ]);
   const byHour = new Map(hour.map((r) => [r.source, r]));
-  const stale = rhythm.filter((r) => !byHour.has(r.source)).slice(0, 200);
-  type Stale = { source: string; source_class: string; last_ts: string; last_sec: Num };
-  const staleRows = stale.length === 0 ? [] : await chQuery<Stale>(
-    `SELECT source, any(source_class) AS source_class, max(received_at) AS last_ts, toUnixTimestamp(max(received_at)) AS last_sec
-     FROM events WHERE ${stale.map((_, i) => `(source = {s${i}:String} AND received_at BETWEEN toDateTime({t${i}:UInt32}) - INTERVAL 15 MINUTE AND toDateTime({t${i}:UInt32}) + INTERVAL 15 MINUTE)`).join(" OR ")}
-     GROUP BY source`,
-    Object.fromEntries(stale.flatMap((r, i) => [[`s${i}`, r.source], [`t${i}`, Number(r.last_sec)]])),
-  );
-  const byStale = new Map(staleRows.map((r) => [r.source, r]));
   const byRhythm = new Map(rhythm.map((r) => [r.source, r]));
-  const sources = [...hour.map((r) => r.source), ...stale.map((r) => r.source)];
-  return sources.map((source) => {
+  // Замолчавшие: из проекции (все писатели events) плюс источники, у которых есть
+  // heartbeat, но нет строк в events за окно; без проекции — только по heartbeat.
+  // Порядок — от недавно замолчавших к давним, предел STALE_SOURCES_LIMIT, остальное — omitted.
+  const proj = staleRows ?? [];
+  const projOmitted = Math.max(0, Number(proj[0]?.stale_total ?? 0) - proj.length);
+  const inProj = new Set(proj.map((r) => r.source));
+  const oldestShown = projOmitted > 0 ? Number(proj[proj.length - 1].last_sec) : -Infinity;
+  const fromHeartbeat: Stale[] = rhythm
+    .filter((r) => !byHour.has(r.source) && !inProj.has(r.source) && Number(r.last_sec) >= oldestShown)
+    .map((r) => ({
+      source: r.source, source_class: "", last_sec: r.last_sec, stale_total: 0,
+      last_ts: new Date(Number(r.last_sec) * 1000).toISOString().slice(0, 19).replace("T", " "),
+    }));
+  const candidates = [...proj.filter((r) => !byHour.has(r.source)), ...fromHeartbeat]
+    .sort((x, y) => Number(y.last_sec) - Number(x.last_sec) || x.source.localeCompare(y.source));
+  const staleShown = candidates.slice(0, STALE_SOURCES_LIMIT);
+  const omitted = projOmitted + (candidates.length - staleShown.length);
+  const byStale = new Map(staleShown.map((r) => [r.source, r]));
+  const sources = [...hour.map((r) => r.source), ...staleShown.map((r) => r.source)].map((source) => {
     const h = byHour.get(source), rh = byRhythm.get(source), st = byStale.get(source);
     const now = Number(h?.now_sec ?? rh?.now_sec ?? Math.floor(Date.now() / 1000));
     // Последнее событие: таблица событий точнее heartbeat (минутная гранулярность).
     const last = Number(h?.last_sec ?? st?.last_sec ?? rh?.last_sec ?? now);
-    const lastTs = h?.last_ts ?? st?.last_ts ?? (rh ? new Date(Number(rh.last_sec) * 1000).toISOString().slice(0, 19).replace("T", " ") : "");
-    // Одна активная минута — разрывов нет (quantile пустого массива — nan/null): ритм неизвестен.
+    const lastTs = h?.last_ts ?? st?.last_ts ?? "";
+    // Меньше двух разрывов — квантиль пустого массива (0/nan/null): ритм неизвестен.
     const gapQ = rh?.gap_q == null ? NaN : Number(rh.gap_q);
     const rhythmSec = Number.isFinite(gapQ) && gapQ > 0 ? Math.max(60, gapQ) : null;
     const threshold = silenceThresholdSec(rhythmSec);
@@ -368,6 +411,12 @@ export async function sourcesHealth(): Promise<SourceHealth[]> {
       silent_for_sec: Math.max(0, now - last), alive: isAlive(now, last, threshold) ? 1 : 0,
     };
   });
+  return { sources, omitted };
+}
+
+/** Только список (страница и тесты, которым не нужен счётчик omitted). */
+export async function sourcesHealth(): Promise<SourceHealth[]> {
+  return (await sourcesHealthReport()).sources;
 }
 
 export type EventRow = {
