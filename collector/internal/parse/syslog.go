@@ -4,6 +4,8 @@ package parse
 
 import (
 	"errors"
+	"fmt"
+	"net/netip"
 	"strconv"
 	"strings"
 	"time"
@@ -23,6 +25,9 @@ type Syslog struct {
 	Message    string
 	Structured map[string]string // SD-элементы RFC 5424, ключи вида id.param
 	Format     string            // rfc5424 | rfc3164 | raw
+	// Zoneless — время из заголовка RFC 3164 без часового пояса: разобрано как UTC,
+	// а на деле это местное время отправителя (см. InZone).
+	Zoneless bool
 }
 
 // ParseSyslog принимает строку с PRI или без; никогда не теряет сообщение.
@@ -167,7 +172,7 @@ func parse3164(s Syslog, rest string) (Syslog, error) {
 	// Mmm dd yyyy hh:mm:ss HOST MSG — Huawei VRP (info-center) пишет год в заголовок.
 	if s.Timestamp.IsZero() && len(rest) >= 20 && rest[6] == ' ' && rest[11] == ' ' {
 		if t, err := time.Parse("Jan _2 2006 15:04:05", rest[:20]); err == nil {
-			s.Timestamp = t.UTC()
+			s.Timestamp, s.Zoneless = t.UTC(), true
 			rest = strings.TrimLeft(rest[20:], " ")
 		}
 	}
@@ -177,7 +182,7 @@ func parse3164(s Syslog, rest string) (Syslog, error) {
 			// BSD-формат без года: подставляем текущий; «31 декабря» в первых
 			// числах января — это прошлый год, а не событие из будущего
 			cur := now()
-			s.Timestamp = time.Date(cur.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, time.UTC)
+			s.Timestamp, s.Zoneless = time.Date(cur.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, time.UTC), true
 			if s.Timestamp.After(cur.Add(24 * time.Hour)) {
 				s.Timestamp = s.Timestamp.AddDate(-1, 0, 0)
 			}
@@ -207,4 +212,77 @@ func nilDash(v string) string {
 		return ""
 	}
 	return v
+}
+
+// InZone перечитывает время заголовка без пояса как местное время loc: QNAP,
+// коммутаторы и прочие устройства с RFC 3164 пишут часы своего пояса, а в
+// заголовке смещения нет. Время с поясом (RFC 5424, ISO) не трогается.
+func (s Syslog) InZone(loc *time.Location) Syslog {
+	if !s.Zoneless || loc == nil || s.Timestamp.IsZero() {
+		return s
+	}
+	t := s.Timestamp
+	s.Timestamp = time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), loc).UTC()
+	return s
+}
+
+// PeerZones — часовые пояса отправителей syslog без пояса в заголовке
+// (SYSLOG_PEER_TZ="192.168.0.59=Europe/Moscow,10.10.10.0/24=Europe/Moscow").
+type PeerZones []peerZone
+
+type peerZone struct {
+	pfx netip.Prefix
+	loc *time.Location
+}
+
+// ParsePeerZones разбирает список «адрес или CIDR=пояс IANA» через запятую.
+func ParsePeerZones(spec string) (PeerZones, error) {
+	var z PeerZones
+	for _, item := range strings.Split(spec, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		addr, zone, ok := strings.Cut(item, "=")
+		if !ok {
+			return nil, fmt.Errorf("syslog tz: %q — нужно адрес=пояс", item)
+		}
+		addr, zone = strings.TrimSpace(addr), strings.TrimSpace(zone)
+		if !strings.Contains(addr, "/") {
+			ip, err := netip.ParseAddr(addr)
+			if err != nil {
+				return nil, fmt.Errorf("syslog tz: %q: %w", addr, err)
+			}
+			addr = netip.PrefixFrom(ip, ip.BitLen()).String()
+		}
+		pfx, err := netip.ParsePrefix(addr)
+		if err != nil {
+			return nil, fmt.Errorf("syslog tz: %q: %w", addr, err)
+		}
+		loc, err := time.LoadLocation(zone)
+		if err != nil {
+			return nil, fmt.Errorf("syslog tz: %q: %w", zone, err)
+		}
+		z = append(z, peerZone{pfx: pfx.Masked(), loc: loc})
+	}
+	return z, nil
+}
+
+// Lookup — пояс отправителя; при пересечении побеждает самый узкий префикс.
+func (z PeerZones) Lookup(addr string) *time.Location {
+	ip, err := netip.ParseAddr(addr)
+	if err != nil {
+		return nil
+	}
+	ip = ip.Unmap()
+	var best *peerZone
+	for i := range z {
+		if z[i].pfx.Contains(ip) && (best == nil || z[i].pfx.Bits() > best.pfx.Bits()) {
+			best = &z[i]
+		}
+	}
+	if best == nil {
+		return nil
+	}
+	return best.loc
 }

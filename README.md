@@ -265,6 +265,7 @@ make replay                                   # залить записанны�
 | Access-логи reverse proxy (NetBird, любой другой с журналом запросов) | NDJSON `action: proxy.access`, `src_ip` — клиент, `node` — хост сервиса, `object` — хост+путь, `attrs.status`/`country`; правила `rules/proxy-*.yml` | `POST …:8089/ingest/events` |
 | Yandex Cloud Audit Trails, VK Cloud | S3-бакет | `collector.yml → s3`, `YC_*` |
 | NetFlow v9 / IPFIX | UDP; `INTERNAL_NETS` — свои сети для `attrs.scope` (inbound/outbound/internal/external) и `attrs.syn_only` у TCP-попыток без ответа; `attrs.avg_pkt` — средний размер пакета; `FLOW_NAT_ADDRS` — адреса NAT, их потоки помечаются `attrs.post_nat=1` | `:2055` |
+| QNAP QTS / QuTS hero (журнал доступа: входы и действия с файлами по SMB/AFP/FTP/NFS/HTTP; журнал событий: администрирование, диски, RAID) | QuLog Center → «Отправитель журналов» → «Отправить серверу Syslog», TCP, «Журналы событий и доступа»; формат RFC 3164 без пояса — адрес NAS в `SYSLOG_PEER_TZ`. Источник `nas.qnap`: `auth.login`/`auth.logout`, `file.read/write/delete/rename/move`, `system.config`, `storage.event`; правила `rules/nas-*.yml`, `rules/ops/nas-storage-failure.yml` | `:5514` |
 | всё остальное (RFC 5424/3164, в том числе ISO-время в заголовке BSD как у rsyslog, сырой текст) | syslog | `:5514` |
 | свои события единой схемы | NDJSON | `POST …:8089/ingest/events` |
 

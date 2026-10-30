@@ -1,0 +1,21 @@
+# Сбой хранилища NAS: журнал событий QNAP (Storage & Snapshots, диски, RAID,
+# S.M.A.R.T.) с уровнем warning и выше — ошибка носителя, деградация массива,
+# начатая перестройка. Инцидент по первому же событию: дежурный должен знать о
+# деградации до того, как откажет второй диск. Повторы того же диска в течение
+# суток схлопываются в один инцидент.
+title: "Ops: NAS storage failure"
+id: a41c-ops-065
+level: high
+tags: [ops.storage, ops.hardware]
+
+detection:
+  selection:
+    source: nas.qnap
+    action: storage.event
+    outcome: failure
+  condition: selection
+
+dedupe: 24h
+
+analyst:
+  profile: on-prem-strict

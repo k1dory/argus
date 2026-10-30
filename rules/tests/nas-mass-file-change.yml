@@ -1,0 +1,5 @@
+rule: a41c-imp-090
+fixture: fixtures/events/nas-qnap.ndjson
+expect_incidents: 1
+expect_actor: i.petrov
+min_events: 200
