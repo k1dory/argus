@@ -252,6 +252,7 @@ services:
       SYSLOG_TCP_MAX_CONNS: ${SYSLOG_TCP_MAX_CONNS:-1024}   # одновременных TCP/TLS-соединений
       NETFLOW_EXPORTERS: ${NETFLOW_EXPORTERS:-}             # allow-list экспортеров (CIDR через запятую); пусто — все
       INTERNAL_NETS: ${INTERNAL_NETS:-}                     # свои сети для attrs.scope потоков; пусто — RFC 1918 и т.п.
+      SYSLOG_PEER_TZ: ${SYSLOG_PEER_TZ:-}                   # пояс отправителей RFC 3164 без смещения: 192.168.0.59=Europe/Moscow,…
       FLOW_NAT_ADDRS: ${FLOW_NAT_ADDRS:-}                   # внешние адреса NAT: потоки с ними → attrs.post_nat=1 (копия уже учтённого)
       SINK_PENDING_ROWS: ${SINK_PENDING_ROWS:-200000}       # оперативный буфер перед дисковой очередью; при заполнении — обратное давление
       SINK_SPOOL_DIR: /state/spool
