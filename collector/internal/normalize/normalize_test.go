@@ -101,7 +101,8 @@ func TestFromWAF(t *testing.T) {
 
 // FromWAF ставит узлом только server_id (его задаёт оператор). [hostname]
 // error-лога присылает клиент (у ModSecurity под Apache/nginx это заголовок
-// Host): IP — в dst_ip/server_addr, имя — в attrs.http_host, узлом не бывает.
+// Host): только в attrs.http_host, даже если это IP. Адрес сокета Coraza
+// допускается в dst_ip/server_addr.
 // Окончательный узел выбирает коллектор (cmd/collector wafNode).
 func TestFromWAFNodeIsNameNotAddress(t *testing.T) {
 	n := &Normalizer{}
@@ -149,6 +150,19 @@ func TestHostAddr(t *testing.T) {
 		got, ok := hostAddr(in)
 		if got != want || ok != (want != "") {
 			t.Errorf("hostAddr(%q) = %q,%v; ожидалось %q", in, got, ok, want)
+		}
+	}
+}
+
+func TestModSecurityHostCannotSupplyServerAddress(t *testing.T) {
+	n := &Normalizer{}
+	for _, host := range []string{"attacker.example", "203.0.113.7", "203.0.113.7:443", "[2001:db8::7]:443"} {
+		for _, serverAddr := range []string{"", "10.0.10.12"} {
+			w := parse.WAF{Product: "modsecurity", ServerName: host, HostIP: serverAddr, ServerID: "operator-waf", Final: true, MaxSeverity: -1}
+			e := n.FromWAF(w, "raw")
+			if e.Node != "operator-waf" || e.DstIP != serverAddr || e.Attrs["server_addr"] != serverAddr || e.Attrs["http_host"] != host {
+				t.Errorf("Host=%q audit address=%q changed trusted identity/address: %+v", host, serverAddr, e)
+			}
 		}
 	}
 }
