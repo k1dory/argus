@@ -41,7 +41,7 @@ async function seed(): Promise<void> {
 // Только схема событий и heartbeat: файлы тестов идут параллельно, и полный прогон
 // миграций здесь гонялся бы с triage-claim-ch.test.ts за таблицы вебхуков (0018/0025).
 const MIGRATIONS = ["0001_init.sql", "0005_events_incidents.sql", "0008_collector_health_log.sql", "0023_events_value.sql",
-  "0028_events_received_at_index.sql", "0029_events_source_last_projection.sql"];
+  "0028_events_received_at_index.sql", "0031_events_source_last_projection.sql"];
 
 test("миграции событий и heartbeat (включая проекцию p_source_last) применяются, фикстура вставляется", { skip }, async () => {
   for (const f of MIGRATIONS) await runMigration(f);
