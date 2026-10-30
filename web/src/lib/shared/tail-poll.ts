@@ -36,6 +36,9 @@ export type TailResult = {
   /** Секунды паузы по 429; 0 — лимита не было. */
   throttled: number;
   incidents: Record<string, IncidentRef[]>;
+  /** Порция после первой не удалась: результат — то, что успели забрать до неё
+   *  (курсор, строки, инциденты), а текст ошибки — для статуса. null — без ошибок. */
+  error: string | null;
 };
 
 export function throttleSeconds(retryAfter: string | null | undefined): number {
@@ -51,9 +54,11 @@ export function tailUrl(filters: JournalFilters, cursor: string): string {
 
 /**
  * Один такт: порции подряд, пока сервер отвечает more (не больше rounds).
- * 429 — не ошибка: курсор стоит, возвращается пауза по Retry-After. Любой
- * другой не-2xx — исключение с текстом ошибки сервера (следующий такт спросит
- * то же место). Отменённый signal останавливает догон между порциями.
+ * 429 — не ошибка: курсор стоит, возвращается пауза по Retry-After. Не-2xx,
+ * не-JSON или сетевой сбой на первой порции — исключение (следующий такт спросит
+ * то же место). Сбой на следующей порции не отменяет уже забранные: результат
+ * несёт продвинутый курсор и строки, а error — текст сбоя. Отменённый signal
+ * останавливает догон между порциями.
  */
 export async function pollTail(input: TailInput): Promise<TailResult> {
   const { filters, signal, fetchFn = fetch, rounds = CATCHUP_ROUNDS, maxRows = MAX_ROWS } = input;
@@ -63,12 +68,19 @@ export async function pollTail(input: TailInput): Promise<TailResult> {
   let trimmed = 0;
   let pending = 0;
   for (let round = 0; round < rounds && !signal?.aborted; round++) {
-    const res = await fetchFn(tailUrl(filters, cursor), { cache: "no-store", signal });
-    const body = (await res.json()) as TailBody;
-    if (res.status === 429) {
-      return { cursor, state, added, trimmed, pending, throttled: throttleSeconds(res.headers.get("Retry-After")), incidents };
+    let res: Response;
+    let body: TailBody;
+    try {
+      res = await fetchFn(tailUrl(filters, cursor), { cache: "no-store", signal });
+      body = (await res.json()) as TailBody;
+      if (res.status !== 429 && !res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
+    } catch (e) {
+      if (round === 0) throw e;
+      return { cursor, state, added, trimmed, pending, throttled: 0, incidents, error: e instanceof Error ? e.message : "ошибка" };
     }
-    if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
+    if (res.status === 429) {
+      return { cursor, state, added, trimmed, pending, throttled: throttleSeconds(res.headers.get("Retry-After")), incidents, error: null };
+    }
     cursor = body.cursor ?? cursor;
     const merged = mergeTail(state, body.rows ?? [], maxRows);
     state = { rows: merged.rows, seen: merged.seen };
@@ -78,14 +90,14 @@ export async function pollTail(input: TailInput): Promise<TailResult> {
     if (body.incidents) Object.assign(incidents, body.incidents);
     if (!body.more) break;
   }
-  return { cursor, state, added, trimmed, pending, throttled: 0, incidents };
+  return { cursor, state, added, trimmed, pending, throttled: 0, incidents, error: null };
 }
 
 export type TailStatus = { at: string; added: number; pending: number; trimmed: number; throttled: number; error: string | null };
 
 /** Накопление статуса между тактами: суммы added/trimmed, последние pending/throttled. */
-export function nextStatus(prev: TailStatus | null, r: Pick<TailResult, "added" | "trimmed" | "pending" | "throttled">, at = new Date().toISOString()): TailStatus {
-  return { at, added: (prev?.added ?? 0) + r.added.length, trimmed: (prev?.trimmed ?? 0) + r.trimmed, pending: r.pending, throttled: r.throttled, error: null };
+export function nextStatus(prev: TailStatus | null, r: Pick<TailResult, "added" | "trimmed" | "pending" | "throttled"> & { error?: string | null }, at = new Date().toISOString()): TailStatus {
+  return { at, added: (prev?.added ?? 0) + r.added.length, trimmed: (prev?.trimmed ?? 0) + r.trimmed, pending: r.pending, throttled: r.throttled, error: r.error ?? null };
 }
 
 export function errorStatus(prev: TailStatus | null, e: unknown, at = new Date().toISOString()): TailStatus {

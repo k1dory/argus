@@ -1,23 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { describeThreshold, formatDuration, formatRhythm, isAlive, rhythmFromGaps, RHYTHM_WINDOW_DAYS, SILENCE_FACTOR, SILENCE_MIN_SEC, silenceThresholdSec } from "../src/lib/shared/source-health";
+import { describeThreshold, formatDuration, formatRhythm, isAlive, RHYTHM_WINDOW_DAYS, SILENCE_FACTOR, SILENCE_MIN_SEC, silenceThresholdSec } from "../src/lib/shared/source-health";
 
 const DAY = 86400;
 
-test("ритм — квантиль разрывов: пачечный суточный источник не становится «раз в 4 часа», одиночный сбой не ломает непрерывный", () => {
-  assert.equal(rhythmFromGaps([]), null, "одна активная минута — разрывов нет");
-  assert.equal(rhythmFromGaps([60, 60, 60]), 60, "каждую минуту");
-  // CI пишет 5 минут раз в сутки неделю: 28 разрывов по минуте и 6 суточных.
-  const ci = [...Array(28).fill(60), ...Array(6).fill(DAY - 240)];
-  assert.ok(rhythmFromGaps(ci)! > 20 * 3600, `суточный CI → ~сутки, а не среднее: ${rhythmFromGaps(ci)}`);
-  // Непрерывный источник с одним двухдневным провалом: квантиль не видит провал.
-  const outage = [...Array(5000).fill(60), 2 * DAY];
-  assert.equal(rhythmFromGaps(outage), 60);
-  // Недельная выгрузка за 30 суток: три разрыва по неделе.
-  assert.equal(rhythmFromGaps([7 * DAY, 7 * DAY, 7 * DAY]), 7 * DAY);
-  assert.equal(rhythmFromGaps([0, -5, NaN, 120]), 120, "мусор отбрасывается");
-  assert.equal(rhythmFromGaps([30]), 60, "меньше минуты не бывает — гранулярность heartbeat");
-});
+// Сам ритм считает SQL sourcesHealthReport — его проверяет sources-rhythm-ch.test.ts на живом ClickHouse.
 
 test("порог тишины: три ритма, не меньше 5 минут; без ритма — минимум", () => {
   assert.equal(silenceThresholdSec(null), SILENCE_MIN_SEC);

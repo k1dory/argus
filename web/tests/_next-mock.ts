@@ -33,6 +33,8 @@ export type QueryMocks = {
   incidentStateHistory: (id: string, limit?: number) => Promise<unknown[]>;
   verdictGet: (id: string) => Promise<unknown>;
   sourcesHealth: () => Promise<unknown[]>;
+  /** По умолчанию — sourcesHealth без пропущенных, чтобы тесты, подменяющие sourcesHealth, работали и для маршрута. */
+  sourcesHealthReport: () => Promise<{ sources: unknown[]; omitted: number }>;
   incidentsList: (...args: unknown[]) => Promise<unknown>;
   saveTriageRevocation: (sessionId: string, incidentId: string, expiresAt: string) => Promise<void>;
   triageRevocations: () => Promise<Map<string, number>>;
@@ -141,6 +143,7 @@ export function installNextMocks(): Mocks {
     incidentStateHistory: async () => [],
     verdictGet: async () => null,
     sourcesHealth: async () => [],
+    sourcesHealthReport: async () => ({ sources: await queries.sourcesHealth(), omitted: 0 }),
     incidentsList: async () => ({ rows: [], total: 0, page: 1, pageSize: 50 }),
     saveTriageRevocation: async () => undefined,
     triageRevocations: async () => new Map(),
@@ -175,6 +178,7 @@ export function installNextMocks(): Mocks {
     EXCEPTION_FIELDS: shared.EXCEPTION_FIELDS,
     isIncidentStatus: shared.isIncidentStatus,
     RESPOND_MODES,
+    STALE_SOURCES_LIMIT: 2000,
   });
   // wazuh-api: настоящий модуль за делегатом (tests/_wazuh-delegate.ts), чтобы
   // тест мог подменить одну функцию. Резолв «./wazuh-api» перенаправляется на
