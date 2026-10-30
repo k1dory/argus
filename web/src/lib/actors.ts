@@ -10,7 +10,7 @@ import { SEARCH_SETTINGS } from "./search";
 import { chTs, LOG_COLUMNS, toLogItem, type LogItem } from "./shared/log-query";
 import type { TriageBinding } from "./shared/triage";
 import {
-  ACTOR_KINDS, activeAliases, aliasColumnExpr, aliasPredicate, aliasActiveAt, aliasMatches, aliasKey, ambiguousAliases, bucketEvents, canonicalIp, canonicalPhone, clampWindow, CONFIRMED_NOTE_PREFIX, HOLD_NOTE_PREFIX, isAliasKind, isHeld, LOWERCASE_KINDS, normalizeAliasValue, rangeWindow, resolveStatus,
+  ACTOR_KINDS, activeAliases, aliasColumnExpr, aliasPredicate, aliasPrefilter, aliasActiveAt, aliasMatches, aliasKey, ambiguousAliases, bucketEvents, canonicalIp, canonicalPhone, clampWindow, CONFIRMED_NOTE_PREFIX, HOLD_NOTE_PREFIX, isAliasKind, isHeld, LOWERCASE_KINDS, normalizeAliasValue, rangeWindow, resolveStatus,
   type ActorIncident, type ActorRange, type ActorReport, type Alias, type AliasInput, type ClassCount, type IpStat, type NodeStat, type Person, type PersonInput, type ResolveMatch, type ResolveStatus, type SourceCoverage, type Window,
 } from "./shared/actors";
 
@@ -93,6 +93,9 @@ export async function listPersons(range: ActorRange, now = Date.now()): Promise<
     const incParams: Record<string, string | number> = { from: chTs(w.fromMs), to: chTs(w.toMs) };
     const evCols: string[] = [];
     const incCols: string[] = [];
+    // Предфильтр по всем алиасам партии: точные countIf считаются только по совпавшим строкам.
+    const pf = aliasPrefilter(chunk.flatMap((p) => byPerson.get(p.person_id) ?? []));
+    Object.assign(evParams, pf.params);
     chunk.forEach((p, j) => {
       const own = byPerson.get(p.person_id) ?? [];
       const pe = aliasPredicate(own, w, `p${j}_`);
@@ -104,7 +107,7 @@ export async function listPersons(range: ActorRange, now = Date.now()): Promise<
     });
     const [ev, inc] = await Promise.all([
       chQuery<Record<string, string | number>>(
-        `SELECT ${evCols.join(", ")} FROM events WHERE ts >= parseDateTime64BestEffort({from:String}, 3, 'UTC') AND ts < parseDateTime64BestEffort({to:String}, 3, 'UTC')`,
+        `SELECT ${evCols.join(", ")} FROM events WHERE ts >= parseDateTime64BestEffort({from:String}, 3, 'UTC') AND ts < parseDateTime64BestEffort({to:String}, 3, 'UTC') AND ${pf.sql}`,
         evParams,
       ),
       chQuery<Record<string, string | number>>(

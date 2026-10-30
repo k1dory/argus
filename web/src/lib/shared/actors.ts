@@ -270,6 +270,36 @@ export function aliasPredicate(aliases: Alias[], window: Window, prefix = "", ts
   return { sql: parts.length ? `(${parts.join(" OR ")})` : "0", params };
 }
 
+/** Строка ClickHouse Array(String) для параметра запроса. */
+export const chStringArray = (values: string[]): string =>
+  `[${values.map((v) => `'${v.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`).join(",")}]`;
+
+/**
+ * Грубый фильтр строк по значениям алиасов без интервалов: колонка IN массив
+ * значений. Ставится в WHERE рядом с точными countIf(aliasPredicate), чтобы
+ * точный подсчёт шёл по тысячам совпавших строк, а не по всему окну
+ * (на живом потоке 7 суток — 100+ млн строк, сотни OR в countIf не
+ * укладывались в 20 с). Удержанные алиасы, как и в aliasPredicate, не участвуют.
+ */
+export function aliasPrefilter(aliases: Alias[], prefix = "pf_"): Predicate {
+  const byExpr = new Map<string, Set<string>>();
+  for (const a of aliases) {
+    if (isHeld(a)) continue;
+    const expr = aliasColumnExpr(a.kind);
+    if (!byExpr.has(expr)) byExpr.set(expr, new Set());
+    byExpr.get(expr)!.add(a.value);
+  }
+  const params: Record<string, string | number> = {};
+  const parts: string[] = [];
+  let i = 0;
+  for (const [expr, values] of [...byExpr.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+    const name = `${prefix}${i++}`;
+    params[name] = chStringArray([...values].sort());
+    parts.push(`${expr} IN {${name}:Array(String)}`);
+  }
+  return { sql: parts.length ? `(${parts.join(" OR ")})` : "0", params };
+}
+
 /** Действует ли алиас в момент at. */
 export function aliasActiveAt(a: Pick<Alias, "valid_from" | "valid_to">, atMs: number): boolean {
   const from = tsMs(a.valid_from);
