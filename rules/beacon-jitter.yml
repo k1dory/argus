@@ -10,6 +10,7 @@ detection:
   selection:
     source.class: netflow
     attrs.scope: outbound
+    attrs.post_nat: 'not 1'      # копия потока после NAT (FLOW_NAT_ADDRS) — уже учтена изнутри
     bytes: '< 65536'
   filter:                      # резолверы и время — ровные интервалы по природе
     dst.port: [53, 123]

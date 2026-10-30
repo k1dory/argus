@@ -264,7 +264,7 @@ make replay                                   # залить записанны�
 | Forgejo runner, OpenBao (служебные журналы) | агент Vector: journald `forgejo-runner` (старт задач `ci.task.start`, ошибки), `bao` (seal/unseal, предупреждения) | `POST …:8089/ingest/events` |
 | Access-логи reverse proxy (NetBird, любой другой с журналом запросов) | NDJSON `action: proxy.access`, `src_ip` — клиент, `node` — хост сервиса, `object` — хост+путь, `attrs.status`/`country`; правила `rules/proxy-*.yml` | `POST …:8089/ingest/events` |
 | Yandex Cloud Audit Trails, VK Cloud | S3-бакет | `collector.yml → s3`, `YC_*` |
-| NetFlow v9 / IPFIX | UDP; `INTERNAL_NETS` — свои сети для `attrs.scope` (inbound/outbound/internal/external) и `attrs.syn_only` у TCP-попыток без ответа | `:2055` |
+| NetFlow v9 / IPFIX | UDP; `INTERNAL_NETS` — свои сети для `attrs.scope` (inbound/outbound/internal/external) и `attrs.syn_only` у TCP-попыток без ответа; `attrs.avg_pkt` — средний размер пакета; `FLOW_NAT_ADDRS` — адреса NAT, их потоки помечаются `attrs.post_nat=1` | `:2055` |
 | всё остальное (RFC 5424/3164, в том числе ISO-время в заголовке BSD как у rsyslog, сырой текст) | syslog | `:5514` |
 | свои события единой схемы | NDJSON | `POST …:8089/ingest/events` |
 
@@ -914,7 +914,7 @@ make deploy                                # cosign verify + pull образов
 
 ## Тесты
 
-Пять слоёв, от быстрых к медленным. Цифры — число тестов на момент rc27.
+Пять слоёв, от быстрых к медленным. Цифры — число тестов на момент rc28.
 
 | Слой | Сколько | Что проверяет | Как запустить |
 |---|---|---|---|
@@ -932,7 +932,7 @@ cd web && npm test && npm run lint && npm run typecheck   # консоль
 ./scripts/api-smoke.sh                                    # API консоли на живом стенде
 ```
 
-Покрытие на rc27: движок — `rules` 99,7 %, `incidents` 99 %, `store` 89 %, `cmd/engine` 74 %
+Покрытие на rc28: движок — `rules` 99,7 %, `incidents` 99 %, `store` 89 %, `cmd/engine` 74 %
 (без покрытия только циклы `run`/`loop`/`pollEvents` — их проверяет e2e); коллектор — `pull` 98 %,
 `listen` 94 %, `sink` 91 %, `cmd/collector` 79 %; policyd — 84–98 %; `mcp` 90 %; консоль —
 88 % операторов, страницы 88–100 %, компоненты 87 %. Слабее прочих: обработчики кликов в

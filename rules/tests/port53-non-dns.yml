@@ -1,0 +1,5 @@
+rule: a41c-c2-017
+fixture: fixtures/events/netflow-port53.ndjson
+expect_incidents: 1
+expect_actor: 10.20.0.14
+min_events: 5

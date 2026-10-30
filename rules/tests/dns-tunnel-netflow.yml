@@ -1,0 +1,4 @@
+# NetFlow на порт 53 (DNS по TCP, крупные UDP-пакеты) правило DNS-туннеля не трогает.
+rule: a41c-c2-015
+fixture: fixtures/events/netflow-port53.ndjson
+expect_incidents: 0
