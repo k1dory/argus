@@ -92,3 +92,60 @@ test("аналитик: просмотр пишется до чтения дан
   assert.ok(fetched.some((s) => s.includes("FROM identities")), "данные читались после записи");
   mocks.jar.clear();
 });
+
+// «Кому принадлежит» (/actors/lookup): та же граница доступа, поиск пишется в
+// журнал до чтения данных, история владения — все интервалы алиасов
+// (включая закрытые), IP дополнительно ищется как внешний адрес клиента VPN.
+const lookupPage = require("../src/app/(console)/actors/lookup/page") as Page; // eslint-disable-line @typescript-eslint/no-require-imports
+
+test("lookup: наблюдатель — отказ; без журнала действий — без данных", async () => {
+  await auth.createSession("viewer1", "viewer");
+  await assert.rejects(lookupPage.default(props({}, { v: "10.0.0.5" })), isForbidden);
+  await auth.createSession("analyst1", "analyst");
+  const orig = mocks.queries.audit;
+  mocks.queries.audit = async () => { throw new Error("журнал действий недоступен — действие отменено"); };
+  try {
+    const n = fetched.length;
+    const text = textOf(await lookupPage.default(props({}, { v: "10.0.0.5" })));
+    assert.ok(text.includes("Журнал действий недоступен"), text.slice(0, 300));
+    assert.equal(fetched.length, n, "ClickHouse не опрашивался");
+  } finally {
+    mocks.queries.audit = orig;
+    mocks.jar.clear();
+  }
+});
+
+test("lookup: пустой запрос — только форма; IP — история, сейчас, VPN и журнал без NetFlow", async () => {
+  await auth.createSession("analyst1", "analyst");
+  const before = mocks.audit.length;
+  let n = fetched.length;
+  textOf(await lookupPage.default(props()));
+  assert.equal(fetched.length, n, "без значения хранилище не опрашивается");
+  assert.equal(mocks.audit.length, before, "и в журнал не пишется");
+
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (_url: URL | string, init?: RequestInit) => {
+    const sql = String(init?.body ?? "");
+    fetched.push(sql);
+    if (sql.includes("FROM identity_aliases") && sql.includes("ORDER BY a.valid_from DESC")) {
+      return new Response(
+        '{"person_id":"a.sidorov","alias_kind":"ip","alias_value":"10.0.0.5","valid_from":"2026-10-20 00:00:00.000","valid_to_raw":null,"source":"event:vpn.netbird","confidence":1,"note":"","display":"Алексей Сидоров","kind":"person"}\n' +
+        '{"person_id":"i.petrov","alias_kind":"ip","alias_value":"10.0.0.5","valid_from":"2026-10-01 00:00:00.000","valid_to_raw":"2026-10-20 00:00:00.000","source":"event:vpn.netbird","confidence":1,"note":"","display":"Иван Петров","kind":"person"}\n',
+      );
+    }
+    return new Response("");
+  }) as typeof fetch;
+  try {
+    n = fetched.length;
+    const text = textOf(await lookupPage.default(props({}, { v: "10.0.0.5", range: "30d" })));
+    assert.ok(mocks.audit.some((a) => a.action === "actor.lookup" && a.target === "10.0.0.5"), "поиск в журнале действий");
+    for (const s of ["История владения", "Алексей Сидоров", "Иван Петров", "действует", "Подключения к VPN", "Где встречалось"]) assert.ok(text.includes(s), s);
+    const sqls = fetched.slice(n);
+    assert.ok(sqls.some((q) => q.includes("attrs['connection_ip'] = {ip:String}")), "внешний адрес клиента VPN");
+    assert.ok(sqls.some((q) => q.includes("src_ip = {ip:String}") && q.includes("source_class != 'netflow'")), "адрес источника без NetFlow");
+    assert.ok(sqls.every((q) => !q.includes("10.0.0.5")), "значение только параметром");
+  } finally {
+    globalThis.fetch = realFetch;
+    mocks.jar.clear();
+  }
+});
