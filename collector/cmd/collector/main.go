@@ -383,6 +383,26 @@ func main() {
 			norm.InternalNets = append(norm.InternalNets, pfx)
 		}
 	}
+	if v := strings.TrimSpace(os.Getenv("FLOW_NAT_ADDRS")); v != "" {
+		for _, c := range strings.Split(v, ",") {
+			c = strings.TrimSpace(c)
+			if c == "" {
+				continue
+			}
+			if !strings.Contains(c, "/") {
+				c += "/32"
+				if strings.Contains(c, ":") {
+					c = strings.TrimSuffix(c, "/32") + "/128"
+				}
+			}
+			pfx, perr := netip.ParsePrefix(c)
+			if perr != nil {
+				slog.Error("FLOW_NAT_ADDRS", "addr", c, "err", perr)
+				os.Exit(1)
+			}
+			norm.NATAddrs = append(norm.NATAddrs, pfx)
+		}
+	}
 	dec := parse.NewDecoder()
 	if dec.Allow, err = parse.ParseCIDRs(cfg.Listeners.NetFlow.Exporters); err != nil {
 		slog.Error("NETFLOW_EXPORTERS", "err", err)
