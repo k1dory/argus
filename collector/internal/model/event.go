@@ -143,7 +143,28 @@ func (e *Event) Ensure() {
 	if e.SourceClass == "" {
 		e.SourceClass = "syslog"
 	}
+	e.fillDNSQuery()
 	e.Sanitize()
+}
+
+// dnsQueryKeys — ключи, под которыми источники передают имя DNS-запроса: CEF/LEEF
+// копируются в attrs как есть, у каждого вендора своё название.
+var dnsQueryKeys = []string{"query", "qname", "query_name", "domain", "destinationDnsDomain", "dns.question.name"}
+
+// fillDNSQuery — имя запроса DNS-события в едином поле attrs.dns_query. Правило
+// dns-tunnel требует его как положительный признак журнала DNS: журнал соединений
+// NGFW на порт 53 (session.allow) имени запроса не несёт и под правило не попадает.
+// Событием DNS считается действие, в котором есть «dns» (event.dns, dns.query…).
+func (e *Event) fillDNSQuery() {
+	if e.Attrs["dns_query"] != "" || !strings.Contains(strings.ToLower(e.Action), "dns") {
+		return
+	}
+	for _, k := range dnsQueryKeys {
+		if v := strings.TrimSpace(e.Attrs[k]); v != "" {
+			e.Attrs["dns_query"] = v
+			return
+		}
+	}
 }
 
 // Sanitize убирает управляющие символы (кроме \t) и ANSI-escape из строк,
