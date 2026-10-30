@@ -219,8 +219,9 @@ test("/api/sources: 401; форма SourceHealth по спецификации �
   ];
   const ok = await sourcesRoute.GET(req("/api/sources"), ctx(""));
   assert.equal(ok.status, 200);
-  const body = (await ok.json()) as { sources: Record<string, unknown>[]; checked_at: string };
-  assert.deepEqual(Object.keys(body).sort(), ["checked_at", "sources"]);
+  const body = (await ok.json()) as { sources: Record<string, unknown>[]; checked_at: string; omitted: number };
+  assert.deepEqual(Object.keys(body).sort(), ["checked_at", "omitted", "sources"]);
+  assert.equal(body.omitted, 0, "без пропущенных — omitted 0");
   assert.ok(!Number.isNaN(Date.parse(body.checked_at)));
   assert.equal(body.sources.length, 3);
   const fields = required("SourceHealth");
@@ -230,6 +231,12 @@ test("/api/sources: 401; форма SourceHealth по спецификации �
     for (const k of ["events_1h", "eps_60s", "events_window", "silence_threshold_sec", "silent_for_sec", "alive"]) assert.equal(typeof s[k], "number", `${k} число у ${s.source}`);
     assert.ok(s.rhythm_sec === null || typeof s.rhythm_sec === "number");
   }
+  // Замолчавших сверх предела — в omitted, список не обрывается молча.
+  const origReport = mocks.queries.sourcesHealthReport;
+  mocks.queries.sourcesHealthReport = async () => ({ sources: [], omitted: 37 });
+  const capped = (await (await sourcesRoute.GET(req("/api/sources"), ctx(""))).json()) as { omitted: number };
+  assert.equal(capped.omitted, 37);
+  mocks.queries.sourcesHealthReport = origReport;
   mocks.queries.sourcesHealth = async () => { throw new Error("Code: 159. DB::Exception: Timeout exceeded"); };
   const down = await sourcesRoute.GET(req("/api/sources"), ctx(""));
   assert.equal(down.status, 503);

@@ -4,13 +4,15 @@
 // небольшой фикстурой, и каждый запрос консоли выполняется настоящим сервером.
 // Пустая таблица тоже проверяет запрос: ClickHouse разбирает его и привязывает столбцы
 // до чтения данных. Нужен ARGUS_TEST_CLICKHOUSE_URL (в CI — сервис clickhouse у job web).
-import { test } from "node:test";
+import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { applyAllMigrations, ch, liveSkip as skip } from "./_ch-live";
+import { serializeLiveFile, applyAllMigrations, ch, liveSkip as skip } from "./_ch-live";
 import { parseJournalParams, parseTailCursor } from "../src/lib/shared/journal";
 import { SILENCE_MIN_SEC } from "../src/lib/shared/source-health";
 import { ACTOR_RANGES } from "../src/lib/shared/actors";
+
+serializeLiveFile({ before, after });
 
 /* eslint-disable @typescript-eslint/no-require-imports -- модули читают env при загрузке */
 const q = () => require("../src/lib/argus-queries") as typeof import("../src/lib/argus-queries");

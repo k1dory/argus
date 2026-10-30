@@ -4,11 +4,13 @@
 // Node-процессов. Нужен сервер: ARGUS_TEST_CLICKHOUSE_URL (+ _USER, _PASSWORD),
 // БД argus; без него тест пропускается.
 //   docker run -d -p 8123:8123 -e CLICKHOUSE_DB=argus -e CLICKHOUSE_PASSWORD=x clickhouse/clickhouse-server:24.8
-import { test } from "node:test";
+import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import path from "node:path";
+
+import { serializeLiveFile } from "./_ch-live";
 
 const url = process.env.ARGUS_TEST_CLICKHOUSE_URL;
 const skip = url ? false : "нет ARGUS_TEST_CLICKHOUSE_URL — тест живого ClickHouse пропущен";
@@ -18,6 +20,7 @@ if (url) {
   process.env.CLICKHOUSE_PASSWORD = process.env.ARGUS_TEST_CLICKHOUSE_PASSWORD ?? "";
   process.env.CLICKHOUSE_DB = "argus";
 }
+serializeLiveFile({ before, after });
 
 /* eslint-disable @typescript-eslint/no-require-imports -- модуль читает env при загрузке */
 const q = () => require("../src/lib/argus-queries") as typeof import("../src/lib/argus-queries");
