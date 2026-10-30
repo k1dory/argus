@@ -556,9 +556,14 @@ services:
       # "internal" (свой CA Caddy) или "/certs/console.crt /certs/console.key"
       CONSOLE_TLS: ${CONSOLE_TLS:-internal}
       # Сети клиентов MCP (:8445). Список через пробел или запятую; entrypoint
-      # проверяет каждый элемент и добавляет шлюз Docker (локальные клиенты приходят
-      # с него) — опечатка здесь не уронит консоль и вебхуки (caddy/entrypoint.sh).
+      # проверяет каждый элемент — опечатка здесь не уронит консоль и вебхуки
+      # (caddy/entrypoint.sh).
       MCP_ALLOWED_NETS: ${MCP_ALLOWED_NETS:-}
+      # Шлюз Docker (клиенты с самого хоста) в списке MCP: по умолчанию — только при
+      # MCP_BIND на loopback. В rootless Docker / userland-proxy с адреса шлюза приходят
+      # все клиенты — там MCP_ALLOW_HOST=1 открыл бы порт всем, кого пускает MCP_BIND.
+      MCP_BIND: ${MCP_BIND:-127.0.0.1}
+      MCP_ALLOW_HOST: ${MCP_ALLOW_HOST:-}
     entrypoint: ["/bin/sh", "/entrypoint.sh"]
     volumes:
       - ./caddy/entrypoint.sh:/entrypoint.sh:ro
