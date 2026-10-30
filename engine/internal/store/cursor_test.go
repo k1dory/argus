@@ -134,32 +134,102 @@ func TestRowHashCoversAllColumns(t *testing.T) {
 	}
 }
 
-// Запрос: включительная секунда с хешем, порядок received_at + хеш, хеш в
-// выборке; ответ разбирается в события с ReceivedAt.
+// Запрос: включительная секунда с ключом event_id, ограниченный срез received_at,
+// порядок received_at + event_id; ответ разбирается в события с ReceivedAt, ключ
+// uint64 — без потери точности.
 func TestEventsSinceQueryAndParse(t *testing.T) {
 	var got string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
 		got = string(b) + " " + r.URL.RawQuery
-		_, _ = w.Write([]byte(`{"ts":"2026-10-20 10:00:01.000","source":"s","action":"x","attrs":{},"received_str":"2026-10-20 10:00:01","row_hash":18446744073709551615}` + "\n"))
+		_, _ = w.Write([]byte(`{"ts":"2026-10-20 10:00:01.000","source":"s","action":"x","attrs":{},"received_str":"2026-10-20 10:00:01","event_id":18446744073709551615}` + "\n"))
 	}))
 	defer srv.Close()
 	c := New(srv.URL, "argus", "", "")
 	cur := StartCursor(time.Date(2026, 10, 20, 10, 0, 1, 0, time.UTC))
 	cur.Hash = 7
-	evs, next, err := c.EventsSince(context.Background(), cur, 100)
+	evs, next, err := c.EventsSince(context.Background(), cur, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"received_at > {cursor:DateTime} OR (received_at = {cursor:DateTime} AND cityHash64(", ">= {hash:UInt64}", "ORDER BY received_at, row_hash", "param_hash=7", "param_cursor=2026-10-20+10%3A00%3A01"} {
+	for _, want := range []string{"received_at >= {cursor:DateTime} AND received_at < {upto:DateTime}", "(received_at > {cursor:DateTime} OR event_id >= {hash:UInt64})",
+		"ORDER BY received_at, event_id", "param_hash=7", "param_cursor=2026-10-20+10%3A00%3A01", "param_upto=2026-10-20+10%3A05%3A01"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("нет %q в запросе: %s", want, got)
 		}
 	}
-	if len(evs) != 1 || evs[0].ReceivedAt != cur.At || next.Hash != 0 {
-		t.Fatalf("events %v cursor %+v", evs, next)
+	for _, bad := range []string{"cityHash64", "AS raw", "row_hash"} {
+		if strings.Contains(got, bad) {
+			t.Errorf("в запросе не должно быть %q: хеш считается при вставке (event_id), raw не читается: %s", bad, got)
+		}
+	}
+	if len(evs) != 1 || evs[0].ReceivedAt != cur.At || evs[0].Raw != "" {
+		t.Fatalf("events %+v", evs)
+	}
+	// страница упёрлась в LIMIT внутри секунды: курсор стоит, ключ продолжения — максимальный
+	if !next.More || !next.At.Equal(cur.At) || next.Hash != 18446744073709551615 || next.Step != sliceDefault/2 {
+		t.Fatalf("cursor %+v", next)
 	}
 	if _, ok := next.Seen[18446744073709551615]; !ok {
-		t.Fatalf("uint64 хеш должен читаться без потери точности: %+v", next.Seen)
+		t.Fatalf("uint64 ключ должен читаться без потери точности: %+v", next.Seen)
+	}
+}
+
+// Верх среза — At+Step, но не дальше последней устоявшейся секунды; курсор на
+// неустоявшейся секунде — читать нечего.
+func TestSliceEnd(t *testing.T) {
+	now := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
+	cur := StartCursor(now.Add(-time.Hour))
+	if upto, ok := sliceEnd(cur, now); !ok || !upto.Equal(cur.At.Add(sliceDefault)) {
+		t.Fatalf("догон: %v %v", upto, ok)
+	}
+	cur = StartCursor(now.Add(-time.Minute))
+	if upto, ok := sliceEnd(cur, now); !ok || !upto.Equal(now.Add(-cursorSettle).Add(time.Second)) {
+		t.Fatalf("у края: %v %v", upto, ok)
+	}
+	cur = StartCursor(now.Add(-cursorSettle).Add(time.Second))
+	if _, ok := sliceEnd(cur, now); ok {
+		t.Fatal("неустоявшаяся секунда — запроса нет")
+	}
+	cur = Cursor{At: now.Add(-time.Hour)}
+	if upto, _ := sliceEnd(cur, now); !upto.Equal(cur.At.Add(sliceDefault)) {
+		t.Fatalf("Step 0 — по умолчанию: %v", upto)
+	}
+}
+
+// Пустой срез в прошлом сдвигает курсор на свой верх (иначе догон стоял бы на
+// дыре в потоке), ширина растёт; страница по LIMIT сужает срез и не уводит
+// курсор за прочитанное; у края догона More снимается; пределы ширины соблюдаются.
+func TestFinishSlice(t *testing.T) {
+	now := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
+	cur := StartCursor(now.Add(-time.Hour))
+	upto := cur.At.Add(sliceDefault)
+	_, adv := advanceCursor(cur, nil, 100, now)
+	next := finishSlice(cur, adv, 0, 100, upto, now)
+	if !next.At.Equal(upto) || !next.More || next.Step != 2*sliceDefault || len(next.Seen) != 0 {
+		t.Fatalf("пустой срез: %+v", next)
+	}
+	rows := []eventRow{row(0, 1), row(1, 2)}
+	cur = StartCursor(rows[0].ReceivedAt)
+	_, adv = advanceCursor(cur, rows, 2, later)
+	next = finishSlice(cur, adv, 2, 2, cur.At.Add(sliceDefault), later)
+	// последняя секунда страницы могла быть прочитана не целиком — курсор встаёт на неё
+	if !next.At.Equal(rows[1].ReceivedAt) || !next.More || next.Step != sliceDefault/2 {
+		t.Fatalf("LIMIT: курсор внутри среза, срез уже: %+v", next)
+	}
+	cur.Step = sliceMin
+	if next = finishSlice(cur, adv, 2, 2, cur.At.Add(sliceMin), later); next.Step != sliceMin {
+		t.Fatalf("нижний предел: %v", next.Step)
+	}
+	cur = StartCursor(now.Add(-10 * time.Second))
+	cur.Step = sliceMax
+	edge := now.Add(-cursorSettle).Add(time.Second)
+	_, adv = advanceCursor(cur, nil, 100, now)
+	if next = finishSlice(cur, adv, 0, 100, edge, now); next.More || !next.At.Equal(edge) || next.Step != sliceMax {
+		t.Fatalf("край догона и верхний предел: %+v", next)
+	}
+	// средняя страница (не меньше четверти LIMIT) — ширина не меняется
+	if next = finishSlice(StartCursor(now.Add(-time.Hour)), adv, 50, 100, now.Add(-55*time.Minute), now); next.Step != sliceDefault {
+		t.Fatalf("ширина без изменений: %v", next.Step)
 	}
 }

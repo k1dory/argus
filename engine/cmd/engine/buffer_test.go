@@ -1,8 +1,15 @@
 package main
 
 import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/devitex-soft/argus/engine/internal/eval"
 
 	"github.com/devitex-soft/argus/engine/internal/model"
 	"github.com/devitex-soft/argus/engine/internal/rules"
@@ -41,4 +48,150 @@ func TestRetentionCappedByLookback(t *testing.T) {
 	if got := e.retention(30 * time.Second); got != 11*time.Minute {
 		t.Fatalf("потолок: %v, ожидалось 10m + 1m", got)
 	}
+}
+
+func loadTestRule(t *testing.T, yml string) *rules.Rule {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "r.yml")
+	if err := os.WriteFile(p, []byte(yml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r, err := rules.LoadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+const hostSilenceYML = `title: host silence
+id: t-host-silence
+level: medium
+detection:
+  selection:
+    source.class: telemetry
+  threshold:
+    kind: absence
+    window: 10m
+    group_by: node
+  condition: selection and threshold
+`
+
+const netflowCountYML = `title: flows
+id: t-flows
+level: low
+detection:
+  selection:
+    source.class: netflow
+  threshold:
+    count: 1000000
+    window: 1h
+    group_by: src.ip
+  condition: selection and threshold
+`
+
+func silenceFired(dets []eval.Detection, node string) bool {
+	for _, d := range dets {
+		if d.Rule.ID == "t-host-silence" && d.Key == node {
+			return true
+		}
+	}
+	return false
+}
+
+// Сценарий отчёта: NetFlow-кандидаты переполняют буфер (ENGINE_BUFFER_MAX),
+// последнее событие телеметрии узла вытесняется — по одному буферу правило
+// молчания узел больше не видит. С отдельным состоянием молчания сработка есть.
+func TestHostSilenceSurvivesBufferEviction(t *testing.T) {
+	rs := []*rules.Rule{loadTestRule(t, hostSilenceYML), loadTestRule(t, netflowCountYML)}
+	now := time.Now().UTC().Truncate(time.Second)
+	t0 := now.Add(-15 * time.Minute)
+	e := &engine{bufferMax: 100, absence: eval.NewAbsenceState(0)}
+	e.rules.Store(&rs)
+	ctx := context.Background()
+	tele := &model.Event{TS: model.FormatTS(t0), ReceivedAt: t0, Source: "telemetry.h1", SourceClass: "telemetry", Node: "h1", Action: "metric"}
+	var buffer []*model.Event
+	buffer, _ = e.ingest(ctx, rs, []*model.Event{tele}, buffer)
+	evicted := 0
+	for page := 0; page < 10; page++ {
+		var evs []*model.Event
+		for i := 0; i < 100; i++ {
+			at := t0.Add(time.Duration(page*100+i+1) * 100 * time.Millisecond).Truncate(time.Second)
+			evs = append(evs, &model.Event{TS: model.FormatTS(at), ReceivedAt: at, Source: "netflow.core", SourceClass: "netflow", Action: "flow", SrcIP: "10.0.0.1"})
+		}
+		var n int
+		buffer, n = e.ingest(ctx, rs, evs, buffer)
+		evicted += n
+	}
+	var n int
+	buffer, n = trimBuffer(buffer, now.Add(-e.retention(30*time.Second)), e.bufferMax)
+	evicted += n
+	for _, ev := range buffer {
+		if ev == tele {
+			t.Fatal("событие телеметрии не должно жить в буфере: правило молчания берёт его из состояния")
+		}
+	}
+	if evicted == 0 || len(buffer) != e.bufferMax {
+		t.Fatalf("буфер должен упереться в потолок: len=%d evicted=%d", len(buffer), evicted)
+	}
+	// Без состояния (как до исправления) молчание узла не видно.
+	dets, _ := eval.Evaluate(eval.Input{Rules: rs, Events: buffer, Now: now})
+	if silenceFired(dets, "h1") {
+		t.Fatal("контроль: без события телеметрии в буфере правило не срабатывает")
+	}
+	dets, _ = eval.Evaluate(eval.Input{Rules: rs, Events: buffer, Now: now, Absence: e.absence})
+	if !silenceFired(dets, "h1") {
+		t.Fatalf("молчание h1 после вытеснения буфера должно сработать: %+v", dets)
+	}
+	// Узел заговорил — молчания нет; группа стареет вместе с буфером (retention).
+	back := &model.Event{TS: model.FormatTS(now.Add(-time.Minute)), ReceivedAt: now.Add(-time.Minute), SourceClass: "telemetry", Node: "h1"}
+	buffer, _ = e.ingest(ctx, rs, []*model.Event{back}, buffer)
+	if dets, _ = eval.Evaluate(eval.Input{Rules: rs, Events: buffer, Now: now, Absence: e.absence}); silenceFired(dets, "h1") {
+		t.Fatal("узел заговорил — сработки нет")
+	}
+	e.absence.Prune(rs, now)
+	if e.absence.Len() != 0 {
+		t.Fatalf("группы старше окна удерживания убираются: %d", e.absence.Len())
+	}
+}
+
+// Буфер хранится в порядке приёма, правила оцениваются по времени источника:
+// оценка не переупорядочивает буфер, и чистка по потолку выбрасывает давно
+// принятые события, а задержанный лог свежего приёма остаётся.
+func TestTrimBufferKeepsFreshReceiptsAfterEvaluate(t *testing.T) {
+	rs := []*rules.Rule{loadTestRule(t, netflowCountYML)}
+	now := time.Now().UTC().Truncate(time.Second)
+	var buffer []*model.Event
+	for i := 0; i < 5; i++ {
+		at := now.Add(time.Duration(i-10) * time.Minute)
+		buffer = append(buffer, &model.Event{TS: model.FormatTS(at), ReceivedAt: at, SourceClass: "netflow", Action: fmt.Sprintf("r%d", i)})
+	}
+	// задержанный лог: время источника — час назад, принят только что
+	buffer = append(buffer, &model.Event{TS: model.FormatTS(now.Add(-time.Hour)), ReceivedAt: now, SourceClass: "netflow", Action: "delayed"})
+	eval.Evaluate(eval.Input{Rules: rs, Events: buffer, Now: now})
+	if buffer[len(buffer)-1].Action != "delayed" {
+		t.Fatal("оценка не должна менять порядок буфера")
+	}
+	kept, evicted := trimBuffer(buffer, time.Time{}, 3)
+	if evicted != 3 || len(kept) != 3 || kept[2].Action != "delayed" || kept[0].Action != "r3" {
+		t.Fatalf("остались не самые свежие по приёму: %v", actions(kept))
+	}
+	// буфер, переупорядоченный по ts (как делала старая оценка на месте), чистится так же
+	shuffled := []*model.Event{
+		{ReceivedAt: now, Action: "delayed"},
+		{ReceivedAt: now.Add(-3 * time.Minute), Action: "a"},
+		{ReceivedAt: now.Add(-2 * time.Minute), Action: "b"},
+		{Action: "no-ts"},
+	}
+	kept, _ = trimBuffer(shuffled, time.Time{}, 2)
+	if got := actions(kept); got != "delayed,no-ts" {
+		t.Fatalf("по приёму, без времени приёма — как самые свежие: %s", got)
+	}
+}
+
+func actions(evs []*model.Event) string {
+	var out []string
+	for _, e := range evs {
+		out = append(out, e.Action)
+	}
+	return strings.Join(out, ",")
 }
