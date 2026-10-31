@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	_ "time/tzdata" // пояса SYSLOG_PEER_TZ и в образе без /usr/share/zoneinfo
 
 	"gopkg.in/yaml.v3"
 
@@ -294,8 +295,15 @@ func main() {
 		os.Exit(2)
 	}
 
+	// Пояс отправителей, у которых в заголовке RFC 3164 местное время без смещения.
+	peerZones, err := parse.ParsePeerZones(os.Getenv("SYSLOG_PEER_TZ"))
+	if err != nil {
+		slog.Error("SYSLOG_PEER_TZ", "err", err)
+		os.Exit(1)
+	}
 	parseLine := func(line string, peer listen.Peer) (model.Event, bool) {
 		sl, _ := parse.ParseSyslog(line)
+		sl = sl.InZone(peerZones.Lookup(peer.Addr))
 		var e model.Event
 		switch {
 		case hasCEF(line):
@@ -323,6 +331,8 @@ func main() {
 				e = sq
 			} else if jk, ok := parse.ParseJenkins(sl.Message, sl.Hostname); ok {
 				e = jk
+			} else if qn, ok := parse.ParseQNAP(sl); ok {
+				e = qn
 			} else if mt, ok := parse.ParseMikroTik(sl); ok {
 				e = mt
 			} else if vr, ok := parse.ParseVRP(sl); ok {
