@@ -117,7 +117,9 @@ func TestIngestModSecurityShapes(t *testing.T) {
 	if code, _ := do(t, srv, "POST", "/ingest/modsecurity", "", `[{"a":1},`); code != 400 {
 		t.Errorf("обрыв массива: %d", code)
 	}
-	h.ParseWAFAudit = func(raw json.RawMessage) (model.Event, bool) {
+	var auditPeers []Peer
+	h.ParseWAFAudit = func(raw json.RawMessage, peer Peer) (model.Event, bool) {
+		auditPeers = append(auditPeers, peer)
 		if strings.Contains(string(raw), "drop") {
 			return model.Event{}, false
 		}
@@ -127,6 +129,14 @@ func TestIngestModSecurityShapes(t *testing.T) {
 	code, resp = do(t, srv, "POST", "/ingest/modsecurity", "", `[{"t":"a"},{"t":"drop"}]`+"\n"+`{"t":"c"}`)
 	if code != 202 || !strings.Contains(resp, `"accepted":2`) || len(*events) != n+2 {
 		t.Errorf("ParseWAFAudit: %d %q events=%d", code, resp, len(*events)-n)
+	}
+	if len(auditPeers) != 3 {
+		t.Fatalf("ParseWAFAudit called %d times, want 3", len(auditPeers))
+	}
+	for _, peer := range auditPeers {
+		if peer.Transport != "http" || peer.Addr != "127.0.0.1" || peer.CN != "" {
+			t.Errorf("ParseWAFAudit lost the HTTP sender identity: %+v", peer)
+		}
 	}
 }
 
