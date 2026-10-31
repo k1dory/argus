@@ -2,10 +2,12 @@
 // место расчёта ритма, юнит-тест его не видит. Фикстура: непрерывный источник, пачка
 // 15 минут раз в сутки, непрерывный с одним двухсуточным провалом, телеметрия мимо
 // коллектора (только events, без heartbeat). Нужен ARGUS_TEST_CLICKHOUSE_URL.
-import { test } from "node:test";
+import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
-import { ch, liveSkip as skip, runMigration } from "./_ch-live";
+import { serializeLiveFile, ch, liveSkip as skip, runMigration } from "./_ch-live";
 import { SILENCE_MIN_SEC } from "../src/lib/shared/source-health";
+
+serializeLiveFile({ before, after });
 
 /* eslint-disable @typescript-eslint/no-require-imports -- модуль читает env при загрузке */
 const q = () => require("../src/lib/argus-queries") as typeof import("../src/lib/argus-queries");
