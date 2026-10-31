@@ -30,6 +30,8 @@ import { fmtNum, formatTs } from "@/lib/shared/time";
 import { agentVerdictsFor, incidentComments, incidentFirstResponse, incidentGet, incidentStateHistory, blockCandidatesFor, verdictGet, responseLog, respondStatus, triageVerdictClaim, INCIDENT_STATUSES } from "@/lib/argus-queries";
 import { MarkdownBody } from "@/components/console/markdown-body";
 import { VERDICT_RU } from "@/lib/shared/triage-verdict";
+import { closureLabelText, isOpsIncident } from "@/lib/shared/closure-label";
+import { hideVerdicts } from "@/lib/blind";
 
 export const dynamic = "force-dynamic";
 
@@ -58,15 +60,19 @@ export default async function IncidentPage({ params }: PageProps<"/incidents/[id
   const inc = r.data;
   if (!inc) notFound();
 
+  // Слепая выборка: до завершения консоль не показывает вердикт агента и анализ
+  // модели — ответ человека должен быть независим от них. Не запрашиваем вовсе,
+  // чтобы ничего не утекло в разметку страницы.
+  const blind = hideVerdicts(inc);
   const [vr, ur, rr, cr, hr, fr, tr, ar] = await Promise.all([
-    safeQuery(() => verdictGet(id)),
+    safeQuery(() => blind ? Promise.resolve(null) : verdictGet(id)),
     safeQuery(() => session.role === "admin" ? listUsers() : Promise.resolve([])),
     safeQuery(() => responseLog({ incidentId: id, limit: 20 })),
     safeQuery(() => incidentComments(id)),
     safeQuery(() => incidentStateHistory(id)),
     safeQuery(() => incidentFirstResponse(id)),
     safeQuery(() => triageVerdictClaim(id)),
-    safeQuery(() => agentVerdictsFor(id)),
+    safeQuery(() => blind ? Promise.resolve([]) : agentVerdictsFor(id)),
   ]);
   const triageClaim = tr.ok ? tr.data : null;
   const agentVerdicts = ar.ok ? ar.data : [];
@@ -81,7 +87,7 @@ export default async function IncidentPage({ params }: PageProps<"/incidents/[id
   const mitre = inc.tags.filter((t) => t.startsWith("attack.t")).map((t) => t.replace("attack.", "").toUpperCase());
   const blockable = blockCandidatesFor(inc);
   const closure = closingEvent(inc.status, changes);
-  const markdown = incidentMarkdown(inc, verdict, changes, comments, { verdict: !vr.ok, history: !hr.ok, comments: !cr.ok });
+  const markdown = incidentMarkdown(inc, verdict, changes, comments, { verdict: !vr.ok, history: !hr.ok, comments: !cr.ok, blind });
   // Активные блокировки движка — только когда есть кому их снимать и что показывать.
   const respond = canEdit ? await respondStatus() : null;
   const activeBlocks = (respond?.active ?? []).filter((b) => b.incident === inc.incident_id || blockable.includes(b.ip));
@@ -118,7 +124,15 @@ export default async function IncidentPage({ params }: PageProps<"/incidents/[id
       </Alert>}
       <div className="grid min-w-0 gap-6 xl:grid-cols-[minmax(0,1.15fr)_minmax(0,1fr)]">
         <div className="flex min-w-0 flex-col gap-6">
-          {(triageClaim || agentVerdicts.length > 0) && (
+          {blind && (
+            <Panel label="Разбор вслепую" meta="подсказки скрыты до завершения">
+              <p className="text-sm text-muted-foreground">
+                Инцидент попал в слепую выборку: вердикт агента и анализ модели появятся после завершения.
+                Ответ при закрытии сохраняется с пометкой «вслепую» — по таким ответам проверяется качество подсказок.
+              </p>
+            </Panel>
+          )}
+          {!blind && (triageClaim || agentVerdicts.length > 0) && (
             <Panel label="Разбор агентом" meta={agentVerdicts.length ? `${fmtNum(agentVerdicts.length)} вердикт(ов) · новые первыми` : "отметка без вердикта"}>
               {agentVerdicts.length > 0 ? (
                 <ol className="space-y-4">
@@ -151,6 +165,7 @@ export default async function IncidentPage({ params }: PageProps<"/incidents/[id
               {!hr.ok ? <p role="status" className="text-sm text-muted-foreground">История завершения временно недоступна.</p> : <dl className="grid gap-x-4 gap-y-2 text-sm sm:grid-cols-[9rem_1fr]">
                 <dt className="text-muted-foreground">Кем</dt><dd>{closure ? closure.kind === "auto_close" ? "ARGUS (автоматически)" : closure.actor : "не зафиксировано в истории"}</dd>
                 <dt className="text-muted-foreground">Когда</dt><dd>{closure ? formatTs(closure.changed_at) : "не зафиксировано в истории"}</dd>
+                {closure && closureLabelText(closure) && <><dt className="text-muted-foreground">Ответ</dt><dd>{closureLabelText(closure)}</dd></>}
                 <dt className="text-muted-foreground">Причина</dt><dd className="whitespace-pre-wrap">{closure?.reason || "не зафиксирована"}</dd>
               </dl>}
             </Panel>
@@ -235,13 +250,14 @@ export default async function IncidentPage({ params }: PageProps<"/incidents/[id
               <div className="c-label">История изменений {changes.length === 200 ? "// последние 200" : `// ${changes.length}`}</div>
               <ol className="space-y-1 font-mono text-xs">
                 {changes.map((change) => <li key={change.event_id} className="border-l border-border pl-3">
-                  {formatTs(change.changed_at)} · {change.actor} · {change.kind === "take" ? "взял в работу" : change.kind === "assign" ? "назначил" : change.kind === "auto_close" ? "закрыто автоматически" : "изменил статус"} · {INCIDENT_STATUSES[change.status] ?? change.status}{change.owner ? ` · ${change.owner}` : ""}{change.reason ? ` · причина: ${change.reason}` : ""}
+                  {formatTs(change.changed_at)} · {change.actor} · {change.kind === "take" ? "взял в работу" : change.kind === "assign" ? "назначил" : change.kind === "auto_close" ? "закрыто автоматически" : "изменил статус"} · {INCIDENT_STATUSES[change.status] ?? change.status}{change.owner ? ` · ${change.owner}` : ""}{closureLabelText(change) ? ` · ${closureLabelText(change)}` : ""}{change.reason ? ` · причина: ${change.reason}` : ""}
                 </li>)}
               </ol>
             </div>}
             {canEdit ? <IncidentStatusForm
               incidentId={inc.incident_id}
               status={inc.status}
+              ops={isOpsIncident(inc.tags)}
               owner={inc.owner}
               currentUser={session.user}
               isAdmin={session.role === "admin"}

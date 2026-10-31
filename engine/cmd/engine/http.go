@@ -137,7 +137,8 @@ func (e *engine) handler() http.Handler {
 			return
 		}
 		var in workflowRequest
-		dec := json.NewDecoder(io.LimitReader(r.Body, 4096))
+		// 8 КиБ: причина до 2000 символов кириллицы (4 КиБ в UTF-8) плюс метка.
+		dec := json.NewDecoder(io.LimitReader(r.Body, 8192))
 		dec.DisallowUnknownFields()
 		if err := dec.Decode(&in); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "некорректная операция"})

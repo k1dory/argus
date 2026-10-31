@@ -143,16 +143,22 @@ test("setIncidentStatus: статус из прототипа (toString/construc
     assert.match(res.error ?? "", /Неизвестный статус/, status);
   }
   const calls: unknown[][] = [];
-  mocks.queries.incidentGet = async () => ({ incident_id: "INC-1", rule_id: "r1", actor_name: "", node: "", owner: "analyst1", status: "in_progress" });
+  mocks.queries.incidentGet = async () => ({ incident_id: "INC-1", rule_id: "r1", actor_name: "", node: "", owner: "analyst1", status: "in_progress", tags: ["attack.t1110"] });
   mocks.queries.incidentTransition = async (...args) => void calls.push(args);
-  const ok = await incidents.setIncidentStatusAction({ error: null }, formData({ incident_id: "INC-1", status: "closed", reason: "Проверены события, угрозы нет" }));
+  // Завершение без метки ответа отклоняется до движка.
+  const unlabeled = await incidents.setIncidentStatusAction({ error: null }, formData({ incident_id: "INC-1", status: "closed", reason: "Проверены события, угрозы нет" }));
+  assert.match(unlabeled.error ?? "", /характер срабатывания/);
+  assert.equal(calls.length, 0);
+  const ok = await incidents.setIncidentStatusAction({ error: null }, formData({ incident_id: "INC-1", status: "closed", reason: "Проверены события, угрозы нет",
+    disposition: "benign_authorized", escalate: "no", severity_correct: "yes" }));
   assert.equal(ok.error, null);
-  assert.deepEqual(calls, [[{ id: "INC-1", kind: "status", status: "closed", reason: "Проверены события, угрозы нет", actor: "analyst1", role: "analyst" }]]);
+  assert.deepEqual(calls, [[{ id: "INC-1", kind: "status", status: "closed", reason: "Проверены события, угрозы нет", actor: "analyst1", role: "analyst",
+    label: { disposition: "benign_authorized", escalate: false, severity_correct: true } }]]);
   assert.ok(mocks.audit.some((e) => e.action === "incident.status" && e.target === "INC-1" && e.user === "analyst1"));
 });
 
 test("комментарий доступен аналитику без назначения; статус только после взятия, передача только администратору", async () => {
-  const current = { incident_id: "INC-22", rule_id: "r1", actor_name: "", node: "", owner: "", status: "new" };
+  const current = { incident_id: "INC-22", rule_id: "r1", actor_name: "", node: "", owner: "", status: "new", tags: ["argus.system", "ops.storage"] };
   const writes: unknown[][] = [];
   const comments: unknown[][] = [];
   mocks.queries.incidentGet = async () => ({ ...current });
@@ -189,7 +195,12 @@ test("комментарий доступен аналитику без назн
   assert.match((await incidents.setIncidentStatusAction({ error: null }, formData({ incident_id: "INC-22", status: "closed" }))).error ?? "", /Сначала возьмите/);
   await login("analyst2");
   assert.equal((await incidents.takeIncidentAction({ error: null }, formData({ incident_id: "INC-22" }))).error, null);
-  assert.equal((await incidents.setIncidentStatusAction({ error: null }, formData({ incident_id: "INC-22", status: "closed", reason: "Проверена цепочка событий, угрозы нет" }))).error, null);
+  // Эксплуатационное правило: вместо вердикта ИБ — причина и действие DevOps.
+  assert.match((await incidents.setIncidentStatusAction({ error: null }, formData({ incident_id: "INC-22", status: "closed", reason: "Проверена цепочка событий, угрозы нет",
+    disposition: "malicious", escalate: "no", severity_correct: "yes" }))).error ?? "", /причину и действие/);
+  assert.equal((await incidents.setIncidentStatusAction({ error: null }, formData({ incident_id: "INC-22", status: "closed", reason: "Проверена цепочка событий, угрозы нет",
+    ops_cause: "planned_work", ops_action: "no_action" }))).error, null);
+  assert.deepEqual((writes.at(-1)?.[0] as { label?: unknown }).label, { ops_cause: "planned_work", ops_action: "no_action" });
 });
 
 test("blockIp: аудит строго до вызова движка; недоступный журнал отменяет блокировку; адрес — только из цепочки", async () => {

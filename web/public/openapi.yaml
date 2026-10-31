@@ -358,6 +358,49 @@ paths:
         "429": { $ref: "#/components/responses/TooManyRequests" }
         "503": { $ref: "#/components/responses/StorageUnavailable" }
 
+  /api/incidents/labels:
+    get:
+      tags: [incidents]
+      summary: Ответы людей при завершении инцидентов
+      description: |
+        Типизированные метки, поставленные человеком при завершении (миграция 0033):
+        для правил ИБ — `disposition`, `escalate`, `severity_correct`; для эксплуатационных
+        (теги `ops.*`) — `ops_cause`, `ops_action`. `blind` — инцидент разбирался вслепую:
+        до закрытия консоль не показывала вердикт агента и анализ модели. Автозакрытия
+        (`kind: auto_close`) не выдаются — их статус `closed` не ответ человека. По времени
+        завершения, с `since` включительно. Лимит выгрузок; сессии разбора закрыт.
+      operationId: listIncidentLabels
+      security:
+        - cookieSession: []
+        - apiToken: []
+      parameters:
+        - name: since
+          in: query
+          schema: { type: string, example: "2026-11-01" }
+          description: Начало периода, дата или дата-время ISO 8601 в UTC. По умолчанию — всё.
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 50000, default: 10000 }
+      responses:
+        "200":
+          description: Метки по времени завершения.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [labels, truncated, exported_at]
+                properties:
+                  labels:
+                    type: array
+                    items: { $ref: "#/components/schemas/IncidentLabel" }
+                  truncated: { type: boolean, description: "Выдано ровно limit строк — продолжить с последнего changed_at." }
+                  exported_at: { type: string, format: date-time }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/OutOfScope" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "503": { $ref: "#/components/responses/StorageUnavailable" }
+
   /api/incidents/{id}:
     get:
       tags: [incidents]
@@ -1533,6 +1576,32 @@ components:
         status: { $ref: "#/components/schemas/IncidentStatus" }
         owner: { type: string }
         reason: { type: string }
+        disposition: { type: string, description: "malicious | benign_authorized | false_positive; пусто — метки нет" }
+        escalate: { type: [boolean, "null"] }
+        severity_correct: { type: [boolean, "null"] }
+        ops_cause: { type: string }
+        ops_action: { type: string }
+        blind: { type: boolean }
+        labeled_by_human: { type: boolean }
+    IncidentLabel:
+      type: object
+      required: [incident_id, changed_at, actor, status, disposition, escalate, severity_correct, ops_cause, ops_action, blind, reason, rule_id, rule_title, level, tags]
+      properties:
+        incident_id: { $ref: "#/components/schemas/IncidentIdString" }
+        changed_at: { $ref: "#/components/schemas/ChTimestamp" }
+        actor: { type: string }
+        status: { type: string, enum: [closed, false_positive] }
+        disposition: { type: string, enum: ["", malicious, benign_authorized, false_positive] }
+        escalate: { type: [boolean, "null"] }
+        severity_correct: { type: [boolean, "null"] }
+        ops_cause: { type: string, enum: ["", real_failure, planned_work, monitoring_noise, wrong_threshold] }
+        ops_action: { type: string, enum: ["", fixed, no_action, rule_tuned, handed_over] }
+        blind: { type: boolean }
+        reason: { type: string }
+        rule_id: { type: string }
+        rule_title: { type: string }
+        level: { type: string }
+        tags: { type: array, items: { type: string } }
     IncidentComment:
       type: object
       required: [comment_id, incident_id, created_at, author, body]
@@ -1602,6 +1671,9 @@ components:
           oneOf:
             - $ref: "#/components/schemas/EngineVerdict"
             - type: "null"
+        verdict_hidden:
+          type: boolean
+          description: Инцидент разбирается вслепую и ещё не завершён — анализ модели скрыт (verdict = null).
         actions:
           type: array
           items: { $ref: "#/components/schemas/AuditRow" }

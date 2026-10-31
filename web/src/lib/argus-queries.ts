@@ -22,6 +22,7 @@ function engineError(scope: string, err: unknown): string {
 }
 export { INCIDENT_STATUSES, EXCEPTION_FIELDS, isIncidentStatus, type IncidentStatus } from "./shared/incidents";
 import { isIncidentStatus, type IncidentStatus } from "./shared/incidents";
+import type { ClosureLabel } from "./shared/closure-label";
 
 
 export type IncidentRow = {
@@ -116,9 +117,11 @@ export class IncidentWorkflowError extends Error {}
 
 export async function incidentTransition(input: {
   id: string; kind: "take" | "assign" | "status"; status?: IncidentStatus; owner?: string; reason?: string; actor: string; role: "viewer" | "analyst" | "admin";
+  /** Ответ человека — только при завершении; движок отклонит переход без него. */
+  label?: ClosureLabel;
 }): Promise<void> {
   // id — в пути, не в теле: движок разбирает тело с DisallowUnknownFields
-  // (workflowRequest: actor, role, kind, status, owner, reason), и лишнее поле
+  // (workflowRequest: actor, role, kind, status, owner, reason, label), и лишнее поле
   // превращало каждое «Взять», «Назначить» и смену статуса в 400.
   const { id, ...body } = input;
   const r = await fetch(`${engineBase()}/incidents/${encodeURIComponent(id)}/workflow`, {
@@ -185,15 +188,59 @@ export type IncidentStateEvent = {
   status: IncidentStatus;
   owner: string;
   reason: string;
+  /** Метка ответа (миграция 0033); у переходов без завершения и у автоматики пустая. */
+  disposition: string;
+  escalate: boolean | null;
+  severity_correct: boolean | null;
+  ops_cause: string;
+  ops_action: string;
+  blind: boolean;
+  labeled_by_human: boolean;
 };
 
 export async function incidentStateHistory(id: string, limit = 200): Promise<IncidentStateEvent[]> {
   const rows = await chQuery<IncidentStateEvent>(
-    `SELECT event_id, revision, changed_at, actor, kind, status, owner, reason
+    `SELECT event_id, revision, changed_at, actor, kind, status, owner, reason,
+            disposition, escalate, severity_correct, ops_cause, ops_action, blind, labeled_by_human
      FROM incident_state_events WHERE incident_id = {id:String}
      ORDER BY revision DESC LIMIT {limit:UInt32}`, { id, limit: Math.min(10_000, Math.max(1, Math.floor(limit))) },
   );
   return rows.reverse().map((row) => ({ ...row, revision: Number(row.revision) }));
+}
+
+/** Метка ответа человека для выгрузки (обучение, доля ложных срабатываний правила). */
+export type IncidentLabelRow = {
+  incident_id: string; changed_at: string; actor: string; status: IncidentStatus;
+  disposition: string; escalate: boolean | null; severity_correct: boolean | null;
+  ops_cause: string; ops_action: string; blind: boolean; reason: string;
+  rule_id: string; rule_title: string; level: string; tags: string[];
+};
+
+/** Ответы людей при завершении с `since` (включительно), по времени. Только
+ *  labeled_by_human: автозакрытия (kind auto_close) пишут тот же статус closed и
+ *  без этого фильтра выдавались бы за ответ человека. Повторное завершение
+ *  одного инцидента — отдельная строка (переоткрытия в консоли нет, но журнал
+ *  append-only). Правило, уровень и теги — последняя версия инцидента. */
+export async function incidentLabels(since: string, limit: number): Promise<IncidentLabelRow[]> {
+  return chQuery<IncidentLabelRow>(
+    `WITH labels AS (
+       SELECT incident_id, changed_at, actor, status, disposition, escalate, severity_correct,
+              ops_cause, ops_action, blind, reason
+       FROM incident_state_events
+       WHERE labeled_by_human AND kind = 'status' AND status IN ('closed', 'false_positive')
+         AND changed_at >= parseDateTime64BestEffort({since:String}, 3, 'UTC')
+       ORDER BY changed_at, incident_id LIMIT {limit:UInt32}
+     )
+     SELECT l.*, i.rule_id, i.rule_title, i.level, i.tags
+     FROM labels AS l
+     LEFT JOIN (
+       SELECT incident_id, argMax(rule_id, updated_at) AS rule_id, argMax(rule_title, updated_at) AS rule_title,
+              argMax(level, updated_at) AS level, argMax(tags, updated_at) AS tags
+       FROM incidents WHERE incident_id IN (SELECT incident_id FROM labels) GROUP BY incident_id
+     ) AS i USING incident_id
+     ORDER BY l.changed_at, l.incident_id`,
+    { since, limit },
+  );
 }
 
 export type IncidentClosure = { incident_id: string; actor: string; kind: string; changed_at: string; reason: string };
