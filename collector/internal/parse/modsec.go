@@ -26,6 +26,7 @@ type WAF struct {
 	ServerName  string
 	UserAgent   string
 	Status      int
+	UnixNano    int64  // время транзакции из unix_timestamp (Coraza), 0 — нет
 	EngineMode  string // On | DetectionOnly | Off
 	UniqueID    string
 	Rules       []WAFRule
@@ -48,15 +49,16 @@ type WAFRule struct {
 
 type modsecAudit struct {
 	Transaction struct {
-		Time       string `json:"time_stamp"` // ModSecurity
-		Timestamp  string `json:"timestamp"`  // Coraza
-		ClientIP   string `json:"client_ip"`
-		ClientPort int    `json:"client_port"`
-		HostIP     string `json:"host_ip"`
-		HostPort   int    `json:"host_port"`
-		ServerID   string `json:"server_id"`
-		UniqueID   string `json:"unique_id"`
-		ID         string `json:"id"`
+		Time       string      `json:"time_stamp"`     // ModSecurity
+		Timestamp  string      `json:"timestamp"`      // Coraza, локальное время без зоны
+		UnixTS     json.Number `json:"unix_timestamp"` // Coraza: наносекунды (time.Unix(0, tx.Timestamp))
+		ClientIP   string      `json:"client_ip"`
+		ClientPort int         `json:"client_port"`
+		HostIP     string      `json:"host_ip"`
+		HostPort   int         `json:"host_port"`
+		ServerID   string      `json:"server_id"`
+		UniqueID   string      `json:"unique_id"`
+		ID         string      `json:"id"`
 		// IsInterrupted — Coraza: движок прервал транзакцию (disruptive action). Код ответа
 		// при этом в аудит не попадает (response.status: null), так что блок виден только здесь.
 		IsInterrupted bool `json:"is_interrupted"`
@@ -123,6 +125,12 @@ func ParseWAFAudit(b []byte) (WAF, bool) {
 		Status: firstNonZero(t.Response.HTTPCode, t.Response.Status), UniqueID: firstNonEmpty(t.UniqueID, t.ID),
 		EngineMode: firstNonEmpty(t.Producer.Engine, t.Producer.RuleEngine), MaxSeverity: -1,
 	}
+	if n, err := t.UnixTS.Int64(); err == nil && n > 0 {
+		if n < 1e12 { // старые сборки и чужие генераторы — секунды
+			n *= int64(1e9)
+		}
+		w.UnixNano = n
+	}
 	if strings.Contains(strings.ToLower(t.Producer.Connector+t.Producer.Server+t.Producer.ModSecurity), "coraza") || t.Producer.RuleEngine != "" {
 		w.Product = "coraza"
 	}
@@ -146,7 +154,9 @@ func ParseWAFAudit(b []byte) (WAF, bool) {
 		}
 		if d.RuleID == "" && rawString(d.ID) == "" && d.Msg == "" && m.ErrorMessage != "" {
 			if loc := wafMarkRe.FindStringSubmatchIndex(m.ErrorMessage); loc != nil {
-				denied = denied || strings.HasPrefix(m.ErrorMessage[loc[2]:loc[3]], "Access denied")
+				if loc[4] >= 0 {
+					denied = denied || wafBlockAction(m.ErrorMessage[loc[4]:loc[5]])
+				}
 				var mw WAF
 				if r, ok := parseRuleMeta(m.ErrorMessage[loc[1]:], &mw); ok {
 					w.addRule(r)
@@ -187,7 +197,9 @@ var (
 	kvRe     = regexp.MustCompile(`\[([a-z_]+) "((?:[^"\\]|\\.)*)"\]`)
 	clientRe = regexp.MustCompile(`\[client "?([0-9a-fA-F.:]+)(?::\d+)?"?\]`)
 	// Coraza пишет «Access denied (phase 2).» без кода — код ответа в строке не указан.
-	wafMarkRe = regexp.MustCompile(`(?:ModSecurity|Coraza): (Warning|Access denied(?: with (?:code (\d+)|redirect|connection close)| \(phase \d\)))`)
+	// Coraza 3.8 (rule_match.go ErrorLog): «Access denied|dropped|redirected|allowed (phase N).»;
+	// группы: 1 — маркер целиком, 2 — действие, 3 — код ответа (только ModSecurity).
+	wafMarkRe = regexp.MustCompile(`(?:ModSecurity|Coraza): (Warning|Access (denied|dropped|redirected|allowed)(?: with (?:code (\d+)|redirect|connection close)| \(phase \d\))?)`)
 	// метаданные правила начинаются с [file "…"] — всё до него (в т.ч. Value: `…' атакующего) не разбираем
 	fileTagRe = regexp.MustCompile(`\[file "`)
 )
@@ -224,9 +236,11 @@ func ParseWAFErrorLine(line string) (WAF, bool) {
 	if c := clientRe.FindStringSubmatch(text[:loc[0]]); c != nil {
 		w.ClientIP = c[1]
 	}
-	denied := strings.HasPrefix(m[1], "Access denied")
-	if m[2] != "" {
-		w.Status, _ = strconv.Atoi(m[2])
+	// denied/dropped/redirected — движок прервал запрос; allowed — явное разрешение правилом.
+	decision := m[2] != ""
+	denied := wafBlockAction(m[2])
+	if m[3] != "" {
+		w.Status, _ = strconv.Atoi(m[3])
 	}
 	if r, ok := parseRuleMeta(text[loc[1]:], &w); ok {
 		w.addRule(r)
@@ -237,8 +251,13 @@ func ParseWAFErrorLine(line string) (WAF, bool) {
 	if denied {
 		w.EngineMode, w.Blocked = "On", true
 	}
-	w.Final = denied || w.hasFinalRule()
+	w.Final = decision || w.hasFinalRule()
 	return w, true
+}
+
+// wafBlockAction — действие из маркера error-лога прерывает запрос (allow — нет).
+func wafBlockAction(a string) bool {
+	return a == "denied" || a == "dropped" || a == "redirected"
 }
 
 // parseRuleMeta — метаданные правила из хвоста строки error-лога после маркера.
