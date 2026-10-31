@@ -76,3 +76,28 @@ func TestQNAPSecondNASFaultCreatesNewIncident(t *testing.T) {
 		t.Fatalf("wrong identity or mixed evidence for second NAS: %+v", created[0])
 	}
 }
+
+// Independent detections must remain independent in the incident registry:
+// the engine sends incident notifications only for Registry.Apply's created list.
+func TestQNAPSecondDiskFaultCreatesNewIncident(t *testing.T) {
+	r := qnapStorageRule(t)
+	reg := NewRegistry(0, nil)
+	first := qnapStorageEvent("QNAP-2", 3, 0)
+	created, _, _ := reg.Apply(eval.Run([]*rules.Rule{r}, []*model.Event{first}), first.Time().Add(time.Second))
+	if len(created) != 1 || created[0].Node != "QNAP-2" {
+		t.Fatalf("initial disk incident: %+v", created)
+	}
+	firstIncident := created[0]
+	firstID := firstIncident.IncidentID
+	second := qnapStorageEvent("QNAP-2", 4, 1)
+	created, updated, _ := reg.Apply(eval.Run([]*rules.Rule{r}, []*model.Event{first, second}), second.Time().Add(time.Second))
+	if len(created) != 1 {
+		t.Fatalf("second disk on the same NAS needs its own incident/notification: created=%d updated=%d, first incident=%s; updating the first disk incident is insufficient", len(created), len(updated), firstID)
+	}
+	if created[0].Node != "QNAP-2" || created[0].IncidentID == firstID || created[0].EventCount != 1 || len(created[0].Events) != 1 || created[0].Events[0].Object != second.Object {
+		t.Fatalf("wrong identity or mixed evidence for second disk: %+v", created[0])
+	}
+	if firstIncident.EventCount != 1 || len(firstIncident.Events) != 1 || firstIncident.Events[0].Object != first.Object {
+		t.Fatalf("second disk replaced the first disk's evidence: %+v", firstIncident)
+	}
+}
