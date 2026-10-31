@@ -2,8 +2,10 @@
 // интервалами, классификация событий, резолв, контракт identities, Markdown.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import {
-  actorMarkdown, aliasEventsQuery, aliasPrefilter, aliasInterval, canonicalIp, canonicalPhone, aliasPredicate, ambiguousAliases, bucketEvents, classifyEvent, clampWindow, holdPolicy, isHeld, isIp, isPhone, normalizeAliasValue, parseActorsParams, parseAliasInput, parseDateInput, parseIdentitiesDoc,
+  ACTOR_KEYS_EXPR, actorMarkdown, aliasEventsQuery, aliasPrefilter, aliasInterval, canonicalIp, canonicalPhone, aliasPredicate, ambiguousAliases, bucketEvents, classifyEvent, clampWindow, holdPolicy, isHeld, isIp, isPhone, normalizeAliasValue, parseActorsParams, parseAliasInput, parseDateInput, parseIdentitiesDoc,
   primaryAlias, rangeWindow, resolveStatus, aliasKey, aliasMatches, activeAliases, ACTOR_KINDS, type ActorReport, type Alias,
 } from "../src/lib/shared/actors";
 import { toLogItem } from "../src/lib/shared/log-query";
@@ -249,15 +251,17 @@ test("алиасы на удержании: confidence < 0.5 — видны, н�
   assert.ok(md.includes("Алиасы «на удержании»"), "раздел «чего нет в данных» объясняет удержание");
 });
 
-test("aliasPrefilter: колонка IN массив, регистр по виду, удержанные мимо, кавычки экранированы", () => {
+test("aliasPrefilter: hasAny по ключам индекса idx_actor_keys, регистр по виду, удержанные мимо, кавычки экранированы", () => {
   const mk = (kind: Alias["kind"], value: string, confidence = 1): Alias => ({ person_id: "p", kind, value, valid_from: "2026-10-01 00:00:00.000", valid_to: null, source: "yaml", confidence, note: "" });
-  const pf = aliasPrefilter([mk("email", "a@x.org"), mk("login", "o'neil"), mk("ip", "10.0.0.5"), mk("uid", "authentik:7"), mk("login", "held", 0.3), mk("host", "srv1")]);
-  assert.match(pf.sql, /lowerUTF8\(actor_name\) IN \{pf_\d:Array\(String\)\}/);
-  assert.match(pf.sql, /\bactor_name IN \{pf_\d:Array\(String\)\}/);
-  assert.match(pf.sql, /src_ip IN \{pf_\d:Array\(String\)\}/);
-  assert.match(pf.sql, /lowerUTF8\(node\) IN/);
-  const all = Object.values(pf.params).join(" ");
+  const pf = aliasPrefilter([mk("email", "A@X.org"), mk("login", "o'neil"), mk("ip", "10.0.0.5"), mk("uid", "Authentik:7"), mk("login", "held", 0.3), mk("host", "SRV1")]);
+  assert.equal(pf.sql, `hasAny(${ACTOR_KEYS_EXPR}, {pf_keys:Array(String)})`);
+  // Выражение совпадает с индексом миграции дословно — иначе ClickHouse его не применит.
+  const migration = readFileSync(path.join(__dirname, "../../clickhouse/migrations/0032_events_actor_keys_index.sql"), "utf8");
+  assert.ok(migration.includes(`idx_actor_keys ${ACTOR_KEYS_EXPR} TYPE bloom_filter`), "ACTOR_KEYS_EXPR = выражение индекса");
+  const all = pf.params.pf_keys as string;
   assert.ok(all.includes("'o\\'neil'"), all);
+  assert.ok(all.includes("'a@x.org'") && all.includes("'srv1'"), "email/host — в нижнем регистре, как в точном предикате");
+  assert.ok(all.includes("'Authentik:7'"), "uid — как есть");
   assert.ok(!all.includes("held"));
   assert.ok(!pf.sql.includes("a@x.org"), "значения только параметрами");
   assert.equal(aliasPrefilter([]).sql, "0");

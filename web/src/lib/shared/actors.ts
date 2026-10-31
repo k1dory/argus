@@ -274,30 +274,29 @@ export function aliasPredicate(aliases: Alias[], window: Window, prefix = "", ts
 export const chStringArray = (values: string[]): string =>
   `[${values.map((v) => `'${v.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`).join(",")}]`;
 
+/** Выражение skip-индекса idx_actor_keys (миграция 0032): все колонки, с которыми
+ *  сравниваются алиасы, в том виде, в каком их сравнивает aliasColumnExpr. Текст должен
+ *  совпадать с индексом дословно — иначе ClickHouse индекс не применит. */
+export const ACTOR_KEYS_EXPR = "[actor_name, lowerUTF8(actor_name), src_ip, lowerUTF8(node)]";
+
 /**
- * Грубый фильтр строк по значениям алиасов без интервалов: колонка IN массив
- * значений. Ставится в WHERE рядом с точными countIf(aliasPredicate), чтобы
- * точный подсчёт шёл по тысячам совпавших строк, а не по всему окну
- * (на живом потоке 7 суток — 100+ млн строк, сотни OR в countIf не
- * укладывались в 20 с). Удержанные алиасы, как и в aliasPredicate, не участвуют.
+ * Грубый фильтр строк по значениям алиасов без интервалов: hasAny(ключи строки,
+ * массив значений). Ставится в WHERE рядом с точным aliasPredicate: bloom-индекс
+ * idx_actor_keys отсекает гранулы для любой смеси видов алиасов (login OR ip …),
+ * чего OR по отдельным индексам не умеет, и точный предикат с интервалами идёт по
+ * тысячам совпавших строк, а не по всему окну (на живом потоке 7 суток — 100+ млн
+ * строк). Значения — как их сравнивает aliasPredicate (compareValue), поэтому
+ * фильтр не уже точного предиката. Удержанные алиасы не участвуют.
  */
 export function aliasPrefilter(aliases: Alias[], prefix = "pf_"): Predicate {
-  const byExpr = new Map<string, Set<string>>();
+  const values = new Set<string>();
   for (const a of aliases) {
     if (isHeld(a)) continue;
-    const expr = aliasColumnExpr(a.kind);
-    if (!byExpr.has(expr)) byExpr.set(expr, new Set());
-    byExpr.get(expr)!.add(a.value);
+    values.add(compareValue(a));
   }
-  const params: Record<string, string | number> = {};
-  const parts: string[] = [];
-  let i = 0;
-  for (const [expr, values] of [...byExpr.entries()].sort(([a], [b]) => a.localeCompare(b))) {
-    const name = `${prefix}${i++}`;
-    params[name] = chStringArray([...values].sort());
-    parts.push(`${expr} IN {${name}:Array(String)}`);
-  }
-  return { sql: parts.length ? `(${parts.join(" OR ")})` : "0", params };
+  if (!values.size) return { sql: "0", params: {} };
+  const name = `${prefix}keys`;
+  return { sql: `hasAny(${ACTOR_KEYS_EXPR}, {${name}:Array(String)})`, params: { [name]: chStringArray([...values].sort()) } };
 }
 
 /** Действует ли алиас в момент at. */
