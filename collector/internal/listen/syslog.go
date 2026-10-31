@@ -15,6 +15,7 @@ type Peer struct {
 	Addr      string // IP отправителя (или метка файла)
 	Transport string // udp | tcp | tls | http | file
 	CN        string // CommonName клиентского сертификата при mTLS
+	Node      string // узел по умолчанию для событий без узла (node: файлового источника)
 }
 
 // LineHandler получает одну строку syslog и сведения об отправителе.
