@@ -18,10 +18,11 @@ deploy: verify-images ## Прод: образы версии из реестра
 	APP_VERSION=$(APP_VERSION) docker compose pull
 	APP_VERSION=$(APP_VERSION) docker compose up -d --no-build
 
-verify-images: ## Проверить подписи cosign образов версии (COSIGN_PUBKEY в .env; пусто — предупреждение). .env не source'ится: значения с пробелами (MCP_ALLOWED_NETS) ломали sh
+verify-images: ## Проверить подписи cosign образов версии (COSIGN_PUBKEY, ARGUS_IMAGE_PREFIX — из окружения или .env; пусто — предупреждение)
 	@set -e; \
-	COSIGN_PUBKEY=$$(sed -n 's/^COSIGN_PUBKEY=//p' .env 2>/dev/null | tr -d '"'); \
-	ARGUS_IMAGE_PREFIX=$$(sed -n 's/^ARGUS_IMAGE_PREFIX=//p' .env 2>/dev/null | tr -d '"'); \
+	envval() { sed -n "s/^$$1=//p" .env 2>/dev/null | head -n1 | sed -e "s/[[:space:]]*#.*$$//" -e "s/^[\"']//" -e "s/[\"']$$//"; }; \
+	COSIGN_PUBKEY="$${COSIGN_PUBKEY:-$$(envval COSIGN_PUBKEY)}"; \
+	ARGUS_IMAGE_PREFIX="$${ARGUS_IMAGE_PREFIX:-$$(envval ARGUS_IMAGE_PREFIX)}"; \
 	if [ -z "$$COSIGN_PUBKEY" ]; then echo "verify-images: COSIGN_PUBKEY не задан — подписи не проверяются"; exit 0; fi; \
 	command -v cosign >/dev/null || { echo "verify-images: cosign не установлен, а COSIGN_PUBKEY задан"; exit 1; }; \
 	for s in shipper policyd collector engine web mcp; do \

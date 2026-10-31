@@ -7,6 +7,7 @@ import Module from "node:module";
 import path from "node:path";
 import os from "node:os";
 import fs from "node:fs";
+import { blockCandidates, RESPOND_MODES } from "../src/lib/shared/respond";
 import { ResponseCookies } from "next/dist/compiled/@edge-runtime/cookies";
 
 export type AuditEntry = { user: string; action: string; target: string; detail: string };
@@ -16,6 +17,7 @@ export type QueryMocks = {
   audit: (user: string, action: string, target: string, detail?: string, opts?: { strict?: boolean }) => Promise<void>;
   incidentGet: (id: string) => Promise<Record<string, unknown> | null>;
   requestBlockIp: (...args: unknown[]) => Promise<{ error?: string; results?: { executor: string; ok: boolean; detail: string }[] }>;
+  blockCandidatesFor: (inc: { actor_name: string; chain: string[] }) => string[];
   requestUnblockIp: (...args: unknown[]) => Promise<{ error?: string; results?: { executor: string; ok: boolean; detail: string }[] }>;
   requestReanalyze: (id: string) => Promise<string | null>;
   addException: (...args: unknown[]) => Promise<void>;
@@ -31,6 +33,8 @@ export type QueryMocks = {
   incidentStateHistory: (id: string, limit?: number) => Promise<unknown[]>;
   verdictGet: (id: string) => Promise<unknown>;
   sourcesHealth: () => Promise<unknown[]>;
+  /** По умолчанию — sourcesHealth без пропущенных, чтобы тесты, подменяющие sourcesHealth, работали и для маршрута. */
+  sourcesHealthReport: () => Promise<{ sources: unknown[]; omitted: number }>;
   incidentsList: (...args: unknown[]) => Promise<unknown>;
   saveTriageRevocation: (sessionId: string, incidentId: string, expiresAt: string) => Promise<void>;
   triageRevocations: () => Promise<Map<string, number>>;
@@ -41,6 +45,19 @@ export type QueryMocks = {
   saveAgentVerdict: (row: Record<string, unknown>) => Promise<void>;
   agentVerdictsFor: (incidentId: string, limit?: number) => Promise<Record<string, unknown>[]>;
   agentVerdictBySession: (incidentId: string, sessionId: string) => Promise<Record<string, unknown> | null>;
+  /** Запросы страниц консоли (обзор, лента, источники, правила, настройки): по умолчанию — пусто. */
+  incidentStats: () => Promise<{ total: number; open: number; escalated: number; pii: number }>;
+  eventsByClass: (hours: number) => Promise<{ source_class: string; count: number; sources: number }[]>;
+  eventsRecent: (source?: string, limit?: number) => Promise<Record<string, unknown>[]>;
+  engineRules: () => Promise<{ rules: Record<string, unknown>[]; health: Record<string, unknown> | null; error: string | null }>;
+  rulesFalsePositives: () => Promise<Record<string, { rule_id: string; total: number; false_positive: number; closed: number }>>;
+  listExceptions: () => Promise<Record<string, unknown>[]>;
+  auditTail: (limit?: number) => Promise<Record<string, unknown>[]>;
+  licenseStats: () => Promise<{ peak_eps_30d: number; avg_eps_7d: number; events_30d: number; retention_days: number; sources: number }>;
+  respondStatus: () => Promise<Record<string, unknown>>;
+  responseLog: (opts?: { incidentId?: string; limit?: number }) => Promise<Record<string, unknown>[]>;
+  verdictsFor: (ids: string[]) => Promise<Record<string, Record<string, unknown>>>;
+  incidentClosuresFor: (ids: string[]) => Promise<Record<string, Record<string, unknown>>>;
 };
 
 type WazuhApi = typeof import("../src/lib/wazuh-api");
@@ -111,6 +128,7 @@ export function installNextMocks(): Mocks {
     },
     incidentGet: async () => null,
     requestBlockIp: async () => ({ error: "движок недоступен" }),
+    blockCandidatesFor: (inc) => blockCandidates(inc.actor_name, inc.chain),
     requestUnblockIp: async () => ({ error: "движок недоступен" }),
     requestReanalyze: async () => "движок недоступен",
     addException: async () => undefined,
@@ -125,6 +143,7 @@ export function installNextMocks(): Mocks {
     incidentStateHistory: async () => [],
     verdictGet: async () => null,
     sourcesHealth: async () => [],
+    sourcesHealthReport: async () => ({ sources: await queries.sourcesHealth(), omitted: 0 }),
     incidentsList: async () => ({ rows: [], total: 0, page: 1, pageSize: 50 }),
     saveTriageRevocation: async () => undefined,
     triageRevocations: async () => new Map(),
@@ -135,6 +154,18 @@ export function installNextMocks(): Mocks {
     saveAgentVerdict: async () => undefined,
     agentVerdictsFor: async () => [],
     agentVerdictBySession: async () => null,
+    incidentStats: async () => ({ total: 0, open: 0, escalated: 0, pii: 0 }),
+    eventsByClass: async () => [],
+    eventsRecent: async () => [],
+    engineRules: async () => ({ rules: [], health: null, error: null }),
+    rulesFalsePositives: async () => ({}),
+    listExceptions: async () => [],
+    auditTail: async () => [],
+    licenseStats: async () => ({ peak_eps_30d: 0, avg_eps_7d: 0, events_30d: 0, retention_days: 180, sources: 0 }),
+    respondStatus: async () => ({ mode: "simulate", mode_from: "config", enabled: false, ttl: "", allowlist: [], active: [], config_errors: [], pending: 0, requested: null }),
+    responseLog: async () => [],
+    verdictsFor: async () => ({}),
+    incidentClosuresFor: async () => ({}),
   };
   const argusQueries = require.resolve(path.resolve(__dirname, "../src/lib/argus-queries"));
   const delegate = Object.fromEntries(
@@ -146,6 +177,8 @@ export function installNextMocks(): Mocks {
     INCIDENT_STATUSES: shared.INCIDENT_STATUSES,
     EXCEPTION_FIELDS: shared.EXCEPTION_FIELDS,
     isIncidentStatus: shared.isIncidentStatus,
+    RESPOND_MODES,
+    STALE_SOURCES_LIMIT: 2000,
   });
   // wazuh-api: настоящий модуль за делегатом (tests/_wazuh-delegate.ts), чтобы
   // тест мог подменить одну функцию. Резолв «./wazuh-api» перенаправляется на

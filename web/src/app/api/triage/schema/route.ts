@@ -10,7 +10,7 @@ const body = JSON.stringify(VERDICT_SCHEMA);
 const etag = `"${createHash("sha256").update(body).digest("hex").slice(0, 32)}"`;
 
 export async function GET(req: Request): Promise<Response> {
-  const guard = await apiGuard(req, "default", { triage: true });
+  const guard = await apiGuard(req, "default", { triage: true, uncharged: true }); // схема статична — бюджет сессии не тратим
   if (guard.response) return guard.response;
   if (!guard.session.triage) return Response.json({ error: "нужен токен triage-session" }, { status: 403 });
   const headers = { "Content-Type": "application/schema+json; charset=utf-8", ETag: etag, "Cache-Control": "private, max-age=3600", "X-Argus-Schema-Version": VERDICT_SCHEMA_VERSION };

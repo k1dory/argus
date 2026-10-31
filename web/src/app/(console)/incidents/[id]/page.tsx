@@ -27,7 +27,7 @@ import { closingEvent, incidentMarkdown } from "@/lib/shared/incident-wiki";
 import { reactionDeadline, reactionLate, reactionOverdue } from "@/lib/shared/incident-sla";
 import { parseSimilarLine } from "@/lib/shared/incident-lines";
 import { fmtNum, formatTs } from "@/lib/shared/time";
-import { agentVerdictsFor, incidentComments, incidentFirstResponse, incidentGet, incidentStateHistory, blockCandidates, verdictGet, responseLog, respondStatus, triageVerdictClaim, INCIDENT_STATUSES } from "@/lib/argus-queries";
+import { agentVerdictsFor, incidentComments, incidentFirstResponse, incidentGet, incidentStateHistory, blockCandidatesFor, verdictGet, responseLog, respondStatus, triageVerdictClaim, INCIDENT_STATUSES } from "@/lib/argus-queries";
 import { MarkdownBody } from "@/components/console/markdown-body";
 import { VERDICT_RU } from "@/lib/shared/triage-verdict";
 
@@ -79,7 +79,7 @@ export default async function IncidentPage({ params }: PageProps<"/incidents/[id
   const missing = [!vr.ok && "анализ модели", !ur.ok && "список сотрудников", !rr.ok && "журнал реагирования", !cr.ok && "записи команды", !hr.ok && "история изменений", !fr.ok && "время первой реакции", !ar.ok && "вердикты агента"].filter(Boolean);
 
   const mitre = inc.tags.filter((t) => t.startsWith("attack.t")).map((t) => t.replace("attack.", "").toUpperCase());
-  const blockable = blockCandidates(inc.actor_name, inc.chain);
+  const blockable = blockCandidatesFor(inc);
   const closure = closingEvent(inc.status, changes);
   const markdown = incidentMarkdown(inc, verdict, changes, comments, { verdict: !vr.ok, history: !hr.ok, comments: !cr.ok });
   // Активные блокировки движка — только когда есть кому их снимать и что показывать.
