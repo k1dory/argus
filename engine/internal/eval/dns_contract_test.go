@@ -1,10 +1,10 @@
 package eval
 
 import (
+	"bufio"
 	"encoding/json"
-	"errors"
-	"io"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -113,16 +113,22 @@ func TestDNSTunnelReferenceFixtures(t *testing.T) {
 			}
 			defer f.Close()
 			var events []*model.Event
-			dec := json.NewDecoder(f)
-			for {
+			scan := bufio.NewScanner(f)
+			scan.Buffer(make([]byte, 4096), 1024*1024)
+			for scan.Scan() {
+				line := strings.TrimSpace(scan.Text())
+				if line == "" || strings.HasPrefix(line, "#") {
+					continue
+				}
 				var e model.Event
-				if err := dec.Decode(&e); errors.Is(err, io.EOF) {
-					break
-				} else if err != nil {
+				if err := json.Unmarshal([]byte(line), &e); err != nil {
 					t.Fatal(err)
 				}
 				e.Ensure()
 				events = append(events, &e)
+			}
+			if err := scan.Err(); err != nil {
+				t.Fatal(err)
 			}
 			if len(events) == 0 {
 				t.Fatal("empty regression fixture")
