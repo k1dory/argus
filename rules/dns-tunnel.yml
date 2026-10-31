@@ -7,14 +7,17 @@ tags: [attack.command_and_control, attack.t1071.004]
 
 # Только исходящий DNS (attrs.scope outbound): запросы к своим резолверам и форвардеру на
 # шлюзе — internal, под правило не попадают; туннель идёт на внешний сервер напрямую.
-# NetFlow сюда не входит: по потоку имени запроса не видно, а порог «> 200 байт»
-# превышает любой DNS по TCP (рукопожатие и заголовки). Трафик на порт 53, который
+# Положительный признак журнала DNS — DNS-действие (event.dns, dns.query…) и имя
+# запроса attrs.dns_query (коллектор берёт его из domain/query/qname вендора).
+# «Не NetFlow» недостаточно: журнал соединений NGFW на порт 53 (session.allow, без
+# имени запроса) давал сработку на 40 обычных UDP-потоках. Трафик на порт 53, который
 # не похож на DNS по размеру пакетов, ловит правило port53-non-dns.
 detection:
   selection:
+    event.action|contains: dns
+    attrs.dns_query: 'regex \S'
     dst.port: 53
     attrs.scope: outbound
-    source.class: 'not netflow'
     bytes: '> 200'
   threshold:
     count: 40
