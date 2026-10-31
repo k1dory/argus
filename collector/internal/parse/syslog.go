@@ -28,6 +28,8 @@ type Syslog struct {
 	// Zoneless — время из заголовка RFC 3164 без часового пояса: разобрано как UTC,
 	// а на деле это местное время отправителя (см. InZone).
 	Zoneless bool
+	// yearless — в заголовке нет и года: InZone выбирает его заново по часам пояса.
+	yearless bool
 }
 
 // ParseSyslog принимает строку с PRI или без; никогда не теряет сообщение.
@@ -181,11 +183,7 @@ func parse3164(s Syslog, rest string) (Syslog, error) {
 		if t, err := time.Parse("Jan _2 15:04:05", rest[:15]); err == nil {
 			// BSD-формат без года: подставляем текущий; «31 декабря» в первых
 			// числах января — это прошлый год, а не событие из будущего
-			cur := now()
-			s.Timestamp, s.Zoneless = time.Date(cur.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, time.UTC), true
-			if s.Timestamp.After(cur.Add(24 * time.Hour)) {
-				s.Timestamp = s.Timestamp.AddDate(-1, 0, 0)
-			}
+			s.Timestamp, s.Zoneless, s.yearless = withYear(t, time.UTC), true, true
 			rest = strings.TrimLeft(rest[15:], " ")
 		}
 	}
@@ -222,8 +220,25 @@ func (s Syslog) InZone(loc *time.Location) Syslog {
 		return s
 	}
 	t := s.Timestamp
+	if s.yearless {
+		// Год выбирается по календарю отправителя: в Москве уже 1 января, когда в UTC
+		// ещё 31 декабря, и «Jan 1» — это наступивший год, а не прошлый.
+		s.Timestamp = withYear(t, loc).UTC()
+		return s
+	}
 	s.Timestamp = time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), loc).UTC()
 	return s
+}
+
+// withYear ставит времени без года (месяц, день, часы) текущий год по часам loc;
+// «31 декабря» в первых числах января — это прошлый год, а не событие из будущего.
+func withYear(t time.Time, loc *time.Location) time.Time {
+	cur := now().In(loc)
+	ts := time.Date(cur.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), loc)
+	if ts.After(cur.Add(24 * time.Hour)) {
+		ts = ts.AddDate(-1, 0, 0)
+	}
+	return ts
 }
 
 // PeerZones — часовые пояса отправителей syslog без пояса в заголовке

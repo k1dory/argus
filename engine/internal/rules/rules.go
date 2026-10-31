@@ -59,6 +59,9 @@ type Rule struct {
 		// (нормальный замер между нарушениями). Такие события движок держит в
 		// буфере наравне с selection и close_on.
 		Reset map[string]any `yaml:"reset"`
+		// GroupBy — ключ склейки правила без порога (у порога — threshold.group_by),
+		// по умолчанию actor.name. Составной ключ — поля через запятую: «node, object».
+		GroupBy string `yaml:"group_by"`
 	} `yaml:"detection"`
 	Enrich    []any          `yaml:"enrich"` // edr.process_tree: 120s | ngfw.sessions: 120s | cmdb.owner
 	Analyst   Analyst        `yaml:"analyst"`
@@ -226,6 +229,9 @@ func (r *Rule) Window() time.Duration {
 func (r *Rule) GroupBy() string {
 	if r.Detection.Threshold != nil && r.Detection.Threshold.GroupBy != "" {
 		return r.Detection.Threshold.GroupBy
+	}
+	if r.Detection.GroupBy != "" {
+		return r.Detection.GroupBy
 	}
 	return "actor.name"
 }
@@ -407,6 +413,9 @@ func LoadFile(path string) (*Rule, error) {
 	default:
 		return nil, fmt.Errorf("auto_close_action %q: ожидается close или escalate", r.AutoCloseAction)
 	}
+	if gb := r.GroupBy(); Getter(gb) == nil {
+		return nil, fmt.Errorf("group_by: неизвестное поле %q", gb)
+	}
 	for _, f := range r.CloseMatch {
 		if Getter(f) == nil {
 			return nil, fmt.Errorf("close_match: неизвестное поле %q", f)
@@ -543,6 +552,29 @@ func asList(v any) []string {
 
 // Getter — доступ к полю события по имени из правила.
 func Getter(field string) func(*model.Event) string {
+	if strings.Contains(field, ",") {
+		// Составной ключ: значения полей через «|»; пустой, только если пусты все поля
+		// (тогда groupKey подставит субъект, узел или адрес, как для одного поля).
+		var parts []func(*model.Event) string
+		for _, f := range strings.Split(field, ",") {
+			g := Getter(strings.TrimSpace(f))
+			if g == nil {
+				return nil
+			}
+			parts = append(parts, g)
+		}
+		return func(e *model.Event) string {
+			vals, empty := make([]string, len(parts)), true
+			for i, g := range parts {
+				vals[i] = g(e)
+				empty = empty && vals[i] == ""
+			}
+			if empty {
+				return ""
+			}
+			return strings.Join(vals, "|")
+		}
+	}
 	switch field {
 	case "event.action", "action":
 		return func(e *model.Event) string { return e.Action }
