@@ -298,7 +298,9 @@ func cursorHTTPStore(t *testing.T, rows []eventRow) (*ClickHouse, func(eventRow)
 // но finishSlice перепрыгивает через неё и очищает Seen. Проверка через
 // EventsSince показывает потерю поздней строки с меньшим ключом после LIMIT.
 func TestEventsSinceRereadsLastSecondAfterBurst(t *testing.T) {
-	at := time.Now().UTC().Add(-time.Minute).Truncate(time.Second)
+	// Вставка опаздывает лишь на секунду за cursorSettle, у live-края.
+	// Это контракт последней прочитанной секунды, не произвольный backfill.
+	at := time.Now().UTC().Add(-cursorSettle - time.Second).Truncate(time.Second)
 	makeRow := func(h uint64) eventRow {
 		return eventRow{Event: &model.Event{TS: model.FormatTS(at), Action: fmt.Sprintf("raw-%d", h)}, ReceivedAt: at, Hash: h}
 	}
