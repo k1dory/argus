@@ -3,6 +3,15 @@
 Версия стека — в файле `VERSION`, схема ClickHouse версионируется миграциями
 в `clickhouse/migrations/` (журнал — таблица `argus.schema_migrations`).
 
+## Не выпущено
+
+- **`/api/sources` отвечал 503 после rc28.** Проверка готовности проекции `p_source_last`
+  читает `system.parts`, а у пользователя `argus_console` этого права не было (ClickHouse 497).
+  Тесты на живом ClickHouse шли под администратором и этого не видели. `migrate.sh` выдаёт
+  консоли `SELECT(database, table, active, projections) ON system.parts`; новый тест
+  `sources-console-role-ch` запускает отчёт под точными правами консоли из `migrate.sh`.
+  Существующей установке достаточно повторить `migrate.sh` — гранты декларативны.
+
 ## 1.0.0-rc28 — 2026-10-30
 
 Сохранность состояния детектов и догон движка (по разбору живого ClickHouse argus1:
