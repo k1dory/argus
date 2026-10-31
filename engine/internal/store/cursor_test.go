@@ -322,6 +322,67 @@ func TestEventsSinceRereadsLastSecondAfterBurst(t *testing.T) {
 	}
 }
 
+// Лимит в production не меняется между опросами. После возврата к live-краю
+// первая страница может целиком состоять из Seen; это не повод повторять её
+// бесконечно. Проверяем публичный EventsSince, включая SQL и finishSlice.
+func TestEventsSinceReplayFullSeenPageMakesProgress(t *testing.T) {
+	const limit = 3
+	at := time.Now().UTC().Add(-cursorSettle - time.Second).Truncate(time.Second)
+	makeRow := func(at time.Time, h uint64, action string) eventRow {
+		return eventRow{Event: &model.Event{TS: model.FormatTS(at), Action: action}, ReceivedAt: at, Hash: h}
+	}
+	c, insert := cursorHTTPStore(t, []eventRow{
+		makeRow(at, 10, "first-10"), makeRow(at, 20, "first-20"), makeRow(at, 30, "first-30"),
+	})
+	cur := StartCursor(at)
+	cur.Step = time.Hour
+	seen := map[string]int{}
+	finished := false
+	for page := 0; page < 8; page++ {
+		events, next, err := c.EventsSince(context.Background(), cur, limit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, event := range events {
+			seen[event.Action]++
+		}
+		cur = next
+		if !cur.More {
+			finished = true
+			break
+		}
+	}
+	if !finished || len(seen) != 3 {
+		t.Fatalf("первый опрос должен прочитать три строки и закончиться: seen=%v cursor=%+v", seen, cur)
+	}
+	// Следующая секунда уже устоялась. Курсор должен пропустить старые Seen и
+	// дойти до неё с тем же LIMIT, без повторной выдачи прежних трёх событий.
+	insert(makeRow(at.Add(time.Second), 40, "next-second"))
+	finished = false
+	for page := 0; page < 8; page++ {
+		events, next, err := c.EventsSince(context.Background(), cur, limit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, event := range events {
+			seen[event.Action]++
+		}
+		cur = next
+		if !cur.More {
+			finished = true
+			break
+		}
+	}
+	if !finished || seen["next-second"] != 1 {
+		t.Fatalf("повторное чтение полной страницы Seen зациклилось: LIMIT=%d seen=%v cursor=%+v", limit, seen, cur)
+	}
+	for action, count := range seen {
+		if count != 1 {
+			t.Fatalf("дедупликация нарушена: %s отдано %d раз", action, count)
+		}
+	}
+}
+
 // Верх среза исключительный, низ следующего включительный. Дырки расширяют
 // окно, но не должны пропускать записи на стыках или выдавать их повторно.
 func TestEventsSinceEmptySlicesAndBoundaries(t *testing.T) {
