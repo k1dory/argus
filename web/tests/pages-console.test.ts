@@ -345,7 +345,9 @@ test("поиск: результаты, фасеты, пагинация; инд
   ];
   let text = await pageText(await search.default(props({}, { q: "root", range: "7d", index: "events", from: "2026-10-28T00:00", page: "2" })));
   assert.match(text, /Распределение · 60 записей/);
-  assert.match(text, /Результаты · стр\. 2 из 2/);
+  // Строки приходят раньше гистограммы; точный итог появляется в отдельном пейджере.
+  assert.match(text, /Результаты · стр\. 2/);
+  assert.match(text, /страница 2 из 2 · строки 51 – 60 из 60/, "точный итог и диапазон сохранены после загрузки гистограммы");
   assert.match(text, /203\.0\.113\.5/);
   assert.match(text, /сбросить интервал/);
   assert.match(text, /linux\.auth 60/, "фасет со счётчиком");
@@ -355,7 +357,8 @@ test("поиск: результаты, фасеты, пагинация; инд
 
   chDown = true;
   text = await pageText(await search.default(props({}, { q: "x" })));
-  assert.match(text, /Ничего не найдено|нет соединения|Хранилище недоступно/);
+  assert.match(text, /хранилище недоступно/i);
+  assert.doesNotMatch(text, /Ничего не найдено/, "сбой хранилища не должен выглядеть как пустая выдача");
 });
 
 /* ===== Журнал событий ===== */
