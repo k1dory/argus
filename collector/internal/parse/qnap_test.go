@@ -14,7 +14,7 @@ func TestQNAP(t *testing.T) {
 	}
 	cases := []struct {
 		line, action, outcome, actor, src, obj, log string
-		sev                                        uint8
+		sev                                         uint8
 	}{
 		{`<30>Oct 31 00:40:15 QNAP-2 qulogd[16075]: conn log: Users: admin, Source IP: 192.168.0.108, Computer name: ---, Connection type: HTTP, Accessed resources: Administration, Action: Login Success`, "auth.login", "success", "admin", "192.168.0.108", "Administration", "access", 1},
 		{`<30>Oct 31 00:40:09 QNAP-2 qulogd[16075]: conn log: Users: admin, Source IP: 192.168.0.108, Computer name: ---, Connection type: HTTP, Accessed resources: ---, Action: Logout`, "auth.logout", "success", "admin", "192.168.0.108", "", "access", 1},
