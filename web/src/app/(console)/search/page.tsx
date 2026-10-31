@@ -180,7 +180,7 @@ function SearchResults({
   const pager = (total: number, exact: boolean) => (
     <Pager
       page={plan.page}
-      pages={pageCount(total, exact, hasMore)}
+      pages={pageCount(total, exact, hasMore, plan.page)}
       total={exact ? total : undefined}
       pageSize={PAGE_SIZE}
       href={(p) => href({ page: p > 1 ? String(p) : undefined })}

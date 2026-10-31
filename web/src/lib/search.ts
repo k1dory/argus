@@ -464,10 +464,12 @@ export function lowerBoundTotal(plan: SearchPlan, rows: number): number {
 }
 
 /** Сколько страниц показать пейджеру: точный итог — по нему; нижняя граница —
- *  доказанные страницы плюс следующая, если она подтверждена лишней строкой. */
-export function pageCount(total: number, exact: boolean, hasMore: boolean): number {
+ *  доказанные страницы плюс следующая, если она подтверждена лишней строкой, но не
+ *  меньше текущей: пустая дальняя страница (page=100) без гистограммы не доказывает
+ *  ни одной строки, а ссылка назад на ней нужна. total при этом не завышается. */
+export function pageCount(total: number, exact: boolean, hasMore: boolean, page = 1): number {
   const proven = Math.ceil(total / PAGE_SIZE);
-  return Math.max(1, exact ? proven : proven + (hasMore ? 1 : 0));
+  return Math.max(1, exact ? proven : Math.max(page, proven + (hasMore ? 1 : 0)));
 }
 
 /** Поиск целиком для API: страница обязательна (её ошибка — ошибка ответа),
