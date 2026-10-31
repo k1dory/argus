@@ -10,7 +10,7 @@ import { SEARCH_SETTINGS } from "./search";
 import { chTs, LOG_COLUMNS, toLogItem, type LogItem } from "./shared/log-query";
 import type { TriageBinding } from "./shared/triage";
 import {
-  ACTOR_KINDS, activeAliases, aliasColumnExpr, aliasPredicate, aliasPrefilter, aliasActiveAt, aliasMatches, aliasKey, ambiguousAliases, bucketEvents, canonicalIp, canonicalPhone, clampWindow, CONFIRMED_NOTE_PREFIX, HOLD_NOTE_PREFIX, isAliasKind, isHeld, LOWERCASE_KINDS, normalizeAliasValue, rangeWindow, resolveStatus,
+  ACTOR_KEYS_EXPR, ACTOR_KINDS, activeAliases, aliasColumnExpr, aliasPredicate, aliasPrefilter, aliasActiveAt, aliasMatches, aliasKey, ambiguousAliases, bucketEvents, canonicalIp, canonicalPhone, chStringArray, clampWindow, CONFIRMED_NOTE_PREFIX, HOLD_NOTE_PREFIX, isAliasKind, isHeld, LOWERCASE_KINDS, normalizeAliasValue, rangeWindow, resolveStatus,
   type ActorIncident, type ActorRange, type ActorReport, type Alias, type AliasInput, type ClassCount, type IpStat, type NodeStat, type Person, type PersonInput, type ResolveMatch, type ResolveStatus, type SourceCoverage, type Window,
 } from "./shared/actors";
 
@@ -223,11 +223,20 @@ export async function aliasSightings(value: string, range: ActorRange, now = Dat
     ]);
     return { kind: "ip", rows: rows.map(toSighting), vpn: vpn.map((r) => ({ ...r, events: Number(r.events) })) };
   }
+  // Те же правила значения, что у алиасов (aliasColumn/compareValue): uid/sid/peer —
+  // actor_name точно, phone — в E.164, login/email — actor_name без учёта регистра,
+  // host — node без учёта регистра. Вид значения заранее неизвестен — проверяются все.
+  // hasAny по idx_actor_keys (0032) отсекает гранулы: каждое из условий ниже — один из ключей.
+  const v = value.trim();
+  const pv = canonicalPhone(v) ?? v;
+  const lv = v.toLowerCase();
   const rows = await chQuery<Row>(
     `SELECT source, action, actor_name AS who, node AS at_node, groupUniqArray(5)(src_ip) AS ips, count() AS events, toString(min(ts)) AS first_ts, toString(max(ts)) AS last_ts
-     FROM events WHERE ${ts} AND actor_name IN ({v:String}, {lv:String})
+     FROM events WHERE ${ts}
+       AND hasAny(${ACTOR_KEYS_EXPR}, {keys:Array(String)})
+       AND (actor_name IN ({v:String}, {pv:String}) OR lowerUTF8(actor_name) = {lv:String} OR lowerUTF8(node) = {lv:String})
      GROUP BY source, action, actor_name, node ORDER BY last_ts DESC LIMIT 100`,
-    { ...win, v: value, lv: value.toLowerCase() },
+    { ...win, v, pv, lv, keys: chStringArray([...new Set([v, pv, lv])].sort()) },
   );
   return { kind: "actor", rows: rows.map(toSighting), vpn: [] };
 }
