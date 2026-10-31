@@ -297,7 +297,8 @@ func finishSlice(cur, next Cursor, nrows, limit int, upto, now time.Time) Cursor
 //     быть прочитана не целиком — её строки откладываются, курсор встаёт на её
 //     начало, More — дочитать сразу;
 //   - выборка упёрлась в LIMIT внутри одной секунды (> limit строк за секунду):
-//     всё отдаётся, продолжение с максимального хеша (More); когда страница не
+//     всё отдаётся, продолжение с максимального хеша страницы, включая уже
+//     отданные из Seen (More); когда страница не
 //     полная, Hash сбрасывается — следующий опрос перечитает секунду с начала,
 //     дедупликация по Seen отдаст только новое;
 //   - иначе курсор — последняя секунда выборки, Seen — её строки.
@@ -333,6 +334,12 @@ func advanceCursor(cur Cursor, rows []eventRow, limit int, now time.Time) ([]*mo
 		if deferLast && r.ReceivedAt.Equal(last) {
 			continue
 		}
+		// Продолжение двигается и по уже отданным строкам: страница целиком из
+		// Seen иначе оставляла бы Hash на месте, и тот же LIMIT перечитывал бы
+		// её бесконечно, не доходя до следующих секунд.
+		if r.ReceivedAt.Equal(next.At) && truncated && !deferLast && r.Hash > next.Hash {
+			next.Hash = r.Hash
+		}
 		if r.ReceivedAt.Equal(cur.At) {
 			if _, ok := cur.Seen[r.Hash]; ok {
 				continue
@@ -341,9 +348,6 @@ func advanceCursor(cur Cursor, rows []eventRow, limit int, now time.Time) ([]*mo
 		out = append(out, r.Event)
 		if r.ReceivedAt.Equal(next.At) {
 			next.Seen[r.Hash] = struct{}{}
-			if truncated && !deferLast && r.Hash > next.Hash {
-				next.Hash = r.Hash
-			}
 		}
 	}
 	return out, next
