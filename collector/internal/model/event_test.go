@@ -190,3 +190,27 @@ func TestApproxSize(t *testing.T) {
 		t.Errorf("ApproxSize=%d", n)
 	}
 }
+
+// Имя DNS-запроса — в attrs.dns_query из вендорского ключа, только у DNS-действий;
+// своё значение не перезаписывается, у журнала соединений поле не появляется.
+func TestEnsureFillsDNSQuery(t *testing.T) {
+	for _, tc := range []struct {
+		action string
+		attrs  map[string]string
+		want   string
+	}{
+		{"event.dns", map[string]string{"domain": "a.example"}, "a.example"},
+		{"dns.query", map[string]string{"qname": " b.example "}, "b.example"},
+		{"event.dns", map[string]string{"query": "c.example", "domain": "x"}, "c.example"},
+		{"event.dns", map[string]string{"destinationDnsDomain": "d.example"}, "d.example"},
+		{"event.dns", map[string]string{"dns_query": "own", "domain": "x"}, "own"},
+		{"event.dns", map[string]string{}, ""},
+		{"session.allow", map[string]string{"domain": "e.example"}, ""},
+	} {
+		e := Event{Action: tc.action, Attrs: tc.attrs}
+		e.Ensure()
+		if got := e.Attrs["dns_query"]; got != tc.want {
+			t.Errorf("%s %v: dns_query %q, ожидалось %q", tc.action, tc.attrs, got, tc.want)
+		}
+	}
+}

@@ -386,6 +386,12 @@ test("список персон: каждая считается своим пр
   assert.match(ev.sql, /countIf\(\(\(lowerUTF8\(actor_name\) = \{p0_a0:String\}/, "предикат персоны 0 с её префиксом параметров");
   assert.ok(ev.sql.includes("AS e1") && ev.sql.includes("AS l1"), "вторая персона — свои колонки");
   assert.equal(ev.params.get("param_p0_a0"), "project_7_bot");
+  // Предфильтр в WHERE: без него точные countIf шли по всему окну и на живом потоке
+  // (100+ млн строк за 7 суток) упирались в max_execution_time.
+  assert.match(ev.sql, /WHERE ts >= .* AND \(.*IN \{pf_\d+:Array\(String\)\}/, "предфильтр по значениям алиасов");
+  const pfVals = [...ev.params.entries()].filter(([k]) => k.startsWith("param_pf_")).map(([, v]) => v).join(" ");
+  assert.ok(pfVals.includes("'project_7_bot'"), "значения алиасов — массивом-параметром");
+  assert.ok(!pfVals.includes("held_bot"), "удержанный алиас не фильтрует");
   const inc = calls.slice(from).find((c) => c.sql.includes("countIf(") && c.sql.includes("FROM incidents_current"))!;
   assert.ok(inc.sql.includes("first_ts >= parseDateTime64BestEffort({p0_f0:String}"), "инциденты — по first_ts алиаса");
   const petrov = list.find((p) => p.person_id === "i.petrov")!;

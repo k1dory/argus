@@ -3,7 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  actorMarkdown, aliasEventsQuery, aliasInterval, canonicalIp, canonicalPhone, aliasPredicate, ambiguousAliases, bucketEvents, classifyEvent, clampWindow, holdPolicy, isHeld, isIp, isPhone, normalizeAliasValue, parseActorsParams, parseAliasInput, parseDateInput, parseIdentitiesDoc,
+  actorMarkdown, aliasEventsQuery, aliasPrefilter, aliasInterval, canonicalIp, canonicalPhone, aliasPredicate, ambiguousAliases, bucketEvents, classifyEvent, clampWindow, holdPolicy, isHeld, isIp, isPhone, normalizeAliasValue, parseActorsParams, parseAliasInput, parseDateInput, parseIdentitiesDoc,
   primaryAlias, rangeWindow, resolveStatus, aliasKey, aliasMatches, activeAliases, ACTOR_KINDS, type ActorReport, type Alias,
 } from "../src/lib/shared/actors";
 import { toLogItem } from "../src/lib/shared/log-query";
@@ -247,4 +247,18 @@ test("алиасы на удержании: confidence < 0.5 — видны, н�
   const md = actorMarkdown(report);
   assert.ok(md.includes("| login | held\\_bot (на удержании: max\\_logins) | "), md);
   assert.ok(md.includes("Алиасы «на удержании»"), "раздел «чего нет в данных» объясняет удержание");
+});
+
+test("aliasPrefilter: колонка IN массив, регистр по виду, удержанные мимо, кавычки экранированы", () => {
+  const mk = (kind: Alias["kind"], value: string, confidence = 1): Alias => ({ person_id: "p", kind, value, valid_from: "2026-10-01 00:00:00.000", valid_to: null, source: "yaml", confidence, note: "" });
+  const pf = aliasPrefilter([mk("email", "a@x.org"), mk("login", "o'neil"), mk("ip", "10.0.0.5"), mk("uid", "authentik:7"), mk("login", "held", 0.3), mk("host", "srv1")]);
+  assert.match(pf.sql, /lowerUTF8\(actor_name\) IN \{pf_\d:Array\(String\)\}/);
+  assert.match(pf.sql, /\bactor_name IN \{pf_\d:Array\(String\)\}/);
+  assert.match(pf.sql, /src_ip IN \{pf_\d:Array\(String\)\}/);
+  assert.match(pf.sql, /lowerUTF8\(node\) IN/);
+  const all = Object.values(pf.params).join(" ");
+  assert.ok(all.includes("'o\\'neil'"), all);
+  assert.ok(!all.includes("held"));
+  assert.ok(!pf.sql.includes("a@x.org"), "значения только параметрами");
+  assert.equal(aliasPrefilter([]).sql, "0");
 });
