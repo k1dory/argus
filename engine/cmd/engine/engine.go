@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,6 +49,7 @@ type metrics struct {
 	notifySuppressed atomic.Int64 // уведомления, ушедшие в сводку или отброшенные лимитом
 	bufferEvents     atomic.Int64 // кандидатов в буфере после последнего цикла
 	bufferEvicted    atomic.Int64 // кандидатов выброшено сверх ENGINE_BUFFER_MAX (окно урезано)
+	absenceGroups    atomic.Int64 // групп правил «молчание» в отдельном состоянии (eval.AbsenceState)
 }
 
 type engine struct {
@@ -80,6 +82,11 @@ type engine struct {
 	respMu     sync.Mutex
 	respState  map[string]respEntry // incident_id → что автоответ уже решил
 	respCycles int                  // циклов с последней чистки respState по возрасту
+
+	// absence — последние события групп правил «молчание», вне буфера кандидатов:
+	// потолок буфера (ENGINE_BUFFER_MAX) их не выбрасывает. Пишет и читает только
+	// главный цикл (loop → ingest → cycle).
+	absence *eval.AbsenceState
 
 	excWarnMu sync.Mutex
 	excWarned map[string]bool
@@ -228,6 +235,7 @@ func newEngine(ctx context.Context, rulesDir string, rs []*rules.Rule, acfg anal
 		respState: map[string]respEntry{},
 		excWarned: map[string]bool{},
 		identFile: env("IDENTITIES_FILE", ""),
+		absence:   eval.NewAbsenceState(0),
 	}
 	e.rules.Store(&rs)
 	var identStore identity.Store
@@ -386,7 +394,10 @@ func (e *engine) retention(poll time.Duration) time.Duration {
 
 // trimBuffer оставляет кандидатов не старше cut (по received_at; без времени
 // приёма — оставляет) и не больше max штук (0 — без предела), выбрасывая самые
-// старые: буфер пополняется в порядке приёма. Возвращает выброшенных сверх max.
+// давно принятые. Буфер пополняется в порядке приёма, а оценка правил его не
+// переупорядочивает (eval.Evaluate сортирует копию); если порядок всё же нарушен,
+// буфер сначала упорядочивается по received_at (без времени приёма — как самые
+// свежие). Возвращает выброшенных сверх max.
 func trimBuffer(buffer []*model.Event, cut time.Time, max int) ([]*model.Event, int) {
 	kept := buffer[:0]
 	for _, ev := range buffer {
@@ -396,12 +407,53 @@ func trimBuffer(buffer []*model.Event, cut time.Time, max int) ([]*model.Event, 
 	}
 	evicted := 0
 	if max > 0 && len(kept) > max {
+		olderReceipt := func(a, b *model.Event) bool {
+			if a.ReceivedAt.IsZero() {
+				return false
+			}
+			return b.ReceivedAt.IsZero() || a.ReceivedAt.Before(b.ReceivedAt)
+		}
+		if !sort.SliceIsSorted(kept, func(i, j int) bool { return olderReceipt(kept[i], kept[j]) }) {
+			sort.SliceStable(kept, func(i, j int) bool { return olderReceipt(kept[i], kept[j]) })
+		}
 		evicted = len(kept) - max
 		fresh := make([]*model.Event, max)
 		copy(fresh, kept[evicted:])
 		kept = fresh
 	}
 	return kept, evicted
+}
+
+// ingest — одна страница опроса: алиасы субъектов из сырого потока, последние
+// события групп правил «молчание» (eval.AbsenceState — до любой чистки буфера,
+// потолок буфера их не касается) и кандидаты в буфер. Возвращает буфер и сколько
+// кандидатов выброшено сверх потолка внутри опроса.
+func (e *engine) ingest(ctx context.Context, rs []*rules.Rule, events []*model.Event, buffer []*model.Event) ([]*model.Event, int) {
+	// Алиасы субъектов — из сырого потока, до фильтра кандидатов:
+	// событию identity.alias правило не нужно; не записанные из-за
+	// хранилища повторяются на следующем цикле (observeIdentities).
+	if e.identity != nil {
+		e.observeIdentities(ctx, events)
+	}
+	// В буфере живут только кандидаты: события, которые проходят selection
+	// (кроме правил молчания — им хватает последнего события группы),
+	// close_on или reset хотя бы одного правила. При тысячах EPS это
+	// уменьшает буфер на порядки — оценка остаётся дешёвой.
+	for _, ev := range events {
+		if e.absence != nil {
+			e.absence.Observe(rs, ev)
+		}
+		if isCandidate(rs, ev) {
+			buffer = append(buffer, ev)
+		}
+	}
+	// Потолок держится и внутри опроса: хвост после рестарта (или шторм)
+	// иначе целиком ложится в память до первой чистки.
+	evicted := 0
+	if e.bufferMax > 0 && len(buffer) > e.bufferMax+e.bufferMax/10 {
+		buffer, evicted = trimBuffer(buffer, time.Time{}, e.bufferMax)
+	}
+	return buffer, evicted
 }
 
 func (e *engine) loop(ctx context.Context, poll time.Duration) {
@@ -424,25 +476,9 @@ func (e *engine) loop(ctx context.Context, poll time.Duration) {
 		polled, evicted := 0, 0
 		next, err := e.pollEvents(ctx, cursor, func(events []*model.Event) {
 			polled += len(events)
-			// Алиасы субъектов — из сырого потока, до фильтра кандидатов:
-			// событию identity.alias правило не нужно; не записанные из-за
-			// хранилища повторяются на следующем цикле (observeIdentities).
-			e.observeIdentities(ctx, events)
-			// В буфере живут только кандидаты: события, которые проходят
-			// selection или close_on хотя бы одного правила. При тысячах EPS
-			// это уменьшает буфер на порядки — оценка остаётся дешёвой.
-			for _, ev := range events {
-				if isCandidate(rs, ev) {
-					buffer = append(buffer, ev)
-				}
-			}
-			// Потолок держится и внутри опроса: хвост после рестарта (или шторм)
-			// иначе целиком ложится в память до первой чистки.
-			if e.bufferMax > 0 && len(buffer) > e.bufferMax+e.bufferMax/10 {
-				var n int
-				buffer, n = trimBuffer(buffer, time.Time{}, e.bufferMax)
-				evicted += n
-			}
+			var n int
+			buffer, n = e.ingest(ctx, rs, events, buffer)
+			evicted += n
 		})
 		if err != nil {
 			slog.Warn("events", "err", err)
@@ -451,8 +487,11 @@ func (e *engine) loop(ctx context.Context, poll time.Duration) {
 			cursor = next
 			e.m.eventsPolled.Add(int64(polled))
 			var n int
-			buffer, n = trimBuffer(buffer, time.Now().Add(-e.retention(poll)), e.bufferMax)
+			cut := time.Now().Add(-e.retention(poll))
+			buffer, n = trimBuffer(buffer, cut, e.bufferMax)
 			evicted += n
+			e.absence.Prune(rs, cut)
+			e.m.absenceGroups.Store(int64(e.absence.Len()))
 			if evicted > 0 {
 				e.m.bufferEvicted.Add(int64(evicted))
 				slog.Warn("buffer: кандидатов больше ENGINE_BUFFER_MAX — самые старые выброшены, окно широких правил урезано", "evicted", evicted, "max", e.bufferMax, "polled", polled)
@@ -510,7 +549,7 @@ func (e *engine) cycle(ctx context.Context, rs []*rules.Rule, buffer []*model.Ev
 	}
 	exc = eval.SanitizeExceptions(exc, e.warnException)
 	now := time.Now()
-	dets, closers := eval.Evaluate(eval.Input{Rules: rs, Events: buffer, Now: now, Exceptions: exc})
+	dets, closers := eval.Evaluate(eval.Input{Rules: rs, Events: buffer, Now: now, Exceptions: exc, Absence: e.absence})
 	created, updated, dropped := e.reg.Apply(dets, now)
 	var toWrite []*incidents.Incident
 	engineClosed := map[string]bool{}
@@ -694,9 +733,12 @@ func wazuhPlaceholderPassword(w *respond.WazuhAR, envURL, envPass string) string
 	return ""
 }
 
+// isCandidate — событие нужно буферу: проходит selection правила (кроме правил
+// молчания — для них последнее событие группы держит eval.AbsenceState), его
+// close_on или reset.
 func isCandidate(rs []*rules.Rule, ev *model.Event) bool {
 	for _, r := range rs {
-		if r.Match(ev) || r.MatchClose(ev) || r.MatchReset(ev) {
+		if (!r.IsAbsence() && r.Match(ev)) || r.MatchClose(ev) || r.MatchReset(ev) {
 			return true
 		}
 	}
