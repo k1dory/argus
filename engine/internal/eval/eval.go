@@ -40,6 +40,10 @@ type Input struct {
 	Events     []*model.Event
 	Now        time.Time              // точка «сейчас» для absence; zero → max ts событий
 	Exceptions map[string][]Exception // rule_id → исключения
+	// Absence — последние события групп правил «молчание», накопленные из потока
+	// независимо от буфера (живой движок). nil — группы строятся только по Events
+	// (replay и тесты правил: там весь трафик в памяти).
+	Absence *AbsenceState
 }
 
 // Run — совместимая обёртка: правила по событиям, без исключений и closers.
@@ -48,8 +52,13 @@ func Run(rs []*rules.Rule, events []*model.Event) []Detection {
 	return dets
 }
 
+// Evaluate не меняет порядок in.Events: правила идут по времени источника (ts),
+// а буфер движка хранится в порядке приёма — по нему он чистится от старых
+// событий. Сортировка на месте выбрасывала при чистке задержанные логи свежего
+// приёма и оставляла давно принятые.
 func Evaluate(in Input) ([]Detection, []Closer) {
-	events := in.Events
+	events := make([]*model.Event, len(in.Events))
+	copy(events, in.Events)
 	sort.SliceStable(events, func(i, j int) bool { return events[i].Time().Before(events[j].Time()) })
 	now := in.Now
 	if now.IsZero() && len(events) > 0 {
@@ -68,7 +77,7 @@ func Evaluate(in Input) ([]Detection, []Closer) {
 				}
 			}
 		}
-		dets = append(dets, runRule(r, filtered, now)...)
+		dets = append(dets, runRule(r, filtered, now, in.Absence.last(r.ID), exc)...)
 		if len(r.CloseOn) > 0 {
 			keyOf := rules.Getter(r.GroupBy())
 			for _, e := range filtered {
@@ -147,7 +156,10 @@ type window struct {
 	fired  bool
 }
 
-func runRule(r *rules.Rule, events []*model.Event, now time.Time) []Detection {
+// runRule — сработки одного правила. absence — последние события групп правила
+// молчания из AbsenceState (nil вне живого движка); exc — исключения правила,
+// применяются и к ним.
+func runRule(r *rules.Rule, events []*model.Event, now time.Time, absence map[string]*model.Event, exc []Exception) []Detection {
 	keyOf := rules.Getter(r.GroupBy())
 	th := r.Detection.Threshold
 	win := r.Window()
@@ -230,14 +242,27 @@ func runRule(r *rules.Rule, events []*model.Event, now time.Time) []Detection {
 	}
 
 	if kind == "absence" {
-		keys := make([]string, 0, len(groups))
-		for k := range groups {
+		// Последнее событие группы — позднейшее из буфера и из состояния молчания:
+		// буфер мог потерять его при чистке по потолку, состояние — нет.
+		lastOf := map[string]*model.Event{}
+		for k, g := range groups {
+			lastOf[k] = g.events[len(g.events)-1]
+		}
+		for k, e := range absence {
+			if len(exc) > 0 && excluded(e, exc) {
+				continue
+			}
+			if cur, ok := lastOf[k]; !ok || e.Time().After(cur.Time()) {
+				lastOf[k] = e
+			}
+		}
+		keys := make([]string, 0, len(lastOf))
+		for k := range lastOf {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
-			g := groups[k]
-			last := g.events[len(g.events)-1]
+			last := lastOf[k]
 			silence := now.Sub(last.Time())
 			if silence >= win {
 				out = append(out, Detection{Rule: r, Key: k, Events: []*model.Event{last}, First: last.Time(), Last: last.Time(),

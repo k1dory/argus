@@ -1,0 +1,12 @@
+-- Устойчивый ключ строки события для курсора движка. Раньше движок считал
+-- cityHash64(…, raw) при чтении, а в той же выборке стоял `'' AS raw`: ClickHouse
+-- подставляет алиас внутрь выражения, и две строки, различающиеся только исходным
+-- логом, получали один хеш — при повторном чтении секунды вторая пропускалась.
+-- Теперь ключ считается из колонок таблицы при вставке (MATERIALIZED: в SELECT *
+-- не попадает, вставкам указывать не нужно). Для старых партов ClickHouse
+-- вычисляет значение тем же выражением при чтении — результат совпадает, курсор
+-- работает сразу. Материализация на старых партах — необязательная разовая мутация
+-- (переписывает колонку event_id, на 120 млн строк — минуты, нагрузка на диск):
+--   ALTER TABLE argus.events MATERIALIZE COLUMN event_id;
+-- Идемпотентно.
+ALTER TABLE argus.events ADD COLUMN IF NOT EXISTS event_id UInt64 MATERIALIZED cityHash64(received_at, ts, source, source_class, action, outcome, severity, actor_name, actor_kind, object, node, session_id, src_ip, src_port, dst_ip, dst_port, proto, bytes, packets, value, unit, pii, arrayStringConcat(arrayMap(k -> concat(k, '=', attrs[k]), arraySort(mapKeys(attrs))), ';'), raw);

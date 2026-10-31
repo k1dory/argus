@@ -21,6 +21,21 @@ jobs:
     strategy:
       matrix:
         module: [collector, engine, policyd, mcp, triage]
+        # Живой ClickHouse нужен только движку: engine/internal/store/live_test.go
+        # (все миграции с нуля и каждый запрос хранилища на настоящей базе). Пустой
+        # image — сервис не запускается: остальные модули не ждут лишний контейнер.
+        include:
+          - module: engine
+            clickhouse: clickhouse/clickhouse-server:24.8
+    services:
+      clickhouse:
+        image: ${{ matrix.clickhouse || '' }}
+        env:
+          CLICKHOUSE_DB: argus
+          CLICKHOUSE_USER: default
+          CLICKHOUSE_PASSWORD: ci-only
+        ports:
+          - 8123:8123
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
@@ -32,6 +47,10 @@ jobs:
         run: |
           cd ${{ matrix.module }} && test -z "$(gofmt -l .)" || { gofmt -l .; echo 'gofmt: файлы не отформатированы'; exit 1; }
       - name: vet + test (с детектором гонок)
+        env:
+          # Без сервиса переменная пустая — живые тесты пропускаются.
+          ARGUS_TEST_CLICKHOUSE_URL: ${{ matrix.clickhouse && 'http://localhost:8123' || '' }}
+          ARGUS_TEST_CLICKHOUSE_PASSWORD: ci-only
         run: cd ${{ matrix.module }} && go vet ./... && go test -race -count=1 ./...
       - name: govulncheck (блокирующий)
         run: cd ${{ matrix.module }} && go run golang.org/x/vuln/cmd/govulncheck@latest ./...
@@ -61,7 +80,8 @@ jobs:
 
   web:
     runs-on: ubuntu-latest
-    # Живой ClickHouse для triage-claim-ch.test.ts: реальная конкурентность claim вердикта.
+    # Живой ClickHouse для web/tests/*-ch.test.ts: миграции с нуля и SQL консоли на
+    # настоящем сервере (ритм и список источников, claim вердикта агента и др.).
     services:
       clickhouse:
         image: clickhouse/clickhouse-server:24.8

@@ -120,46 +120,63 @@ func (c *ClickHouse) insert(ctx context.Context, table string, rows []any) error
 // eventsSelectColumns — колонки события единой схемы в порядке model.Event;
 // перечислены явно, чтобы SELECT * не тянул служебные колонки будущих миграций.
 // raw в движке не используется (правила смотрят на поля и attrs), а это самая
-// тяжёлая колонка: при шторме NetFlow именно она раздувала память опроса.
+// тяжёлая колонка: при шторме NetFlow именно она раздувала память опроса. Её
+// нет в выборке совсем — не `” AS raw`: алиас в SELECT ClickHouse подставляет
+// во все выражения запроса с этим именем, и хеш строки по raw переставал
+// различать события с разным исходным логом (см. миграцию 0029).
 func eventsSelectColumns() string {
 	return `ts, source, source_class, vendor, product, action, outcome, severity,
 	       actor_name, actor_kind, object, node, session_id, src_ip, src_port, dst_ip, dst_port, proto,
-	       bytes, packets, value, unit, pii, attrs, '' AS raw`
+	       bytes, packets, value, unit, pii, attrs`
 }
 
 /* ===== курсор чтения событий =====
    received_at — секундный DateTime, который ставит база при INSERT. Читать
    «строго после последней секунды» нельзя: вставка той же секунды, пришедшая
    после опроса, терялась бы, как и остаток секунды за LIMIT. Поэтому курсор —
-   секунда, читаемая включительно, плюс множество хешей уже обработанных строк
-   этой секунды (дедупликация). Если LIMIT сработал внутри одной секунды,
-   страницы дочитываются по хешу сразу (More), а на следующем опросе секунда
-   перечитывается целиком с дедупликацией по Seen — поздняя вставка с меньшим
-   хешем не теряется. Строки моложе cursorSettle не берутся: вставка получает
-   received_at в начале INSERT, а видна по его завершении — секунда должна
-   «устояться», иначе её хвост остался бы за курсором. */
+   секунда, читаемая включительно, плюс множество ключей (event_id) уже
+   обработанных строк этой секунды (дедупликация). Если LIMIT сработал внутри
+   одной секунды, страницы дочитываются по ключу сразу (More), а на следующем
+   опросе секунда перечитывается целиком с дедупликацией по Seen — поздняя
+   вставка с меньшим ключом не теряется. Строки моложе cursorSettle не берутся:
+   вставка получает received_at в начале INSERT, а видна по его завершении —
+   секунда должна «устояться», иначе её хвост остался бы за курсором.
+
+   Догон читается срезами received_at ∈ [At, At+Step): запрос с открытым верхом
+   после рестарта сортировал весь хвост ради одной страницы (6,8 млн строк и
+   общий лимит памяти ClickHouse на стенде). Срез подстраивается под плотность
+   потока: упёрся в LIMIT — вдвое уже, вернул меньше четверти — вдвое шире. */
 
 // Cursor — позиция чтения argus.events.
 type Cursor struct {
 	At   time.Time           // секунда received_at, читается включительно
-	Hash uint64              // продолжение внутри секунды At в пределах одного опроса; 0 — с начала секунды
-	Seen map[uint64]struct{} // хеши строк секунды At, уже отданных вызывающему
-	More bool                // страница упёрлась в LIMIT: дочитать сразу, не дожидаясь следующего опроса
+	Hash uint64              // продолжение внутри секунды At в пределах одного опроса (event_id); 0 — с начала секунды
+	Seen map[uint64]struct{} // event_id строк секунды At, уже отданных вызывающему
+	More bool                // страница упёрлась в LIMIT или срез догона не последний: дочитать сразу
+	Step time.Duration       // ширина среза received_at для следующего запроса; 0 — sliceDefault
 }
 
 // StartCursor — курсор с начала секунды at.
 func StartCursor(at time.Time) Cursor {
-	return Cursor{At: at.UTC().Truncate(time.Second), Seen: map[uint64]struct{}{}}
+	return Cursor{At: at.UTC().Truncate(time.Second), Seen: map[uint64]struct{}{}, Step: sliceDefault}
 }
 
 // cursorSettle — сколько секунда должна «устояться», прежде чем курсор её
 // пройдёт: строки с received_at моложе этого откладываются до следующего опроса.
 const cursorSettle = 3 * time.Second
 
+// Ширина среза received_at одного запроса: начальная и пределы подстройки.
+const (
+	sliceDefault = 5 * time.Minute
+	sliceMin     = time.Second
+	sliceMax     = time.Hour
+)
+
 // rowHashExpr — устойчивый ключ строки события по всем колонкам единой схемы
-// (своего id у events нет); attrs — по отсортированным ключам, чтобы хеш не
-// зависел от порядка в Map. Внутренний ключ курсора движка, не идентификатор
-// для внешних систем.
+// (своего id у events нет); attrs — по отсортированным ключам, чтобы ключ не
+// зависел от порядка в Map. С миграции 0029 это выражение колонки event_id
+// (MATERIALIZED): движок читает её, а не считает хеш в запросе. Внутренний ключ
+// курсора движка, не идентификатор для внешних систем.
 const rowHashExpr = "cityHash64(received_at, ts, source, source_class, action, outcome, severity, actor_name, actor_kind, object, node, session_id, " +
 	"src_ip, src_port, dst_ip, dst_port, proto, bytes, packets, value, unit, pii, " +
 	"arrayStringConcat(arrayMap(k -> concat(k, '=', attrs[k]), arraySort(mapKeys(attrs))), ';'), raw)"
@@ -171,15 +188,38 @@ type eventRow struct {
 	Hash       uint64
 }
 
+// sliceEnd — верхняя граница среза (не включительно): At+Step, но не дальше
+// последней устоявшейся секунды; ok=false — читать пока нечего.
+func sliceEnd(cur Cursor, now time.Time) (time.Time, bool) {
+	step := cur.Step
+	if step <= 0 {
+		step = sliceDefault
+	}
+	upto := cur.At.Add(step)
+	if limit := now.UTC().Add(-cursorSettle).Truncate(time.Second).Add(time.Second); upto.After(limit) {
+		upto = limit
+	}
+	return upto, upto.After(cur.At)
+}
+
 // EventsSince — события от курсора (по received_at, не ts: у источников свои
-// часы, а курсор должен быть монотонным). Возвращает ещё не отданные события
-// и следующий курсор; см. advanceCursor.
+// часы, а курсор должен быть монотонным) в пределах одного среза. Возвращает ещё
+// не отданные события и следующий курсор; см. advanceCursor и finishSlice.
 func (c *ClickHouse) EventsSince(ctx context.Context, cur Cursor, limit int) ([]*model.Event, Cursor, error) {
-	out, err := c.do(ctx, `SELECT `+eventsSelectColumns()+`, toString(received_at) AS received_str, `+rowHashExpr+` AS row_hash
-	FROM events WHERE received_at > {cursor:DateTime} OR (received_at = {cursor:DateTime} AND `+rowHashExpr+` >= {hash:UInt64})
-	ORDER BY received_at, row_hash LIMIT {limit:UInt32}
+	now := time.Now()
+	upto, ok := sliceEnd(cur, now)
+	if !ok {
+		cur.More = false
+		return nil, cur, nil
+	}
+	out, err := c.do(ctx, `SELECT `+eventsSelectColumns()+`, toString(received_at) AS received_str, event_id
+	FROM events
+	WHERE received_at >= {cursor:DateTime} AND received_at < {upto:DateTime}
+	  AND (received_at > {cursor:DateTime} OR event_id >= {hash:UInt64})
+	ORDER BY received_at, event_id LIMIT {limit:UInt32}
 	FORMAT JSONEachRow`, nil, map[string]string{
-		"cursor": cur.At.UTC().Format("2006-01-02 15:04:05"), "hash": fmt.Sprint(cur.Hash), "limit": fmt.Sprint(limit)})
+		"cursor": cur.At.UTC().Format("2006-01-02 15:04:05"), "upto": upto.UTC().Format("2006-01-02 15:04:05"),
+		"hash": fmt.Sprint(cur.Hash), "limit": fmt.Sprint(limit)})
 	if err != nil {
 		return nil, cur, err
 	}
@@ -191,7 +231,7 @@ func (c *ClickHouse) EventsSince(ctx context.Context, cur Cursor, limit int) ([]
 		var row struct {
 			model.Event
 			ReceivedAt string `json:"received_str"`
-			Hash       uint64 `json:"row_hash"`
+			Hash       uint64 `json:"event_id"`
 		}
 		if err := json.Unmarshal(line, &row); err != nil {
 			continue
@@ -207,8 +247,47 @@ func (c *ClickHouse) EventsSince(ctx context.Context, cur Cursor, limit int) ([]
 		}
 		rows = append(rows, eventRow{Event: &e, ReceivedAt: t, Hash: row.Hash})
 	}
-	events, next := advanceCursor(cur, rows, limit, time.Now())
-	return events, next, nil
+	events, next := advanceCursor(cur, rows, limit, now)
+	return events, finishSlice(cur, next, len(rows), limit, upto, now), nil
+}
+
+// finishSlice — куда встать после среза [cur.At, upto) и какой ширины брать
+// следующий. Страница упёрлась в LIMIT — курсор уже внутри среза (advanceCursor),
+// срез сужается. Иначе срез прочитан целиком:
+//   - срез в прошлом (upto раньше устоявшейся границы): курсор переходит на upto
+//     с пустым Seen — иначе пустой срез в прошлом не сдвинул бы курсор никогда;
+//   - срез у live-края (upto — устоявшаяся граница), и в нём были строки: курсор
+//     остаётся на последней прочитанной секунде с её Seen и Hash = 0. Следующий
+//     опрос перечитает эту секунду целиком, дедупликация отдаст только новое —
+//     INSERT той же секунды, завершившийся после чтения, с меньшим event_id не
+//     теряется. Переход на upto здесь сбрасывал Seen и отменял это перечитывание.
+//     Диапазон чтения остаётся ограниченным: [At, min(At+Step, граница));
+//   - пустой срез у края — как в прошлом: курсор на upto (перечитывать нечего).
+//
+// More — когда до устоявшейся границы ещё есть срезы.
+func finishSlice(cur, next Cursor, nrows, limit int, upto, now time.Time) Cursor {
+	step := cur.Step
+	if step <= 0 {
+		step = sliceDefault
+	}
+	if limit > 0 && nrows >= limit {
+		next.Step = max(step/2, sliceMin)
+		return next
+	}
+	if limit > 0 && nrows < limit/4 {
+		step = min(step*2, sliceMax)
+	}
+	settledEnd := now.UTC().Add(-cursorSettle).Truncate(time.Second).Add(time.Second)
+	atEdge := !upto.Before(settledEnd)
+	switch {
+	case atEdge && len(next.Seen) > 0:
+		next.Hash = 0 // перечитать последнюю секунду с начала; Seen отсеет отданное
+	case upto.After(next.At):
+		next = Cursor{At: upto, Seen: map[uint64]struct{}{}}
+	}
+	next.Step = step
+	next.More = !atEdge
+	return next
 }
 
 // advanceCursor — какие строки выборки отдать и куда сдвинуть курсор.
@@ -218,7 +297,8 @@ func (c *ClickHouse) EventsSince(ctx context.Context, cur Cursor, limit int) ([]
 //     быть прочитана не целиком — её строки откладываются, курсор встаёт на её
 //     начало, More — дочитать сразу;
 //   - выборка упёрлась в LIMIT внутри одной секунды (> limit строк за секунду):
-//     всё отдаётся, продолжение с максимального хеша (More); когда страница не
+//     всё отдаётся, продолжение с максимального хеша страницы, включая уже
+//     отданные из Seen (More); когда страница не
 //     полная, Hash сбрасывается — следующий опрос перечитает секунду с начала,
 //     дедупликация по Seen отдаст только новое;
 //   - иначе курсор — последняя секунда выборки, Seen — её строки.
@@ -254,6 +334,12 @@ func advanceCursor(cur Cursor, rows []eventRow, limit int, now time.Time) ([]*mo
 		if deferLast && r.ReceivedAt.Equal(last) {
 			continue
 		}
+		// Продолжение двигается и по уже отданным строкам: страница целиком из
+		// Seen иначе оставляла бы Hash на месте, и тот же LIMIT перечитывал бы
+		// её бесконечно, не доходя до следующих секунд.
+		if r.ReceivedAt.Equal(next.At) && truncated && !deferLast && r.Hash > next.Hash {
+			next.Hash = r.Hash
+		}
 		if r.ReceivedAt.Equal(cur.At) {
 			if _, ok := cur.Seen[r.Hash]; ok {
 				continue
@@ -262,9 +348,6 @@ func advanceCursor(cur Cursor, rows []eventRow, limit int, now time.Time) ([]*mo
 		out = append(out, r.Event)
 		if r.ReceivedAt.Equal(next.At) {
 			next.Seen[r.Hash] = struct{}{}
-			if truncated && !deferLast && r.Hash > next.Hash {
-				next.Hash = r.Hash
-			}
 		}
 	}
 	return out, next

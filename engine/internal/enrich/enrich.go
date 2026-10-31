@@ -138,9 +138,12 @@ func or(v, def string) string {
 	return v
 }
 
+// cut — не длиннее n символов (рун, не байт: кириллица в объекте или имени
+// источника не должна давать битый UTF-8), последний символ — многоточие.
 func cut(s string, n int) string {
-	if len(s) <= n {
+	r := []rune(s)
+	if len(r) <= n {
 		return s
 	}
-	return s[:n-1] + "…"
+	return string(r[:n-1]) + "…"
 }

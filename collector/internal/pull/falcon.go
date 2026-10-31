@@ -111,6 +111,9 @@ type Falcon struct {
 	cfg  FalconConfig
 	http *http.Client
 	Emit func(model.Event)
+	// Delay — первая пауза перед переподключением (далее удваивается до 2 минут);
+	// 0 — 5 секунд. Поле, а не константа, чтобы тесты не ждали реального времени.
+	Delay time.Duration
 }
 
 func NewFalcon(cfg FalconConfig, emit func(model.Event)) *Falcon {
@@ -154,7 +157,10 @@ func (f *Falcon) Run(ctx context.Context) {
 		slog.Warn("falcon: client_id/client_secret не заданы — источник выключен")
 		return
 	}
-	delay := 5 * time.Second
+	delay := f.Delay
+	if delay <= 0 {
+		delay = 5 * time.Second
+	}
 	for ctx.Err() == nil {
 		if err := f.once(ctx); err != nil {
 			slog.Warn("falcon", "err", err, "retry_in", delay)
