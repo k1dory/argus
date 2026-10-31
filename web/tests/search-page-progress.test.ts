@@ -79,3 +79,33 @@ test("страница отдаёт строки и независимые Suspe
     facets.resolve(timeoutResponse());
   }
 });
+
+test("пустая дальняя страница при таймауте гистограммы сохраняет ссылку назад", async (t) => {
+  t.mock.method(console, "error", () => undefined);
+  t.mock.method(globalThis, "fetch", async (_url: URL | string, init?: RequestInit) => {
+    const sql = String(init?.body ?? "");
+    if (sql.includes("OFFSET {offset:UInt32}") || sql.includes("arrayJoin")) return new Response("");
+    if (sql.includes("toStartOfInterval")) return timeoutResponse();
+    throw new Error(`unexpected SQL: ${sql}`);
+  });
+  const page = await SearchPage({ searchParams: Promise.resolve({ index: "events", q: "sshd", range: "30d", page: "100" }) });
+  const results = descendants(page).find((e) => Array.isArray(e.props.rows));
+  assert.ok(results);
+  assert.deepEqual(results.props.rows, []);
+  const tree = (results.type as (props: Record<string, unknown>) => ReactNode)(results.props);
+  // Настоящий async-компонент пейджера после отказа series выбирает fallback.
+  // Затем вызываем настоящий Pager и проверяем доступную ссылку, а не только
+  // арифметику pageCount: при pages=1 Pager сейчас возвращает null.
+  const exactPager = descendants(tree).find((e) => e.props.seriesP === results.props.seriesP && typeof e.props.pager === "function");
+  assert.ok(exactPager, "страница содержит компонент навигации");
+  const pager = await (exactPager.type as (props: Record<string, unknown>) => Promise<ReactNode>)(exactPager.props);
+  assert.ok(isValidElement<Record<string, unknown>>(pager));
+  assert.equal(typeof pager.type, "function");
+  const rendered = (pager.type as (props: Record<string, unknown>) => ReactNode)(pager.props);
+  const previous = descendants(rendered).find((e) => e.props.rel === "prev");
+  assert.ok(previous, "page=100, rows=0 и неизвестный total не должны убирать ссылку на предыдущую страницу");
+  const href = new URL(String(previous.props.href), "http://test.invalid");
+  assert.equal(href.searchParams.get("page"), "99");
+  assert.equal(href.searchParams.get("q"), "sshd");
+  assert.equal(href.searchParams.get("index"), "events");
+});
