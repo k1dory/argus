@@ -251,12 +251,13 @@ func wafAuditEvent(norm *normalize.Normalizer, obj json.RawMessage, peer listen.
 //  2. node: источника (WAF_NODE) — оператор назвал хост явно;
 //  3. server_id audit-лога — тоже задаёт оператор в конфиге WAF, но для многих
 //     серверов он один и тот же или пуст, поэтому ниже явного имени;
-//  4. адрес сервера (host_ip audit-лога или IP из [hostname]) — разные серверы
-//     дают разные узлы, на этом держится правило waf-scanner-multihost;
+//  4. адрес сервера (host_ip audit-лога или, у Coraza, IP сокета из [hostname]) —
+//     разные серверы дают разные узлы, на этом держится правило
+//     waf-scanner-multihost;
 //  5. адрес отправителя.
 //
-// [hostname] error-лога и заголовок Host присылает клиент: узлом они не бывают
-// (FromWAF кладёт имя в attrs.http_host).
+// [hostname] ModSecurity и заголовок Host присылает клиент: ни узлом, ни адресом
+// сервера они не бывают, даже в виде IP (FromWAF кладёт их в attrs.http_host).
 func wafNode(e *model.Event, senderHost string, peer listen.Peer) {
 	e.Node = firstNonEmpty(strings.TrimSpace(senderHost), strings.TrimSpace(peer.Node), e.Node,
 		e.Attrs["server_addr"], e.DstIP, peer.Addr)

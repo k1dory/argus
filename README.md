@@ -451,8 +451,9 @@ Coraza под Caddy/nginx) и **error-лог** (`ModSecurity: …` в nginx/Apac
 массив). В единой схеме: `source_class=waf`, `action=http.attack`, `outcome=deny|allow` (заблокировано
 или только замечено: DetectionOnly, либо score не набран), атрибуты `category` (sqli, xss, rce, lfi…),
 `rule_ids`, `anomaly_score`, `status`, `engine_mode`, `host` (заголовок Host из audit-лога), `http_host`
-(`[hostname]` error-лога, если там имя), `server_addr`, `method`, `user_agent`. `host` и `http_host`
-присылает клиент: это справка, не узел и не основание для автоблокировки.
+(`[hostname]` error-лога ModSecurity в любом виде, у Coraza — если там имя), `server_addr`, `method`,
+`user_agent`. `host` и `http_host` присылает клиент: это справка, не узел, не адрес сервера и не
+основание для автоблокировки.
 Правила `rules/waf-*.yml`: серия атак с адреса, сканер по нескольким хостам, критичный RCE/LFI
 с высоким score — эти три с `respond`; «атака дошла до приложения» (детект + 5xx) — без автоответа,
 её разбирает человек. Из error-лога событием считается итоговая строка транзакции (Access denied
@@ -462,12 +463,18 @@ Coraza под Caddy/nginx) и **error-лог** (`ModSecurity: …` в nginx/Apac
 
 Узел события WAF коллектор выбирает одинаково для error-лога, файла audit и
 `POST /ingest/modsecurity`: имя хоста из заголовка syslog (агент на хосте WAF) → `node:` источника
-(`WAF_NODE`) → `server_id` audit-лога → адрес сервера (`host_ip` audit-лога или IP из `[hostname]`)
-→ адрес отправителя. `[hostname "…"]` error-лога узлом не бывает никогда: у ModSecurity под
-Apache/nginx это заголовок Host запроса, его подставляет клиент, а Coraza пишет туда локальный
-адрес сокета (внутри Docker — адрес контейнера). IP оттуда уходит в `dst_ip` и `attrs.server_addr`,
-имя — в `attrs.http_host`. Разные серверы без `server_id` дают разные узлы по адресу — на этом
-держится правило «сканер по нескольким хостам».
+(`WAF_NODE`) → `server_id` audit-лога → адрес сервера (`host_ip` audit-лога или, только у Coraza,
+IP из `[hostname]`) → адрес отправителя. Происхождение `[hostname "…"]` у двух WAF разное:
+
+- у ModSecurity под Apache/nginx это заголовок Host запроса, его подставляет клиент. Он
+  недоверенный в любом виде, даже как IP, IPv6 или IP с портом: только `attrs.http_host`, ни
+  узлом, ни `dst_ip`/`attrs.server_addr` не становится — иначе атакующий тремя разными Host
+  «создал бы» три сервера для правила «сканер по нескольким хостам»;
+- Coraza пишет туда сама локальный адрес сокета (внутри Docker — адрес контейнера): IP уходит
+  в `dst_ip` и `attrs.server_addr`, узлом напрямую не бывает.
+
+Разные серверы без `server_id` дают разные узлы по доверенному адресу (`host_ip` audit-лога,
+адрес отправителя) — на этом держится правило «сканер по нескольким хостам».
 
 Имени контейнера в логе нет: для файла — `attrs: {container: …}` (`WAF_CONTAINER`), для агента на
 хосте — SD-элемент RFC 5424 `[argus container="caddy"]` в заголовке строки. Из SD-элемента `argus`
