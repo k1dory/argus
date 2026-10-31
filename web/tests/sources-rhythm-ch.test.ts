@@ -57,6 +57,7 @@ test("ритм: пачка раз в сутки — около суток и ж�
   assert.ok(cont && daily && outage, `источники в списке: ${sources.map((r) => r.source).join(", ")}`);
   assert.equal(cont.rhythm_sec, 60); assert.equal(cont.silence_threshold_sec, SILENCE_MIN_SEC); assert.equal(cont.alive, 1);
   assert.ok(daily.rhythm_sec! > 20 * 3600 && daily.rhythm_sec! <= DAY, `суточная пачка 15 минут → ~сутки, а не минута: ${daily.rhythm_sec}`);
+  assert.equal(daily.rhythm_sec, (1440 - 14) * 60, "production SQL взвешивает разрывы по времени: пауза между 15-минутными пачками");
   assert.equal(daily.alive, 1, "через 12 часов после пачки суточный источник жив");
   assert.ok(daily.silent_for_sec >= 12 * 3600 - 60);
   assert.equal(outage.rhythm_sec, 60, "одиночный двухсуточный провал отброшен — ритм непрерывного остаётся минутой");
@@ -71,4 +72,60 @@ test("замолчавшие: источник мимо коллектора о�
   assert.ok(Number.isInteger(omitted) && omitted >= 0);
   const quiet = sources.filter((r) => r.events_1h === 0);
   for (let i = 1; i < quiet.length; i++) assert.ok(quiet[i - 1].silent_for_sec <= quiet[i].silent_for_sec + 60, `порядок: ${quiet[i - 1].source} → ${quiet[i].source}`);
+});
+
+test("больше 2000 молчащих: порядок при равном времени, точный omitted и объединение с heartbeat", { skip }, async (t) => {
+  const c = ch();
+  const limit = q().STALE_SOURCES_LIMIT;
+  assert.equal(limit, 2000, "предел соответствует текущему контракту /api/sources");
+  const prefix = `cap.${RUN}.`;
+  const name = (i: number) => `${prefix}${String(i).padStart(5, "0")}`;
+  const n = limit + 5;
+  const baseline = await q().sourcesHealthReport();
+  const beforeQuiet = baseline.sources.filter((s) => s.events_1h === 0);
+  assert.ok(beforeQuiet.every((s) => s.silent_for_sec > 70 * 60), "фикстура cap должна быть новее ранее вставленных молчащих источников");
+  const beforeTotal = beforeQuiet.length + baseline.omitted;
+  const [stamp] = await c.chQuery<{ ts: string }>("SELECT toString(now() - INTERVAL 65 MINUTE) AS ts");
+  await c.chCommand(`INSERT INTO events (ts, received_at, source, source_class, action)
+    SELECT toDateTime({ts:String}), toDateTime({ts:String}), concat({prefix:String}, leftPad(toString(number), 5, '0')), 'system', 'x'
+    FROM numbers({n:UInt32}) ORDER BY number DESC`, { ts: stamp.ts, prefix, n });
+  try {
+    await t.test("равные timestamp сортируются по source, limit не зависит от порядка вставки", async () => {
+      const first = await q().sourcesHealthReport();
+      const second = await q().sourcesHealthReport();
+      const expected = Array.from({ length: limit }, (_, i) => name(i));
+      assert.deepEqual(first.sources.filter((s) => s.events_1h === 0).map((s) => s.source), expected);
+      assert.deepEqual(second.sources.map((s) => s.source), first.sources.map((s) => s.source), "повтор загрузки показывает тот же набор");
+      assert.equal(first.omitted, beforeTotal + n - limit, "все источники вне списка посчитаны");
+      assert.equal(second.omitted, first.omitted);
+    });
+
+    // Источник есть в events, но оказался за LIMIT. Его heartbeat с тем же
+    // временем не должен добавлять ещё один пропущенный источник.
+    await c.chCommand(`INSERT INTO collector_health (source, listener, seen_at, events_1m)
+      VALUES ({s:String}, 'http', toDateTime({ts:String}), 1)`, { s: name(n - 1), ts: stamp.ts });
+    await t.test("heartbeat источника за LIMIT не дублирует счётчик", async () => {
+      const report = await q().sourcesHealthReport();
+      assert.equal(report.omitted, beforeTotal + n - limit);
+    });
+
+    // После отдельной проверки дубля удаляем его heartbeat, чтобы ошибка
+    // переучёта не могла замаскировать недоучёт старого heartbeat-only.
+    for (const table of ["collector_health", "collector_health_log"]) {
+      await c.chCommand(`ALTER TABLE ${table} DELETE WHERE source = {s:String} SETTINGS mutations_sync = 1`, { s: name(n - 1) });
+    }
+    await c.chCommand(`INSERT INTO collector_health (source, listener, seen_at, events_1m)
+      VALUES ({s:String}, 'http', now() - INTERVAL 4 HOUR, 1)`, { s: `${prefix}heartbeat-only` });
+    await t.test("старый heartbeat-only остаётся в omitted, когда места в списке нет", async () => {
+      const report = await q().sourcesHealthReport();
+      assert.equal(report.omitted, beforeTotal + n + 1 - limit);
+      assert.equal(report.sources.some((s) => s.source === `${prefix}heartbeat-only`), false);
+    });
+  } finally {
+    // Файлы делят одну БД под lock: убираем только свою cap-фикстуру, чтобы она
+    // не вытесняла источники из последующих живых тестов.
+    for (const table of ["events", "collector_health", "collector_health_log"]) {
+      await c.chCommand(`ALTER TABLE ${table} DELETE WHERE startsWith(source, {prefix:String}) SETTINGS mutations_sync = 1`, { prefix });
+    }
+  }
 });

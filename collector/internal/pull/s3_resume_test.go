@@ -208,6 +208,49 @@ func TestS3BodyCutResumesFromLastEmittedLine(t *testing.T) {
 	}
 }
 
+// Сжатый ответ сначала оборвался после выданных строк и посреди следующей JSON-
+// строки, но повтор вернул весь объект. Смещение считается по непустым входным
+// строкам, включая невалидный JSON, а не по количеству успешно выданных событий.
+func TestS3GzipRetryRecoversCompleteObjectWithoutReplayingPrefix(t *testing.T) {
+	prefix := append(ndjson("a", 2), []byte("\nnot-json\n")...)
+	suffix := ndjson("b", 2)
+	var compressed bytes.Buffer
+	zw := gzip.NewWriter(&compressed)
+	if _, err := zw.Write(append(prefix, suffix[:10]...)); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	cut := compressed.Len()
+	if _, err := zw.Write(suffix[10:]); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	body := compressed.Bytes()
+	b := newResumeBucket(t, map[string][]byte{"1.json.gz": body, "2.json": ndjson("c", 1)})
+	b.serve = func(key string, attempt int, w http.ResponseWriter) bool {
+		if key != "1.json.gz" || attempt != 1 {
+			return false
+		}
+		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+		_, _ = w.Write(body[:cut])
+		return true
+	}
+	s, got, state := b.run(t, 500*time.Millisecond)
+	if strings.Join(got, ",") != "a1,a2,b1,b2,c1" {
+		t.Fatalf("принятый префикс не дублируется, хвост не теряется: %v", got)
+	}
+	if b.attempts("1.json.gz") != 2 || b.attempts("2.json") != 1 {
+		t.Fatalf("попыток gzip=%d, следующий объект=%d", b.attempts("1.json.gz"), b.attempts("2.json"))
+	}
+	if state != "2.json" || s.Skipped.Load() != 0 {
+		t.Fatalf("успешно дочитанный объект не считается пропущенным: курсор %q, Skipped %d", state, s.Skipped.Load())
+	}
+}
+
 // Отказ хранилища на GET (нет прав) — не порча объекта: повтор без предела, объект
 // не бросается и дальше по бакету чтение не идёт. 404 (удалён после листинга) — пропуск.
 func TestS3AccessErrorNeverSkipsButNotFoundDoes(t *testing.T) {

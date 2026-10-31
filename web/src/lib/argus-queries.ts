@@ -376,23 +376,51 @@ export async function sourcesHealthReport(): Promise<SourcesReport> {
   ]);
   const byHour = new Map(hour.map((r) => [r.source, r]));
   const byRhythm = new Map(rhythm.map((r) => [r.source, r]));
-  // Замолчавшие: из проекции (все писатели events) плюс источники, у которых есть
-  // heartbeat, но нет строк в events за окно; без проекции — только по heartbeat.
-  // Порядок — от недавно замолчавших к давним, предел STALE_SOURCES_LIMIT, остальное — omitted.
-  const proj = staleRows ?? [];
-  const projOmitted = Math.max(0, Number(proj[0]?.stale_total ?? 0) - proj.length);
-  const inProj = new Set(proj.map((r) => r.source));
-  const oldestShown = projOmitted > 0 ? Number(proj[proj.length - 1].last_sec) : -Infinity;
-  const fromHeartbeat: Stale[] = rhythm
-    .filter((r) => !byHour.has(r.source) && !inProj.has(r.source) && Number(r.last_sec) >= oldestShown)
+  // Замолчавшие — объединение двух множеств: проекция (все писатели events) и
+  // источники с heartbeat, у которых нет событий за час. Итог и omitted считаются по
+  // уникальному объединению ДО обрезки выдачи, иначе на пределе:
+  //  - heartbeat-only старше границы списка пропадал из счёта;
+  //  - источник за LIMIT проекции с heartbeat считался дважды (в stale_total и как heartbeat).
+  // Имена за LIMIT проекция не вернула; heartbeat-кандидатов, которых нет среди её строк,
+  // проверяем той же проекцией точечно (source IN — ключ агрегатной проекции, полного
+  // скана нет): найденные уже сосчитаны в stale_total, ненайденные — heartbeat-only.
+  // Без проекции (миграция идёт) — только heartbeat, как в rc27.
+  const proj = (staleRows ?? []).filter((r) => !byHour.has(r.source));
+  const projDropped = (staleRows ?? []).length - proj.length; // замолчали час назад и уже снова пишут
+  const projTotal = staleRows ? Math.max(0, Number(staleRows[0]?.stale_total ?? 0) - projDropped) : 0;
+  const projTruncated = staleRows !== null && Number(staleRows[0]?.stale_total ?? 0) > staleRows.length;
+  const inProj = new Set((staleRows ?? []).map((r) => r.source));
+  const hbStale = rhythm.filter((r) => !byHour.has(r.source) && !inProj.has(r.source));
+  let beyondLimit: Stale[] = [];
+  if (projTruncated && hbStale.length > 0) {
+    type Named = Omit<Stale, "stale_total">;
+    beyondLimit = (await chQuery<Named>(
+      `SELECT source, any(source_class) AS source_class, max(received_at) AS last_ts,
+              toUnixTimestamp(max(received_at)) AS last_sec
+       FROM events WHERE source IN {names:Array(String)} GROUP BY source
+       HAVING last_ts >= now() - INTERVAL {days:UInt32} DAY AND last_ts < now() - INTERVAL 1 HOUR
+       SETTINGS force_optimize_projection = 1`,
+      // Array(String) параметром — литерал массива (как ids в actors.ts).
+      { names: `[${hbStale.map((r) => `'${r.source.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`).join(",")}]`, days },
+    ).catch((err: unknown) => {
+      console.error("sourcesHealth: проекция p_source_last по именам недоступна:", err instanceof Error ? err.message : err);
+      return [] as Named[];
+    })).map((r) => ({ ...r, stale_total: 0 }));
+  }
+  const inBeyond = new Set(beyondLimit.map((r) => r.source));
+  const heartbeatOnly: Stale[] = hbStale
+    .filter((r) => !inBeyond.has(r.source))
     .map((r) => ({
       source: r.source, source_class: "", last_sec: r.last_sec, stale_total: 0,
       last_ts: new Date(Number(r.last_sec) * 1000).toISOString().slice(0, 19).replace("T", " "),
     }));
-  const candidates = [...proj.filter((r) => !byHour.has(r.source)), ...fromHeartbeat]
+  // Порядок детерминирован: от недавно замолчавших к давним, при равенстве — по имени.
+  const candidates = [...proj, ...beyondLimit, ...heartbeatOnly]
     .sort((x, y) => Number(y.last_sec) - Number(x.last_sec) || x.source.localeCompare(y.source));
   const staleShown = candidates.slice(0, STALE_SOURCES_LIMIT);
-  const omitted = projOmitted + (candidates.length - staleShown.length);
+  // Объединение: проекция целиком (stale_total, включая имена за LIMIT) + heartbeat-only.
+  const unionTotal = Math.max(projTotal, proj.length + beyondLimit.length) + heartbeatOnly.length;
+  const omitted = Math.max(0, unionTotal - staleShown.length);
   const byStale = new Map(staleShown.map((r) => [r.source, r]));
   const sources = [...hour.map((r) => r.source), ...staleShown.map((r) => r.source)].map((source) => {
     const h = byHour.get(source), rh = byRhythm.get(source), st = byStale.get(source);

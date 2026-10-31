@@ -55,3 +55,31 @@ test("сбой на первой порции — исключение, как �
   assert.equal(r.error, null);
   assert.equal(nextStatus(errorStatus(null, new Error("x")), r).error, null, "успешный такт снимает ошибку");
 });
+
+test("после сбоя второй порции следующий такт продолжает догон с сохранённого курсора и не дублирует строки", async () => {
+  const first = scripted([
+    () => json({ rows: [row("a1"), row("a2")], cursor: "c1", more: true, pending: 2, incidents: { a2: [{ incident_id: "INC-2" }] } }),
+    () => json({ error: "временная ошибка" }, 503),
+  ]);
+  const partial = await pollTail({ filters, cursor: "c0", state: { rows: [row("a0")], seen: new Set(["a0"]) }, maxRows: 2, fetchFn: first.fetchFn });
+  assert.equal(partial.cursor, "c1");
+  assert.equal(partial.trimmed, 1, "первый успешный ответ уже применил предел ленты");
+  assert.equal(partial.pending, 2, "сбой не обнуляет последний известный размер очереди");
+  assert.equal(partial.incidents.a2[0].incident_id, "INC-2");
+
+  const retry = scripted([
+    () => json({ rows: [row("a2"), row("a3")], cursor: "c2", more: true, pending: 1 }),
+    () => json({ rows: [row("a4")], cursor: "c3", more: false }),
+  ]);
+  const caughtUp = await pollTail({ filters, cursor: partial.cursor, state: partial.state, maxRows: 2, fetchFn: retry.fetchFn });
+  assert.equal(new URL(retry.urls[0], "http://x").searchParams.get("cursor"), "c1", "ошибочная порция повторяется, уже принятую не запрашиваем");
+  assert.equal(new URL(retry.urls[1], "http://x").searchParams.get("cursor"), "c2");
+  assert.equal(caughtUp.cursor, "c3");
+  assert.deepEqual(caughtUp.added.map((r) => r.id), ["a3", "a4"], "повтор a2 не добавлен второй раз");
+  assert.deepEqual(caughtUp.state.rows.map((r) => r.id).sort(), ["a3", "a4"]);
+  assert.equal(caughtUp.pending, 0);
+  const status = nextStatus(nextStatus(null, partial), caughtUp);
+  assert.equal(status.added, 4);
+  assert.equal(status.trimmed, 3);
+  assert.equal(status.error, null, "успешное продолжение снимает ошибку прошлого такта");
+});
