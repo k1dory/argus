@@ -35,7 +35,7 @@ printf '%s\\n' "$MCP_ALLOWED_NETS"
       const result = spawnSync("sh", [entrypoint, ...args], {
         encoding: "utf8", timeout: 5_000, maxBuffer: 64 * 1024,
         env: {
-          PATH: `${dir}:/usr/bin:/bin`, HOME: dir, TMPDIR: dir, LANG: "C", LC_ALL: "C",
+          PATH: `${dir}:/usr/bin:/bin`, HOME: dir, TMPDIR: dir, LANG: "C", LC_ALL: "C", NODE_ENV: "test",
           ARGUS_TEST_ROUTE_READS: routeReads, ...env,
         },
       });
