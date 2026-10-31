@@ -6,6 +6,7 @@ import { test, before } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { installNextMocks, loadAuth } from "./_next-mock";
+import { classifyEvent } from "../src/lib/shared/actors";
 
 const auth = loadAuth();
 const mocks = installNextMocks();
@@ -68,6 +69,8 @@ globalThis.fetch = (async (url: URL | string, init?: RequestInit) => {
     for (const m of sql.matchAll(/AS ([eli]\d+)/g)) out[m[1]] = m[1].startsWith("e") ? "2" : m[1].startsWith("i") ? "1" : "2026-10-24 11:00:00.000";
     return rows([out]);
   }
+  // Выборка раздела паспорта: SECTION_SQL = {section} — отвечаем тем же разбором, что classifyEvent.
+  if (sql.includes("ORDER BY ts DESC") && p.has("param_section")) return rows(EVENTS.filter((e) => classifyEvent(String(e.action), String(e.outcome), String(e.source_class ?? "")) === p.get("param_section")));
   if (sql.includes("ORDER BY ts DESC")) return rows(EVENTS);
   if (sql.includes("GROUP BY source_class ORDER BY")) return rows([{ source_class: "identity", count: "1" }, { source_class: "syslog", count: "1" }]);
   if (sql.includes("GROUP BY node ORDER BY")) return rows([{ node: "web-01", count: "2", first_ts: "2026-10-24 10:00:00.000", last_ts: "2026-10-24 11:00:00.000" }]);
@@ -106,7 +109,7 @@ const bearer = (path: string, token: string, init: RequestInit = {}) => new Requ
 const cookie = (path: string, init: RequestInit = {}) => new Request(`http://x${path}`, { ...init, headers: { "content-type": "application/json", ...(init.headers ?? {}) } });
 const ctx = (params: Record<string, string>): Ctx => ({ params: Promise.resolve(params) });
 const since = () => calls.length;
-const lastTimeline = (from: number) => calls.slice(from).find((c) => c.sql.includes("ORDER BY ts DESC"));
+const lastTimeline = (from: number) => calls.slice(from).find((c) => c.sql.includes("ORDER BY ts DESC") && !c.params.has("param_section"));
 
 before(async () => {
   await auth.getAuthState();

@@ -10,7 +10,7 @@ import { SEARCH_SETTINGS } from "./search";
 import { chTs, LOG_COLUMNS, toLogItem, type LogItem } from "./shared/log-query";
 import type { TriageBinding } from "./shared/triage";
 import {
-  ACTOR_KEYS_EXPR, ACTOR_KINDS, activeAliases, aliasColumnExpr, aliasPredicate, aliasPrefilter, aliasActiveAt, aliasMatches, aliasKey, ambiguousAliases, bucketEvents, canonicalIp, canonicalPhone, chStringArray, clampWindow, CONFIRMED_NOTE_PREFIX, HOLD_NOTE_PREFIX, isAliasKind, isHeld, LOWERCASE_KINDS, normalizeAliasValue, rangeWindow, resolveStatus,
+  ACTOR_KEYS_EXPR, ACTOR_KINDS, activeAliases, aliasColumnExpr, aliasPredicate, aliasPrefilter, aliasActiveAt, aliasMatches, aliasKey, ambiguousAliases, bucketEvents, canonicalIp, canonicalPhone, chStringArray, clampWindow, SECTION_LABELS, SECTION_SQL, SECTIONS, CONFIRMED_NOTE_PREFIX, HOLD_NOTE_PREFIX, isAliasKind, isHeld, LOWERCASE_KINDS, normalizeAliasValue, rangeWindow, resolveStatus,
   type ActorIncident, type ActorRange, type ActorReport, type Alias, type AliasInput, type ClassCount, type IpStat, type NodeStat, type Person, type PersonInput, type ResolveMatch, type ResolveStatus, type SourceCoverage, type Window,
 } from "./shared/actors";
 
@@ -298,8 +298,8 @@ function bindPredicate(bind: TriageBinding, params: Record<string, string | numb
 /**
  * Паспорт за период: сводка по классам источников, узлы, адреса, покрытие
  * источников, инциденты (actor_name ∈ субъектных алиасов, действовавших на
- * first_ts), таймлайн последних N событий в форме /api/v1/log и его разбивка
- * по разделам. Персона и алиасы обязательны (исключение), остальное —
+ * first_ts), таймлайн последних N событий в форме /api/v1/log и последние N
+ * событий каждого раздела (своя выборка на раздел). Персона и алиасы обязательны (исключение), остальное —
  * частичная деградация через missing. Удержанные алиасы в aliases остаются
  * (паспорт их показывает), но ни один предикат их не использует.
  */
@@ -331,6 +331,11 @@ export async function actorReport(person: Person, aliases: Alias[], range: Actor
   }
   const tlParams: Record<string, string | number> = { ...params, limit };
 
+  // Разделы — своей выборкой каждый: в общей ленте частый раздел вытеснял бы остальные.
+  const shown = SECTIONS.filter((s) => s !== "other");
+  const secP = Promise.all(shown.map((s) => safeQuery(() => chQuery<Record<string, unknown>>(
+    `SELECT ${LOG_COLUMNS} FROM events WHERE ${base} AND ${SECTION_SQL} = {section:String} ORDER BY ts DESC LIMIT {limit:UInt32}`,
+    { ...tlParams, section: s }))));
   const [classes, nodes, ips, sources, incRows, tl, amb] = await Promise.all([
     safeQuery(() => chQuery<{ source_class: string; count: string | number }>(`SELECT source_class, count() AS count FROM events WHERE ${base} GROUP BY source_class ORDER BY count DESC`, params)),
     safeQuery(() => chQuery<NodeStat>(`SELECT node, count() AS count, toString(min(ts)) AS first_ts, toString(max(ts)) AS last_ts FROM events WHERE ${base} AND node != '' GROUP BY node ORDER BY count DESC LIMIT 50`, params)),
@@ -363,6 +368,9 @@ export async function actorReport(person: Person, aliases: Alias[], range: Actor
     .filter((i) => subject.some((a) => aliasMatches(a, i.actor_name) && aliasActiveAt(a, Date.parse(i.first_s.replace(" ", "T") + "Z"))))
     .map(({ id, level, status, rule_id, rule_title, created_s }) => ({ id, level, status, rule_id, rule_title, created_at: created_s }));
   const timeline: LogItem[] = take(tl, "таймлайн", [] as Record<string, unknown>[]).map(toLogItem);
+  const secRows = await secP;
+  const sections = bucketEvents(timeline);
+  shown.forEach((s, i) => { sections[s] = take(secRows[i], `раздел «${SECTION_LABELS[s]}»`, [] as Record<string, unknown>[]).map(toLogItem); });
   let ambiguous: string[] = [];
   if (amb.ok) ambiguous = [...ambiguousAliases(amb.data, w)].filter((k) => aliases.some((a) => aliasKey(a) === k));
   else missing.push("проверка неоднозначности");
@@ -376,7 +384,7 @@ export async function actorReport(person: Person, aliases: Alias[], range: Actor
       nodes: nodeStats, src_ips: ipStats, incidents: incidents.length,
     },
     sources: coverage,
-    sections: bucketEvents(timeline),
+    sections,
     incidents, timeline, limit, missing,
     generated_at: chTs(now),
   };

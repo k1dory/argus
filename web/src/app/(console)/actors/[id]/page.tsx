@@ -212,7 +212,7 @@ function ReportBody({ r, range }: { r: ActorReport; range: string }) {
           <li>Содержимого данных внутри приложений: паспорт строится по журналу событий, а не по данным систем.</li>
           <li>Событий вне интервалов действия алиасов: до «действует с» и после «по» они субъекту не приписываются.</li>
           <li>Источников, не подключённых к ARGUS, и событий старше срока хранения.</li>
-          <li>Разделы «Входы» … «Изменения» построены по последним {fmtNum(r.limit)} событиям периода, сводка — по всем.</li>
+          <li>Разделы «Входы» … «Изменения» показывают последние {fmtNum(r.limit)} событий каждого раздела за период, сводка — по всем.</li>
           {r.ambiguous.length > 0 && <li>Алиасы с пометкой «неоднозначно» делятся с другой персоной — их события могут быть не этого субъекта.</li>}
           {r.aliases.some(isHeld) && <li>Алиасы «на удержании» (нарушение политики идентичности) в сшивку не входят: их события в паспорте не учтены, пока администратор не подтвердит алиас.</li>}
         </ul>
@@ -231,8 +231,8 @@ function SectionPanel({ section, items, limit }: { section: Exclude<Section, "ot
   };
   const fail = items.filter((e) => /fail|deny|denied|error/i.test(e.outcome)).length;
   return (
-    <Panel label={`${SECTION_LABELS[section]} · ${fmtNum(items.length)}`} meta={`${meta[section]}${fail ? ` · отказов ${fmtNum(fail)}` : ""} · по последним ${fmtNum(limit)}`} bodyClassName="p-0">
-      {items.length === 0 ? <Empty className="p-4">Нет событий этого раздела среди последних в периоде.</Empty> : <EventTable items={items.slice(0, 50)} />}
+    <Panel label={`${SECTION_LABELS[section]} · ${fmtNum(items.length)}`} meta={`${meta[section]}${fail ? ` · отказов ${fmtNum(fail)}` : ""} · последние ${fmtNum(limit)} раздела`} bodyClassName="p-0">
+      {items.length === 0 ? <Empty className="p-4">Нет событий этого раздела в периоде.</Empty> : <EventTable items={items.slice(0, 50)} />}
     </Panel>
   );
 }

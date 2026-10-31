@@ -372,6 +372,20 @@ export function classifyEvent(action: string, outcome: string, sourceClass = "")
   return "other";
 }
 
+/**
+ * classifyEvent на SQL — для выборки последних событий каждого раздела отдельно:
+ * частый раздел (журнал соединений) не вытесняет редкие из общей ленты.
+ * Порядок веток совпадает с classifyEvent; сверка — tests/actors-sections-ch.test.ts.
+ */
+export const SECTION_SQL = `multiIf(
+  startsWith(lowerUTF8(action), 'auth.') OR position(lowerUTF8(action), 'login') > 0 OR position(lowerUTF8(action), 'logon') > 0 OR position(lowerUTF8(action), 'sshd') > 0, 'login',
+  startsWith(lowerUTF8(action), 'identity.'), 'change',
+  lowerUTF8(source_class) IN ('netflow', 'ngfw') OR startsWith(lowerUTF8(action), 'net.'), 'network',
+  startsWith(lowerUTF8(action), 'priv.') OR position(lowerUTF8(action), 'sudo') > 0 OR match(lowerUTF8(action), '(^|[._-])su($|[._-])') OR startsWith(lowerUTF8(action), 'session.'), 'host',
+  startsWith(lowerUTF8(action), 'app.') OR position(lowerUTF8(action), 'authorize') > 0 OR position(lowerUTF8(action), 'oauth') > 0, 'app',
+  match(lowerUTF8(action), 'create|update|delete|change|modify') AND lowerUTF8(outcome) = 'success', 'change',
+  'other')`;
+
 /** Разложить события по разделам (порядок строк сохраняется). */
 export function bucketEvents(items: LogItem[]): Record<Section, LogItem[]> {
   const out: Record<Section, LogItem[]> = { login: [], host: [], network: [], app: [], change: [], other: [] };
@@ -580,7 +594,7 @@ export function actorMarkdown(r: ActorReport): string {
     if (s === "other") continue;
     const items = r.sections[s];
     lines.push("", `## ${SECTION_LABELS[s]}`, "");
-    if (!items.length) lines.push("Нет событий этого раздела среди последних в окне.");
+    if (!items.length) lines.push("Нет событий этого раздела в окне.");
     else lines.push(...items.map(eventLine));
   }
   lines.push("", "## Инциденты", "");
@@ -594,7 +608,7 @@ export function actorMarkdown(r: ActorReport): string {
     "- Содержимое данных внутри приложений: паспорт строится по журналу событий, а не по данным систем.",
     "- События вне интервалов действия алиасов: до valid_from и после valid_to они субъекту не приписываются.",
     "- Источники, не подключённые к ARGUS, и события старше срока хранения.",
-    `- Разделы «Входы» … «Изменения» построены по последним ${r.limit} событиям окна, сводка — по всем.`,
+    `- Разделы «Входы» … «Изменения» — последние ${r.limit} событий каждого раздела в окне, сводка — по всем.`,
   );
   if (r.ambiguous.length) lines.push("- Алиасы с пометкой «неоднозначно» в окне делятся с другой персоной: их события могут быть не этого субъекта.");
   if (r.aliases.some(isHeld)) lines.push("- Алиасы «на удержании» (нарушение политики идентичности) в сшивку не входят: их события в паспорте не учтены, пока администратор не подтвердит алиас.");
