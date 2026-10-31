@@ -223,11 +223,16 @@ export async function aliasSightings(value: string, range: ActorRange, now = Dat
     ]);
     return { kind: "ip", rows: rows.map(toSighting), vpn: vpn.map((r) => ({ ...r, events: Number(r.events) })) };
   }
+  // Те же правила значения, что у алиасов (aliasColumn/compareValue): uid/sid/peer —
+  // actor_name точно, phone — в E.164, login/email — actor_name без учёта регистра,
+  // host — node без учёта регистра. Вид значения заранее неизвестен — проверяются все.
+  const v = value.trim();
   const rows = await chQuery<Row>(
     `SELECT source, action, actor_name AS who, node AS at_node, groupUniqArray(5)(src_ip) AS ips, count() AS events, toString(min(ts)) AS first_ts, toString(max(ts)) AS last_ts
-     FROM events WHERE ${ts} AND actor_name IN ({v:String}, {lv:String})
+     FROM events WHERE ${ts}
+       AND (actor_name IN ({v:String}, {pv:String}) OR lowerUTF8(actor_name) = {lv:String} OR lowerUTF8(node) = {lv:String})
      GROUP BY source, action, actor_name, node ORDER BY last_ts DESC LIMIT 100`,
-    { ...win, v: value, lv: value.toLowerCase() },
+    { ...win, v, pv: canonicalPhone(v) ?? v, lv: v.toLowerCase() },
   );
   return { kind: "actor", rows: rows.map(toSighting), vpn: [] };
 }
