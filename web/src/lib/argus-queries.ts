@@ -4,7 +4,7 @@ import "server-only";
 import { isAlive, RHYTHM_QUANTILE, RHYTHM_WINDOW_DAYS, silenceThresholdSec } from "./shared/source-health";
 import crypto from "node:crypto";
 import { clampInt, clampPage } from "./shared/limits";
-import { chCommand, chQuery as chQueryRaw } from "./clickhouse";
+import { chCommand, chQuery as chQueryRaw, ClickHouseError } from "./clickhouse";
 
 /** Серверные лимиты на все запросы консоли к ClickHouse: пользователь консоли
  *  без квот, а скан за 30 дней — полный. Тот же набор, что в search.ts. */
@@ -317,6 +317,16 @@ export type SourcesReport = {
   omitted: number;
 };
 
+/** Условие запросов к p_source_last: все активные парты events уже с проекцией.
+ *  force_optimize_projection этого не гарантирует — пока MATERIALIZE идёт, оптимизатор
+ *  берёт проекцию из новых партов и сырые строки из старых, и запрос сканирует историю.
+ *  Скалярный подзапрос к system.parts (строка на парт) вычисляется до выбора партов: не
+ *  готово — WHERE 0, проекция не применяется, force_optimize_projection даёт
+ *  PROJECTION_NOT_USED без чтения events. */
+const SOURCE_LAST_READY = `(SELECT count() FROM system.parts
+         WHERE database = currentDatabase() AND table = 'events' AND active AND NOT has(projections, 'p_source_last')) = 0`;
+const PROJECTION_NOT_USED = 584;
+
 /** Ритм по журналу heartbeat (collector_health_log) — единственное место расчёта, тесты гоняют его на живом ClickHouse.
  *  Разрывы между соседними активными минутами (минутами с событиями) за окно; самый длинный разрыв отбрасывается —
  *  одиночный сбой или простой не растягивает ритм непрерывного источника на месяц; квантиль RHYTHM_QUANTILE
@@ -335,8 +345,9 @@ export async function sourcesHealthReport(): Promise<SourcesReport> {
   // пишет в events мимо коллектора и heartbeat не имеет (телеметрия движка
   // argus.system): упавший движок виден как «молчит», а не пропадает через час.
   // Скан сырых events за окно здесь недопустим — сотни миллионов строк на каждую
-  // загрузку; force_optimize_projection превращает отсутствие проекции (миграция
-  // ещё идёт) в ошибку, и тогда список строится по heartbeat, как в rc27.
+  // загрузку. Пока проекция есть не во всех партах (миграция идёт), запрос не читает
+  // events (SOURCE_LAST_READY) и список строится по heartbeat, как в rc27. Прочие ошибки
+  // не маскируются пустым результатом: маршрут отвечает 503.
   type Num = number | string; // ClickHouse JSON: UInt32/Float64 приходят числами, count() — строкой
   type Hour = { source: string; source_class: string; events_1h: Num; eps_60s: Num; last_ts: string; last_sec: Num; pii_share: Num | null; now_sec: Num };
   type Rhythm = { source: string; events_window: Num; gap_q: Num | null; last_sec: Num; now_sec: Num };
@@ -364,13 +375,14 @@ export async function sourcesHealthReport(): Promise<SourcesReport> {
     chQuery<Stale>(
       `SELECT source, any(source_class) AS source_class, max(received_at) AS last_ts,
               toUnixTimestamp(max(received_at)) AS last_sec, count() OVER () AS stale_total
-       FROM events GROUP BY source
+       FROM events WHERE ${SOURCE_LAST_READY} GROUP BY source
        HAVING last_ts >= now() - INTERVAL {days:UInt32} DAY AND last_ts < now() - INTERVAL 1 HOUR
        ORDER BY last_ts DESC, source LIMIT {lim:UInt32}
        SETTINGS force_optimize_projection = 1`,
       { days, lim: STALE_SOURCES_LIMIT },
     ).catch((err: unknown) => {
-      console.error("sourcesHealth: проекция p_source_last недоступна, замолчавшие — по heartbeat:", err instanceof Error ? err.message : err);
+      if (!(err instanceof ClickHouseError) || err.code !== PROJECTION_NOT_USED) throw err;
+      console.error("sourcesHealth: проекция p_source_last ещё не во всех партах, замолчавшие — по heartbeat");
       return null;
     }),
   ]);
@@ -384,7 +396,9 @@ export async function sourcesHealthReport(): Promise<SourcesReport> {
   // Имена за LIMIT проекция не вернула; heartbeat-кандидатов, которых нет среди её строк,
   // проверяем той же проекцией точечно (source IN — ключ агрегатной проекции, полного
   // скана нет): найденные уже сосчитаны в stale_total, ненайденные — heartbeat-only.
-  // Без проекции (миграция идёт) — только heartbeat, как в rc27.
+  // Без проекции (миграция идёт) — только heartbeat, как в rc27. Отказ этого запроса
+  // пробрасывается: без него неизвестно, кто из кандидатов уже в stale_total, и
+  // omitted был бы выдуман.
   const proj = (staleRows ?? []).filter((r) => !byHour.has(r.source));
   const projDropped = (staleRows ?? []).length - proj.length; // замолчали час назад и уже снова пишут
   const projTotal = staleRows ? Math.max(0, Number(staleRows[0]?.stale_total ?? 0) - projDropped) : 0;
@@ -397,15 +411,12 @@ export async function sourcesHealthReport(): Promise<SourcesReport> {
     beyondLimit = (await chQuery<Named>(
       `SELECT source, any(source_class) AS source_class, max(received_at) AS last_ts,
               toUnixTimestamp(max(received_at)) AS last_sec
-       FROM events WHERE source IN {names:Array(String)} GROUP BY source
+       FROM events WHERE source IN {names:Array(String)} AND ${SOURCE_LAST_READY} GROUP BY source
        HAVING last_ts >= now() - INTERVAL {days:UInt32} DAY AND last_ts < now() - INTERVAL 1 HOUR
        SETTINGS force_optimize_projection = 1`,
       // Array(String) параметром — литерал массива (как ids в actors.ts).
       { names: `[${hbStale.map((r) => `'${r.source.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`).join(",")}]`, days },
-    ).catch((err: unknown) => {
-      console.error("sourcesHealth: проекция p_source_last по именам недоступна:", err instanceof Error ? err.message : err);
-      return [] as Named[];
-    })).map((r) => ({ ...r, stale_total: 0 }));
+    )).map((r) => ({ ...r, stale_total: 0 }));
   }
   const inBeyond = new Set(beyondLimit.map((r) => r.source));
   const heartbeatOnly: Stale[] = hbStale
