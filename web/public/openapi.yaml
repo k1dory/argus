@@ -228,11 +228,11 @@ paths:
                 type: string
                 description: "CSV с BOM; заголовок `Content-Disposition: attachment; filename=\"argus-<index>-<дата>.csv\"`."
         "400":
-          description: "Ошибка запроса — `{error}` (текст разбора), `index=alerts` при выключенном модуле Wazuh или для сессии разбора `{error: invalid_value|missing_filter, detail}`."
+          description: "Ошибка запроса — `{error}` (текст разбора), `index=alerts` при выключенном модуле Wazuh или для сессии разбора `{error: invalid_value|missing_filter, detail}`. Ошибка разбора приходит полным `SearchResult` с заполненным `error`; такое тело подходит и под `Error` (поле `error` — строка, остальные свойства разрешены), поэтому альтернативы — `anyOf`, а не `oneOf`."
           content:
             application/json:
               schema:
-                oneOf:
+                anyOf:
                   - $ref: "#/components/schemas/Error"
                   - $ref: "#/components/schemas/SearchResult"
         "401": { $ref: "#/components/responses/Unauthorized" }
@@ -1330,7 +1330,15 @@ components:
         rows:
           type: array
           items: { $ref: "#/components/schemas/SearchRow" }
-        total: { type: integer }
+        total:
+          type: integer
+          description: Сумма гистограммы. Если гистограмма не посчиталась за свой бюджет (`incomplete` содержит `series`) — настоящая нижняя граница, `total_exact=false`, только доказанные строки — `(page − 1) × 50 + rows` при непустой странице, `0` при пустой. Наличие следующей страницы в `total` не прибавляется — см. `has_more`.
+        total_exact:
+          type: boolean
+          description: "`false` — `total` нижняя граница: гистограмма не уложилась в 15 с."
+        has_more:
+          type: boolean
+          description: Следующая страница существует — за текущей прочитана ещё одна строка (она не показывается). Не зависит от `total_exact`.
         page: { type: integer }
         pageSize: { type: integer, const: 50 }
         series:
@@ -1338,7 +1346,7 @@ components:
           items: { $ref: "#/components/schemas/SeriesPoint" }
         facets:
           type: array
-          description: Пусто для сессии разбора.
+          description: Топ значений полей по последним `facets_sample` совпадениям (не больше 10 000). Пусто для сессии разбора.
           items:
             type: object
             required: [field, label, values]
@@ -1353,9 +1361,19 @@ components:
                   properties:
                     value: { type: string }
                     count: { type: integer }
+        facets_sample:
+          type: [integer, "null"]
+          description: По скольким последним совпадениям посчитаны фасеты; 10 000 — выборка полная и счётчики приблизительные; `null` — фасеты не считались.
+        incomplete:
+          type: array
+          description: Части ответа, не посчитанные за свой бюджет; страница результатов при этом полная, код ответа 200.
+          items: { type: string, enum: [series, facets] }
+        notice:
+          type: [string, "null"]
+          description: Почему часть ответа неполная.
         error:
           type: [string, "null"]
-          description: Текст ошибки разбора запроса (ответ тогда приходит кодом 400).
+          description: Текст ошибки разбора запроса или страницы результатов (ответ тогда приходит кодом 400).
         ms:
           type: integer
           description: Время выполнения, мс.

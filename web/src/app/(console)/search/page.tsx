@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import Link from "next/link";
+import { Suspense, type ReactNode } from "react";
 import { Search as SearchIcon } from "lucide-react";
 import { AlertsSeriesChart } from "@/components/console/charts";
 import { DownloadButton } from "@/components/console/download-button";
@@ -7,13 +8,16 @@ import { Empty, PageHeader, Panel } from "@/components/console/panel";
 import { Pager } from "@/components/console/pager";
 import { RangePicker } from "@/components/console/range-picker";
 import { SearchHit } from "@/components/console/search-hit";
-import { StorageUnavailable } from "@/components/console/storage-error";
+import { ChartSkeleton, PanelSkeleton } from "@/components/console/skeletons";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { requirePageSession } from "@/lib/auth";
-import { safeQuery } from "@/lib/clickhouse";
-import { availableIndexes, clampPage, INDEXES, MAX_QUERY_LEN, parseIndex, search, type IndexKey } from "@/lib/search";
+import {
+  availableIndexes, clampPage, FACET_SAMPLE, FACETS_SETTINGS, INDEXES, lowerBoundTotal, MAX_QUERY_LEN, PAGE_SIZE, pageCount, parseIndex, partErrorMessage, planSearch,
+  searchErrorMessage, searchFacets, searchPage, searchSeries, seriesTotal, SERIES_SETTINGS, type Facet, type IndexKey, type SearchPlan,
+} from "@/lib/search";
+import type { SeriesPoint } from "@/lib/queries";
 import { parseRange } from "@/lib/shared/ranges";
 import { appendTerm } from "@/lib/shared/search-query";
 import { fmtMs, fmtNum, isLongRange } from "@/lib/shared/time";
@@ -57,7 +61,18 @@ export default async function SearchPage({ searchParams }: PageProps<"/search">)
   const exportName = `argus-${input.index}-${new Date().toISOString().slice(0, 10)}`;
   const longRange = isLongRange(input.range, input.from);
 
-  const r = await safeQuery(() => search(input));
+  // Страница результатов — сразу; гистограмма (с итогом) и поля догружаются
+  // своими блоками: для частого слова за длинный интервал это полный скан, и
+  // раньше вся страница ждала самый медленный из трёх запросов (или его таймаут).
+  const { plan, empty } = planSearch(input);
+  const seriesP = plan ? settle(searchSeries(plan)) : null;
+  const facetsP = plan ? settle(searchFacets(plan)) : null;
+  const timed = plan ? await timedRows(plan) : null;
+  const r = timed?.r ?? null;
+  const rowsMs = timed?.ms ?? 0;
+  if (r && !r.ok) console.error("search:", r.error instanceof Error ? r.error.message : r.error);
+  // Ошибка разбора запроса или страницы результатов — в панель запроса, как раньше.
+  const formError = !plan ? empty.error : r && !r.ok ? searchErrorMessage(r.error) : null;
 
   return (
     <>
@@ -95,21 +110,50 @@ export default async function SearchPage({ searchParams }: PageProps<"/search">)
               </Link>
             )}
           </div>
-          {r.ok && r.data.error && <p role="alert" className="text-sm text-destructive">{r.data.error}</p>}
+          {formError && <p role="alert" className="text-sm text-destructive">{formError}</p>}
         </form>
       </Panel>
 
-      {!r.ok ? (
-        <StorageUnavailable reason={r.error} />
-      ) : (
-        <SearchResults res={r.data} def={def} index={input.index} q={input.q} longRange={longRange} href={href} exportHref={exportHref} exportName={exportName} />
-      )}
+      {plan && r?.ok && seriesP && facetsP ? (
+        <SearchResults
+          plan={plan}
+          rows={r.data.rows}
+          hasMore={r.data.hasMore}
+          rowsMs={rowsMs}
+          seriesP={seriesP}
+          facetsP={facetsP}
+          def={def}
+          index={input.index}
+          q={input.q}
+          longRange={longRange}
+          href={href}
+          exportHref={exportHref}
+          exportName={exportName}
+        />
+      ) : null}
     </>
   );
 }
 
+type Settled<T> = { ok: true; data: T } | { ok: false; error: unknown };
+/** Страница результатов со временем ответа (для подписи «страница — N мс»). */
+async function timedRows(plan: SearchPlan): Promise<{ r: Settled<{ rows: Record<string, unknown>[]; hasMore: boolean }>; ms: number }> {
+  const started = Date.now();
+  const r = await settle(searchPage(plan));
+  return { r, ms: Date.now() - started };
+}
+/** Обещание без отказа: ошибка части страницы не роняет рендер. */
+function settle<T>(p: Promise<T>): Promise<Settled<T>> {
+  return p.then((data) => ({ ok: true as const, data }), (error: unknown) => ({ ok: false as const, error }));
+}
+
 function SearchResults({
-  res,
+  plan,
+  rows,
+  hasMore,
+  rowsMs,
+  seriesP,
+  facetsP,
   def,
   index,
   q,
@@ -118,7 +162,13 @@ function SearchResults({
   exportHref,
   exportName,
 }: {
-  res: Awaited<ReturnType<typeof search>>;
+  plan: SearchPlan;
+  rows: Record<string, unknown>[];
+  /** Следующая страница подтверждена лишней прочитанной строкой. */
+  hasMore: boolean;
+  rowsMs: number;
+  seriesP: Promise<Settled<SeriesPoint[]>>;
+  facetsP: Promise<Settled<{ facets: Facet[]; sample: number }>>;
   def: (typeof INDEXES)[IndexKey];
   index: IndexKey;
   q: string;
@@ -127,37 +177,29 @@ function SearchResults({
   exportHref: (format: string) => string;
   exportName: string;
 }) {
-  const pages = Math.max(1, Math.ceil(res.total / res.pageSize));
+  const pager = (total: number, exact: boolean) => (
+    <Pager
+      page={plan.page}
+      pages={pageCount(total, exact, hasMore, plan.page)}
+      total={exact ? total : undefined}
+      pageSize={PAGE_SIZE}
+      href={(p) => href({ page: p > 1 ? String(p) : undefined })}
+    />
+  );
+  const approxPager = pager(lowerBoundTotal(plan, rows.length), false);
   return (
     <>
-      <Panel label={`Распределение · ${fmtNum(res.total)} записей`} meta={`${fmtMs(res.ms)} · время UTC`}>
-        {res.series.length === 0 ? (
-          <Empty>Нет данных за выбранный интервал.</Empty>
-        ) : (
-          <AlertsSeriesChart data={res.series} longRange={longRange} />
-        )}
-      </Panel>
+      <Suspense fallback={<ChartSkeleton label="Распределение · считаем…" />}>
+        <SeriesBlock seriesP={seriesP} longRange={longRange} rowsMs={rowsMs} />
+      </Suspense>
 
       <div className="grid gap-6 lg:grid-cols-[16rem_1fr]">
-        <Panel label="Поля" meta="клик — добавить в запрос" bodyClassName="space-y-4">
-          {res.facets.map((f) => (
-            <div key={f.field}>
-              <div className="c-label mb-1">{f.label} <span className="text-muted-foreground">{f.field}</span></div>
-              <ul className="space-y-0.5 font-mono text-xs">
-                {f.values.length === 0 && <li className="text-muted-foreground">—</li>}
-                {f.values.map((v) => (
-                  <li key={v.value} className="flex justify-between gap-2">
-                    <Link href={href({ q: appendTerm(q, f.field, v.value, { literal: true }), page: undefined })} className="truncate hover:underline" title={v.value}>{v.value}</Link>
-                    <span className="text-muted-foreground tabular-nums">{fmtNum(v.count)}</span>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          ))}
-        </Panel>
+        <Suspense fallback={<PanelSkeleton label="Поля" lines={8} />}>
+          <FacetsBlock facetsP={facetsP} q={q} href={href} />
+        </Suspense>
 
         <Panel
-          label={`Результаты · стр. ${fmtNum(res.page)} из ${fmtNum(pages)}`}
+          label={`Результаты · стр. ${fmtNum(plan.page)}`}
           meta={
             <span className="flex gap-2">
               <DownloadButton href={exportHref("csv")} filename={`${exportName}.csv`} size="sm" variant="ghost">CSV</DownloadButton>
@@ -174,16 +216,81 @@ function SearchResults({
                 </tr>
               </thead>
               <tbody>
-                {res.rows.length === 0 && (
+                {rows.length === 0 && (
                   <tr><td colSpan={def.columns.length + 1} className="py-8 text-center font-mono text-muted-foreground">Ничего не найдено — измените запрос или интервал</td></tr>
                 )}
-                {res.rows.map((row, i) => <SearchHit key={`${String(row.time ?? "")}|${i}`} row={row} columns={def.columns} index={index} />)}
+                {rows.map((row, i) => <SearchHit key={`${String(row.time ?? "")}|${i}`} row={row} columns={def.columns} index={index} />)}
               </tbody>
             </table>
           </div>
-          <Pager page={res.page} pages={pages} total={res.total} pageSize={res.pageSize} href={(p) => href({ page: p > 1 ? String(p) : undefined })} />
+          <Suspense fallback={approxPager}>
+            <ExactPager seriesP={seriesP} fallback={approxPager} pager={pager} />
+          </Suspense>
         </Panel>
       </div>
     </>
   );
+}
+
+async function SeriesBlock({ seriesP, longRange, rowsMs }: { seriesP: Promise<Settled<SeriesPoint[]>>; longRange: boolean; rowsMs: number }) {
+  const r = await seriesP;
+  if (!r.ok) {
+    return (
+      <Panel label="Распределение" meta={`страница — ${fmtMs(rowsMs)} · время UTC`}>
+        <p role="status" className="text-sm text-muted-foreground">Распределение и итог не посчитаны: {partErrorMessage(r.error, SERIES_SETTINGS.max_execution_time)}. Результаты ниже — полные для своей страницы.</p>
+      </Panel>
+    );
+  }
+  return (
+    <Panel label={`Распределение · ${fmtNum(seriesTotal(r.data))} записей`} meta={`страница — ${fmtMs(rowsMs)} · время UTC`}>
+      {r.data.length === 0 ? <Empty>Нет данных за выбранный интервал.</Empty> : <AlertsSeriesChart data={r.data} longRange={longRange} />}
+    </Panel>
+  );
+}
+
+async function FacetsBlock({ facetsP, q, href }: { facetsP: Promise<Settled<{ facets: Facet[]; sample: number }>>; q: string; href: (patch: Record<string, string | undefined>) => string }) {
+  const r = await facetsP;
+  if (!r.ok) {
+    return (
+      <Panel label="Поля" bodyClassName="space-y-2">
+        <p role="status" className="text-sm text-muted-foreground">Не посчитаны: {partErrorMessage(r.error, FACETS_SETTINGS.max_execution_time)}.</p>
+      </Panel>
+    );
+  }
+  const sampled = r.data.sample >= FACET_SAMPLE;
+  return (
+    <Panel
+      label="Поля"
+      meta={sampled ? `по последним ${fmtNum(FACET_SAMPLE)} совпадениям · клик — добавить в запрос` : "клик — добавить в запрос"}
+      bodyClassName="space-y-4"
+    >
+      {r.data.facets.map((f) => (
+        <div key={f.field}>
+          <div className="c-label mb-1">{f.label} <span className="text-muted-foreground">{f.field}</span></div>
+          <ul className="space-y-0.5 font-mono text-xs">
+            {f.values.length === 0 && <li className="text-muted-foreground">—</li>}
+            {f.values.map((v) => (
+              <li key={v.value} className="flex justify-between gap-2">
+                <Link href={href({ q: appendTerm(q, f.field, v.value, { literal: true }), page: undefined })} className="truncate hover:underline" title={v.value}>{v.value}</Link>
+                <span className="text-muted-foreground tabular-nums">{fmtNum(v.count)}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ))}
+    </Panel>
+  );
+}
+
+async function ExactPager({
+  seriesP,
+  fallback,
+  pager,
+}: {
+  seriesP: Promise<Settled<SeriesPoint[]>>;
+  fallback: ReactNode;
+  pager: (total: number, exact: boolean) => ReactNode;
+}) {
+  const r = await seriesP;
+  return r.ok ? pager(seriesTotal(r.data), true) : fallback;
 }
