@@ -297,6 +297,7 @@ func (c *ClickHouse) OpenIncidents(ctx context.Context) ([]incidents.Incident, i
 			open = append(open, inc)
 		}
 	}
+	c.restoreGroupKeys(ctx, open)
 	return open, maxN, nil
 }
 
@@ -413,6 +414,39 @@ func (c *ClickHouse) OperatorStates(ctx context.Context, ids []string) (map[stri
 		res[st.IncidentID] = st
 	}
 	return res, nil
+}
+
+// restoreGroupKeys — group_key открытых инцидентов (колонка incidents из
+// миграции 0034, в incidents_current её нет). Без колонки или при ошибке ключи
+// остаются пустыми: реестр примет такие инциденты под старым ключом
+// «правило|субъект|узел» и передаст первой сработке группы.
+func (c *ClickHouse) restoreGroupKeys(ctx context.Context, open []incidents.Incident) {
+	if len(open) == 0 {
+		return
+	}
+	ids := make([]string, len(open))
+	for i := range open {
+		ids[i] = open[i].IncidentID
+	}
+	out, err := c.do(ctx, `SELECT incident_id, argMax(group_key, (updated_at, event_count, last_ts)) AS group_key
+	FROM incidents WHERE incident_id IN {ids:Array(String)} GROUP BY incident_id FORMAT JSONEachRow`, nil,
+		map[string]string{"ids": chArray(ids)})
+	if err != nil {
+		return
+	}
+	keys := map[string]string{}
+	for _, line := range bytes.Split(out, []byte("\n")) {
+		var row struct {
+			IncidentID string `json:"incident_id"`
+			GroupKey   string `json:"group_key"`
+		}
+		if json.Unmarshal(line, &row) == nil {
+			keys[row.IncidentID] = row.GroupKey
+		}
+	}
+	for i := range open {
+		open[i].GroupKey = keys[open[i].IncidentID]
+	}
 }
 
 func (c *ClickHouse) InsertIncidents(ctx context.Context, incs []*incidents.Incident) error {
