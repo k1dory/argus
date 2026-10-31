@@ -57,10 +57,14 @@ type modsecAudit struct {
 		ServerID   string `json:"server_id"`
 		UniqueID   string `json:"unique_id"`
 		ID         string `json:"id"`
-		Request    struct {
-			Method  string            `json:"method"`
-			URI     string            `json:"uri"`
-			Headers map[string]string `json:"headers"`
+		// IsInterrupted — Coraza: движок прервал транзакцию (disruptive action). Код ответа
+		// при этом в аудит не попадает (response.status: null), так что блок виден только здесь.
+		IsInterrupted bool `json:"is_interrupted"`
+		Request       struct {
+			Method string `json:"method"`
+			URI    string `json:"uri"`
+			// ModSecurity — {"Host":"…"}, Coraza 3.8 — {"host":["…"]}
+			Headers json.RawMessage `json:"headers"`
 		} `json:"request"`
 		Response struct {
 			HTTPCode int `json:"http_code"` // ModSecurity
@@ -83,7 +87,10 @@ type modsecAudit struct {
 type modsecMessage struct {
 	Message string        `json:"message"`
 	Details modsecDetails `json:"details"` // ModSecurity
-	Data    modsecDetails `json:"data"`    // Coraza
+	Data    modsecDetails `json:"data"`    // Coraza до 3.8
+	// ErrorMessage — Coraza 3.8: data: null, метаданные правила только строкой
+	// error-лога ("[client …] Coraza: Warning. … [id \"930130\"] …").
+	ErrorMessage string `json:"error_message"`
 }
 
 type modsecDetails struct {
@@ -119,7 +126,7 @@ func ParseWAFAudit(b []byte) (WAF, bool) {
 	if strings.Contains(strings.ToLower(t.Producer.Connector+t.Producer.Server+t.Producer.ModSecurity), "coraza") || t.Producer.RuleEngine != "" {
 		w.Product = "coraza"
 	}
-	for k, v := range t.Request.Headers {
+	for k, v := range auditHeaders(t.Request.Headers) {
 		switch strings.ToLower(k) {
 		case "host":
 			w.Host = v
@@ -131,10 +138,21 @@ func ParseWAFAudit(b []byte) (WAF, bool) {
 	if len(msgs) == 0 {
 		msgs = t.Messages
 	}
+	denied := false
 	for _, m := range msgs {
 		d := m.Details
 		if d.RuleID == "" && rawString(d.ID) == "" && d.Msg == "" {
 			d = m.Data
+		}
+		if d.RuleID == "" && rawString(d.ID) == "" && d.Msg == "" && m.ErrorMessage != "" {
+			if loc := wafMarkRe.FindStringSubmatchIndex(m.ErrorMessage); loc != nil {
+				denied = denied || strings.HasPrefix(m.ErrorMessage[loc[2]:loc[3]], "Access denied")
+				var mw WAF
+				if r, ok := parseRuleMeta(m.ErrorMessage[loc[1]:], &mw); ok {
+					w.addRule(r)
+				}
+				continue
+			}
 		}
 		r := WAFRule{ID: firstNonEmpty(d.RuleID, rawString(d.ID)), Msg: firstNonEmpty(d.Msg, m.Message), Tags: d.Tags, Data: d.Data, Severity: -1}
 		if sev := rawString(d.Severity); sev != "" {
@@ -147,7 +165,9 @@ func ParseWAFAudit(b []byte) (WAF, bool) {
 		w.addRule(r)
 	}
 	w.Final = true
-	w.Blocked = !strings.EqualFold(w.EngineMode, "DetectionOnly") && (w.Status == 403 || w.Status == 406) && w.hasFinalRule()
+	// Coraza: is_interrupted / «Access denied» в сообщении — решение движка, код ответа не нужен.
+	w.Blocked = !strings.EqualFold(w.EngineMode, "DetectionOnly") &&
+		(t.IsInterrupted || denied || ((w.Status == 403 || w.Status == 406) && w.hasFinalRule()))
 	return w, true
 }
 
@@ -164,9 +184,10 @@ func (w *WAF) hasFinalRule() bool {
 // --- error-log строка: Apache/nginx "ModSecurity: Warning. …" и Caddy "Coraza: Warning. …" ---
 
 var (
-	kvRe      = regexp.MustCompile(`\[([a-z_]+) "((?:[^"\\]|\\.)*)"\]`)
-	clientRe  = regexp.MustCompile(`\[client "?([0-9a-fA-F.:]+)(?::\d+)?"?\]`)
-	wafMarkRe = regexp.MustCompile(`(?:ModSecurity|Coraza): (Warning|Access denied with (?:code (\d+)|redirect|connection close))`)
+	kvRe     = regexp.MustCompile(`\[([a-z_]+) "((?:[^"\\]|\\.)*)"\]`)
+	clientRe = regexp.MustCompile(`\[client "?([0-9a-fA-F.:]+)(?::\d+)?"?\]`)
+	// Coraza пишет «Access denied (phase 2).» без кода — код ответа в строке не указан.
+	wafMarkRe = regexp.MustCompile(`(?:ModSecurity|Coraza): (Warning|Access denied(?: with (?:code (\d+)|redirect|connection close)| \(phase \d\)))`)
 	// метаданные правила начинаются с [file "…"] — всё до него (в т.ч. Value: `…' атакующего) не разбираем
 	fileTagRe = regexp.MustCompile(`\[file "`)
 )
@@ -207,8 +228,23 @@ func ParseWAFErrorLine(line string) (WAF, bool) {
 	if m[2] != "" {
 		w.Status, _ = strconv.Atoi(m[2])
 	}
-	// метаданные правила — от первого [file "…"]; до него — совпадение с данными запроса
-	meta := text[loc[1]:]
+	if r, ok := parseRuleMeta(text[loc[1]:], &w); ok {
+		w.addRule(r)
+	}
+	// «Access denied» = движок заблокировал; Warning — только детект (DetectionOnly или score ещё не набран).
+	// Одна транзакция даёт N строк Warning (по правилу) и одну итоговую: событием считаем итоговую —
+	// Access denied либо оценку anomaly score (949110/980130), иначе счётчики правил завышаются в N раз.
+	if denied {
+		w.EngineMode, w.Blocked = "On", true
+	}
+	w.Final = denied || w.hasFinalRule()
+	return w, true
+}
+
+// parseRuleMeta — метаданные правила из хвоста строки error-лога после маркера.
+// Разбор — от первого [file "…"]; до него — совпадение с данными запроса атакующего.
+// hostname/uri/unique_id пишутся в w.
+func parseRuleMeta(meta string, w *WAF) (WAFRule, bool) {
 	if fi := fileTagRe.FindStringIndex(meta); fi != nil {
 		meta = meta[fi[0]:]
 	} else {
@@ -240,17 +276,28 @@ func ParseWAFErrorLine(line string) (WAF, bool) {
 			w.UniqueID = v
 		}
 	}
-	if r.ID != "" || r.Msg != "" {
-		w.addRule(r)
+	return r, r.ID != "" || r.Msg != ""
+}
+
+// auditHeaders — заголовки запроса из аудита: объект строк (ModSecurity) или массивов (Coraza 3.8).
+func auditHeaders(raw json.RawMessage) map[string]string {
+	out := map[string]string{}
+	if len(raw) == 0 {
+		return out
 	}
-	// «Access denied» = движок заблокировал; Warning — только детект (DetectionOnly или score ещё не набран).
-	// Одна транзакция даёт N строк Warning (по правилу) и одну итоговую: событием считаем итоговую —
-	// Access denied либо оценку anomaly score (949110/980130), иначе счётчики правил завышаются в N раз.
-	if denied {
-		w.EngineMode, w.Blocked = "On", true
+	var flat map[string]string
+	if json.Unmarshal(raw, &flat) == nil {
+		return flat
 	}
-	w.Final = denied || w.hasFinalRule()
-	return w, true
+	var multi map[string][]string
+	if json.Unmarshal(raw, &multi) == nil {
+		for k, v := range multi {
+			if len(v) > 0 {
+				out[k] = v[0]
+			}
+		}
+	}
+	return out
 }
 
 func (w *WAF) addRule(r WAFRule) {
