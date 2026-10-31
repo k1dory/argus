@@ -216,11 +216,11 @@ paths:
                 type: string
                 description: "CSV с BOM; заголовок `Content-Disposition: attachment; filename=\"argus-<index>-<дата>.csv\"`."
         "400":
-          description: "Ошибка запроса — `{error}` (текст разбора), `index=alerts` при выключенном модуле Wazuh или для сессии разбора `{error: invalid_value|missing_filter, detail}`."
+          description: "Ошибка запроса — `{error}` (текст разбора), `index=alerts` при выключенном модуле Wazuh или для сессии разбора `{error: invalid_value|missing_filter, detail}`. Ошибка разбора приходит полным `SearchResult` с заполненным `error`; такое тело подходит и под `Error` (поле `error` — строка, остальные свойства разрешены), поэтому альтернативы — `anyOf`, а не `oneOf`."
           content:
             application/json:
               schema:
-                oneOf:
+                anyOf:
                   - $ref: "#/components/schemas/Error"
                   - $ref: "#/components/schemas/SearchResult"
         "401": { $ref: "#/components/responses/Unauthorized" }
@@ -1297,10 +1297,13 @@ components:
           items: { $ref: "#/components/schemas/SearchRow" }
         total:
           type: integer
-          description: Сумма гистограммы. Если гистограмма не посчиталась за свой бюджет (`incomplete` содержит `series`) — нижняя граница по странице, `total_exact=false`.
+          description: Сумма гистограммы. Если гистограмма не посчиталась за свой бюджет (`incomplete` содержит `series`) — настоящая нижняя граница, `total_exact=false`, только доказанные строки — `(page − 1) × 50 + rows` при непустой странице, `0` при пустой. Наличие следующей страницы в `total` не прибавляется — см. `has_more`.
         total_exact:
           type: boolean
           description: "`false` — `total` нижняя граница: гистограмма не уложилась в 15 с."
+        has_more:
+          type: boolean
+          description: Следующая страница существует — за текущей прочитана ещё одна строка (она не показывается). Не зависит от `total_exact`.
         page: { type: integer }
         pageSize: { type: integer, const: 50 }
         series:

@@ -141,6 +141,8 @@ export type SearchResult = {
   total: number;
   /** false — total нижняя граница (гистограмма не уложилась в свой бюджет). */
   total_exact: boolean;
+  /** Следующая страница существует: прочитана лишняя строка за текущей. */
+  has_more: boolean;
   page: number;
   pageSize: number;
   series: SeriesPoint[];
@@ -395,7 +397,7 @@ export type SearchPlan = {
 export function planSearch(input: SearchInput): { plan: SearchPlan | null; empty: SearchResult } {
   const def = INDEXES[input.index];
   const page = clampPage(input.page);
-  const empty: SearchResult = { rows: [], total: 0, total_exact: true, page, pageSize: PAGE_SIZE, series: [], facets: [], facets_sample: null, incomplete: [], notice: null, error: null, ms: 0 };
+  const empty: SearchResult = { rows: [], total: 0, total_exact: true, has_more: false, page, pageSize: PAGE_SIZE, series: [], facets: [], facets_sample: null, incomplete: [], notice: null, error: null, ms: 0 };
   if (input.index === "alerts" && !wazuhEnabled()) return { plan: null, empty: { ...empty, error: WAZUH_DISABLED_ERROR } };
   const built = buildWhere(input);
   if (built.error) return { plan: null, empty: { ...empty, error: built.error } };
@@ -403,14 +405,22 @@ export function planSearch(input: SearchInput): { plan: SearchPlan | null; empty
 }
 
 /** Страница результатов: ORDER BY ts DESC LIMIT — ClickHouse читает в порядке
- *  ключа сортировки и останавливается, как только страница набрана. */
-export function searchRows(plan: SearchPlan): Promise<Record<string, unknown>[]> {
+ *  ключа сортировки и останавливается, как только страница набрана. Читается
+ *  на одну строку больше страницы: эта строка не показывается, а только
+ *  доказывает, что следующая страница существует (hasMore). */
+export async function searchPage(plan: SearchPlan): Promise<{ rows: Record<string, unknown>[]; hasMore: boolean }> {
   const { def, where, params, offset } = plan;
-  return chQuery<Record<string, unknown>>(
+  const rows = await chQuery<Record<string, unknown>>(
     `SELECT ${def.select} FROM ${def.table} WHERE ${where} ORDER BY ${def.tsCol} DESC LIMIT {limit:UInt32} OFFSET {offset:UInt32}`,
-    { ...params, limit: PAGE_SIZE, offset },
+    { ...params, limit: PAGE_SIZE + 1, offset },
     SEARCH_SETTINGS,
   );
+  return { rows: rows.slice(0, PAGE_SIZE), hasMore: rows.length > PAGE_SIZE };
+}
+
+/** Только строки страницы (без признака продолжения). */
+export async function searchRows(plan: SearchPlan): Promise<Record<string, unknown>[]> {
+  return (await searchPage(plan)).rows;
 }
 
 /** Гистограмма по уровням; её сумма — итог total. Для частого слова за длинный
@@ -444,10 +454,20 @@ export async function searchFacets(plan: SearchPlan): Promise<{ facets: Facet[];
   return { facets, sample };
 }
 
-/** Итог, когда гистограмма не посчиталась: нижняя граница по странице — пейджер
- *  предлагает следующую страницу, пока текущая полная. */
+/** Итог, когда гистограмма не посчиталась: настоящая нижняя граница — только
+ *  доказанные строки. Строки текущей страницы доказывают и все предыдущие
+ *  (упорядоченная выборка с OFFSET), пустая страница не доказывает ничего:
+ *  page=100 без строк — 0, а не 4950. Есть ли следующая страница — отдельный
+ *  признак hasMore (лишняя прочитанная строка), в total он не добавляется. */
 export function lowerBoundTotal(plan: SearchPlan, rows: number): number {
-  return plan.offset + rows + (rows === PAGE_SIZE ? 1 : 0);
+  return rows > 0 ? plan.offset + rows : 0;
+}
+
+/** Сколько страниц показать пейджеру: точный итог — по нему; нижняя граница —
+ *  доказанные страницы плюс следующая, если она подтверждена лишней строкой. */
+export function pageCount(total: number, exact: boolean, hasMore: boolean): number {
+  const proven = Math.ceil(total / PAGE_SIZE);
+  return Math.max(1, exact ? proven : proven + (hasMore ? 1 : 0));
 }
 
 /** Поиск целиком для API: страница обязательна (её ошибка — ошибка ответа),
@@ -460,7 +480,7 @@ export async function search(input: SearchInput): Promise<SearchResult> {
   const started = Date.now();
   const wantFacets = input.facets !== false;
   const [rowsR, seriesR, facetsR] = await Promise.allSettled([
-    searchRows(plan),
+    searchPage(plan),
     searchSeries(plan),
     wantFacets ? searchFacets(plan) : Promise.resolve({ facets: [] as Facet[], sample: 0 }),
   ]);
@@ -468,7 +488,7 @@ export async function search(input: SearchInput): Promise<SearchResult> {
     console.error("search:", rowsR.reason instanceof Error ? rowsR.reason.message : rowsR.reason);
     return { ...empty, error: searchErrorMessage(rowsR.reason) };
   }
-  const rows = rowsR.value;
+  const { rows, hasMore } = rowsR.value;
   const incomplete: SearchResult["incomplete"] = [];
   const notes: string[] = [];
   let series: SeriesPoint[] = [];
@@ -500,6 +520,7 @@ export async function search(input: SearchInput): Promise<SearchResult> {
     rows,
     total,
     total_exact: totalExact,
+    has_more: hasMore,
     page: plan.page,
     pageSize: PAGE_SIZE,
     series,

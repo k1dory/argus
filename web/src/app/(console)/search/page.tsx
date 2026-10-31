@@ -14,8 +14,8 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { requirePageSession } from "@/lib/auth";
 import {
-  availableIndexes, clampPage, FACET_SAMPLE, FACETS_SETTINGS, INDEXES, lowerBoundTotal, MAX_QUERY_LEN, PAGE_SIZE, parseIndex, partErrorMessage, planSearch,
-  searchErrorMessage, searchFacets, searchRows, searchSeries, seriesTotal, SERIES_SETTINGS, type Facet, type IndexKey, type SearchPlan,
+  availableIndexes, clampPage, FACET_SAMPLE, FACETS_SETTINGS, INDEXES, lowerBoundTotal, MAX_QUERY_LEN, PAGE_SIZE, pageCount, parseIndex, partErrorMessage, planSearch,
+  searchErrorMessage, searchFacets, searchPage, searchSeries, seriesTotal, SERIES_SETTINGS, type Facet, type IndexKey, type SearchPlan,
 } from "@/lib/search";
 import type { SeriesPoint } from "@/lib/queries";
 import { parseRange } from "@/lib/shared/ranges";
@@ -117,7 +117,8 @@ export default async function SearchPage({ searchParams }: PageProps<"/search">)
       {plan && r?.ok && seriesP && facetsP ? (
         <SearchResults
           plan={plan}
-          rows={r.data}
+          rows={r.data.rows}
+          hasMore={r.data.hasMore}
           rowsMs={rowsMs}
           seriesP={seriesP}
           facetsP={facetsP}
@@ -136,9 +137,9 @@ export default async function SearchPage({ searchParams }: PageProps<"/search">)
 
 type Settled<T> = { ok: true; data: T } | { ok: false; error: unknown };
 /** Страница результатов со временем ответа (для подписи «страница — N мс»). */
-async function timedRows(plan: SearchPlan): Promise<{ r: Settled<Record<string, unknown>[]>; ms: number }> {
+async function timedRows(plan: SearchPlan): Promise<{ r: Settled<{ rows: Record<string, unknown>[]; hasMore: boolean }>; ms: number }> {
   const started = Date.now();
-  const r = await settle(searchRows(plan));
+  const r = await settle(searchPage(plan));
   return { r, ms: Date.now() - started };
 }
 /** Обещание без отказа: ошибка части страницы не роняет рендер. */
@@ -149,6 +150,7 @@ function settle<T>(p: Promise<T>): Promise<Settled<T>> {
 function SearchResults({
   plan,
   rows,
+  hasMore,
   rowsMs,
   seriesP,
   facetsP,
@@ -162,6 +164,8 @@ function SearchResults({
 }: {
   plan: SearchPlan;
   rows: Record<string, unknown>[];
+  /** Следующая страница подтверждена лишней прочитанной строкой. */
+  hasMore: boolean;
   rowsMs: number;
   seriesP: Promise<Settled<SeriesPoint[]>>;
   facetsP: Promise<Settled<{ facets: Facet[]; sample: number }>>;
@@ -176,7 +180,7 @@ function SearchResults({
   const pager = (total: number, exact: boolean) => (
     <Pager
       page={plan.page}
-      pages={Math.max(1, Math.ceil(total / PAGE_SIZE))}
+      pages={pageCount(total, exact, hasMore)}
       total={exact ? total : undefined}
       pageSize={PAGE_SIZE}
       href={(p) => href({ page: p > 1 ? String(p) : undefined })}
