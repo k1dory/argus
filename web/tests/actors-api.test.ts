@@ -388,7 +388,7 @@ test("список персон: каждая считается своим пр
   assert.equal(ev.params.get("param_p0_a0"), "project_7_bot");
   // Предфильтр в WHERE: без него точные countIf шли по всему окну и на живом потоке
   // (100+ млн строк за 7 суток) упирались в max_execution_time.
-  assert.match(ev.sql, /WHERE ts >= .* AND \(.*IN \{pf_\d+:Array\(String\)\}/, "предфильтр по значениям алиасов");
+  assert.match(ev.sql, /WHERE ts >= .* AND hasAny\(\[actor_name, lowerUTF8\(actor_name\), src_ip, lowerUTF8\(node\)\], \{pf_keys:Array\(String\)\}\)/, "предфильтр по индексу ключей алиасов");
   const pfVals = [...ev.params.entries()].filter(([k]) => k.startsWith("param_pf_")).map(([, v]) => v).join(" ");
   assert.ok(pfVals.includes("'project_7_bot'"), "значения алиасов — массивом-параметром");
   assert.ok(!pfVals.includes("held_bot"), "удержанный алиас не фильтрует");

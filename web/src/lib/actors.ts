@@ -298,9 +298,11 @@ export async function actorReport(person: Person, aliases: Alias[], range: Actor
   const now = opts.now ?? Date.now();
   const w = clampWindow(opts.window ?? rangeWindow(range, now));
   const pred = aliasPredicate(aliases, w);
-  const params: Record<string, string | number> = { ...pred.params, from: chTs(w.fromMs), to: chTs(w.toMs) };
+  // Предфильтр по индексу idx_actor_keys: без него каждая агрегация читала всё окно.
+  const pf = aliasPrefilter(aliases);
+  const params: Record<string, string | number> = { ...pred.params, ...pf.params, from: chTs(w.fromMs), to: chTs(w.toMs) };
   const bind = opts.bind ? ` AND ${bindPredicate(opts.bind, params)}` : "";
-  const base = `ts >= parseDateTime64BestEffort({from:String}, 3, 'UTC') AND ts < parseDateTime64BestEffort({to:String}, 3, 'UTC') AND ${pred.sql}${bind}`;
+  const base = `ts >= parseDateTime64BestEffort({from:String}, 3, 'UTC') AND ts < parseDateTime64BestEffort({to:String}, 3, 'UTC') AND ${pf.sql} AND ${pred.sql}${bind}`;
 
   // Инциденты: actor_name инцидента среди субъектных алиасов (без удержанных) — для email/login без учёта регистра.
   const subject = activeAliases(aliases).filter((a) => ACTOR_KINDS.includes(a.kind));

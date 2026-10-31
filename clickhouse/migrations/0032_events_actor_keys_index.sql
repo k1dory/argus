@@ -1,0 +1,14 @@
+-- Паспорт ищет человека по алиасам разных видов сразу: login/email без учёта регистра
+-- (lowerUTF8(actor_name)), uid/sid/peer точно (actor_name), адрес (src_ip), хост
+-- (lowerUTF8(node)) — через OR. Отдельные bloom-индексы idx_actor и idx_src_ip тут не
+-- работают: выражение lowerUTF8(actor_name) не совпадает с выражением индекса, а OR по
+-- разным индексам ClickHouse не отсекает — каждый видит «своё ИЛИ неизвестно». Редкий
+-- субъект читал всё окно (на стенде 5 выборок по ~117 млн строк, до 7,3 с).
+-- Один bloom-индекс по массиву всех ключей поиска: предфильтр
+-- hasAny(<то же выражение>, массив значений) отсекает гранулы для любой смеси видов,
+-- точный предикат с интервалами алиасов идёт уже по оставшимся строкам. Выражение
+-- должно совпадать дословно с ACTOR_KEYS_EXPR в web/src/lib/shared/actors.ts.
+-- MATERIALIZE — фоновая мутация только индексных файлов по существующим партам;
+-- новые парты индексируются при вставке. Идемпотентно.
+ALTER TABLE argus.events ADD INDEX IF NOT EXISTS idx_actor_keys [actor_name, lowerUTF8(actor_name), src_ip, lowerUTF8(node)] TYPE bloom_filter(0.01) GRANULARITY 4;
+ALTER TABLE argus.events MATERIALIZE INDEX idx_actor_keys;
