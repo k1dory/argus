@@ -108,6 +108,34 @@ function connectionError(e: unknown): ClickHouseError {
   return new ClickHouseError("ClickHouse недоступен");
 }
 
+/** Типы, значения которых ClickHouse читает из param_* в экранированном текстовом
+ *  формате (как TSV): «\a» там — управляющий символ, «\\» — один обратный слэш. */
+const STRING_PARAM_TYPE = /^(?:(?:Nullable|LowCardinality)\(\s*)*(?:String|FixedString\(\s*\d+\s*\))(?:\s*\))*$/;
+const PARAM_PLACEHOLDER = /\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([^{}]+?)\s*\}/g;
+const ESCAPED: Record<string, string> = { "\\": "\\\\", "\t": "\\t", "\n": "\\n", "\r": "\\r", "\0": "\\0", "\b": "\\b", "\f": "\\f" };
+
+/** Значение строкового параметра в экранированном формате ClickHouse. */
+export function escapeChString(value: string): string {
+  return value.replace(/[\\\t\n\r\0\b\f]/g, (c) => ESCAPED[c]);
+}
+
+/** Имя параметра → тип из плейсхолдеров {name:Type} запроса. */
+export function paramTypes(sql: string): Map<string, string> {
+  const types = new Map<string, string>();
+  for (const m of sql.matchAll(PARAM_PLACEHOLDER)) types.set(m[1], m[2]);
+  return types;
+}
+
+/** Значение param_* для URL: строки (String, FixedString, Nullable/LowCardinality
+ *  от них) экранируются по формату ClickHouse — иначе «dir\logs\auth» доходит с
+ *  управляющим символом вместо «\a», а «\%» из экранирования LIKE теряет слэш.
+ *  Остальные типы — как есть: числа и даты экранирования не содержат, а литералы
+ *  Array(String) вызывающий собирает сам, со своими кавычками и экранированием. */
+export function encodeParam(value: string | number, type: string | undefined): string {
+  const text = String(value);
+  return type !== undefined && STRING_PARAM_TYPE.test(type.trim()) ? escapeChString(text) : text;
+}
+
 function chFetch(sql: string, params: Record<string, string | number>, settings: Record<string, string | number>, format: string | null): Promise<string> {
   return chLimit(() => chFetchWithSlot(sql, params, settings, format));
 }
@@ -117,7 +145,8 @@ async function chFetchWithSlot(sql: string, params: Record<string, string | numb
   for (const [key, value] of Object.entries({ ...DEFAULT_SETTINGS, ...settings })) url.searchParams.set(key, String(value));
   url.searchParams.set("database", CH_DB);
   if (format) url.searchParams.set("default_format", format);
-  for (const [key, value] of Object.entries(params)) url.searchParams.set(`param_${key}`, String(value));
+  const types = paramTypes(sql);
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(`param_${key}`, encodeParam(value, types.get(key)));
   let resp: Response;
   try {
     resp = await fetch(url, {
