@@ -1,0 +1,85 @@
+// Live-tail: сбой на второй порции догона не отменяет первую — курсор, строки и
+// инциденты уже забранных порций остаются, ошибка уходит в статус. Сбой на первой
+// порции по-прежнему исключение (следующий такт спросит то же место).
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { parseJournalParams, type JournalEvent } from "../src/lib/shared/journal";
+import { errorStatus, nextStatus, pollTail, tailStatusText } from "../src/lib/shared/tail-poll";
+
+const filters = parseJournalParams({});
+const row = (id: string) => ({ id, time: "2026-10-30 10:00:00.000", received: "2026-10-30 10:00:00" }) as unknown as JournalEvent;
+const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+
+function scripted(replies: (() => Response | Promise<Response>)[]) {
+  const urls: string[] = [];
+  const fetchFn = (async (url: string | URL) => {
+    urls.push(String(url));
+    const next = replies.shift();
+    if (!next) throw new Error("лишний запрос");
+    return next();
+  }) as typeof fetch;
+  return { fetchFn, urls };
+}
+
+for (const [name, second] of [
+  ["503 со своим текстом", () => json({ error: "хранилище недоступно" }, 503)],
+  ["HTML-страница прокси вместо JSON", () => new Response("<html>502 Bad Gateway</html>", { status: 502 })],
+  ["сетевой сбой", () => Promise.reject(new TypeError("fetch failed"))],
+] as const) {
+  test(`догон: ${name} на второй порции — первая порция применена, курсор сдвинут, ошибка в статусе`, async () => {
+    const { fetchFn, urls } = scripted([
+      () => json({ rows: [row("a1"), row("a2")], cursor: "c1", more: true, pending: 300, incidents: { a1: [{ incident_id: "INC-1" }] } }),
+      second,
+    ]);
+    const r = await pollTail({ filters, cursor: "c0", state: { rows: [], seen: new Set() }, fetchFn });
+    assert.equal(urls.length, 2);
+    assert.match(urls[1], /cursor=c1/, "вторая порция спрошена с нового курсора");
+    assert.equal(r.cursor, "c1", "курсор после первой порции не теряется");
+    assert.deepEqual(r.added.map((x) => x.id), ["a1", "a2"]);
+    assert.deepEqual(r.state.rows.map((x) => x.id).sort(), ["a1", "a2"]);
+    assert.ok(r.incidents.a1, "инциденты первой порции");
+    assert.ok(r.error && r.error.length > 0, "текст сбоя");
+    assert.equal(r.throttled, 0);
+    const st = nextStatus(null, r);
+    assert.equal(st.added, 2, "в статусе учтены забранные строки");
+    assert.equal(st.error, r.error);
+    assert.match(tailStatusText(st, true, true), /^ошибка обновления: /);
+  });
+}
+
+test("сбой на первой порции — исключение, как раньше; успешный такт — без ошибки", async () => {
+  const { fetchFn } = scripted([() => json({ error: "cursor: ожидается received_at|id" }, 400)]);
+  await assert.rejects(pollTail({ filters, cursor: "bad", state: { rows: [], seen: new Set() }, fetchFn }), /cursor: ожидается/);
+  const ok = scripted([() => json({ rows: [row("b1")], cursor: "c2", more: false })]);
+  const r = await pollTail({ filters, cursor: "c1", state: { rows: [], seen: new Set() }, fetchFn: ok.fetchFn });
+  assert.equal(r.error, null);
+  assert.equal(nextStatus(errorStatus(null, new Error("x")), r).error, null, "успешный такт снимает ошибку");
+});
+
+test("после сбоя второй порции следующий такт продолжает догон с сохранённого курсора и не дублирует строки", async () => {
+  const first = scripted([
+    () => json({ rows: [row("a1"), row("a2")], cursor: "c1", more: true, pending: 2, incidents: { a2: [{ incident_id: "INC-2" }] } }),
+    () => json({ error: "временная ошибка" }, 503),
+  ]);
+  const partial = await pollTail({ filters, cursor: "c0", state: { rows: [row("a0")], seen: new Set(["a0"]) }, maxRows: 2, fetchFn: first.fetchFn });
+  assert.equal(partial.cursor, "c1");
+  assert.equal(partial.trimmed, 1, "первый успешный ответ уже применил предел ленты");
+  assert.equal(partial.pending, 2, "сбой не обнуляет последний известный размер очереди");
+  assert.equal(partial.incidents.a2[0].incident_id, "INC-2");
+
+  const retry = scripted([
+    () => json({ rows: [row("a2"), row("a3")], cursor: "c2", more: true, pending: 1 }),
+    () => json({ rows: [row("a4")], cursor: "c3", more: false }),
+  ]);
+  const caughtUp = await pollTail({ filters, cursor: partial.cursor, state: partial.state, maxRows: 2, fetchFn: retry.fetchFn });
+  assert.equal(new URL(retry.urls[0], "http://x").searchParams.get("cursor"), "c1", "ошибочная порция повторяется, уже принятую не запрашиваем");
+  assert.equal(new URL(retry.urls[1], "http://x").searchParams.get("cursor"), "c2");
+  assert.equal(caughtUp.cursor, "c3");
+  assert.deepEqual(caughtUp.added.map((r) => r.id), ["a3", "a4"], "повтор a2 не добавлен второй раз");
+  assert.deepEqual(caughtUp.state.rows.map((r) => r.id).sort(), ["a3", "a4"]);
+  assert.equal(caughtUp.pending, 0);
+  const status = nextStatus(nextStatus(null, partial), caughtUp);
+  assert.equal(status.added, 4);
+  assert.equal(status.trimmed, 3);
+  assert.equal(status.error, null, "успешное продолжение снимает ошибку прошлого такта");
+});

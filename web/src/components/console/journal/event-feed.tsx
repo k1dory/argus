@@ -5,18 +5,14 @@ import Link from "next/link";
 import { ChevronRight, Minus, Plus, Radio, Pause } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import { journalHref, journalParams, mergeTail, withTerm, type IncidentRef, type JournalEvent, type JournalFilters, type JournalPatch, type TailState } from "@/lib/shared/journal";
+import { journalHref, withTerm, type IncidentRef, type JournalEvent, type JournalFilters, type JournalPatch, type TailState } from "@/lib/shared/journal";
+import { errorStatus, MAX_ROWS, nextStatus, pollTail, TAIL_EVERY_MS, tailStatusText, type TailStatus } from "@/lib/shared/tail-poll";
 import { SEVERITY, severityTone } from "@/lib/shared/severity";
 import { LEVEL_TONE, STATUS_TONE, TONE_CLASS, toneFor } from "@/components/console/tone";
 import { INCIDENT_LEVEL_LABELS } from "@/lib/shared/labels";
 import { INCIDENT_STATUSES, isIncidentStatus } from "@/lib/shared/incidents";
 import { formatTs } from "@/lib/shared/time";
 import { RawBlock } from "./raw-block";
-
-const TAIL_EVERY_MS = 5_000;
-/** Сколько порций (по 100) забрать подряд за один такт, если сервер говорит more. */
-const CATCHUP_ROUNDS = 4;
-const MAX_ROWS = 500;
 
 type Props = {
   initial: JournalEvent[];
@@ -28,9 +24,6 @@ type Props = {
   liveAllowed: boolean;
   showDate: boolean;
 };
-
-type TailBody = { rows?: JournalEvent[]; incidents?: Record<string, IncidentRef[]>; cursor?: string; more?: boolean; pending?: number; error?: string };
-type TailStatus = { at: string; added: number; pending: number; trimmed: number; throttled: number; error: string | null };
 
 /** Лента журнала: плотные строки, раскрытие по клику, live-tail по курсору (received_at, id). */
 export function EventFeed({ initial, incidents: initialIncidents, filters, cursor: initialCursor, liveAllowed, showDate }: Props) {
@@ -45,37 +38,17 @@ export function EventFeed({ initial, incidents: initialIncidents, filters, curso
   const cursor = useRef(initialCursor);
   const tail = useRef<TailState>({ rows: initial, seen: new Set(initial.map((r) => r.id)) });
 
-  /** Один такт: порции подряд, пока сервер отвечает more (не больше CATCHUP_ROUNDS). */
+  /** Один такт: порции подряд, пока сервер отвечает more (lib/shared/tail-poll). */
   const tick = useCallback(async (signal: AbortSignal) => {
-    let added = 0;
-    let trimmed = 0;
-    let pending = 0;
-    for (let round = 0; round < CATCHUP_ROUNDS && !signal.aborted; round++) {
-      const params = journalParams(filters, { range: undefined, from: undefined, to: undefined });
-      params.set("cursor", cursor.current);
-      const res = await fetch(`/api/events/tail?${params.toString()}`, { cache: "no-store", signal });
-      const body = (await res.json()) as TailBody;
-      if (res.status === 429) {
-        // Лимит API (несколько вкладок, долгий догон) — не ошибка: курсор стоит, ждём Retry-After.
-        const wait = Math.min(60, Math.max(5, Number(res.headers.get("Retry-After")) || 5));
-        return { added, trimmed, pending, throttled: wait };
-      }
-      if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
-      // Курсор двигаем только после успешного ответа: ошибка или 429 — следующий такт спросит то же место.
-      cursor.current = body.cursor ?? cursor.current;
-      const merged = mergeTail(tail.current, body.rows ?? [], MAX_ROWS);
-      tail.current = { rows: merged.rows, seen: merged.seen };
-      added += merged.added.length;
-      trimmed += merged.trimmed;
-      pending = body.more ? body.pending ?? 0 : 0;
-      if (merged.added.length) {
-        setRows(merged.rows);
-        setFresh(new Set(merged.added.map((r) => r.id)));
-      }
-      if (body.incidents && Object.keys(body.incidents).length) setIncidents((prev) => ({ ...prev, ...body.incidents }));
-      if (!body.more) break;
+    const r = await pollTail({ filters, cursor: cursor.current, state: tail.current, signal });
+    cursor.current = r.cursor;
+    tail.current = r.state;
+    if (r.added.length) {
+      setRows(r.state.rows);
+      setFresh(new Set(r.added.map((x) => x.id)));
     }
-    return { added, trimmed, pending, throttled: 0 };
+    if (Object.keys(r.incidents).length) setIncidents((prev) => ({ ...prev, ...r.incidents }));
+    return r;
   }, [filters]);
 
   // Опрос без наложения: следующий такт планируется только после завершения
@@ -89,14 +62,14 @@ export function EventFeed({ initial, incidents: initialIncidents, filters, curso
         try {
           const r = await tick(ctrl.signal);
           if (ctrl.signal.aborted) return;
-          setStatus((prev) => ({ at: new Date().toISOString(), added: (prev?.added ?? 0) + r.added, trimmed: (prev?.trimmed ?? 0) + r.trimmed, pending: r.pending, throttled: r.throttled, error: null }));
+          setStatus((prev) => nextStatus(prev, r));
           if (r.throttled && !ctrl.signal.aborted) {
             timer = setTimeout(run, r.throttled * 1000);
             return;
           }
         } catch (e) {
           if (ctrl.signal.aborted) return;
-          setStatus((prev) => ({ at: new Date().toISOString(), added: prev?.added ?? 0, trimmed: prev?.trimmed ?? 0, pending: prev?.pending ?? 0, throttled: 0, error: e instanceof Error ? e.message : "ошибка" }));
+          setStatus((prev) => errorStatus(prev, e));
         }
       }
       if (!ctrl.signal.aborted) timer = setTimeout(run, TAIL_EVERY_MS);
@@ -126,24 +99,14 @@ export function EventFeed({ initial, incidents: initialIncidents, filters, curso
           aria-pressed={live}
           disabled={!liveAllowed}
           onClick={() => setLive(!live)}
-          title={liveAllowed ? "Подгружать новые события каждые 5 с" : "Live-tail работает для «сейчас»: уберите точный интервал и вернитесь на первую страницу"}
+          title={liveAllowed ? `Подгружать новые события каждые ${TAIL_EVERY_MS / 1000} с` : "Live-tail работает для «сейчас»: уберите точный интервал и вернитесь на первую страницу"}
         >
           {live ? <Pause strokeWidth={1.5} aria-hidden /> : <Radio strokeWidth={1.5} aria-hidden />}
           {live ? "Пауза" : "Live-tail"}
         </Button>
         <span className="text-[12px] text-[var(--text-tertiary)]" aria-live="polite">
           {live && <span className="mr-1.5 inline-block size-2 rounded-full bg-[var(--status-ok)] align-middle" aria-hidden />}
-          {!liveAllowed
-            ? "live-tail недоступен для прошлого интервала"
-            : status
-              ? status.error
-                ? `ошибка обновления: ${status.error} — повторим через 5 с, события не пропадут`
-                : status.throttled
-                  ? `пауза ${status.throttled} с, догоняем — события не пропадут`
-                : `обновлено ${formatTs(status.at, "time")} UTC · пришло с начала live ${status.added}${status.pending ? ` · догоняем, в очереди ещё ${status.pending}` : ""}`
-              : live
-                ? "ждём новые события…"
-                : "лента зафиксирована на момент загрузки"}
+          {tailStatusText(status, live, liveAllowed)}
         </span>
         {status && status.trimmed > 0 && (
           <span className="text-[12px] text-num" role="status">

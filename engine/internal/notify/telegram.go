@@ -42,7 +42,8 @@ func (t *Telegram) Send(ctx context.Context, text string) error {
 		select {
 		case <-time.After(time.Duration(attempt+1) * 2 * time.Second):
 		case <-ctx.Done():
-			return err
+			// Отмена отличима от отказа API: errors.Is(err, context.Canceled/DeadlineExceeded).
+			return fmt.Errorf("%w (последняя попытка: %v)", ctx.Err(), err)
 		}
 	}
 	return err

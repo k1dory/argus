@@ -44,7 +44,8 @@ info:
     на `npm run build`; тест `web/tests/openapi.test.ts` следит, чтобы копия и маршруты не
     расходились).
   license:
-    name: См. LICENSE в корне репозитория
+    name: AGPL-3.0-only
+    identifier: AGPL-3.0-only
 servers:
   - url: /
     description: Та же схема и хост, что у консоли (за Caddy — https://<host>:8443).
@@ -101,7 +102,11 @@ paths:
     get:
       tags: [service]
       summary: Живость источников
-      description: События за час, EPS за 60 секунд, последний приём и признак «жив» (приём за 5 минут) по каждому источнику. Доступна и сессии разбора — инциденты не раскрывает.
+      description: >-
+        События за час, EPS за 60 секунд, последний приём, ритм и признак «жив» по порогу
+        самого источника. В список входят все источники с событиями за 30 суток, включая
+        пишущих мимо коллектора (телеметрия движка): замолчавшие — до 2000 самых свежих,
+        остальные считает omitted. Доступна и сессии разбора — инциденты не раскрывает.
       operationId: getSources
       security:
         - cookieSession: []
@@ -114,12 +119,19 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [sources, checked_at]
+                required: [sources, omitted, checked_at]
                 properties:
                   sources:
                     type: array
                     items:
                       $ref: "#/components/schemas/SourceHealth"
+                  omitted:
+                    type: integer
+                    minimum: 0
+                    description: >-
+                      Замолчавших источников сверх предела 2000 (самые давно молчащие) — в sources
+                      не вошли. 0 — список полный. Считается по объединению источников из таблицы
+                      событий и из heartbeat коллектора: каждый источник — один раз.
                   checked_at:
                     type: string
                     format: date-time
@@ -1249,13 +1261,13 @@ components:
     IncidentStatus:
       type: string
       enum: [new, escalated, in_progress, waiting_owner, observing, closed, false_positive]
-    Role:
-      type: string
-      enum: [viewer, analyst, admin]
-
     SourceHealth:
       type: object
-      required: [source, source_class, events_1h, eps_60s, last_ts, pii_share, alive]
+      description: >-
+        Источник, от которого были события за последние 30 суток — через коллектор или мимо
+        него. Счётчики за час — по таблице событий; ритм — типичный разрыв между пачками
+        событий по heartbeat коллектора за 30 суток.
+      required: [source, source_class, events_1h, eps_60s, last_ts, pii_share, alive, events_window, rhythm_sec, silence_threshold_sec, silent_for_sec]
       properties:
         source: { type: string }
         source_class: { type: string }
@@ -1268,7 +1280,30 @@ components:
         alive:
           type: integer
           enum: [0, 1]
-          description: 1 — был приём за последние 5 минут.
+          description: >-
+            1 — тишина не дольше порога источника (silence_threshold_sec = max(5 мин,
+            3 × ритм)); непрерывный источник молчит через 5 минут, суточный — через трое
+            суток. Без ритма (меньше двух разрывов или источник без heartbeat) порог — 5 минут.
+        events_window:
+          type: integer
+          description: >-
+            Событий за окно ритма (30 суток) по heartbeat коллектора. У источника без heartbeat
+            (пишет в events мимо коллектора, например телеметрия движка argus.system) значение
+            берётся из events_1h — то есть это события за последний час, а не за 30 суток;
+            у такого источника, замолчавшего больше часа назад, оно равно 0.
+        rhythm_sec:
+          type: [number, "null"]
+          description: >-
+            Ритм, секунд: разрывы между соседними активными минутами за окно без самого
+            длинного, 90-й процентиль, взвешенный длительностью разрыва (доля времени, а не
+            разрывов) — у пачечного источника это период пачек, у непрерывного минута.
+            null — разрывов меньше двух или нет heartbeat, ритм неизвестен.
+        silence_threshold_sec:
+          type: integer
+          description: Порог тишины для этого источника, секунд.
+        silent_for_sec:
+          type: integer
+          description: Секунд с последнего события на момент запроса.
 
     SeriesPoint:
       type: object
