@@ -81,7 +81,7 @@ test("свободный текст: те же совпадения, что у �
   await applyMigrations();
   await insertFixture();
 
-  await t.test("одиночные слова и фразы — как раньше", async () => {
+  await t.test("одиночные слова и фразы — как раньше", async (words) => {
     const cases: [string, number][] = [
       ["root", 1], // ROOT в raw, root в actor_name — одна запись
       ["publickey", 1],
@@ -108,14 +108,24 @@ test("свободный текст: те же совпадения, что у �
       ["50aaoff", 1], // не должен совпасть с буквальным 50%_off из другой строки
     ];
     for (const [qv, want] of cases) {
-      const term = /\s/.test(qv) ? `"${qv}"` : qv;
-      assert.equal(await countNew(term), want, `new: ${qv}`);
-      assert.equal(await countOld(qv), want, `old: ${qv}`);
+      await words.test(JSON.stringify(qv), async () => {
+        const term = /\s/.test(qv) ? `"${qv}"` : qv;
+        // Получаем оба результата до проверки: если сломан транспорт
+        // параметра, нельзя выдать ошибку обоих предикатов за баг индекса.
+        const [indexed, legacy] = await Promise.all([countNew(term), countOld(qv)]);
+        assert.deepEqual({ indexed, legacy }, { indexed: want, legacy: want }, `семантика ${JSON.stringify(qv)}`);
+      });
     }
     // отрицание и сочетание с полем
     assert.equal(await countNew("-root"), FIXTURE.length - 1);
     assert.equal(await countNew("action:flow beacon"), 1);
     assert.equal(await countNew("action:flow root"), 0);
+  });
+
+  await t.test("строковый HTTP-параметр сохраняет обратные слеши до применения предиката", async () => {
+    const value = "dir\\logs\\auth";
+    const rows = await ch().chQuery<{ value: string }>("SELECT {v:String} AS value", { v: value });
+    assert.deepEqual(rows, [{ value }], "если round-trip меняет строку, расходятся и старый, и индексированный поиск");
   });
 
   await t.test("алерты: подстрока в raw, фраза целиком", async () => {
