@@ -253,10 +253,18 @@ func (c *ClickHouse) EventsSince(ctx context.Context, cur Cursor, limit int) ([]
 
 // finishSlice — куда встать после среза [cur.At, upto) и какой ширины брать
 // следующий. Страница упёрлась в LIMIT — курсор уже внутри среза (advanceCursor),
-// срез сужается. Иначе срез прочитан целиком: все его секунды устоялись (upto не
-// дальше устоявшейся секунды), поэтому курсор переходит на upto с пустым Seen —
-// иначе пустой срез в прошлом не сдвинул бы курсор никогда. More — когда до
-// устоявшейся границы ещё есть срезы.
+// срез сужается. Иначе срез прочитан целиком:
+//   - срез в прошлом (upto раньше устоявшейся границы): курсор переходит на upto
+//     с пустым Seen — иначе пустой срез в прошлом не сдвинул бы курсор никогда;
+//   - срез у live-края (upto — устоявшаяся граница), и в нём были строки: курсор
+//     остаётся на последней прочитанной секунде с её Seen и Hash = 0. Следующий
+//     опрос перечитает эту секунду целиком, дедупликация отдаст только новое —
+//     INSERT той же секунды, завершившийся после чтения, с меньшим event_id не
+//     теряется. Переход на upto здесь сбрасывал Seen и отменял это перечитывание.
+//     Диапазон чтения остаётся ограниченным: [At, min(At+Step, граница));
+//   - пустой срез у края — как в прошлом: курсор на upto (перечитывать нечего).
+//
+// More — когда до устоявшейся границы ещё есть срезы.
 func finishSlice(cur, next Cursor, nrows, limit int, upto, now time.Time) Cursor {
 	step := cur.Step
 	if step <= 0 {
@@ -270,11 +278,15 @@ func finishSlice(cur, next Cursor, nrows, limit int, upto, now time.Time) Cursor
 		step = min(step*2, sliceMax)
 	}
 	settledEnd := now.UTC().Add(-cursorSettle).Truncate(time.Second).Add(time.Second)
-	if upto.After(next.At) {
+	atEdge := !upto.Before(settledEnd)
+	switch {
+	case atEdge && len(next.Seen) > 0:
+		next.Hash = 0 // перечитать последнюю секунду с начала; Seen отсеет отданное
+	case upto.After(next.At):
 		next = Cursor{At: upto, Seen: map[uint64]struct{}{}}
 	}
 	next.Step = step
-	next.More = upto.Before(settledEnd)
+	next.More = !atEdge
 	return next
 }
 
