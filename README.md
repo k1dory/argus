@@ -852,12 +852,13 @@ policies:
 куски таблицы; по старым его строят один раз вручную — фоновая мутация по всей `events`, запускать в
 спокойное время (повтор миграции её не ставит). Сначала проверьте, не поставила ли её прежняя 0032 (до
 PR #28 миграция материализовала индекс сама): строка с `is_done = 1` — индекс уже построен, шаг не
-нужен; `is_done = 0` — мутация ещё идёт, ждать; пусто — запустить (ClickHouse хранит лишь последние
-завершённые мутации, поэтому пусто бывает и после очень старой материализации — повтор тогда только
-лишняя работа, не ошибка):
+нужен; `is_done = 0` — мутация ещё идёт, ждать; пусто — запустить. Засчитывается только команда
+целиком: `… IN PARTITION …` строит индекс по одной партиции, а похожее имя (`idx_actor_keys_v2`) —
+другой индекс. ClickHouse хранит лишь последние завершённые мутации, поэтому пусто бывает и после
+очень старой материализации — повтор тогда только лишняя работа, не ошибка:
 
 ```sh
-docker compose exec clickhouse clickhouse-client --query "SELECT command, create_time, parts_to_do, is_done, latest_fail_reason FROM system.mutations WHERE database = 'argus' AND table = 'events' AND command LIKE '%MATERIALIZE INDEX idx_actor_keys%' ORDER BY create_time"
+docker compose exec clickhouse clickhouse-client --query "SELECT command, create_time, parts_to_do, is_done, latest_fail_reason FROM system.mutations WHERE database = 'argus' AND table = 'events' AND trimBoth(command) = 'MATERIALIZE INDEX idx_actor_keys' ORDER BY create_time"
 docker compose exec clickhouse clickhouse-client --query "ALTER TABLE argus.events MATERIALIZE INDEX idx_actor_keys"
 ```
 
