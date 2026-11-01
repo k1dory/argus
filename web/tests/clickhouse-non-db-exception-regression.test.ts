@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { format } from "node:util";
 import { chCommand, chQuery, ClickHouseError, shortChError } from "../src/lib/clickhouse";
 import { installNextMocks, loadAuth } from "./_next-mock";
-import { chHttp } from "./_ch-http";
+import { chHttp, chJsonException } from "./_ch-http";
 
 const marker = "PrivateNonDbExceptionFixture";
 const cases = [
@@ -17,7 +17,7 @@ const cases = [
 
 for (const fixture of cases) {
   for (const shape of ["plain", "json"] as const) {
-    const body = shape === "plain" ? fixture.text + "\n" : JSON.stringify({ exception: fixture.text }) + "\n";
+    const body = shape === "plain" ? fixture.text + "\n" : chJsonException(fixture.text) + "\n";
 
     test(`shortChError: ${fixture.name}/${shape} сохраняет код без заголовка`, () => {
       assert.deepEqual(shortChError(body, 500), {
@@ -61,7 +61,7 @@ test("GET /api/search: JSON-исключение std::exception не уходи�
   t.mock.method(console, "error", (...args: unknown[]) => { logs.push(format(...args)); });
   t.mock.method(globalThis, "fetch", chHttp(
     '{"time":"2026-11-01 10:00:00.000","source":"fixture","action":"login"}\n'
-    + JSON.stringify({ exception: cases[1].text }) + "\n",
+    + chJsonException(cases[1].text) + "\n",
   ));
   const response = await route.GET(new Request("http://fixture/api/search?index=events&format=export&range=24h", {
     headers: { Authorization: `Bearer ${token}` },

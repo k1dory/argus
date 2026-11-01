@@ -4,7 +4,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { format } from "node:util";
 import { chCommand, chQuery, ClickHouseError, sqlForLog } from "../src/lib/clickhouse";
-import { chHttp } from "./_ch-http";
+import { chHttp, chJsonException } from "./_ch-http";
 
 const marker = "PrivateMetadataFixture";
 const queryId = "ed948b42-fc93-41f3-85c9-e13705928f97";
@@ -42,7 +42,7 @@ test("ClickHouse: штатная JSON DB::Exception после HTTP 200 откл
   t.mock.method(console, "error", (...args: unknown[]) => { logs.push(format(...args)); });
   t.mock.method(globalThis, "fetch", chHttp(
     JSON.stringify({ body: marker }) + "\n"
-    + JSON.stringify({ exception: `Code: 241. DB::Exception: '${marker}' (SPOOFED_NAME)` }) + "\n",
+    + chJsonException(`Code: 241. DB::Exception: '${marker}' (SPOOFED_NAME)`) + "\n",
   ));
   await assert.rejects(chQuery("SELECT body FROM incident_comments"), (error: unknown) =>
     error instanceof ClickHouseError && error.code === 241 && error.message === "код 241 (MEMORY_LIMIT_EXCEEDED)");

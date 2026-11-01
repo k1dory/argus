@@ -4,7 +4,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { format } from "node:util";
 import { formData, installNextMocks, loadAuth } from "./_next-mock";
-import { chHttp } from "./_ch-http";
+import { chHttp, chJsonException } from "./_ch-http";
 
 process.env.CLICKHOUSE_RO_USER = "fixture-ro";
 process.env.CLICKHOUSE_RO_PASSWORD = "fixture-password";
@@ -18,7 +18,7 @@ const marker = "PrivateDashboardExceptionFixture";
 const detail = `Code: 6. DB::Exception: Cannot parse string '${marker}' as UInt8. (CANNOT_PARSE_TEXT)`;
 const fixtures = [
   { name: "HTTP 400", status: 400, body: detail, headers: { "X-ClickHouse-Exception-Code": "6" } },
-  { name: "JSON после HTTP 200", status: 200, body: '{"n":1}\n' + JSON.stringify({ exception: detail }) + "\n", headers: {} },
+  { name: "JSON после HTTP 200", status: 200, body: '{"n":1}\n' + chJsonException(detail) + "\n", headers: {} },
   { name: "строки ответа и код в заголовке", status: 200, body: JSON.stringify({ n: marker }) + "\n", headers: { "X-ClickHouse-Exception-Code": "6" } },
 ] as const;
 
