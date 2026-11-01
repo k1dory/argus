@@ -128,6 +128,51 @@ test("обзор: пустой период — подсказка про ист
 
 /* ===== Инциденты ===== */
 
+test("инциденты: сканы снаружи свёрнуты по подсети, раскрытие со статусом блока и групповыми действиями", async () => {
+  await auth.createSession("analyst1", "analyst");
+  const listed: unknown[] = [];
+  mocks.queries.incidentsList = async (...args: unknown[]) => { listed.push(args[0]); return { rows: [], total: 0, page: 1, pageSize: 50 }; };
+  mocks.queries.incidentStats = async () => ({ total: 3, open: 3, escalated: 0, pii: 0 });
+  mocks.queries.scanGroups = async () => [{ subnet: "203.0.113.0/24", incidents: 3, addresses: 2, rules: ["a41c-net-070", "a41c-net-071"], first_ts: NOW, last_ts: NOW, level: "medium", unassigned: 1 }];
+  mocks.queries.scanGroupIncidents = async () => [
+    incidentRow({ incident_id: "INC-41", rule_id: "a41c-net-070", actor_name: "203.0.113.7", level: "medium" }),
+    incidentRow({ incident_id: "INC-42", rule_id: "a41c-net-071", actor_name: "203.0.113.9", level: "medium", owner: "anna" }),
+  ];
+  mocks.queries.incidentBlockStates = async () => ({ "INC-41": "blocked" });
+  const folded = await pageText(await incidents.default(props({}, { queue: "open" })));
+  assert.match(folded, /Сканы снаружи · по подсетям/);
+  assert.match(folded, /203\.0\.113\.0\/24/);
+  assert.match(folded, /раскрыть/);
+  assert.doesNotMatch(folded, /INC-41/, "свёрнутая группа не показывает инциденты");
+  assert.equal((listed[0] as { groupScans?: boolean }).groupScans, true, "очередь без сканов, пока они свёрнуты");
+
+  const open = await pageText(await incidents.default(props({}, { queue: "open", subnet: "203.0.113.0/24" })));
+  assert.match(open, /Подсеть 203\.0\.113\.0\/24 · 2 открытых инцидентов/);
+  assert.match(open, /INC-41/);
+  assert.match(open, /заблокирован/);
+  assert.match(open, /свернуть/);
+  assert.match(open, /Взять все в работу/);
+  assert.match(open, /Завершить все/);
+  assert.doesNotMatch(open, /Назначить все/, "назначать группу — только администратору");
+
+  await auth.createSession("viewer1", "viewer");
+  const viewer = await pageText(await incidents.default(props({}, { queue: "open", subnet: "203.0.113.0/24" })));
+  assert.match(viewer, /INC-41/);
+  assert.doesNotMatch(viewer, /Завершить все/, "наблюдателю групповые действия не показываются");
+
+  listed.length = 0;
+  const flat = await pageText(await incidents.default(props({}, { scans: "list" })));
+  assert.doesNotMatch(flat, /Сканы снаружи · по подсетям/);
+  assert.match(flat, /свернуть по подсетям/);
+  assert.equal((listed[0] as { groupScans?: boolean }).groupScans, false);
+  // Неподсеть в адресе страницы не раскрывает ничего.
+  const bad = await pageText(await incidents.default(props({}, { subnet: "x' OR 1=1" })));
+  assert.doesNotMatch(bad, /Подсеть x/);
+  mocks.queries.scanGroups = async () => [];
+  mocks.queries.scanGroupIncidents = async () => [];
+  mocks.queries.incidentBlockStates = async () => ({});
+});
+
 test("инциденты: очередь с вердиктами, закрытием и просрочкой; фильтры в ссылках", async () => {
   await auth.createSession("analyst1", "analyst");
   const old = "2026-10-29 06:00:00"; // high → срок 1 ч → просрочен относительно now()

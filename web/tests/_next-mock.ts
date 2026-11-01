@@ -58,6 +58,9 @@ export type QueryMocks = {
   responseLog: (opts?: { incidentId?: string; limit?: number }) => Promise<Record<string, unknown>[]>;
   verdictsFor: (ids: string[]) => Promise<Record<string, Record<string, unknown>>>;
   incidentClosuresFor: (ids: string[]) => Promise<Record<string, Record<string, unknown>>>;
+  scanGroups: (...args: unknown[]) => Promise<Record<string, unknown>[]>;
+  scanGroupIncidents: (...args: unknown[]) => Promise<Record<string, unknown>[]>;
+  incidentBlockStates: (...args: unknown[]) => Promise<Record<string, string>>;
   incidentLabels: (since: string, limit: number, after?: import("../src/lib/label-cursor").LabelCursor) => Promise<unknown[]>;
 };
 
@@ -167,6 +170,9 @@ export function installNextMocks(): Mocks {
     responseLog: async () => [],
     verdictsFor: async () => ({}),
     incidentClosuresFor: async () => ({}),
+    scanGroups: async () => [],
+    scanGroupIncidents: async () => [],
+    incidentBlockStates: async () => ({}),
     incidentLabels: async () => [],
   };
   const argusQueries = require.resolve(path.resolve(__dirname, "../src/lib/argus-queries"));
