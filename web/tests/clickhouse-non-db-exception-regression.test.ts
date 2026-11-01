@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import { format } from "node:util";
 import { chCommand, chQuery, ClickHouseError, shortChError } from "../src/lib/clickhouse";
 import { installNextMocks, loadAuth } from "./_next-mock";
+import { chHttp } from "./_ch-http";
 
 const marker = "PrivateNonDbExceptionFixture";
 const cases = [
@@ -27,11 +28,11 @@ for (const fixture of cases) {
     test(`chQuery: ${fixture.name}/${shape} после HTTP 200 не становится данными`, async (t) => {
       const logs: string[] = [];
       t.mock.method(console, "error", (...args: unknown[]) => { logs.push(format(...args)); });
-      t.mock.method(globalThis, "fetch", async () => new Response('{"n":1}\n' + body));
+      t.mock.method(globalThis, "fetch", chHttp('{"n":1}\n' + body));
       await assert.rejects(chQuery("SELECT 1 AS n"), (error: unknown) => {
         assert.ok(error instanceof ClickHouseError, "исключение должно обрабатываться до JSON.parse");
         assert.equal(error.code, fixture.code);
-        assert.equal(error.status, 200);
+        assert.equal(error.status, 500, "с wait_end_of_query=1 сервер отвечает HTTP-ошибкой, а не 200");
         assert.ok(!format(error).includes(marker), "message и stack не содержат текст сервера");
         return true;
       });
@@ -41,7 +42,7 @@ for (const fixture of cases) {
 
   test(`chCommand: ${fixture.name} после HTTP 200 не подтверждает неуспешную запись`, async (t) => {
     t.mock.method(console, "error", () => undefined);
-    t.mock.method(globalThis, "fetch", async () => new Response(fixture.text + "\n"));
+    t.mock.method(globalThis, "fetch", chHttp(fixture.text + "\n"));
     await assert.rejects(chCommand("INSERT INTO console_audit (detail) VALUES ({detail:String})", { detail: marker }),
       (error: unknown) => error instanceof ClickHouseError && error.code === fixture.code);
   });
@@ -58,7 +59,7 @@ const route = require("../src/app/api/search/route") as typeof import("../src/ap
 test("GET /api/search: JSON-исключение std::exception не уходит в успешный экспорт", async (t) => {
   const logs: string[] = [];
   t.mock.method(console, "error", (...args: unknown[]) => { logs.push(format(...args)); });
-  t.mock.method(globalThis, "fetch", async () => new Response(
+  t.mock.method(globalThis, "fetch", chHttp(
     '{"time":"2026-11-01 10:00:00.000","source":"fixture","action":"login"}\n'
     + JSON.stringify({ exception: cases[1].text }) + "\n",
   ));

@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { chHttp } from "./_ch-http";
 
 // RO-пользователь читается при загрузке модуля — окружение до импорта.
 process.env.CLICKHOUSE_RO_USER = "argus_ro";
@@ -16,7 +17,8 @@ test("панель: в запросе нет настроек ClickHouse — п�
   const d = await runPanelQuery("SELECT 1 AS n", "24h");
   assert.equal(d.error, undefined);
   assert.deepEqual(d.rows, [{ n: 1 }]);
-  assert.deepEqual([...seen!.searchParams.keys()].sort(), ["database", "default_format"]);
+  // wait_end_of_query — параметр HTTP-обработчика, не настройка: readonly=1 его пропускает.
+  assert.deepEqual([...seen!.searchParams.keys()].sort(), ["database", "default_format", "wait_end_of_query"]);
 });
 
 test("панель: break режет по блокам — строк не больше 5000, truncated", async (t) => {
@@ -31,7 +33,7 @@ test("панель: исключение после HTTP 200 — ошибка, �
     '{"n":1}\n{"exception": "Code: 159. DB::Exception: Timeout exceeded: elapsed 20 seconds"}\n',
     '{"n":1}\nCode: 159. DB::Exception: Timeout exceeded: elapsed 20 seconds\n',
   ]) {
-    t.mock.method(globalThis, "fetch", async () => new Response(body));
+    t.mock.method(globalThis, "fetch", chHttp(body));
     const d = await runPanelQuery("SELECT 1 AS n", "24h");
     assert.match(d.error ?? "", /код 159/);
     assert.deepEqual(d.rows, []);
@@ -86,7 +88,7 @@ test("панель: «Code: …» внутри данных не исключе�
 });
 
 test("панель: исключение {\"exception\": …} после строк — ошибка с кодом и именем, без текста", async (t) => {
-  t.mock.method(globalThis, "fetch", async () => new Response('{"n":1}\n{"exception": "Code: 159. DB::Exception: Timeout exceeded"}\n'));
+  t.mock.method(globalThis, "fetch", chHttp('{"n":1}\n{"exception": "Code: 159. DB::Exception: Timeout exceeded"}\n'));
   const d = await runPanelQuery("SELECT 2 AS n", "24h");
   assert.equal(d.error, "код 159 (TIMEOUT_EXCEEDED)");
   assert.deepEqual(d.rows, []);

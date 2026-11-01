@@ -101,16 +101,11 @@ function maskSqlLiterals(sql: string): string {
  *  не выводится вовсе: он цитирует данные запроса (строку INSERT, параметр, значение
  *  колонки) — замаскировать его регулярками надёжно нельзя (вложенные кавычки, обрезка,
  *  JSON-обёртка). Полный текст — в system.query_log по query_id. */
-/** Строка исключения ClickHouse 24.8 (Exception.cpp, getCurrentExceptionMessageAndPattern):
- *  «Code: N. DB::Exception: …», «Poco::Exception. Code: 1000, …», «std::exception. Code: 1001, …»,
- *  отдельной строкой или в JSONEachRow объектом {"exception": "…"} — в том числе после
- *  HTTP 200 и уже отданных строк результата. */
-const CH_EXCEPTION_RE = /^(?:\{"exception":\s*")?(?:Poco::Exception\. |std::exception\. )?Code:\s*(\d+)[.,]/m;
-
-/** Позиция исключения ClickHouse в теле ответа (или -1). */
-export function chExceptionIndex(text: string): number {
-  return CH_EXCEPTION_RE.exec(text)?.index ?? -1;
-}
+/** Код в теле ответа-ошибки (HTTP не 2xx): «Code: N. DB::Exception», «Poco::Exception.
+ *  Code: N,», «std::exception. Code: N,», в том числе в {"exception": "…"}. Тело успешного
+ *  ответа на исключение не разбирается: с wait_end_of_query=1 ClickHouse при любой ошибке
+ *  отвечает HTTP-ошибкой с X-ClickHouse-Exception-Code, а «Code: 1.» в данных — это данные. */
+const CH_ERROR_CODE_RE = /^(?:\{"exception":\s*")?(?:Poco::Exception\. |std::exception\. )?Code:\s*(\d+)[.,]/m;
 
 /** X-ClickHouse-Exception-Code — только целое число; иначе (мусор, «__proto__») — нет кода. */
 export function headerChCode(value: string | null): number | null {
@@ -118,7 +113,7 @@ export function headerChCode(value: string | null): number | null {
 }
 
 export function shortChError(text: string, status: number | null, headerCode: number | null = null): { message: string; code: number | null } {
-  const parsed = Number(CH_EXCEPTION_RE.exec(text)?.[1] ?? NaN);
+  const parsed = Number(CH_ERROR_CODE_RE.exec(text)?.[1] ?? NaN);
   const code = headerCode && headerCode > 0 ? headerCode : Number.isFinite(parsed) ? parsed : null;
   if (code != null) {
     const name = Object.hasOwn(CH_ERROR_NAMES, code) ? CH_ERROR_NAMES[code] : undefined;
@@ -174,6 +169,9 @@ async function chFetchWithSlot(sql: string, params: Record<string, string | numb
   for (const [key, value] of Object.entries({ ...DEFAULT_SETTINGS, ...settings })) url.searchParams.set(key, String(value));
   url.searchParams.set("database", CH_DB);
   if (format) url.searchParams.set("default_format", format);
+  // Ответ буферизуется на сервере до конца запроса: ошибка посреди выдачи приходит HTTP-
+  // ошибкой с X-ClickHouse-Exception-Code, а не строкой в конце тела со статусом 200.
+  url.searchParams.set("wait_end_of_query", "1");
   const types = paramTypes(sql);
   for (const [key, value] of Object.entries(params)) url.searchParams.set(`param_${key}`, encodeParam(value, types.get(key)));
   let resp: Response;
@@ -201,15 +199,12 @@ async function chFetchWithSlot(sql: string, params: Record<string, string | numb
   }
   // ClickHouse may append an exception after sending HTTP 200. JSONEachRow
   // escapes newlines within values: only a standalone exception line counts.
-  // ClickHouse может дописать исключение после HTTP 200 — строкой «Code: …» или, в
-  // JSONEachRow, объектом {"exception": "Code: …"}. Значения JSON экранируют переводы
-  // строк, поэтому в счёт идёт только отдельная строка.
-  const exception = CH_EXCEPTION_RE.exec(text);
+  // Ошибка — только по HTTP-статусу и заголовку (wait_end_of_query=1, см. выше).
   const headerCode = headerChCode(resp.headers.get("X-ClickHouse-Exception-Code"));
-  if (!resp.ok || exception || headerCode != null) {
+  if (!resp.ok || headerCode != null) {
     // Ни тело ответа, ни текст исключения в журнал не идут (строки результата и
     // цитаты данных) — только код, имя, статус, query_id и SQL без данных.
-    const { message, code } = shortChError(exception ? text.slice(exception.index) : resp.ok ? "" : text, resp.status, headerCode);
+    const { message, code } = shortChError(resp.ok ? "" : text, resp.status, headerCode);
     const queryId = resp.headers.get("X-ClickHouse-Query-Id") ?? "";
     console.error(`clickhouse ${resp.status}: ${message}${queryId ? ` query_id=${queryId}` : ""}`, "\nSQL:", sqlForLog(sql));
     throw new ClickHouseError(message, resp.status, code);

@@ -5,7 +5,7 @@
 import "server-only";
 import { promises as fs } from "fs";
 import path from "path";
-import { chCommand, chExceptionIndex, chQuery, createLimiter, headerChCode, LimiterWaitError, shortChError } from "./clickhouse";
+import { chCommand, chQuery, createLimiter, headerChCode, LimiterWaitError, shortChError } from "./clickhouse";
 import { RANGES, type RangeKey } from "./shared/ranges";
 import { normalizeSpec, refreshSeconds, SPEC_LIMITS, SpecError, type DashboardSpec, type Panel, type PanelType } from "./shared/dashboard-spec";
 import { wazuhEnabled } from "./integrations";
@@ -129,6 +129,9 @@ export function validateSql(sql: string): string | null {
   if (scan.code.includes(";")) return "Один запрос без «;»";
   if (!/^(select|with)\b/i.test(s)) return "Разрешены только SELECT / WITH";
   // По исходному тексту и по тексту без комментариев: `url/**/(` ловится вторым.
+  // Формат ответа ставит консоль (JSONEachRow): иной FORMAT (JSONCompactEachRow,
+  // TabSeparated…) ломает разбор строк и прячет ошибки в данных.
+  if (/\bFORMAT\b/i.test(scan.code)) return "FORMAT задаёт консоль — уберите его из запроса";
   if (FORBIDDEN.test(s) || FORBIDDEN.test(scan.noComments)) return "Запрос содержит запрещённое ключевое слово";
   return null;
 }
@@ -210,6 +213,10 @@ async function executePanel(sql: string, range: RangeKey, signal?: AbortSignal):
   const url = new URL(CH_URL);
   url.searchParams.set("database", CH_DB);
   url.searchParams.set("default_format", "JSONEachRow");
+  // Буферизация на сервере: ошибка посреди выдачи — HTTP-ошибка с кодом в заголовке, а не
+  // строка в конце тела со статусом 200. Это параметр HTTP, не настройка — readonly=1 его
+  // пропускает (проверено на 24.8).
+  url.searchParams.set("wait_end_of_query", "1");
   // Настроек в запросе нет: при readonly=1 ClickHouse отклоняет любую, что
   // расходится с профилем. Лимиты, break и формат JSON — в профиле argus_ro
   // (scripts/migrate.sh).
@@ -224,10 +231,9 @@ async function executePanel(sql: string, range: RangeKey, signal?: AbortSignal):
       signal: signal ? AbortSignal.any([timeout, signal]) : timeout,
     });
     const text = await resp.text();
-    const at = chExceptionIndex(text);
     const headerCode = headerChCode(resp.headers.get("X-ClickHouse-Exception-Code"));
-    if (!resp.ok || at >= 0 || headerCode != null) {
-      const { message } = shortChError(at >= 0 ? text.slice(at) : resp.ok ? "" : text, resp.status, headerCode);
+    if (!resp.ok || headerCode != null) {
+      const { message } = shortChError(resp.ok ? "" : text, resp.status, headerCode);
       const queryId = resp.headers.get("X-ClickHouse-Query-Id") ?? "";
       console.error(`panel query ${resp.status}: ${message}${queryId ? ` query_id=${queryId}` : ""}`);
       return { columns: [], rows: [], error: message, ...(queryId ? { errorDetail: `query_id: ${queryId}` } : {}), ms: Date.now() - started };

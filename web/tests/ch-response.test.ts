@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { chCommand, chQuery, ClickHouseError } from "../src/lib/clickhouse";
+import { chHttp } from "./_ch-http";
 
 test("ClickHouse rejects HTTP 200 exceptions for writes and partial reads", async (t) => {
   for (const [body, headers] of [
@@ -8,7 +9,7 @@ test("ClickHouse rejects HTTP 200 exceptions for writes and partial reads", asyn
     ['{"c":1}\nCode: 241. DB::Exception: Memory limit exceeded', {}],
     ["", { "X-ClickHouse-Exception-Code": "241" }],
   ] as const) {
-    t.mock.method(globalThis, "fetch", async () => new Response(body, { status: 200, headers }));
+    t.mock.method(globalThis, "fetch", chHttp(body, { status: 200, headers }));
     const fails = (err: unknown) => err instanceof ClickHouseError && err.code === 241;
     await assert.rejects(chCommand("INSERT INTO incident_comments VALUES ()"), fails);
     await assert.rejects(chQuery("SELECT 1"), fails);

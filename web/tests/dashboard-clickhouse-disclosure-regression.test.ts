@@ -4,6 +4,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { format } from "node:util";
 import { formData, installNextMocks, loadAuth } from "./_next-mock";
+import { chHttp } from "./_ch-http";
 
 process.env.CLICKHOUSE_RO_USER = "fixture-ro";
 process.env.CLICKHOUSE_RO_PASSWORD = "fixture-password";
@@ -26,7 +27,7 @@ for (const fixture of fixtures) {
     await auth.createSession("sso:dashboard-error-fixture", "analyst", true);
     const logs: string[] = [];
     t.mock.method(console, "error", (...args: unknown[]) => { logs.push(format(...args)); });
-    t.mock.method(globalThis, "fetch", async () => new Response(fixture.body, {
+    t.mock.method(globalThis, "fetch", chHttp(fixture.body, {
       status: fixture.status, headers: fixture.headers,
     }));
     const result = await previewPanelAction({ data: null, error: null }, formData({

@@ -4,6 +4,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { format } from "node:util";
 import { chCommand, chQuery, ClickHouseError, sqlForLog } from "../src/lib/clickhouse";
+import { chHttp } from "./_ch-http";
 
 const marker = "PrivateMetadataFixture";
 const queryId = "ed948b42-fc93-41f3-85c9-e13705928f97";
@@ -39,7 +40,7 @@ for (const [header, code, name] of [
 test("ClickHouse: штатная JSON DB::Exception после HTTP 200 отклоняется без утечки", async (t) => {
   const logs: string[] = [];
   t.mock.method(console, "error", (...args: unknown[]) => { logs.push(format(...args)); });
-  t.mock.method(globalThis, "fetch", async () => new Response(
+  t.mock.method(globalThis, "fetch", chHttp(
     JSON.stringify({ body: marker }) + "\n"
     + JSON.stringify({ exception: `Code: 241. DB::Exception: '${marker}' (SPOOFED_NAME)` }) + "\n",
   ));
