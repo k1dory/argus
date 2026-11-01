@@ -433,6 +433,47 @@ type ResponseRow struct {
 	Actor      string `json:"actor"` // argus-engine | оператор
 }
 
+// RespondedIPs — адреса, по которым автоответ инцидентов ids уже принял решение
+// (в response_log есть запись с адресом, кроме ожидания и предупреждений), не
+// старше since. После рестарта движка по ним склеенный инцидент не блокирует
+// адрес повторно, даже если тот вытеснен из списка участников. Ошибка ClickHouse,
+// в том числе внутри ответа 200, возвращается без текста строки.
+func (c *ClickHouse) RespondedIPs(ctx context.Context, ids []string, since time.Time) (map[string][]string, error) {
+	out := map[string][]string{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	body, err := c.do(ctx, `SELECT incident_id, ip, detail FROM response_log
+		WHERE incident_id IN {ids:Array(String)} AND ip != '' AND ts >= {since:DateTime} FORMAT JSONEachRow`, nil,
+		map[string]string{"ids": chArray(ids), "since": since.UTC().Format("2006-01-02 15:04:05")})
+	if err != nil {
+		return nil, fmt.Errorf("response_log: %w", err)
+	}
+	seen := map[string]bool{}
+	for _, line := range bytes.Split(body, []byte("\n")) {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		var row struct {
+			IncidentID string `json:"incident_id"`
+			IP         string `json:"ip"`
+			Detail     string `json:"detail"`
+			Exception  string `json:"exception"`
+		}
+		if err := json.Unmarshal(line, &row); err != nil || row.Exception != "" || row.IncidentID == "" {
+			return nil, errors.New("response_log: неожиданная строка ответа ClickHouse")
+		}
+		if row.IP == "" || strings.HasPrefix(row.Detail, "ожидание:") || strings.HasPrefix(row.Detail, "предупреждение:") {
+			continue
+		}
+		if k := row.IncidentID + "|" + row.IP; !seen[k] {
+			seen[k] = true
+			out[row.IncidentID] = append(out[row.IncidentID], row.IP)
+		}
+	}
+	return out, nil
+}
+
 func (c *ClickHouse) InsertResponses(ctx context.Context, rows []ResponseRow) error {
 	anyRows := make([]any, len(rows))
 	for i := range rows {
@@ -542,9 +583,10 @@ func (c *ClickHouse) OperatorStates(ctx context.Context, ids []string) (map[stri
 func (c *ClickHouse) restoreGroupKeys(ctx context.Context, open []incidents.Incident) error {
 	const batch = 5000
 	type restored struct {
-		groupKey string
-		members  incidents.MemberList
-		dropped  uint32
+		groupKey  string
+		members   incidents.MemberList
+		dropped   uint32
+		collapsed uint8
 	}
 	keys := map[string]restored{}
 	for lo := 0; lo < len(open); lo += batch {
@@ -555,7 +597,8 @@ func (c *ClickHouse) restoreGroupKeys(ctx context.Context, open []incidents.Inci
 		}
 		out, err := c.do(ctx, `SELECT incident_id, argMax(group_key, (updated_at, event_count, last_ts)) AS group_key,
 		argMax(members, (updated_at, event_count, last_ts)) AS members,
-		argMax(members_dropped, (updated_at, event_count, last_ts)) AS members_dropped
+		argMax(members_dropped, (updated_at, event_count, last_ts)) AS members_dropped,
+		argMax(collapsed, (updated_at, event_count, last_ts)) AS collapsed
 		FROM incidents WHERE incident_id IN {ids:Array(String)} GROUP BY incident_id FORMAT JSONEachRow`, nil,
 			map[string]string{"ids": chArray(ids)})
 		if err != nil {
@@ -570,18 +613,19 @@ func (c *ClickHouse) restoreGroupKeys(ctx context.Context, open []incidents.Inci
 				GroupKey       string               `json:"group_key"`
 				Members        incidents.MemberList `json:"members"`
 				MembersDropped uint32               `json:"members_dropped"`
+				Collapsed      uint8                `json:"collapsed"`
 				Exception      string               `json:"exception"`
 			}
 			if err := json.Unmarshal(line, &row); err != nil || row.Exception != "" || row.IncidentID == "" {
 				// Без текста строки: это может быть исключение с цитатой данных.
 				return errors.New("restore group_key: неожиданная строка ответа ClickHouse")
 			}
-			keys[row.IncidentID] = restored{row.GroupKey, row.Members, row.MembersDropped}
+			keys[row.IncidentID] = restored{row.GroupKey, row.Members, row.MembersDropped, row.Collapsed}
 		}
 	}
 	for i := range open {
 		k := keys[open[i].IncidentID]
-		open[i].GroupKey, open[i].Members, open[i].MembersDropped = k.groupKey, k.members, k.dropped
+		open[i].GroupKey, open[i].Members, open[i].MembersDropped, open[i].Collapsed = k.groupKey, k.members, k.dropped, k.collapsed
 	}
 	return nil
 }

@@ -96,8 +96,10 @@ func (e *engine) pruneRespStateLocked(now time.Time, ttl time.Duration) int {
 // заново: список активных блокировок в памяти и после рестарта пуст.
 func (e *engine) restoreRespState(open []incidents.Incident, now time.Time) int {
 	n := 0
+	var collapsed []string
 	for i := range open {
-		if incidents.IsCollapsedKey(open[i].GroupKey) {
+		if open[i].Collapsed == 1 {
+			collapsed = append(collapsed, open[i].IncidentID)
 			// Склеенный по подсети: каждый адрес — как отдельный инцидент со своим
 			// правилом. Решён адрес, у которого сработало правило с respond.
 			for _, m := range open[i].Members {
@@ -114,6 +116,22 @@ func (e *engine) restoreRespState(open []incidents.Incident, now time.Time) int 
 		if r := e.ruleFor(open[i].RuleID); r != nil && r.Respond != nil {
 			e.setRespStatus(open[i].IncidentID, "done", now)
 			n++
+		}
+	}
+	// Список участников — выборка последних 256 адресов: решения по вытесненным
+	// адресам берутся из журнала. Журнал недоступен — хватит участников выше.
+	if len(collapsed) > 0 {
+		ips, err := e.ch.RespondedIPs(context.Background(), collapsed, now.Add(-respStateTTL))
+		if err != nil {
+			slog.Warn("ips: решения по адресам склеенных инцидентов из response_log не прочитаны", "err", err)
+		}
+		for id, list := range ips {
+			for _, ip := range list {
+				if e.respStatus(id+"|"+ip) != "done" {
+					e.setRespStatus(id+"|"+ip, "done", now)
+					n++
+				}
+			}
 		}
 	}
 	return n
@@ -167,7 +185,7 @@ type respUnit struct {
 }
 
 func (e *engine) respUnits(inc *incidents.Incident) []respUnit {
-	if !incidents.IsCollapsedKey(inc.GroupKey) {
+	if inc.Collapsed != 1 {
 		r := e.ruleFor(inc.RuleID)
 		if !respondsAt(r, inc.Level) {
 			return nil

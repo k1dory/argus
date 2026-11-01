@@ -106,7 +106,7 @@ func TestPR49RestartPreservesMemberHistory(t *testing.T) {
 	r := pr49CollapsedRule("scan")
 	ip := "203.0.113.7"
 	old := Incident{IncidentID: "INC-7", RuleID: r.ID, RuleTitle: r.Title, Level: r.Level, Status: StatusNew,
-		ActorName: "203.0.113.0/24", GroupKey: CollapsedKey("inbound-scan", "203.0.113.0/24"),
+		ActorName: "203.0.113.0/24", GroupKey: CollapsedKey("inbound-scan", "203.0.113.0/24"), Collapsed: 1,
 		CreatedAt: model.FormatTS(start)[:19], UpdatedAt: model.FormatTS(start.Add(time.Minute))[:19],
 		FirstTS: model.FormatTS(start), LastTS: model.FormatTS(start.Add(time.Minute)), EventCount: 60,
 		Members: MemberList{{IP: ip, First: model.FormatTS(start), Last: model.FormatTS(start.Add(time.Minute)),

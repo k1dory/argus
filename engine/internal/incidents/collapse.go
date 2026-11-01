@@ -29,8 +29,20 @@ const (
 	minPartEvents = 4
 )
 
-// IsCollapsedKey — ключ группы склеенного инцидента.
-func IsCollapsedKey(groupKey string) bool { return strings.HasPrefix(groupKey, collapsePrefix) }
+// collapseSource — ключ сработки действительно адрес источника: у всех её
+// событий src.ip равен ключу. Без src.ip eval группирует по node (экспортёр
+// NetFlow) — такая сработка не склеивается, и цели для блока у неё нет.
+func collapseSource(d eval.Detection) bool {
+	if d.Key == "" || len(d.Events) == 0 {
+		return false
+	}
+	for _, e := range d.Events {
+		if e.SrcIP != d.Key {
+			return false
+		}
+	}
+	return true
+}
 
 // CollapsedKey — ключ группы склеенного инцидента.
 func CollapsedKey(group, net string) string { return collapsePrefix + group + ":" + net }
@@ -113,16 +125,25 @@ type Candidate struct {
 	Origins  map[string]int
 }
 
-// RespondCandidates — копии сработок участников (для снимка автоответа: Apply
-// следующего цикла перезаписывает части), по адресу и правилу в стабильном порядке.
+// RespondCandidates — копии сработок участников и сработок этого цикла (для снимка
+// автоответа: Apply следующего цикла перезаписывает части), по адресу и правилу в
+// стабильном порядке. Сработки цикла после снимка сбрасываются.
 func (inc *Incident) RespondCandidates() []Candidate {
-	out := make([]Candidate, 0, len(inc.parts))
-	for _, p := range inc.parts {
-		o := make(map[string]int, len(p.origins))
-		for k, v := range p.origins {
+	byKey := map[string]Candidate{}
+	for k, p := range inc.parts {
+		byKey[k] = Candidate{Rule: p.rule, IP: p.ip, Origins: p.origins}
+	}
+	for k, c := range inc.fresh {
+		byKey[k] = c
+	}
+	inc.fresh = nil
+	out := make([]Candidate, 0, len(byKey))
+	for _, c := range byKey {
+		o := make(map[string]int, len(c.Origins))
+		for k, v := range c.Origins {
 			o[k] = v
 		}
-		out = append(out, Candidate{Rule: p.rule, IP: p.ip, Origins: o})
+		out = append(out, Candidate{Rule: c.Rule, IP: c.IP, Origins: o})
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].IP != out[j].IP {
@@ -172,7 +193,7 @@ func (r *Registry) applyCollapsed(d eval.Detection, net string, now time.Time, c
 		return
 	}
 	inc := build(d, now)
-	inc.ActorName, inc.GroupKey = net, key
+	inc.ActorName, inc.GroupKey, inc.Collapsed = net, key, 1
 	inc.setPart(newPart(d))
 	inc.aggregate()
 	inc.noteSecrets(d)
@@ -187,6 +208,13 @@ func (inc *Incident) setPart(p *part) {
 		inc.parts = map[string]*part{}
 	}
 	inc.parts[p.rule+"|"+p.ip] = p
+	// Сработка этого цикла идёт в автоответ, даже если лимит участников вытеснит
+	// её из parts раньше снимка (256 свежих соседей без respond не должны
+	// спрятать доверенный скан).
+	if inc.fresh == nil {
+		inc.fresh = map[string]Candidate{}
+	}
+	inc.fresh[p.rule+"|"+p.ip] = Candidate{Rule: p.rule, IP: p.ip, Origins: p.origins}
 }
 
 // memberCovers — сработка правила rule по адресу уже записана в списке участников

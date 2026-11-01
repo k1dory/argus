@@ -56,6 +56,9 @@ type Incident struct {
 	// В incidents_current не выводится — движок и консоль читают его из incidents.
 	Members        MemberList `json:"members,omitempty"`
 	MembersDropped uint32     `json:"members_dropped,omitempty"`
+	// Collapsed — инцидент склеен по подсети (collapse.go). Только этот флаг, а не
+	// вид GroupKey: у обычного правила с group_by значение ключа — данные события.
+	Collapsed uint8 `json:"collapsed,omitempty"`
 	// Candidates — снимок сработок участников для автоответа (snapshotIncidents);
 	// в реестре пуст, в таблицу не пишется.
 	Candidates []Candidate `json:"-"`
@@ -86,6 +89,7 @@ type Incident struct {
 	// droppedIPs — адреса, вытесненные из Members (счёт MembersDropped без повторов).
 	parts      map[string]*part
 	droppedIPs map[string]bool
+	fresh      map[string]Candidate // сработки этого цикла до снимка автоответа
 	// reviewNoted — ротация без подтверждения уже отмечена заметкой.
 	reviewNoted bool
 	// Review — причина пометки «закрыт автоматикой, нужна проверка» для
@@ -191,7 +195,7 @@ func NewRegistry(startFrom int, open []Incident) *Registry {
 // regKey — ключ реестра: правило, субъект, узел и, у явного group_by, его значение.
 // У склеенного по подсети — ключ группы: в нём несколько правил и адресов.
 func (inc *Incident) regKey() string {
-	if IsCollapsedKey(inc.GroupKey) {
+	if inc.Collapsed == 1 {
 		return inc.GroupKey
 	}
 	k := inc.RuleID + "|" + inc.ActorName + "|" + inc.Node
@@ -211,7 +215,7 @@ func (r *Registry) Apply(dets []eval.Detection, now time.Time) (created, updated
 	for _, d := range dets {
 		inc := build(d, now)
 		key := inc.regKey()
-		if d.Rule.Collapsed() {
+		if d.Rule.Collapsed() && collapseSource(d) {
 			// Открытый инцидент адреса, заведённый до склейки, дописывается как
 			// раньше: живые инциденты задним числом не склеиваются.
 			if ex, ok := r.open[key]; !ok || isFinal(ex.Status) {
