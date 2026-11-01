@@ -73,12 +73,12 @@ func (c *ClickHouse) HasStatusColumn(ctx context.Context) (bool, error) {
 		return false, fmt.Errorf("clickhouse describe: %w", err)
 	}
 	defer resp.Body.Close()
-	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	body, readErr := readBody(resp.Body, 64<<10)
 	if headerFailed(resp) {
 		return false, chError("describe", resp, body)
 	}
 	if readErr != nil {
-		return false, fmt.Errorf("clickhouse describe: response: %w", readErr)
+		return false, &readError{op: "describe", cause: readErr}
 	}
 	// Ответ DESCRIBE — TSV: у каждой строки есть табуляция, и имя столбца вида
 	// «Code: 27.» — данные. Строка исключения после 200 табуляции не содержит.
@@ -125,19 +125,52 @@ func (c *ClickHouse) InsertVerdicts(ctx context.Context, rows []VerdictRow) erro
 	defer resp.Body.Close()
 	// Тело читается и при 200: ClickHouse может сообщить ошибку заголовком
 	// X-ClickHouse-Exception-Code или строкой исключения в теле.
-	msg, readErr := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+	msg, readErr := readBody(resp.Body, 4<<10)
 	if headerFailed(resp) {
 		return chError("insert", resp, msg)
 	}
 	// Ответ 200, тело не дочитано (обрыв, таймаут): итог вставки неизвестен — ошибка.
 	if readErr != nil {
-		return fmt.Errorf("clickhouse insert: response: %w", readErr)
+		return &readError{op: "insert", cause: readErr}
 	}
 	if responseException.Match(msg) {
 		return chError("insert", resp, msg)
 	}
 	return nil
 }
+
+// readBody — диагностический префикс тела (до limit байт) и проверка, что ответ дочитан:
+// остаток сливается, и обрыв за пределом префикса — тоже ошибка (LimitReader иначе
+// принял бы недочитанный ответ за полный).
+func readBody(r io.Reader, limit int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, limit))
+	if err != nil {
+		return data, err
+	}
+	_, err = io.Copy(io.Discard, r)
+	return data, err
+}
+
+// readError — ответ ClickHouse не дочитан. Error() — только класс сбоя: текст ошибки
+// HTTP-разборщика Go может цитировать байты ответа (кривой chunked trailer), а ошибка
+// уходит в журнал и в открытый /healthz. Причина доступна через errors.Is/As.
+type readError struct {
+	op    string
+	cause error
+}
+
+func (e *readError) Error() string {
+	class := "ошибка чтения"
+	switch {
+	case errors.Is(e.cause, io.ErrUnexpectedEOF):
+		class = "ответ оборван"
+	case errors.Is(e.cause, context.DeadlineExceeded), errors.Is(e.cause, context.Canceled):
+		class = "таймаут или отмена"
+	}
+	return "clickhouse " + e.op + ": чтение ответа не удалось (" + class + ")"
+}
+
+func (e *readError) Unwrap() error { return e.cause }
 
 // Исключение в теле ответа 200 — формы сервера: «Code: N. DB::Exception»,
 // «Poco::Exception. Code: N,», «std::exception. Code: N,», {"exception": "Code: …"}.

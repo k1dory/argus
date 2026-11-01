@@ -180,6 +180,58 @@ func syncDir(dir string) error {
 	return f.Sync()
 }
 
+// shrink — атомарно заменить spool-файл батча остатком rows (temp + rename поверх
+// того же пути): сбой до rename оставляет прежний файл, после — только остаток.
+// Батч возвращается без строк (перечитается из файла), учёт места — по новому размеру.
+func (q *Queue) shrink(b Batch, rows []any) (Batch, error) {
+	if b.file == "" {
+		b.Rows = rows
+		b.Bytes, b.Count = SizeOf(rows), len(rows)
+		return b, nil
+	}
+	data, err := json.Marshal(rows)
+	if err != nil {
+		return b, err
+	}
+	f, err := os.CreateTemp(q.spool.dir, ".batch-*.tmp")
+	if err != nil {
+		return b, err
+	}
+	tmp := f.Name()
+	fail := func(err error) (Batch, error) {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return b, err
+	}
+	if err := f.Chmod(0600); err != nil {
+		return fail(err)
+	}
+	if _, err := f.Write(data); err != nil {
+		return fail(err)
+	}
+	if err := f.Sync(); err != nil {
+		return fail(err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return b, err
+	}
+	if err := os.Rename(tmp, b.file); err != nil {
+		_ = os.Remove(tmp)
+		return b, err
+	}
+	if err := syncDir(q.spool.dir); err != nil {
+		return b, err
+	}
+	need := int64(len(data))
+	q.mu.Lock()
+	q.spool.used += need - b.diskSize
+	q.mu.Unlock()
+	b.diskSize, b.Rows = need, nil
+	b.Bytes, b.Count = SizeOf(rows), len(rows)
+	return b, nil
+}
+
 func (q *Queue) ack(b Batch) error {
 	if b.file == "" {
 		return nil

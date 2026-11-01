@@ -278,7 +278,8 @@ func TestRunDurableStopsOnCancel(t *testing.T) {
 	}
 }
 
-// writeDurable: ошибка данных → весь батч в ingest_rejects и ack; если
+// writeDurable: ошибка данных → бисекция: ядовитая строка в ingest_rejects, корректная
+// вставлена, ack; если
 // таблицы отказов нет — батч остаётся на диске (requeue); транспорт —
 // повторы с Retries, потом requeue; отменённый контекст — requeue сразу.
 func TestWriteDurableBranches(t *testing.T) {
@@ -293,14 +294,14 @@ func TestWriteDurableBranches(t *testing.T) {
 		b, _ := q.Pop()
 		return q, b
 	}
-	t.Run("ядовитая строка → dead letter и ack", func(t *testing.T) {
+	t.Run("ядовитая строка → dead letter, соседняя вставлена, ack", func(t *testing.T) {
 		st := &Stats{}
 		m := &mockCH{}
 		q, b := newQ(t, st, ev("poison"), ev("fine"))
 		w := NewWriter(m, q, st)
 		w.WriteBatch(context.Background(), b)
-		if st.DeadLetter.Load() != 2 || len(m.rejects) != 2 || q.SpoolBytes() != 0 || q.Rows() != 0 || st.Requeued.Load() != 0 {
-			t.Errorf("dead=%d rejects=%d spool=%d pending=%d requeued=%d", st.DeadLetter.Load(), len(m.rejects), q.SpoolBytes(), q.Rows(), st.Requeued.Load())
+		if st.DeadLetter.Load() != 1 || len(m.rejects) != 1 || m.rows() != 1 || q.SpoolBytes() != 0 || q.Rows() != 0 || st.Requeued.Load() != 0 {
+			t.Errorf("dead=%d rejects=%d inserted=%d spool=%d pending=%d requeued=%d", st.DeadLetter.Load(), len(m.rejects), m.rows(), q.SpoolBytes(), q.Rows(), st.Requeued.Load())
 		}
 	})
 	t.Run("нет таблицы отказов → батч остаётся на диске", func(t *testing.T) {

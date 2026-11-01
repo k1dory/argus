@@ -109,17 +109,19 @@ func TestPoisonManyAndNoRejectsTable(t *testing.T) {
 		}
 	}
 	w.Write(context.Background(), batch)
-	// ядовитые строки в обеих половинах — потолок бисекции: батч целиком в rejects
-	if m.rows() != 0 || st.DeadLetter.Load() != 100 {
+	// бисекция до строк: 15 ядовитых (каждая 7-я) отвергнуты, 85 корректных вставлены;
+	// таблицы отказов нет — ядовитые строки (в очереди в памяти) отбрасываются.
+	if m.rows() != 85 || st.DeadLetter.Load() != 15 {
 		t.Fatalf("rows=%d dead=%d", m.rows(), st.DeadLetter.Load())
 	}
-	if st.RejectsFailed.Load() != 100 || m.rejectCalls != 1 {
+	if st.RejectsFailed.Load() != 15 || m.rejectCalls != 15 {
 		t.Errorf("RejectsFailed=%d rejectCalls=%d", st.RejectsFailed.Load(), m.rejectCalls)
 	}
 }
 
-// Потолок бисекции: 8 ядовитых строк — полный батч, две половины, и всё; в
-// ingest_rejects один batched INSERT на 8 строк, а не 8 отдельных.
+// Бисекция до строк и при ядовитых данных во всех строках: 8 строк — батч, 2, 4, 8
+// частей (15 вставок), каждая строка — отдельный отказ. Это цена того, что ядовитая
+// строка не уносит корректных соседей (ревью codex #43).
 func TestBisectCapBothHalvesRejected(t *testing.T) {
 	m := &mockCH{}
 	w, st := newTestWriter(m)
@@ -128,10 +130,10 @@ func TestBisectCapBothHalvesRejected(t *testing.T) {
 		batch = append(batch, ev("poison"))
 	}
 	w.Write(context.Background(), batch)
-	if m.calls != 3 {
-		t.Errorf("InsertEvents вызван %d раз, want 3 (батч + две половины)", m.calls)
+	if m.calls != 15 {
+		t.Errorf("InsertEvents вызван %d раз, want 15 (1+2+4+8)", m.calls)
 	}
-	if m.rejectCalls != 1 || len(m.rejects) != 8 || st.DeadLetter.Load() != 8 {
+	if m.rejectCalls != 8 || len(m.rejects) != 8 || st.DeadLetter.Load() != 8 {
 		t.Errorf("rejectCalls=%d rejects=%d dead=%d", m.rejectCalls, len(m.rejects), st.DeadLetter.Load())
 	}
 	// одна ядовитая строка в хвосте: бисекция доходит до неё, остальное вставлено

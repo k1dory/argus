@@ -302,9 +302,11 @@ func (w *Writer) WriteBatch(ctx context.Context, b Batch) {
 	}
 }
 
-// В дисковой очереди подтверждаем файл только после успешной вставки.
-// Ошибка данных отправляет батч целиком в ingest_rejects: частичная вставка
-// при бисекции и последующий сбой транспорта привели бы к дубликатам при replay.
+// В дисковой очереди файл подтверждается (удаляется) только когда решена судьба всех
+// строк. Ошибка данных — та же бисекция до строк, что и в памяти: корректные строки
+// вставляются, ядовитые уходят в ingest_rejects. Если часть осталась нерешённой
+// (транспорт, остановка, ingest_rejects недоступна), spool-файл атомарно заменяется
+// только этими строками: вставленные при повторе не задвоятся.
 func (w *Writer) writeDurable(ctx context.Context, b Batch) {
 	delay := w.Backoff
 	for attempt := 1; ; attempt++ {
@@ -316,11 +318,22 @@ func (w *Writer) writeDurable(ctx context.Context, b Batch) {
 			return
 		}
 		if isData(err) {
-			if w.deadLetter(b.Rows, err) {
+			rest := w.resolve(ctx, b.Rows, err, true)
+			if len(rest) == 0 {
 				if err := w.Queue.ack(b); err != nil {
 					slog.Error("spool ack", "err", err, "file", b.file)
 				}
 				return
+			}
+			if len(rest) < len(b.Rows) {
+				nb, serr := w.Queue.shrink(b, rest)
+				if serr != nil {
+					// Файл остаётся целиком: при повторе вставленные строки задвоятся,
+					// но ни одна не потеряется.
+					slog.Error("spool: остаток батча не сохранён, файл повторится целиком", "rows", len(rest), "err", serr)
+				} else {
+					b = nb
+				}
 			}
 			break
 		}
@@ -387,39 +400,43 @@ func (w *Writer) sleep(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// bisect: обе половины пробуются; прошедшая учтена, отвергнутая как данные делится
-// дальше, транспортная — в обычный цикл повторов. Ошибка, зависящая от размера
-// вставки (IsDivisible: 241 MEMORY_LIMIT_EXCEEDED и т.п.), делится до одной строки
-// даже когда отвергнуты обе половины: части поменьше могут пройти. Обе половины
-// отвергнуты как ядовитые данные (IsPermanent: 27, 6, 53, 117) — потолок: весь батч
-// одним INSERT в ingest_rejects, стоимость бисекции O(log n) вставок на батч.
+// bisect — ошибка данных в очереди в памяти: бисекция до строк (resolve), нерешённый
+// транспортом остаток — в обычный цикл повторов.
 func (w *Writer) bisect(ctx context.Context, rows []any, err error) {
+	if rest := w.resolve(ctx, rows, err, false); len(rest) > 0 {
+		w.WriteBatch(ctx, Batch{Rows: rest, Bytes: SizeOf(rest), mark: w.Stats.Inserted.Load()})
+	}
+}
+
+// resolve — бисекция ошибки данных до отдельных строк: прошедшая часть вставлена,
+// отвергнутая как данные (241 и др. по размеру, 27/6/53/117 по содержимому) делится
+// дальше, одна строка уходит в ingest_rejects. Ядовитая строка не уносит с собой
+// корректных соседей; цена — около 2·k·log₂n вставок при k ядовитых строках на n.
+// Возвращает нерешённые строки: часть с транспортной ошибкой, остаток при остановке,
+// а при keepUnrejected — и строки, которые не удалось записать в ingest_rejects.
+func (w *Writer) resolve(ctx context.Context, rows []any, err error, keepUnrejected bool) []any {
 	if len(rows) == 1 {
-		w.deadLetter(rows, err)
-		return
+		if !w.deadLetter(rows, err) && keepUnrejected {
+			return rows
+		}
+		return nil
+	}
+	if ctx.Err() != nil {
+		return rows
 	}
 	slog.Warn("insert: ошибка данных, делю батч", "rows", len(rows), "err", short(err.Error()))
 	mid := len(rows) / 2
-	left, right := rows[:mid], rows[mid:]
-	errL, errR := w.insert(left), w.insert(right)
-	if IsPermanent(errL) && IsPermanent(errR) {
-		slog.Warn("insert: обе половины отвергнуты, батч целиком в ingest_rejects", "rows", len(rows))
-		w.deadLetter(rows, err)
-		return
+	var rest []any
+	for _, part := range [][]any{rows[:mid], rows[mid:]} {
+		switch perr := w.insert(part); {
+		case perr == nil:
+		case isData(perr):
+			rest = append(rest, w.resolve(ctx, part, perr, keepUnrejected)...)
+		default:
+			rest = append(rest, part...)
+		}
 	}
-	w.after(ctx, left, errL)
-	w.after(ctx, right, errR)
-}
-
-func (w *Writer) after(ctx context.Context, rows []any, err error) {
-	switch {
-	case err == nil:
-	case isData(err):
-		w.bisect(ctx, rows, err)
-	default:
-		// транспорт внутри бисекции — обычный цикл повторов
-		w.WriteBatch(ctx, Batch{Rows: rows, Bytes: SizeOf(rows), mark: w.Stats.Inserted.Load()})
-	}
+	return rest
 }
 
 // deadLetter пишет строки в ingest_rejects одним INSERT.
