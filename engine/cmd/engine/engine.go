@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/devitex-soft/argus/engine/internal/registry"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -277,8 +278,22 @@ func newEngine(ctx context.Context, rulesDir string, rs []*rules.Rule, acfg anal
 	return e
 }
 
+// logShippedRegistry — реестр поставляемого набора (internal/registry) при
+// старте: корреляции он не нужен, но выкатка видит в логе, что образ несёт
+// копию набора и её хватает для engine dataset export. Без реестра — warn, не
+// отказ: движок работает и без него.
+func logShippedRegistry() {
+	if err := registry.LoadEnv(); err != nil {
+		slog.Warn("registry: поставляемый набор не загружен — engine dataset export откажет", "err", err)
+		return
+	}
+	r, s, a := registry.Stats()
+	slog.Info("registry", "rules", r, "sources", s, "actions", a)
+}
+
 func run(rulesDir string) {
 	rs := mustLoad(rulesDir)
+	logShippedRegistry()
 	acfg, err := analyst.LoadConfig(env("ANALYST_CONFIG", ""))
 	if err != nil {
 		slog.Error("analyst config", "err", err)
