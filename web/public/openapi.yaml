@@ -358,6 +358,66 @@ paths:
         "429": { $ref: "#/components/responses/TooManyRequests" }
         "503": { $ref: "#/components/responses/StorageUnavailable" }
 
+  /api/incidents/labels:
+    get:
+      tags: [incidents]
+      summary: Ответы людей при завершении инцидентов
+      description: |
+        Типизированные метки, поставленные человеком при завершении (миграция 0033):
+        для правил ИБ — `disposition`, `escalate`, `severity_correct`; для эксплуатационных
+        (теги `ops.*`) — `ops_cause`, `ops_action`. `blind` — инцидент разбирался вслепую:
+        до закрытия консоль не показывала вердикт агента и анализ модели. Автозакрытия
+        (`kind: auto_close`) не выдаются — их статус `closed` не ответ человека. По времени
+        завершения (при равном времени — по `incident_id`, `event_id`), с `since` включительно; продолжение — `cursor=next_cursor`.
+        Лимит выгрузок; сессии разбора закрыт.
+      operationId: listIncidentLabels
+      security:
+        - cookieSession: []
+        - apiToken: []
+      parameters:
+        - name: since
+          in: query
+          schema:
+            type: string
+            pattern: '^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d{1,9})?)?Z?)?$'
+            example: "2026-11-01T10:00:00.123Z"
+          description: |
+            Начало периода (включительно): дата `YYYY-MM-DD` или дата-время
+            `YYYY-MM-DDTHH:MM[:SS[.fff]][Z]` в UTC; смещения не принимаются, несуществующая
+            дата (`2026-02-30`, `25:00`) — 400. По умолчанию — всё.
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 50000, default: 10000 }
+        - name: cursor
+          in: query
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{1,128}$' }
+          description: |
+            `next_cursor` предыдущего ответа: выдача продолжается строго после его последней
+            метки по (`changed_at`, `incident_id`, `event_id`) — без повторов и пропусков при равном времени.
+            Применяется вместе с `since`. Повреждённый курсор — 400.
+      responses:
+        "200":
+          description: Метки по времени завершения.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [labels, truncated, next_cursor, exported_at]
+                properties:
+                  labels:
+                    type: array
+                    items: { $ref: "#/components/schemas/IncidentLabel" }
+                  truncated: { type: boolean, description: "Выдано ровно limit строк — продолжить с `cursor=next_cursor`." }
+                  next_cursor:
+                    type: [string, "null"]
+                    description: Курсор следующей порции при `truncated`, иначе null. Непрозрачен.
+                  exported_at: { type: string, format: date-time }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/OutOfScope" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "503": { $ref: "#/components/responses/StorageUnavailable" }
+
   /api/incidents/{id}:
     get:
       tags: [incidents]
@@ -1536,6 +1596,33 @@ components:
         status: { $ref: "#/components/schemas/IncidentStatus" }
         owner: { type: string }
         reason: { type: string }
+        disposition: { type: string, description: "malicious | benign_authorized | false_positive; пусто — метки нет" }
+        escalate: { type: [boolean, "null"] }
+        severity_correct: { type: [boolean, "null"] }
+        ops_cause: { type: string }
+        ops_action: { type: string }
+        blind: { type: boolean }
+        labeled_by_human: { type: boolean }
+    IncidentLabel:
+      type: object
+      required: [event_id, incident_id, changed_at, actor, status, disposition, escalate, severity_correct, ops_cause, ops_action, blind, reason, rule_id, rule_title, level, tags]
+      properties:
+        event_id: { type: string, format: uuid, description: "Запись журнала incident_state_events; вместе с changed_at и incident_id задаёт порядок выдачи." }
+        incident_id: { $ref: "#/components/schemas/IncidentIdString" }
+        changed_at: { $ref: "#/components/schemas/ChTimestamp" }
+        actor: { type: string }
+        status: { type: string, enum: [closed, false_positive] }
+        disposition: { type: string, enum: ["", malicious, benign_authorized, false_positive] }
+        escalate: { type: [boolean, "null"] }
+        severity_correct: { type: [boolean, "null"] }
+        ops_cause: { type: string, enum: ["", real_failure, planned_work, monitoring_noise, wrong_threshold] }
+        ops_action: { type: string, enum: ["", fixed, no_action, rule_tuned, handed_over] }
+        blind: { type: boolean }
+        reason: { type: string }
+        rule_id: { type: string }
+        rule_title: { type: string }
+        level: { type: string }
+        tags: { type: array, items: { type: string } }
     IncidentComment:
       type: object
       required: [comment_id, incident_id, created_at, author, body]
@@ -1605,6 +1692,12 @@ components:
           oneOf:
             - $ref: "#/components/schemas/EngineVerdict"
             - type: "null"
+        verdict_hidden:
+          type: boolean
+          description: |
+            Инцидент разбирается вслепую и ещё не завершён — анализ модели скрыт (verdict = null),
+            вместе с копиями вердикта агента: комментарии `agent:*` и записи аудита `triage.verdict*`
+            не выдаются в `comments` и `actions`. После завершения выдаются все.
         actions:
           type: array
           items: { $ref: "#/components/schemas/AuditRow" }
@@ -1704,6 +1797,11 @@ components:
           oneOf:
             - $ref: "#/components/schemas/EngineVerdict"
             - type: "null"
+        verdict_hidden:
+          type: boolean
+          description: |
+            Инцидент разбирается вслепую и ещё не завершён: как в `/api/incidents/{id}`,
+            анализ модели скрыт (verdict = null), комментарии `agent:*` не выдаются.
         related:
           type: array
           items: { $ref: "#/components/schemas/RelatedSummary" }
