@@ -207,7 +207,7 @@ func parseSyslogLine(norm *normalize.Normalizer, zones parse.PeerZones, line str
 				break
 			}
 		}
-		unparsedWAF = parse.IsWAFErrorLine(line)
+		unparsedWAF = isWAFText(line, payload)
 		e = norm.FromSyslog(sl, line)
 	case parse.FormatLEEF:
 		if rec, ok := appRecord(line, sl, "LEEF:"); ok {
@@ -216,12 +216,12 @@ func parseSyslogLine(norm *normalize.Normalizer, zones parse.PeerZones, line str
 				break
 			}
 		}
-		unparsedWAF = parse.IsWAFErrorLine(line)
+		unparsedWAF = isWAFText(line, payload)
 		e = norm.FromSyslog(sl, line)
 	case parse.FormatWAFCoraza:
 		wf, ok := parse.ParseCorazaLine(payload)
 		if !ok {
-			unparsedWAF = parse.IsWAFErrorLine(payload)
+			unparsedWAF = isWAFText(line, payload)
 			e = norm.FromSyslog(sl, line)
 			break
 		}
@@ -237,7 +237,7 @@ func parseSyslogLine(norm *normalize.Normalizer, zones parse.PeerZones, line str
 			e = qn
 			break
 		}
-		if parse.IsWAFErrorLine(line) {
+		if isWAFText(line, payload) {
 			// msg/uri строки WAF («/credentials», запись CEF) — данные запроса.
 			unparsedWAF = true
 			e = norm.FromSyslog(sl, line)
@@ -1063,30 +1063,53 @@ func undeclaredFormat(peer listen.Peer) {
 		"peer", peer.Addr, "transport", peer.Transport)
 }
 
-// appRecord — запись объявленного CEF/LEEF, если с неё начинается сообщение приложения:
-// тело после заголовка syslog начинается с маркера (BOM RFC 5424 и пробелы не в счёт),
-// или первый маркер стоит в самом заголовке (запись сразу за HOSTNAME: ParseSyslog
-// принимает «CEF:» за TAG, а при одном PRI — за часть HOSTNAME). Маркер внутри текста
-// сообщения — данные (msg строки ModSecurity с TAG «ModSecurity:»), не запись. Строка
-// файла без PRI («Oct 29 17:39:38 host CEF:…») проверяется как заголовок RFC 3164.
+// appRecord — запись объявленного CEF/LEEF без эвристик пробела и TAG:
+//   - RFC 5424: только в начале MSG, после SD, которую выделил парсер (BOM и пробелы не в
+//     счёт). Значения SD — данные;
+//   - RFC 3164, только PRI, сырая строка: запись — первое вхождение маркера во всей строке,
+//     и оно должно стоять там, где начинается сообщение приложения: в начале строки, в
+//     начале MSG или на месте TAG («CEF:» парсер принимает за TAG). Заголовок 3164 маркера
+//     не содержит; всё вложенное (msg запроса, поле JSON, текст после TAG «ModSecurity:»)
+//     стоит позже и остаётся данными. Строка файла без PRI проверяется как заголовок 3164.
 func appRecord(line string, sl parse.Syslog, marker string) (string, bool) {
 	line = strings.TrimRight(line, "\r\n")
-	if sl.Format == "raw" {
-		if alt, _ := parse.ParseSyslog("<13>" + line); alt.Format != "raw" {
-			if rec, ok := appRecord("<13>"+line, alt, marker); ok {
-				return rec, true
-			}
+	switch sl.Format {
+	case "rfc5424":
+		if msg := strings.TrimLeft(sl.Message, "\ufeff "); strings.HasPrefix(msg, marker) {
+			return msg, true
 		}
-	}
-	msg := strings.TrimLeft(sl.Message, "\ufeff ")
-	if strings.HasPrefix(msg, marker) {
-		return msg, true
+		return "", false
+	case "raw":
+		if strings.HasPrefix(strings.TrimLeft(line, "\ufeff "), marker) {
+			return line[strings.Index(line, marker):], true
+		}
+		if alt, _ := parse.ParseSyslog("<13>" + line); alt.Format == "rfc3164" {
+			return appRecord("<13>"+line, alt, marker)
+		}
+		return "", false
 	}
 	i := strings.Index(line, marker)
-	if i >= 0 && sl.Format != "raw" && strings.HasSuffix(line, sl.Message) && i < len(line)-len(sl.Message) {
-		return line[i:], true
+	if i < 0 || !strings.HasSuffix(line, sl.Message) {
+		return "", false
 	}
-	return "", false
+	start := len(line) - len(sl.Message) // начало MSG
+	lead := strings.TrimLeft(line[start:], "\ufeff ")
+	switch {
+	case i == len(line)-len(lead): // MSG начинается с записи
+	case strings.HasPrefix(line, "<") && strings.IndexByte(line, '>')+1 == i: // только PRI
+	case sl.AppName+":" == marker && i+len(marker) <= start && strings.TrimSpace(line[i+len(marker):start]) == "":
+		// запись сразу за HOSTNAME: «CEF:» стал TAG
+	default:
+		return "", false
+	}
+	return line[i:], true
+}
+
+// isWAFText — строка error-лога WAF: маркер в строке (в том числе TAG «ModSecurity:»)
+// или в декодированном msg JSON Caddy в сообщении приложения (маркер может прийти
+// экранированным, «Coraza:\u0020»).
+func isWAFText(line, payload string) bool {
+	return parse.IsWAFErrorLine(line) || parse.IsWAFErrorLine(payload)
 }
 
 func hasCEF(s string) bool  { return strings.Contains(s, "CEF:") }
