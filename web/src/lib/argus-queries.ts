@@ -557,7 +557,7 @@ export async function sourcesHealthReport(): Promise<SourcesReport> {
               max(received_at) AS last_ts, toUnixTimestamp(max(received_at)) AS last_sec,
               round(100 * avg(pii), 1) AS pii_share, toUnixTimestamp(now()) AS now_sec
        FROM events WHERE received_at >= now() - INTERVAL 1 HOUR
-       GROUP BY source ORDER BY events_1h DESC`,
+       GROUP BY source ORDER BY events_1h DESC, source`,
     ),
     chQuery<Rhythm>(
       `SELECT source, events_window, arrayReduce('quantileExactWeighted({q:Float64})', gaps, gaps) AS gap_q, last_sec, now_sec

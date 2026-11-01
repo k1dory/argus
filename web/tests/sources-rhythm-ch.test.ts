@@ -81,16 +81,51 @@ test("больше 2000 молчащих: порядок при равном в�
   const prefix = `cap.${RUN}.`;
   const name = (i: number) => `${prefix}${String(i).padStart(5, "0")}`;
   const n = limit + 5;
-  const baseline = await q().sourcesHealthReport();
-  const beforeQuiet = baseline.sources.filter((s) => s.events_1h === 0);
-  const beforeTotal = beforeQuiet.length + baseline.omitted;
-  // Общая живая база хранит молчащие источники прошлых прогонов (других файлов и этого):
-  // фикстура cap ставится на секунду новее самого свежего из них, но не ближе 61 минуты
-  // к «сейчас», чтобы за время теста не попасть в events_1h. Иначе прогон через час
-  // после предыдущего ловил чужие источники среди своих.
-  const freshest = Math.min(70 * 60, ...beforeQuiet.map((s) => s.silent_for_sec)) - 2;
-  assert.ok(freshest > 61 * 60, `молчащий источник прошлого прогона слишком свежий (${freshest + 2} с) — повторите через минуту`);
-  const [stamp] = await c.chQuery<{ ts: string }>("SELECT toString(now() - toIntervalSecond({s:UInt32})) AS ts", { s: freshest });
+  // Общая живая база хранит источники прошлых прогонов (других файлов и этого). Cap
+  // ставится на секунду новее самого свежего молчащего из них — иначе чужие попали бы
+  // между своими, — но не ближе CAP_MIN_AGE к «сейчас», чтобы за время теста не
+  // попасть в events_1h. Активный источник, который выйдет из окна часа за время
+  // теста (BOUNDARY_SLACK), сдвинул бы оба отчёта — ждём, пока он пересечёт границу.
+  // После каждого ожидания baseline считается заново целиком (состав меняется со
+  // временем: границы часа и 30 суток). Всё — по часам ClickHouse: last_ts пишет CH,
+  // «сейчас» — его now(). Ждать дольше WAIT_MAX нельзя (общая блокировка live-тестов) —
+  // тогда тест пропускается с пояснением.
+  const CAP_MIN_AGE = 3600 + 30;
+  const BOUNDARY_SLACK = 30;
+  const WAIT_MAX = 90;
+  const sec = (ts: string) => Date.parse(ts.replace(" ", "T") + "Z") / 1000;
+  const fmt = (x: number) => new Date(x * 1000).toISOString().slice(0, 19).replace("T", " ");
+  const nowSQL = "SELECT toString(now() - toIntervalSecond({s:UInt32})) AS ts";
+  let waited = 0;
+  let beforeTotal: number;
+  let capSec: number;
+  for (;;) {
+    const baseline = await q().sourcesHealthReport();
+    const [chNowRow] = await c.chQuery<{ ts: string }>(nowSQL, { s: 0 });
+    const chNow = sec(chNowRow.ts);
+    const lastOf = (s: { last_ts: string; silent_for_sec: number }) => (s.last_ts ? sec(s.last_ts) : chNow - s.silent_for_sec);
+    const beforeQuiet = baseline.sources.filter((s) => s.events_1h === 0);
+    beforeTotal = beforeQuiet.length + baseline.omitted;
+    const freshestLast = Math.max(0, ...beforeQuiet.map(lastOf));
+    capSec = Math.max(freshestLast + 1, chNow - 65 * 60);
+    let wait = capSec - (chNow - CAP_MIN_AGE);
+    for (const s of baseline.sources.filter((x) => x.events_1h > 0)) {
+      const leaves = lastOf(s) + 3600 - chNow; // через столько секунд источник выйдет из окна часа
+      if (leaves <= BOUNDARY_SLACK) wait = Math.max(wait, leaves + 1);
+    }
+    if (wait <= 0) break;
+    if (waited + wait > WAIT_MAX) {
+      const why = `чужой источник слишком свежий: место для cap освободится через ${wait} с, а ждать можно не больше ${WAIT_MAX} с`;
+      if (typeof (t as { skip?: unknown }).skip === "function") {
+        t.skip(why);
+        return;
+      }
+      throw new Error(why);
+    }
+    await new Promise((r) => setTimeout(r, wait * 1000));
+    waited += wait;
+  }
+  const stamp = { ts: fmt(capSec) };
   await c.chCommand(`INSERT INTO events (ts, received_at, source, source_class, action)
     SELECT toDateTime({ts:String}), toDateTime({ts:String}), concat({prefix:String}, leftPad(toString(number), 5, '0')), 'system', 'x'
     FROM numbers({n:UInt32}) ORDER BY number DESC`, { ts: stamp.ts, prefix, n });
