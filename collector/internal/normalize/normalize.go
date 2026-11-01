@@ -467,7 +467,10 @@ func (n *Normalizer) FromWAF(w parse.WAF, raw string) model.Event {
 	if e.Vendor == "" {
 		e.Vendor = "OWASP"
 	}
-	if t := parseWAFTime(w.Time); !t.IsZero() {
+	// unix_timestamp Coraza однозначен; строка timestamp — локальное время хоста без зоны.
+	if w.UnixNano > 0 {
+		e.SetTS(time.Unix(0, w.UnixNano), w.Time)
+	} else if t := parseWAFTime(w.Time); !t.IsZero() {
 		e.SetTS(t, w.Time)
 	}
 	if len(w.Rules) > 0 {

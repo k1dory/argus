@@ -5,39 +5,25 @@
 // Нужен сервер: ARGUS_TEST_CLICKHOUSE_URL (+ _USER, _PASSWORD), БД argus;
 // без него тест пропускается. Таблицы между прогонами не чистятся — фикстура
 // помечена своим source/агентом на прогон.
-import { test } from "node:test";
+import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
-import { readdirSync, readFileSync } from "node:fs";
-import path from "node:path";
+import { applyAllMigrations, ch, liveSkip as skip, serializeLiveFile } from "./_ch-live";
 
-const url = process.env.ARGUS_TEST_CLICKHOUSE_URL;
-const skip = url ? false : "нет ARGUS_TEST_CLICKHOUSE_URL — тест живого ClickHouse пропущен";
-if (url) {
-  process.env.CLICKHOUSE_URL = url;
-  process.env.CLICKHOUSE_USER = process.env.ARGUS_TEST_CLICKHOUSE_USER ?? "default";
-  process.env.CLICKHOUSE_PASSWORD = process.env.ARGUS_TEST_CLICKHOUSE_PASSWORD ?? "";
-  process.env.CLICKHOUSE_DB = "argus";
-}
+// Миграции с асинхронными MATERIALIZE (0029–0031) меняют парты events — без общей
+// блокировки этот файл шёл параллельно с sources-*-ch, и их отчёт видел парты без
+// проекции p_source_last (fallback на heartbeat вместо проверяемого пути).
+serializeLiveFile({ before, after });
 
 /* eslint-disable @typescript-eslint/no-require-imports -- модули читают env при загрузке */
-const ch = () => require("../src/lib/clickhouse") as typeof import("../src/lib/clickhouse");
 const s = () => require("../src/lib/search") as typeof import("../src/lib/search");
 /* eslint-enable @typescript-eslint/no-require-imports */
 
-const root = path.resolve(__dirname, "../..");
 const RUN = `r${Date.now().toString(36)}`;
 const SRC = `search.test.${RUN}`;
 const AGENT = `agent-${RUN}`;
 /** Прежняя склейка полей поиска по событиям (до миграции 0030). */
 const OLD_HAY = "concat(raw, ' ', actor_name, ' ', object, ' ', node, ' ', src_ip, ' ', dst_ip, ' ', action, ' ', toString(attrs))";
 
-async function applyMigrations(): Promise<void> {
-  const files = readdirSync(path.join(root, "clickhouse/migrations")).filter((f) => f.endsWith(".sql")).sort();
-  for (const f of files) {
-    const text = readFileSync(path.join(root, "clickhouse/migrations", f), "utf8").replace(/^--.*$/gm, "");
-    for (const stmt of text.split(/;\s*\n/).map((x) => x.trim()).filter(Boolean)) await ch().chCommand(stmt);
-  }
-}
 
 const now = () => new Date().toISOString().replace("T", " ").replace("Z", "");
 type Ev = { raw?: string; actor_name?: string; object?: string; node?: string; src_ip?: string; dst_ip?: string; action?: string; attrs?: Record<string, string>; severity?: number };
@@ -78,7 +64,7 @@ async function countOld(value: string): Promise<number> {
 }
 
 test("свободный текст: те же совпадения, что у прежнего предиката; индекс idx_text применяется", { skip }, async (t) => {
-  await applyMigrations();
+  await applyAllMigrations();
   await insertFixture();
 
   await t.test("одиночные слова и фразы — как раньше", async (words) => {

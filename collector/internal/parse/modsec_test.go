@@ -1,6 +1,9 @@
 package parse
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 const modsecJSON = `{"transaction":{"client_ip":"203.0.113.9","time_stamp":"Sat Sep 13 12:00:01 2026","server_id":"a1b2","client_port":51234,"host_ip":"10.0.10.11","host_port":443,"unique_id":"172345.1","request":{"method":"GET","http_version":1.1,"uri":"/products?id=1'%20OR%201=1--","headers":{"Host":"shop.corp.local","User-Agent":"sqlmap/1.7"}},"response":{"http_code":403,"headers":{}},"producer":{"modsecurity":"ModSecurity v3.0.12 (Linux)","connector":"ModSecurity-nginx v1.0.3","secrules_engine":"Enabled","components":["OWASP_CRS/3.3.5"]}},"messages":[{"message":"SQL Injection Attack Detected via libinjection","details":{"match":"detected SQLi","reference":"v18,14","ruleId":"942100","file":"REQUEST-942-APPLICATION-ATTACK-SQLI.conf","lineNumber":"45","data":"Matched Data: s&1o found","severity":"2","ver":"OWASP_CRS/3.3.5","rev":"","tags":["application-multi","language-multi","platform-multi","attack-sqli","paranoia-level/1","OWASP_CRS","capec/1000/152/248/66"]}},{"message":"Inbound Anomaly Score Exceeded (Total Score: 5)","details":{"ruleId":"949110","severity":"2","tags":["anomaly-evaluation"]}}]}`
 
@@ -112,5 +115,43 @@ func TestWAFErrorLineServerNameAndSyslogWrap(t *testing.T) {
 	// Та же строка целиком (с заголовком) парсеру не по зубам: кавычки внутри JSON экранированы.
 	if w3, ok := ParseWAFErrorLine(line); ok && w3.ServerName != "" {
 		t.Fatalf("ожидался пустой hostname при разборе строки с заголовком, получено %+v", w3)
+	}
+}
+
+// Coraza 3.8 (coraza-caddy 2.6): messages на верхнем уровне, data: null, метаданные —
+// только строкой error_message; response.status: null, блок виден по is_interrupted.
+const coraza38JSON = `{"transaction":{"timestamp":"2026/10/29 17:39:38","unix_timestamp":1793284778618840706,"id":"kyKrHrKYSJzEzrcV","client_ip":"203.0.113.50","client_port":0,"host_ip":"","host_port":0,"server_id":"nas.example.org","request":{"method":"GET","protocol":"HTTP/2.0","uri":"/cgi-bin/qpkg/FileStation5/config.json?v=5.5.7","http_version":"","headers":{"host":["nas.example.org"],"user-agent":["Mozilla/5.0"]},"body":"","files":null,"args":{},"length":0},"producer":{"connector":"","version":"","server":"","rule_engine":"On","stopwatch":"x","rulesets":["OWASP_CRS/4.25.0"]},"highest_severity":"","is_interrupted":true},"messages":[{"actionset":"","message":"","error_message":"[client \"203.0.113.50\"] Coraza: Warning. Restricted File Access Attempt [file \"@owasp_crs/REQUEST-930-APPLICATION-ATTACK-LFI.conf\"] [line \"3285\"] [id \"930130\"] [rev \"\"] [msg \"Restricted File Access Attempt\"] [data \"Matched Data: config.json found within REQUEST_FILENAME: /cgi-bin/qpkg/FileStation5/config.json\"] [severity \"critical\"] [ver \"OWASP_CRS/4.25.0\"] [tag \"attack-lfi\"] [tag \"paranoia-level/1\"] [hostname \"\"] [uri \"/cgi-bin/qpkg/FileStation5/config.json?v=5.5.7\"] [unique_id \"kyKrHrKYSJzEzrcV\"]","data":null},{"actionset":"","message":"","error_message":"[client \"203.0.113.50\"] Coraza: Access denied (phase 2). Inbound Anomaly Score Exceeded (Total Score: 5) [file \"@owasp_crs/REQUEST-949-BLOCKING-EVALUATION.conf\"] [line \"7667\"] [id \"949110\"] [rev \"\"] [msg \"Inbound Anomaly Score Exceeded (Total Score: 5)\"] [data \"\"] [severity \"unknown\"] [ver \"OWASP_CRS/4.25.0\"] [tag \"anomaly-evaluation\"] [hostname \"\"] [uri \"/cgi-bin/qpkg/FileStation5/config.json?v=5.5.7\"] [unique_id \"kyKrHrKYSJzEzrcV\"]","data":null}]}`
+
+func TestParseWAFAuditCoraza38Interrupted(t *testing.T) {
+	w, ok := ParseWAFAudit([]byte(coraza38JSON))
+	if !ok {
+		t.Fatal("аудит Coraza 3.8 не разобран")
+	}
+	if w.Product != "coraza" || w.ClientIP != "203.0.113.50" || w.Host != "nas.example.org" || w.UserAgent != "Mozilla/5.0" || w.Status != 0 {
+		t.Fatalf("%+v", w)
+	}
+	if len(w.Rules) != 2 || w.Rules[0].ID != "930130" || w.Rules[1].ID != "949110" || w.Rules[0].Severity != 2 || w.AnomalyIn != 5 {
+		t.Fatalf("rules: %+v anomaly=%d", w.Rules, w.AnomalyIn)
+	}
+	if len(w.Categories) != 1 || w.Categories[0] != "lfi" || !w.Blocked || !w.Final {
+		t.Fatalf("cats %v blocked=%v final=%v", w.Categories, w.Blocked, w.Final)
+	}
+	// тот же аудит в DetectionOnly — не блок, даже если is_interrupted
+	det := strings.Replace(coraza38JSON, `"rule_engine":"On"`, `"rule_engine":"DetectionOnly"`, 1)
+	if w, _ := ParseWAFAudit([]byte(det)); w.Blocked {
+		t.Fatal("DetectionOnly не может блокировать")
+	}
+	// прошедшая транзакция без сообщений — не блок
+	pass := `{"transaction":{"timestamp":"2026/10/31 12:01:20","client_ip":"203.0.113.51","request":{"method":"GET","uri":"/share.cgi?ssid=x","headers":null},"producer":{"rule_engine":"On"},"is_interrupted":false}}`
+	if w, ok := ParseWAFAudit([]byte(pass)); !ok || w.Blocked || len(w.Rules) != 0 {
+		t.Fatalf("pass: ok=%v %+v", ok, w)
+	}
+}
+
+func TestParseWAFErrorLineCorazaAccessDeniedPhase(t *testing.T) {
+	line := `{"level":"warn","ts":1793284780.89,"logger":"http.handlers.waf","msg":"[client \"203.0.113.50\"] Coraza: Access denied (phase 2). Inbound Anomaly Score Exceeded (Total Score: 5) [file \"@owasp_crs/REQUEST-949-BLOCKING-EVALUATION.conf\"] [line \"7667\"] [id \"949110\"] [rev \"\"] [msg \"Inbound Anomaly Score Exceeded (Total Score: 5)\"] [data \"\"] [severity \"unknown\"] [tag \"anomaly-evaluation\"] [hostname \"\"] [uri \"/cgi-bin/sys/sysRequest.cgi\"] [unique_id \"TZlb\"]"}`
+	w, ok := ParseWAFErrorLine(line)
+	if !ok || w.ClientIP != "203.0.113.50" || !w.Blocked || !w.Final || w.EngineMode != "On" || w.AnomalyIn != 5 || w.URI != "/cgi-bin/sys/sysRequest.cgi" {
+		t.Fatalf("ok=%v %+v", ok, w)
 	}
 }
