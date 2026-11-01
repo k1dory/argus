@@ -121,6 +121,29 @@ test("actorReport: редкий login/email с IP-алиасом сохраня�
         }
       });
     }
+    await t.test("aliasSightings: предфильтр idx_actor_keys при подзапросах к identity_aliases", async (caseTest) => {
+      const captured: Query[] = [];
+      const fetch = globalThis.fetch;
+      const spy = caseTest.mock.method(globalThis, "fetch", async (input: URL | string | Request, init?: RequestInit) => {
+        const sql = String(init?.body ?? "");
+        if (/\bFROM\s+events\b/i.test(sql) && /\bGROUP BY source, action, actor_name, node\b/.test(sql)) {
+          const url = new URL(input instanceof Request ? input.url : String(input));
+          const bound = Object.fromEntries([...url.searchParams].filter(([k]) => k.startsWith("param_")).map(([k, v]) => [k.slice(6), v]));
+          captured.push({ sql, params: bound });
+        }
+        return fetch(input, init);
+      });
+      const seen = await actors().aliasSightings(login, "7d", window.toMs);
+      spy.mock.restore();
+      // login не зарегистрирован — сравнение точное: только нижний регистр.
+      assert.ok(seen.rows.length > 0 && seen.rows.every((r) => r.source === source && r.who === login), JSON.stringify(seen.rows));
+      assert.equal(seen.rows.reduce((n, r) => n + r.events, 0), 5);
+      assert.equal(captured.length, 1, "проверяется SQL, фактически отправленный aliasSightings");
+      const plan = await granules(captured[0]);
+      const bloom = plan.text.match(/Name:\s+idx_actor_keys\b[\s\S]*?Granules:\s*(\d+)\s*\/\s*(\d+)/);
+      assert.ok(bloom, `aliasSightings: применяется bloom-индекс ключей алиасов:\n${plan.text}`);
+      assert.ok(Number(bloom[1]) < Number(bloom[2]), `aliasSightings: bloom-индекс должен отсечь фоновые гранулы:\n${plan.text}`);
+    });
   } finally {
     // Общая БД защищена _ch-live lock; удаляется только собственная фикстура.
     await ch().chCommand("ALTER TABLE events DELETE WHERE source = {source:String} SETTINGS mutations_sync = 1", { source });
