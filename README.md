@@ -322,6 +322,14 @@ LLM-аналитик: профили в `engine/argus.analyst.yml`, ключи �
 `ANALYST_CONCURRENCY`, `ANALYST_DAILY_LIMIT` (сверх лимита инциденты создаются без
 вердикта). На стенде без модели `ARGUS_ANALYST_FORCE_PROFILE=mock`.
 
+Локальный классификатор инцидентов — дообученная Laya (System One, типизированные решения) —
+ведётся отдельно: [huggingface.co/k1dory/laya-argus](https://huggingface.co/k1dory/laya-argus)
+(решения, вопросы и разметка, план, веса и замеры). Со стороны ARGUS — выгрузка датасета и
+замеры: `engine dataset export` берёт инциденты, завершённые человеком с меткой, и при
+`--models laya,jev` задаёт им те же вопросы через протокол System One; `engine dataset eval`
+считает точность и калибровку по слепой отложенной части. Jev — облако: инциденты с ПДн ему
+не отправляются.
+
 ## Хранилище: отдельный диск
 
 Данные ClickHouse держите на отдельном разделе — так же, как `/var/ossec` у

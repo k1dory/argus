@@ -6,6 +6,7 @@
 //	engine rules list                   — какие правила загружены
 //	engine rules test --replay f.ndjson — прогнать правила по записанному трафику
 //	engine rules test                   — тесты из rules/tests/*.yml
+//	engine dataset export               — JSONL для обучения и замеров моделей решений
 package main
 
 import (
@@ -75,6 +76,8 @@ func main() {
 			fmt.Fprintln(os.Stderr, "неизвестная подкоманда rules", args[1])
 			os.Exit(2)
 		}
+	case "dataset":
+		os.Exit(datasetCmd(args[1:]))
 	default:
 		fmt.Fprintln(os.Stderr, "неизвестная команда", args[0])
 		os.Exit(2)
