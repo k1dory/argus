@@ -209,18 +209,10 @@ func (r *Registry) Apply(dets []eval.Detection, now time.Time) (created, updated
 		if ex, ok := r.open[key]; ok && isFinal(ex.Status) && inc.LastTS <= ex.LastTS {
 			// Закрытый инцидент по той же сработке без новых событий: absence
 			// и склеенные окна иначе заводили бы новый инцидент каждый цикл.
-			if ex.groupPending {
-				updated = append(updated, ex.bumpUpdated(now))
-			}
 			continue
 		}
 		if ex, ok := r.open[key]; ok && !isFinal(ex.Status) {
 			if inc.EventCount <= ex.EventCount && inc.LastTS <= ex.LastTS {
-				// Присвоенный group_key записывается отдельной версией строки и без
-				// новых событий: иначе после рестарта инцидент снова окажется без ключа.
-				if ex.groupPending {
-					updated = append(updated, ex.bumpUpdated(now))
-				}
 				continue // ничего нового
 			}
 			ex.EventCount, ex.LastTS, ex.Chain, ex.Sources, ex.Events = inc.EventCount, inc.LastTS, inc.Chain, inc.Sources, inc.Events
@@ -242,6 +234,22 @@ func (r *Registry) Apply(dets []eval.Detection, now time.Time) (created, updated
 		r.open[key] = inc
 		created = append(created, inc)
 	}
+	// Присвоенный group_key, ещё не подтверждённый Persisted, записывается
+	// отдельной версией строки каждый цикл — без новых событий и даже когда
+	// исходная сработка уже ушла из буфера: иначе после рестарта инцидент
+	// снова окажется без ключа.
+	inUpdated := make(map[*Incident]bool, len(updated))
+	for _, inc := range updated {
+		inUpdated[inc] = true
+	}
+	var pending []*Incident
+	for _, inc := range r.open {
+		if inc.groupPending && !inUpdated[inc] {
+			pending = append(pending, inc.bumpUpdated(now))
+		}
+	}
+	sort.Slice(pending, func(i, j int) bool { return pending[i].IncidentID < pending[j].IncidentID })
+	updated = append(updated, pending...)
 	return created, updated, dropped
 }
 
@@ -680,20 +688,20 @@ func (i *Incident) Summary() string {
 }
 
 // explicitGroup — group_by правила задан явно и не совпадает с тем, что уже
-// в ключе реестра (субъект, узел; адрес становится субъектом в build).
+// в ключе реестра (субъект, узел; одиночный адрес становится субъектом в build).
+// Составной ключ — всегда явный: адрес в нём в субъект не попадает, а close_on
+// ищет инцидент по тому же составному ключу (admin|NAS-B) в GroupKey.
 func explicitGroup(r *rules.Rule) bool {
 	gb := r.Detection.GroupBy
 	if r.Detection.Threshold != nil && r.Detection.Threshold.GroupBy != "" {
 		gb = r.Detection.Threshold.GroupBy
 	}
-	// Составной ключ только из субъекта, узла и адресов ничего не добавляет к
-	// ключу реестра «правило|субъект|узел» — как и одиночное поле.
-	for _, f := range strings.Split(gb, ",") {
-		switch strings.TrimSpace(f) {
-		case "", "actor.name", "node", "src.ip", "dst.ip":
-		default:
-			return true
-		}
+	if strings.Contains(gb, ",") {
+		return true
 	}
-	return false
+	switch strings.TrimSpace(gb) {
+	case "", "actor.name", "node", "src.ip", "dst.ip":
+		return false
+	}
+	return true
 }
