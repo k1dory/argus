@@ -10,7 +10,7 @@ import { SEARCH_SETTINGS } from "./search";
 import { chTs, LOG_COLUMNS, toLogItem, type LogItem } from "./shared/log-query";
 import type { TriageBinding } from "./shared/triage";
 import {
-  ACTOR_KINDS, activeAliases, aliasColumnExpr, aliasPredicate, aliasPrefilter, aliasActiveAt, aliasMatches, aliasKey, ambiguousAliases, bucketEvents, canonicalIp, canonicalPhone, clampWindow, CONFIRMED_NOTE_PREFIX, HOLD_NOTE_PREFIX, isAliasKind, isHeld, LOWERCASE_KINDS, normalizeAliasValue, rangeWindow, resolveStatus,
+  ACTOR_KEYS_EXPR, ACTOR_KINDS, activeAliases, aliasColumnExpr, aliasPredicate, aliasPrefilter, aliasActiveAt, aliasMatches, aliasKey, ambiguousAliases, bucketEvents, canonicalIp, canonicalPhone, chStringArray, clampWindow, SECTION_LABELS, SECTION_SQL, SECTIONS, CONFIRMED_NOTE_PREFIX, HOLD_NOTE_PREFIX, isAliasKind, isHeld, LOWERCASE_KINDS, normalizeAliasValue, rangeWindow, resolveStatus,
   type ActorIncident, type ActorRange, type ActorReport, type Alias, type AliasInput, type ClassCount, type IpStat, type NodeStat, type Person, type PersonInput, type ResolveMatch, type ResolveStatus, type SourceCoverage, type Window,
 } from "./shared/actors";
 
@@ -232,17 +232,21 @@ export async function aliasSightings(value: string, range: ActorRange, now = Dat
   // login/email: иначе uid CaseKey одной персоны подтягивал бы события casekey
   // другой (и любого незарегистрированного cAsEkEy). Подзапрос идёт по первичному
   // ключу identity_aliases (alias_kind, alias_value) — одна гранула, не весь справочник.
+  // hasAny по idx_actor_keys (0032) отсекает гранулы: каждое из условий ниже — один из ключей.
   const v = value.trim();
+  const pv = canonicalPhone(v) ?? v;
+  const lv = v.toLowerCase();
   const rows = await chQuery<Row>(
     `SELECT source, action, actor_name AS who, node AS at_node, groupUniqArray(5)(src_ip) AS ips, count() AS events, toString(min(ts)) AS first_ts, toString(max(ts)) AS last_ts
      FROM events WHERE ${ts}
+       AND hasAny(${ACTOR_KEYS_EXPR}, {keys:Array(String)})
        AND (actor_name IN ({v:String}, {pv:String})
          OR (lowerUTF8(actor_name) = {lv:String} AND {lv:String} IN (
                SELECT alias_value FROM identity_aliases WHERE alias_kind IN (${CASE_INSENSITIVE_ACTOR_SQL}) AND alias_value = {lv:String}
                GROUP BY alias_kind, alias_value, valid_from, person_id HAVING argMax(deleted, updated_at) = 0))
          OR lowerUTF8(node) = {lv:String})
      GROUP BY source, action, actor_name, node ORDER BY last_ts DESC LIMIT 100`,
-    { ...win, v, pv: canonicalPhone(v) ?? v, lv: v.toLowerCase() },
+    { ...win, v, pv, lv, keys: chStringArray([...new Set([v, pv, lv])].sort()) },
   );
   return { kind: "actor", rows: rows.map(toSighting), vpn: [] };
 }
@@ -304,8 +308,8 @@ function bindPredicate(bind: TriageBinding, params: Record<string, string | numb
 /**
  * Паспорт за период: сводка по классам источников, узлы, адреса, покрытие
  * источников, инциденты (actor_name ∈ субъектных алиасов, действовавших на
- * first_ts), таймлайн последних N событий в форме /api/v1/log и его разбивка
- * по разделам. Персона и алиасы обязательны (исключение), остальное —
+ * first_ts), таймлайн последних N событий в форме /api/v1/log и последние N
+ * событий каждого раздела (своя выборка на раздел). Персона и алиасы обязательны (исключение), остальное —
  * частичная деградация через missing. Удержанные алиасы в aliases остаются
  * (паспорт их показывает), но ни один предикат их не использует.
  */
@@ -313,9 +317,11 @@ export async function actorReport(person: Person, aliases: Alias[], range: Actor
   const now = opts.now ?? Date.now();
   const w = clampWindow(opts.window ?? rangeWindow(range, now));
   const pred = aliasPredicate(aliases, w);
-  const params: Record<string, string | number> = { ...pred.params, from: chTs(w.fromMs), to: chTs(w.toMs) };
+  // Предфильтр по индексу idx_actor_keys: без него каждая агрегация читала всё окно.
+  const pf = aliasPrefilter(aliases);
+  const params: Record<string, string | number> = { ...pred.params, ...pf.params, from: chTs(w.fromMs), to: chTs(w.toMs) };
   const bind = opts.bind ? ` AND ${bindPredicate(opts.bind, params)}` : "";
-  const base = `ts >= parseDateTime64BestEffort({from:String}, 3, 'UTC') AND ts < parseDateTime64BestEffort({to:String}, 3, 'UTC') AND ${pred.sql}${bind}`;
+  const base = `ts >= parseDateTime64BestEffort({from:String}, 3, 'UTC') AND ts < parseDateTime64BestEffort({to:String}, 3, 'UTC') AND ${pf.sql} AND ${pred.sql}${bind}`;
 
   // Инциденты: actor_name инцидента среди субъектных алиасов (без удержанных) — для email/login без учёта регистра.
   const subject = activeAliases(aliases).filter((a) => ACTOR_KINDS.includes(a.kind));
@@ -335,6 +341,11 @@ export async function actorReport(person: Person, aliases: Alias[], range: Actor
   }
   const tlParams: Record<string, string | number> = { ...params, limit };
 
+  // Разделы — своей выборкой каждый: в общей ленте частый раздел вытеснял бы остальные.
+  const shown = SECTIONS.filter((s) => s !== "other");
+  const secP = Promise.all(shown.map((s) => safeQuery(() => chQuery<Record<string, unknown>>(
+    `SELECT ${LOG_COLUMNS} FROM events WHERE ${base} AND ${SECTION_SQL} = {section:String} ORDER BY ts DESC LIMIT {limit:UInt32}`,
+    { ...tlParams, section: s }))));
   const [classes, nodes, ips, sources, incRows, tl, amb] = await Promise.all([
     safeQuery(() => chQuery<{ source_class: string; count: string | number }>(`SELECT source_class, count() AS count FROM events WHERE ${base} GROUP BY source_class ORDER BY count DESC`, params)),
     safeQuery(() => chQuery<NodeStat>(`SELECT node, count() AS count, toString(min(ts)) AS first_ts, toString(max(ts)) AS last_ts FROM events WHERE ${base} AND node != '' GROUP BY node ORDER BY count DESC LIMIT 50`, params)),
@@ -367,6 +378,9 @@ export async function actorReport(person: Person, aliases: Alias[], range: Actor
     .filter((i) => subject.some((a) => aliasMatches(a, i.actor_name) && aliasActiveAt(a, Date.parse(i.first_s.replace(" ", "T") + "Z"))))
     .map(({ id, level, status, rule_id, rule_title, created_s }) => ({ id, level, status, rule_id, rule_title, created_at: created_s }));
   const timeline: LogItem[] = take(tl, "таймлайн", [] as Record<string, unknown>[]).map(toLogItem);
+  const secRows = await secP;
+  const sections = bucketEvents(timeline);
+  shown.forEach((s, i) => { sections[s] = take(secRows[i], `раздел «${SECTION_LABELS[s]}»`, [] as Record<string, unknown>[]).map(toLogItem); });
   let ambiguous: string[] = [];
   if (amb.ok) ambiguous = [...ambiguousAliases(amb.data, w)].filter((k) => aliases.some((a) => aliasKey(a) === k));
   else missing.push("проверка неоднозначности");
@@ -380,7 +394,7 @@ export async function actorReport(person: Person, aliases: Alias[], range: Actor
       nodes: nodeStats, src_ips: ipStats, incidents: incidents.length,
     },
     sources: coverage,
-    sections: bucketEvents(timeline),
+    sections,
     incidents, timeline, limit, missing,
     generated_at: chTs(now),
   };
