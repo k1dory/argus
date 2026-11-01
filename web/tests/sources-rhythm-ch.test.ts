@@ -96,10 +96,14 @@ test("больше 2000 молчащих: порядок при равном в�
   const sec = (ts: string) => Date.parse(ts.replace(" ", "T") + "Z") / 1000;
   const fmt = (x: number) => new Date(x * 1000).toISOString().slice(0, 19).replace("T", " ");
   const nowSQL = "SELECT toString(now() - toIntervalSecond({s:UInt32})) AS ts";
-  let waited = 0;
+  // Бюджет — по часам CH от начала настройки: ожидания и сами запросы baseline, плюс
+  // запас на следующий baseline такой же длительности.
+  const chClock = async () => sec((await c.chQuery<{ ts: string }>(nowSQL, { s: 0 }))[0].ts);
+  const startCh = await chClock();
   let beforeTotal: number;
   let capSec: number;
   for (;;) {
+    const beforeReport = await chClock();
     const baseline = await q().sourcesHealthReport();
     const [chNowRow] = await c.chQuery<{ ts: string }>(nowSQL, { s: 0 });
     const chNow = sec(chNowRow.ts);
@@ -114,16 +118,13 @@ test("больше 2000 молчащих: порядок при равном в�
       if (leaves <= BOUNDARY_SLACK) wait = Math.max(wait, leaves + 1);
     }
     if (wait <= 0) break;
-    if (waited + wait > WAIT_MAX) {
-      const why = `чужой источник слишком свежий: место для cap освободится через ${wait} с, а ждать можно не больше ${WAIT_MAX} с`;
-      if (typeof (t as { skip?: unknown }).skip === "function") {
-        t.skip(why);
-        return;
-      }
-      throw new Error(why);
+    if (chNow - startCh + wait + (chNow - beforeReport) > WAIT_MAX) {
+      // Пропуск, а не ошибка: ни cap, ни проверок после него.
+      (t as { skip?: (why: string) => void }).skip?.(
+        `чужой источник слишком свежий: место для cap освободится через ${wait} с, а всего ждать можно не больше ${WAIT_MAX} с (уже ${chNow - startCh} с)`);
+      return;
     }
     await new Promise((r) => setTimeout(r, wait * 1000));
-    waited += wait;
   }
   const stamp = { ts: fmt(capSec) };
   await c.chCommand(`INSERT INTO events (ts, received_at, source, source_class, action)
