@@ -1,4 +1,4 @@
-import { Bell, ShieldOff, XCircle } from "lucide-react";
+import { Bell, ShieldMinus, ShieldOff, Undo2, XCircle } from "lucide-react";
 import { PasswordForm } from "@/components/console/password-form";
 import { TotpControls } from "@/components/console/totp-form";
 import { Led, Panel } from "@/components/console/panel";
@@ -13,6 +13,8 @@ import { mutedRulesList } from "@/lib/queries";
 import { APP_VERSION } from "@/lib/version";
 import { auditTail, incidentGet, licenseStats, listExceptions, respondStatus, responseLog, RESPOND_MODES } from "@/lib/argus-queries";
 import { removeExceptionAction, unblockIpFormAction } from "@/lib/incident-actions";
+import { excludeIpAction, revokeExclusionAction } from "@/lib/respond-actions";
+import { EXCLUDE_TTLS } from "@/lib/shared/respond";
 import { CreateUserForm, DeleteUserButton, ResetPasswordButton } from "@/components/console/users-form";
 import { ActionForm, ConfirmActionForm } from "@/components/console/action-form";
 import { StorageUnavailable } from "@/components/console/storage-error";
@@ -227,6 +229,51 @@ export default async function SettingsPage() {
                       </li>
                     ))}
                   </ul>
+                )}
+              </dd>
+              <dt className="text-muted-foreground">исключены из автоблокировки</dt>
+              <dd className="space-y-3">
+                {(respond.excluded ?? []).length === 0 ? <span>—</span> : (
+                  <ul className="space-y-2">
+                    {(respond.excluded ?? []).map((x) => (
+                      <li key={x.ip} className="flex flex-wrap items-center gap-2">
+                        <span>{x.ip} до {formatTs(x.until)} · {x.actor}: {x.reason}</span>
+                        {isAdmin && (
+                          <ConfirmActionForm
+                            action={revokeExclusionAction}
+                            title={`Отозвать исключение ${x.ip}?`}
+                            description="Автоблокировка адреса снова работает: свежие события его инцидентов блокируют адрес. Причина попадёт в журнал реагирования."
+                            confirmLabel="Отозвать исключение"
+                            successText={`исключение ${x.ip} отозвано`}
+                            className="flex flex-wrap items-center gap-2"
+                          >
+                            <input type="hidden" name="ip" value={x.ip} />
+                            <input name="reason" required minLength={3} maxLength={500} placeholder="причина" aria-label={`Причина отзыва исключения ${x.ip}`} className="h-8 w-48 border border-border bg-[var(--surface-deep)] px-2 font-mono text-xs" />
+                            <Button type="submit" variant="ghost" size="sm"><Undo2 strokeWidth={1.5} />Отозвать</Button>
+                          </ConfirmActionForm>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                {isAdmin ? (
+                  <ConfirmActionForm
+                    action={excludeIpAction}
+                    title="Исключить адрес из автоблокировки?"
+                    description="До конца срока автоответ не блокирует адрес ни по одному инциденту, в том числе по будущим и по критическим. Активный блок это не снимает. Причина попадёт в журнал реагирования и аудит."
+                    confirmLabel="Исключить"
+                    successText="адрес исключён из автоблокировки"
+                    className="flex flex-wrap items-center gap-2"
+                  >
+                    <input name="ip" required maxLength={64} placeholder="адрес" aria-label="Адрес для исключения из автоблокировки" className="h-8 w-40 border border-border bg-[var(--surface-deep)] px-2 font-mono text-xs" />
+                    <select name="ttl" required defaultValue="24h" aria-label="Срок исключения" className="h-8 border border-border bg-[var(--surface-deep)] px-2 font-mono text-xs">
+                      {EXCLUDE_TTLS.map((t) => <option key={t.value} value={t.value}>{t.label}</option>)}
+                    </select>
+                    <input name="reason" required minLength={3} maxLength={500} placeholder="причина" aria-label="Причина исключения" className="h-8 w-48 border border-border bg-[var(--surface-deep)] px-2 font-mono text-xs" />
+                    <Button type="submit" variant="ghost" size="sm"><ShieldMinus strokeWidth={1.5} />Исключить</Button>
+                  </ConfirmActionForm>
+                ) : (
+                  <p className="text-muted-foreground">исключает и отзывает администратор</p>
                 )}
               </dd>
             </dl>

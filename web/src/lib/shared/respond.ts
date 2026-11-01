@@ -8,6 +8,15 @@ export type RespondMode = keyof typeof RESPOND_MODES;
 export type RespondModeFrom = "config" | "console";
 export const isRespondMode = (x: unknown): x is RespondMode => x === "ids" || x === "simulate" || x === "ips";
 
+/** Сроки исключения адреса из автоблокировки в консоли (движок принимает 1m–720h). */
+export const EXCLUDE_TTLS = [
+  { value: "1h", label: "1 час" },
+  { value: "24h", label: "сутки" },
+  { value: "72h", label: "3 суток" },
+  { value: "168h", label: "неделя" },
+  { value: "720h", label: "30 суток" },
+] as const;
+
 /** IPv4 dotted-quad с октетами 0–255. Границы — не цифра и не точка: в
  *  «10.0.0.1.5» или «1.2.3.4.5» адреса нет. Для проверки ввода на сервере
  *  используйте net.isIP — здесь только извлечение из текста. */

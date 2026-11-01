@@ -338,7 +338,7 @@ test("настройки: администратор — пользовател�
   mocks.queries.listExceptions = async () => [{ rule_id: "ssh.bruteforce", field: "actor.name", value: "scanner", reason: "сканер ИБ", incident_id: "INC-2", created_by: "admin", created_at: NOW }];
   mocks.queries.auditTail = async () => [{ ts: NOW, user: "admin", action: "incident.status", target: "INC-2", detail: "closed" }];
   mocks.queries.licenseStats = async () => ({ peak_eps_30d: 150, avg_eps_7d: 12.34, events_30d: 1_000_000, retention_days: 180, sources: 9 });
-  mocks.queries.respondStatus = async () => ({ mode: "ips", mode_from: "console", enabled: true, ttl: "1h", allowlist: ["10.0.0.0/8"], active: [{ ip: "198.51.100.9", incident: "INC-7", until: "0001-01-01 00:00:00", manual: true }], config_errors: ["нет пароля Wazuh"], pending: 2, requested: "ips" });
+  mocks.queries.respondStatus = async () => ({ mode: "ips", mode_from: "console", enabled: true, ttl: "1h", allowlist: ["10.0.0.0/8"], active: [{ ip: "198.51.100.9", incident: "INC-7", until: "0001-01-01 00:00:00", manual: true }], excluded: [{ ip: "192.0.2.44", since: "2026-11-01 10:00:00", until: "2026-11-02 10:00:00", actor: "admin", reason: "сканер партнёра" }], config_errors: ["нет пароля Wazuh"], pending: 2, requested: "ips" });
   mocks.queries.responseLog = async () => [{ ts: NOW, incident_id: "INC-7", rule_id: "r", ip: "198.51.100.9", mode: "manual", executor: "ngfw", dry_run: 0, ok: 0, detail: "timeout", reason: "оператор", actor: "admin" }];
 
   await auth.createSession("admin", "admin");
@@ -353,6 +353,9 @@ test("настройки: администратор — пользовател�
   assert.match(text, /конфиг: нет пароля Wazuh/);
   assert.match(text, /198\.51\.100\.9 \( ?INC-7 ?\) постоянно/);
   assert.match(text, /10\.0\.0\.0\/8/);
+  assert.match(text, /192\.0\.2\.44 до .*admin ?: сканер партнёра/);
+  assert.match(text, /Отозвать/);
+  assert.match(text, /Исключить/);
   assert.match(text, /пиковый EPS, 30 д 150/);
   assert.match(text, /incident\.status/);
   assert.doesNotMatch(text, /Заглушённые правила/, "без модуля Wazuh мьютов нет");
@@ -368,6 +371,9 @@ test("настройки: администратор — пользовател�
   assert.match(text, /переключает администратор/);
   assert.match(text, /viewer1 · это вы/);
   assert.doesNotMatch(text, /Сбросить пароль/, "кнопки администратора наблюдателю не показываются");
+  assert.match(text, /192\.0\.2\.44 до/, "список исключений виден всем");
+  assert.match(text, /исключает и отзывает администратор/);
+  assert.doesNotMatch(text, /Отозвать/, "отзыв исключения — только администратору");
 });
 
 test("настройки: без ClickHouse правая колонка заменяется окном ошибки, учётная запись и «О системе» остаются", async () => {
