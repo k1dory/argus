@@ -1,8 +1,10 @@
 package engine_test
 
 import (
+	"bufio"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -11,44 +13,38 @@ import (
 	"github.com/devitex-soft/argus/engine/internal/registry"
 )
 
-// PR #73: compose builds used by make up/up-dev must carry the same shipped
-// registry as the release image. The /rules runtime mount cannot replace it:
-// that mount may contain private operator rules.
-// Run from engine: go test . -run 'Test(Compose|Release)EngineRegistry' -count=1
+// PR #73 (ревью codex): сборки compose (make up/up-dev, ansible argus_images:
+// build) должны нести тот же поставляемый набор, что образ релиза. Монтирование
+// /rules его не заменяет: там бывают пользовательские правила. Образ engine
+// собирается из корня репозитория (engine/Dockerfile копирует rules/ и
+// fixtures/events/), поэтому именованные контексты и buildx не нужны.
+// Run from engine: go test . -run 'Test(Compose|Release|Dockerfile)EngineRegistry' -count=1
+
 func TestComposeEngineRegistryContexts(t *testing.T) {
 	var compose struct {
 		Services map[string]struct {
 			Build struct {
-				AdditionalContexts yaml.Node `yaml:"additional_contexts"`
+				Context    string `yaml:"context"`
+				Dockerfile string `yaml:"dockerfile"`
 			} `yaml:"build"`
 		} `yaml:"services"`
 	}
 	readRegistryPackagingYAML(t, "docker-compose.yml", &compose)
-	node := compose.Services["engine"].Build.AdditionalContexts
-	contexts := map[string]string{}
-	switch node.Kind {
-	case yaml.MappingNode:
-		if err := node.Decode(&contexts); err != nil {
-			t.Fatal(err)
-		}
-	case yaml.SequenceNode:
-		var entries []string
-		if err := node.Decode(&entries); err != nil {
-			t.Fatal(err)
-		}
-		contexts = registryContextEntries(entries)
+	b := compose.Services["engine"].Build
+	if b.Context != "." || b.Dockerfile != "engine/Dockerfile" {
+		t.Fatalf("compose собирает engine не из корня репозитория: context=%q dockerfile=%q", b.Context, b.Dockerfile)
 	}
-	checkRegistryBuildContexts(t, contexts)
 }
 
-// Both the locally scanned image and the pushed image need the bundle.
+// Оба шага релиза (сканируемый образ и публикуемый) — из корня для engine.
 func TestReleaseEngineRegistryContexts(t *testing.T) {
 	var workflow struct {
 		Jobs map[string]struct {
 			Steps []struct {
 				Uses string `yaml:"uses"`
 				With struct {
-					BuildContexts string `yaml:"build-contexts"`
+					Context string `yaml:"context"`
+					File    string `yaml:"file"`
 				} `yaml:"with"`
 			} `yaml:"steps"`
 		} `yaml:"jobs"`
@@ -56,9 +52,13 @@ func TestReleaseEngineRegistryContexts(t *testing.T) {
 	readRegistryPackagingYAML(t, ".github/workflows/release.yml", &workflow)
 	builds := 0
 	for _, step := range workflow.Jobs["images"].Steps {
-		if strings.HasPrefix(step.Uses, "docker/build-push-action@") {
-			builds++
-			checkRegistryBuildContexts(t, registryContextEntries(strings.Split(step.With.BuildContexts, "\n")))
+		if !strings.HasPrefix(step.Uses, "docker/build-push-action@") {
+			continue
+		}
+		builds++
+		if step.With.Context != "${{ matrix.service == 'engine' && '.' || format('./{0}', matrix.service) }}" ||
+			step.With.File != "./${{ matrix.service }}/Dockerfile" {
+			t.Errorf("шаг сборки релиза: context=%q file=%q — engine должен собираться из корня", step.With.Context, step.With.File)
 		}
 	}
 	if builds == 0 {
@@ -66,14 +66,44 @@ func TestReleaseEngineRegistryContexts(t *testing.T) {
 	}
 }
 
-func registryContextEntries(entries []string) map[string]string {
-	out := map[string]string{}
-	for _, entry := range entries {
-		if name, path, ok := strings.Cut(strings.TrimSpace(entry), "="); ok {
-			out[name] = path
+// Dockerfile копирует набор, корневой .dockerignore его пропускает, и копии
+// достаточно для реестра (правило SSH и словарь, который есть только в фикстурах).
+func TestDockerfileEngineRegistryCopy(t *testing.T) {
+	df, err := os.ReadFile("Dockerfile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"COPY rules/ /usr/share/argus/shipped/rules/", "COPY fixtures/events/ /usr/share/argus/shipped/fixtures/"} {
+		if !strings.Contains(string(df), want) {
+			t.Errorf("engine/Dockerfile: нет %q", want)
 		}
 	}
-	return out
+	f, err := os.Open(filepath.Join("..", ".dockerignore"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	var lines []string
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		if l := strings.TrimSpace(sc.Text()); l != "" && !strings.HasPrefix(l, "#") {
+			lines = append(lines, l)
+		}
+	}
+	for _, want := range []string{"!engine/", "!rules/", "!fixtures/events/"} {
+		if !slices.Contains(lines, want) {
+			t.Errorf(".dockerignore не пропускает %s", want)
+		}
+	}
+	if err := registry.LoadDirs(filepath.Join("..", "rules"), filepath.Join("..", "fixtures", "events")); err != nil {
+		t.Fatalf("копия набора не даёт реестра: %v", err)
+	}
+	if _, ok := registry.LookupRule("a41c-auth-031"); !ok {
+		t.Error("в наборе нет поставляемого правила SSH")
+	}
+	if !registry.Source("edr.kaspersky") || !registry.Action("file.read") {
+		t.Error("в наборе нет словаря из фикстур")
+	}
 }
 
 func readRegistryPackagingYAML(t *testing.T, path string, into any) {
@@ -84,26 +114,5 @@ func readRegistryPackagingYAML(t *testing.T, path string, into any) {
 	}
 	if err := yaml.Unmarshal(data, into); err != nil {
 		t.Fatal(err)
-	}
-}
-
-func checkRegistryBuildContexts(t *testing.T, contexts map[string]string) {
-	t.Helper()
-	for _, name := range []string{"rules", "fixtures"} {
-		if strings.TrimSpace(contexts[name]) == "" {
-			t.Errorf("engine build omits named context %q: the Dockerfile's scratch fallback has no registry data", name)
-		}
-	}
-	if contexts["rules"] == "" || contexts["fixtures"] == "" {
-		return
-	}
-	if err := registry.LoadDirs(filepath.Join("..", contexts["rules"]), filepath.Join("..", contexts["fixtures"])); err != nil {
-		t.Fatalf("configured image contexts do not contain a usable registry: %v", err)
-	}
-	if _, ok := registry.LookupRule("a41c-auth-031"); !ok {
-		t.Error("configured rule context omits the shipped SSH rule")
-	}
-	if !registry.Source("edr.kaspersky") || !registry.Action("file.read") {
-		t.Error("configured fixture context omits fixture-only vocabulary")
 	}
 }

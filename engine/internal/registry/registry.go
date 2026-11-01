@@ -91,14 +91,26 @@ func LoadDirs(rulesDir, fixturesDir string) error {
 	if err != nil {
 		return fmt.Errorf("registry: %w", err)
 	}
+	if len(s.rules) == 0 {
+		return errors.New("registry: в " + rulesDir + " нет правил")
+	}
+	// Фикстуры обязательны отдельно от правил: значения source/action из
+	// селекторов правил не заменяют словарь фикстур, и без него состояния
+	// молча теряли бы действия (edr.kaspersky / file.read → [action]).
+	if st, err := os.Stat(fixturesDir); err != nil || !st.IsDir() {
+		return errors.New("registry: нет каталога фикстур " + fixturesDir)
+	}
 	files, _ := filepath.Glob(filepath.Join(fixturesDir, "*.ndjson"))
+	fromFixtures := 0
 	for _, f := range files {
-		if err := readFixture(f, s); err != nil {
+		n, err := readFixture(f, s)
+		if err != nil {
 			return fmt.Errorf("registry: %s: %w", f, err)
 		}
+		fromFixtures += n
 	}
-	if len(s.rules) == 0 || len(s.sources) == 0 || len(s.actions) == 0 {
-		return errors.New("registry: в " + rulesDir + " / " + fixturesDir + " нет правил или фикстур")
+	if fromFixtures == 0 {
+		return errors.New("registry: в " + fixturesDir + " нет событий с source и action")
 	}
 	current.Store(s)
 	return nil
@@ -113,10 +125,11 @@ func LoadEnv() error {
 	return Load(dir)
 }
 
-func readFixture(path string, s *snapshot) error {
+// readFixture — значения source/action из NDJSON; n — событий с обоими полями.
+func readFixture(path string, s *snapshot) (n int, err error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer f.Close()
 	sc := bufio.NewScanner(f)
@@ -130,9 +143,12 @@ func readFixture(path string, s *snapshot) error {
 			if e.Action != "" {
 				s.actions[e.Action] = true
 			}
+			if e.Source != "" && e.Action != "" {
+				n++
+			}
 		}
 	}
-	return sc.Err()
+	return n, sc.Err()
 }
 
 // exact — точные значения поля key (без модификаторов |contains и т. п.).

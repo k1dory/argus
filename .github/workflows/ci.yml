@@ -179,6 +179,7 @@ jobs:
           go test -count=1 ./scripts/changelog_release_test.go
           go test -count=1 ./scripts/asn_update_test.go
           go test -count=1 ./.github/workflows/changelog_test.go
+          go test -count=1 ./.github/workflows/registry_smoke_regression_test.go
 
   ansible:
     # Регрессии роли argus (deploy/ansible/roles/argus/tests): настоящие задачи выкатки
@@ -209,9 +210,9 @@ jobs:
       - run: APP_VERSION=ci docker compose --env-file .env.dev -f docker-compose.yml -f docker-compose.dev.yml --profile wazuh --profile mcp build
       - name: mcp без compose — как в release.yml (именованный контекст triage)
         run: docker build -q --build-context triage=./triage -t argus-ci/mcp:check ./mcp
-      - name: engine — как в release.yml (поставляемый набор для internal/registry в образе)
+      - name: engine — поставляемый набор для internal/registry в образе (compose собирает его так же)
         run: |
-          docker build -q --build-context rules=./rules --build-context fixtures=./fixtures/events -t argus-ci/engine:check ./engine
+          docker build -q -f engine/Dockerfile -t argus-ci/engine:check .
           docker run --rm --entrypoint /bin/busybox argus-ci/engine:check test -s /usr/share/argus/shipped/rules/host-ssh-bruteforce.yml
           # в distroless нет ссылок на аплеты busybox — только встроенные команды sh
           docker run --rm --entrypoint /bin/busybox argus-ci/engine:check sh -c 'for f in /usr/share/argus/shipped/fixtures/*.ndjson; do test -s "$f" && exit 0; done; exit 1'
