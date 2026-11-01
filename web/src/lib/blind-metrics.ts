@@ -2,14 +2,17 @@ import "server-only";
 
 // Метрики слепой выборки (web/src/lib/shared/blind-metrics.ts). Только завершённые
 // инциденты: последняя закрывающая метка человека попадает в окно, и сейчас
-// инцидент closed / false_positive в incidents_current. Вердикт агента — последний
-// записанный не позже этой метки. Метки DevOps (правила ops.*, без disposition) не
-// участвуют. Запрос не передаёт настроек и годится и для argus_ro: его политики
-// argus_ro_blind скрывают только незавершённые слепые инциденты, а они сюда не входят.
+// инцидент closed / false_positive в incidents_current. Вердикт агента — вердикт
+// последней сессии разбора, начатой не позже этой метки (одна сессия — один вердикт,
+// как в карточке). Метки DevOps (правила ops.*, без disposition) не участвуют. Запрос
+// уходит без настроек, даже без умолчания консоли (max_execution_time: null), и
+// исполним от argus_ro: его политики argus_ro_blind скрывают только незавершённые
+// слепые инциденты, а они сюда не входят.
 import { ForbiddenError, requirePageSession, type Session } from "./auth";
 import { chQuery } from "./clickhouse";
 import { ROLE_RANK } from "./shared/incidents";
 import { chTs } from "./shared/log-query";
+import { AGENT_VERDICT_SESSION_ORDER } from "./shared/triage-verdict";
 import { AGREEMENT_WINDOWS, VERDICT_DISPOSITION, assembleAgreement, type AgreementSqlRow, type AgreementWindow } from "./shared/blind-metrics";
 
 const VERDICTS = Object.keys(VERDICT_DISPOSITION).map((v) => `'${v}'`).join(", ");
@@ -33,11 +36,23 @@ export const AGREEMENT_SQL = `WITH
     FROM incidents_current
     WHERE incident_id IN (SELECT incident_id FROM closes) AND status IN ('closed', 'false_positive')
   ),
+  sessions AS (
+    -- Вердикт сессии — как в карточке (agentVerdictsFor): самая ранняя строка сессии.
+    -- Псевдонимы не совпадают с колонками, поэтому prefer_column_name_to_alias, которую
+    -- профиль argus_ro передать не позволил бы, не нужна.
+    SELECT incident_id AS session_incident, session_id AS session,
+           min(created_at) AS session_created,
+           argMin(verdict, ${AGENT_VERDICT_SESSION_ORDER}) AS session_verdict
+    FROM agent_verdicts
+    WHERE incident_id IN (SELECT incident_id FROM closes)
+    GROUP BY incident_id, session_id
+  ),
   verdicts AS (
-    SELECT v.incident_id AS incident_id, argMax(v.verdict, v.created_at) AS verdict
-    FROM agent_verdicts AS v INNER JOIN closes AS c ON c.incident_id = v.incident_id
-    WHERE v.created_at <= c.closed_at
-    GROUP BY v.incident_id
+    -- Последняя сессия, начатая не позже закрытия.
+    SELECT s.session_incident AS incident_id, argMax(s.session_verdict, (s.session_created, s.session)) AS verdict
+    FROM sessions AS s INNER JOIN closes AS c ON c.incident_id = s.session_incident
+    WHERE s.session_created <= c.closed_at
+    GROUP BY s.session_incident
   )
 SELECT d.rule_id AS rule_id, any(d.rule_title) AS rule_title, c.blind AS blind,
        count() AS labeled,
@@ -58,7 +73,7 @@ export function agreementParams(window: AgreementWindow, nowMs = Date.now()): { 
 
 export async function agreementMetrics(window: AgreementWindow, nowMs = Date.now()) {
   const params = agreementParams(window, nowMs);
-  const rows = await chQuery<AgreementSqlRow>(AGREEMENT_SQL, params);
+  const rows = await chQuery<AgreementSqlRow>(AGREEMENT_SQL, params, { max_execution_time: null });
   return { window, ...params, ...assembleAgreement(rows) };
 }
 
