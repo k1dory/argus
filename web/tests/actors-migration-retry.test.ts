@@ -76,6 +76,7 @@ function fixture(t: TestContext, failBookkeeping = false) {
       CLICKHOUSE_USER: "default",
       CLICKHOUSE_PASSWORD: "",
       ARGUS_DEV: "0",
+      NODE_ENV: "test", // ProcessEnv в @types/node требует NODE_ENV
     },
     encoding: "utf8",
     timeout: 10_000,
