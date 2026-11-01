@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -188,7 +189,8 @@ func (e *engine) handler() http.Handler {
 		defer cancel()
 		actor := orDefault(strings.TrimSpace(in.User), "оператор")
 		res, err := e.resp.BlockIP(ctx, in.IP, id, in.Reason)
-		ts := model.FormatTS(time.Now())[:19]
+		now := time.Now()
+		ts := model.FormatTS(now)[:19]
 		if err != nil {
 			e.logResponses(ctx, []store.ResponseRow{respRow(ts, "manual", actor, respond.Result{Executor: "argus", IP: in.IP, Incident: id, Detail: err.Error()}, "", in.Reason)})
 			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error()})
@@ -198,7 +200,10 @@ func (e *engine) handler() http.Handler {
 		for _, x := range res {
 			rows = append(rows, respRow(ts, "manual", actor, x, "", in.Reason))
 		}
-		e.logResponses(ctx, rows)
+		// Ручной блок — решение оператора: автоматика по этому адресу больше не
+		// повторяет и не снимает его своим путём.
+		override, _ := e.operatorOverride(in.IP, actor, in.Reason, now)
+		e.logResponses(ctx, append(rows, override...))
 		writeJSON(w, http.StatusOK, map[string]any{"results": res, "ttl": e.resp.ManualTTL().String()})
 	}))
 	// Снятие блокировки из консоли: {ip, user, reason}. 422 — блок не найден или
@@ -216,13 +221,22 @@ func (e *engine) handler() http.Handler {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(e.ctx), 60*time.Second)
 		defer cancel()
 		actor := orDefault(strings.TrimSpace(in.User), "оператор")
-		ts := model.FormatTS(time.Now())[:19]
+		now := time.Now()
+		ts := model.FormatTS(now)[:19]
 		ip := strings.TrimSpace(in.IP)
+		// Снятие — решение оператора и для ожидающей автоблокировки: ключи адреса
+		// конечные, повтор их больше не трогает (иначе снятый адрес заблокировался бы снова).
+		override, pending := e.operatorOverride(ip, actor, in.Reason, now)
 		res, err := e.resp.Unblock(ctx, ip, in.Reason)
-		rows := make([]store.ResponseRow, 0, len(res)+1)
+		if errors.Is(err, respond.ErrNotBlocked) && pending > 0 {
+			res, err = []respond.Result{{Executor: "argus", OK: true, IP: ip,
+				Detail: fmt.Sprintf("блокировки ещё не было — ожидающая автоблокировка отменена (%d)", pending)}}, nil
+		}
+		rows := make([]store.ResponseRow, 0, len(res)+len(override)+1)
 		for _, x := range res {
 			rows = append(rows, respRow(ts, "manual_unblock", actor, x, "", in.Reason))
 		}
+		rows = append(rows, override...)
 		if err != nil {
 			rows = append(rows, respRow(ts, "manual_unblock", actor, respond.Result{Executor: "argus", IP: ip, Detail: err.Error()}, "", in.Reason))
 			e.logResponses(ctx, rows)

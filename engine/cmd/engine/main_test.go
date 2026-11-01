@@ -243,6 +243,38 @@ func wafEvent(ts, ip, transport, peer string) *model.Event {
 	return e
 }
 
+// withoutReserve — строки журнала без записи-резерва (step=reserve): до каждого
+// вызова исполнителя движок пишет её отдельным INSERT (запись вперёд).
+func withoutReserve(rows []string) []string {
+	var out []string
+	for _, r := range rows {
+		if !strings.Contains(r, `"step":"reserve"`) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// reserveBefore — у адреса есть резерв, и он записан раньше строки исполнителя.
+func reserveBefore(t *testing.T, rows []string, ip, executor string) {
+	t.Helper()
+	reserve, exec := -1, -1
+	for i, r := range rows {
+		if !strings.Contains(r, `"ip":"`+ip+`"`) {
+			continue
+		}
+		if reserve < 0 && strings.Contains(r, `"step":"reserve"`) {
+			reserve = i
+		}
+		if exec < 0 && strings.Contains(r, `"executor":"`+executor+`"`) {
+			exec = i
+		}
+	}
+	if reserve < 0 || exec < 0 || reserve > exec {
+		t.Fatalf("%s: резерв (%d) должен быть записан до строки исполнителя %s (%d): %v", ip, reserve, executor, exec, rows)
+	}
+}
+
 func TestAutoRespondTrustAndMinEvents(t *testing.T) {
 	f := newFakeCH(t)
 	srv, blocks := ngfw(t)
@@ -268,8 +300,9 @@ func TestAutoRespondTrustAndMinEvents(t *testing.T) {
 	inc2 := mk("INC-2", "203.0.113.10", wafEvent("2026-09-10 10:01:00.000", "203.0.113.10", "file", ""),
 		wafEvent("2026-09-10 10:01:05.000", "203.0.113.10", "tcp", "10.0.10.11:40000"))
 	e.autoRespond(context.Background(), []*incidents.Incident{inc2}, now)
-	rows = f.waitRows(t, "response_log", 2)
-	if !strings.Contains(rows[1], `"executor":"ngfw.test"`) || !strings.Contains(rows[1], `"ok":1`) || *blocks != 1 {
+	rows = f.waitRows(t, "response_log", 3)
+	reserveBefore(t, rows, "203.0.113.10", "ngfw.test")
+	if out := withoutReserve(rows); !strings.Contains(out[1], `"executor":"ngfw.test"`) || !strings.Contains(out[1], `"ok":1`) || *blocks != 1 {
 		t.Fatalf("trusted block: %v blocks=%d", rows, *blocks)
 	}
 	// решение принято — дописанный инцидент исполнителя не дёргает
@@ -277,7 +310,7 @@ func TestAutoRespondTrustAndMinEvents(t *testing.T) {
 	inc2.EventCount = 3
 	e.autoRespond(context.Background(), []*incidents.Incident{inc2}, now)
 	time.Sleep(50 * time.Millisecond)
-	if len(f.rows("response_log")) != 2 || *blocks != 1 {
+	if len(f.rows("response_log")) != 3 || *blocks != 1 {
 		t.Fatalf("повтор решения: %v blocks=%d", f.rows("response_log"), *blocks)
 	}
 	if e.m.untrustedSkips.Load() != 0 || e.m.autoBlocks.Load() != 1 || e.m.blockFailures.Load() != 0 {
@@ -303,7 +336,9 @@ func TestAutoRespondTrustedSubset(t *testing.T) {
 		wafEvent("2026-09-10 10:00:01.000", "203.0.113.9", "file", ""),
 		wafEvent("2026-09-10 10:00:02.000", "203.0.113.9", "file", ""))
 	e.autoRespond(context.Background(), []*incidents.Incident{inc}, now)
-	rows := f.waitRows(t, "response_log", 2)
+	all := f.waitRows(t, "response_log", 3)
+	reserveBefore(t, all, "203.0.113.9", "ngfw.test")
+	rows := withoutReserve(all)
 	if !strings.Contains(rows[0], "предупреждение: 1 недоверенных событий не учтены") || !strings.Contains(rows[0], "192.0.2.77") {
 		t.Fatalf("предупреждение о недоверенных: %v", rows)
 	}
@@ -318,7 +353,7 @@ func TestAutoRespondTrustedSubset(t *testing.T) {
 		wafEvent("2026-09-10 10:01:00.000", "203.0.113.10", "udp", "192.0.2.77:514"),
 		wafEvent("2026-09-10 10:01:01.000", "203.0.113.10", "udp", "192.0.2.77:514"))
 	e.autoRespond(context.Background(), []*incidents.Incident{inc2}, now)
-	rows = f.waitRows(t, "response_log", 3)
+	rows = withoutReserve(f.waitRows(t, "response_log", 4))
 	if !strings.Contains(rows[2], "ожидание: доверенных событий 0 из 2") || !strings.Contains(rows[2], "не учтено недоверенных: 2") || !strings.Contains(rows[2], `"ok":0`) {
 		t.Fatalf("ожидание по недоверию: %v", rows)
 	}
@@ -336,7 +371,9 @@ func TestAutoRespondTrustedSubset(t *testing.T) {
 	inc2.Events = append(inc2.Events, wafEvent("2026-09-10 10:01:06.000", "203.0.113.10", "file", ""))
 	inc2.EventCount = 4
 	e.autoRespond(context.Background(), []*incidents.Incident{inc2}, now)
-	rows = f.waitRows(t, "response_log", 5)
+	all = f.waitRows(t, "response_log", 7)
+	reserveBefore(t, all, "203.0.113.10", "ngfw.test")
+	rows = withoutReserve(all)
 	if e.respStatus("INC-2") != "done" || *blocks != 2 || !strings.Contains(rows[4], `"ip":"203.0.113.10"`) || !strings.Contains(rows[4], `"ok":1`) {
 		t.Fatalf("блок после доверенных: state=%s blocks=%d rows=%v", e.respStatus("INC-2"), *blocks, rows)
 	}
@@ -345,9 +382,10 @@ func TestAutoRespondTrustedSubset(t *testing.T) {
 		wafEvent("2026-09-10 10:02:00.000", "203.0.113.10", "file", ""),
 		wafEvent("2026-09-10 10:02:01.000", "203.0.113.10", "file", ""))
 	e.autoRespond(context.Background(), []*incidents.Incident{inc3}, now)
-	rows = f.waitRows(t, "response_log", 6)
-	if !strings.Contains(rows[5], "уже заблокирован") || e.m.blockFailures.Load() != 0 || *blocks != 2 {
-		t.Fatalf("уже заблокирован: %v failures=%d", rows[5], e.m.blockFailures.Load())
+	// «уже заблокирован» — резерв не нужен: исполнитель не вызывается
+	rows = f.waitRows(t, "response_log", 8)
+	if !strings.Contains(rows[7], "уже заблокирован") || strings.Contains(rows[7], `"step":"reserve"`) || !strings.Contains(rows[7], `"step":"noop"`) || e.m.blockFailures.Load() != 0 || *blocks != 2 {
+		t.Fatalf("уже заблокирован: %v failures=%d", rows[7], e.m.blockFailures.Load())
 	}
 }
 

@@ -80,6 +80,7 @@ func (e *engine) pruneRespState(now time.Time, ttl time.Duration) int {
 }
 
 func (e *engine) pruneRespStateLocked(now time.Time, ttl time.Duration) int {
+	e.pruneKeysLocked(now, ttl)
 	n := 0
 	for k, v := range e.respState {
 		if now.Sub(v.at) > ttl {
@@ -140,6 +141,18 @@ func (e *engine) autoRespond(ctx context.Context, incs []*incidents.Incident, no
 	var rows []store.ResponseRow
 	ts := model.FormatTS(now)[:19]
 	mode, _ := e.resp.Mode()
+	// Без прочитанного журнала решения по адресам неизвестны: новых блоков нет,
+	// инциденты с respond откладываются и решаются, когда журнал прочитается
+	// (expireBlocks), — даже если их события больше не приходят.
+	var eligible []*incidents.Incident
+	for _, inc := range incs {
+		if r := e.ruleFor(inc.RuleID); r != nil && r.Respond != nil {
+			eligible = append(eligible, inc)
+		}
+	}
+	if len(eligible) > 0 && !e.respReadyOrDefer(ctx, now, eligible) {
+		return
+	}
 	for _, inc := range incs {
 		r := e.ruleFor(inc.RuleID)
 		if r == nil || r.Respond == nil {
@@ -190,33 +203,14 @@ func (e *engine) autoRespond(ctx context.Context, incs []*incidents.Incident, no
 			rows = append(rows, respRow(ts, mode, "argus-engine", respond.Result{Executor: "argus", OK: true, Incident: inc.IncidentID,
 				Detail: fmt.Sprintf("адресов больше max_targets: %d отброшено", truncated)}, inc.RuleID, reason))
 		}
-		for _, ip := range targets {
-			results, applied, err := e.resp.Auto(ctx, ip, inc.IncidentID, reason, ttl)
-			if err != nil {
-				// отказ по allowlist/адресу — не ошибка исполнителя, а решение движка
-				rows = append(rows, respRow(ts, mode, "argus-engine", respond.Result{Executor: "argus", OK: true, IP: ip, Incident: inc.IncidentID, Detail: err.Error()}, inc.RuleID, reason))
+		for _, target := range targets {
+			ip, ok := respond.CanonicalIP(target)
+			if !ok {
+				rows = append(rows, respRow(ts, mode, "argus-engine", respond.Result{Executor: "argus", OK: true, IP: target, Incident: inc.IncidentID,
+					Detail: fmt.Sprintf("адрес %q не разбирается — не блокируется", target)}, inc.RuleID, reason))
 				continue
 			}
-			if mode == respond.ModeIDS {
-				rows = append(rows, respRow(ts, mode, "argus-engine", respond.Result{Executor: "argus", OK: true, IP: ip, Incident: inc.IncidentID, Detail: "режим IDS: автоответ выключен"}, inc.RuleID, reason))
-				continue
-			}
-			for _, res := range results {
-				rows = append(rows, respRow(ts, mode, "argus-engine", res, inc.RuleID, reason))
-			}
-			switch {
-			case applied:
-				e.m.autoBlocks.Add(1)
-				slog.Warn("ips: заблокирован", "ip", ip, "incident", inc.IncidentID, "rule", inc.RuleID)
-			case mode == respond.ModeSimulate:
-				e.m.simulatedBlocks.Add(1)
-			case respond.Noop(results):
-				// уже заблокирован (другим инцидентом или оператором) — делать нечего, не отказ
-				slog.Info("ips: уже заблокирован", "ip", ip, "incident", inc.IncidentID, "rule", inc.RuleID, "detail", results[0].Detail)
-			default:
-				e.m.blockFailures.Add(1)
-				slog.Error("ips: блокировка не выполнена", "ip", ip, "incident", inc.IncidentID, "rule", inc.RuleID)
-			}
+			rows = append(rows, e.attemptKey(ctx, respKey{incident: inc.IncidentID, ip: ip, ruleID: inc.RuleID, reason: reason, ttl: ttl}, now)...)
 		}
 	}
 	if len(rows) > 0 {
@@ -226,18 +220,20 @@ func (e *engine) autoRespond(ctx context.Context, incs []*incidents.Incident, no
 	}
 }
 
-// expireBlocks — снятие по TTL и повторы неудачных автоблокировок.
+// expireBlocks — снятие по TTL и повторы неудачных автоблокировок. Повторы —
+// автоматом ключей (retryKeys), тем же путём с резервом, что и первая попытка.
 func (e *engine) expireBlocks(ctx context.Context, now time.Time) {
 	ts := model.FormatTS(now)[:19]
 	var rows []store.ResponseRow
 	for _, res := range e.resp.Expire(ctx) {
 		rows = append(rows, respRow(ts, "ips", "argus-engine", res, "", "TTL истёк"))
 	}
-	for _, res := range e.resp.Retry(ctx) {
-		rows = append(rows, respRow(ts, "ips", "argus-engine", res, "", "повтор автоблокировки"))
-		if res.OK && res.Executor != "argus" {
-			e.m.autoBlocks.Add(1)
+	if e.respReady(ctx, now) {
+		if deferred := e.takeDeferred(); len(deferred) > 0 {
+			slog.Info("ips: журнал прочитан — решаю отложенные инциденты", "incidents", len(deferred))
+			e.autoRespond(ctx, deferred, now)
 		}
+		rows = append(rows, e.retryKeys(ctx, now)...)
 	}
 	if len(rows) == 0 {
 		return

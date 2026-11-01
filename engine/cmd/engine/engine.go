@@ -82,6 +82,16 @@ type engine struct {
 	respMu     sync.Mutex
 	respState  map[string]respEntry // incident_id → что автоответ уже решил
 	respCycles int                  // циклов с последней чистки respState по возрасту
+	// Автомат блокировки адреса (respond_key.go): ключ «incident_id|адрес».
+	respKeys     map[string]*respKey             // состояние ключа
+	respFlight   map[string]bool                 // ключ → идёт попытка (единственный владелец)
+	respSlots    map[string]map[string]time.Time // потолок «режим|правило|подсеть» → ключ → время места
+	respRestored bool                            // решения из response_log прочитаны
+	// respRestoreMu — одно восстановление журнала на движок; под ним же — очередь
+	// инцидентов, отложенных до чтения журнала.
+	respRestoreMu     sync.Mutex
+	respDeferred      map[string]*incidents.Incident
+	respDeferredOrder []string
 
 	// absence — последние события групп правил «молчание», вне буфера кандидатов:
 	// потолок буфера (ENGINE_BUFFER_MAX) их не выбрасывает. Пишет и читает только
@@ -233,9 +243,11 @@ func newEngine(ctx context.Context, rulesDir string, rs []*rules.Rule, acfg anal
 		resp:      respond.New(acfg.Respond),
 		storms:    map[string]*incidents.Incident{},
 		respState: map[string]respEntry{},
-		excWarned: map[string]bool{},
-		identFile: env("IDENTITIES_FILE", ""),
-		absence:   eval.NewAbsenceState(0),
+		respKeys:  map[string]*respKey{}, respFlight: map[string]bool{}, respSlots: map[string]map[string]time.Time{},
+		respDeferred: map[string]*incidents.Incident{},
+		excWarned:    map[string]bool{},
+		identFile:    env("IDENTITIES_FILE", ""),
+		absence:      eval.NewAbsenceState(0),
 	}
 	e.rules.Store(&rs)
 	var identStore identity.Store
@@ -337,6 +349,7 @@ func run(rulesDir string) {
 			e.reg = reg
 			e.sysMu.Unlock()
 			restored := e.restoreRespState(open, time.Now())
+			e.restoreKeys(ctx, time.Now())
 			slog.Info("engine started", "rules", len(rs), "open_incidents", len(open), "respond_restored", restored, "next", maxN+1, "poll", poll)
 			break
 		}

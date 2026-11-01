@@ -5,6 +5,7 @@ package rules
 import (
 	"fmt"
 	"io/fs"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -101,6 +102,52 @@ type Respond struct {
 	// событий (по умолчанию 1). Для правил без threshold это защита от одного
 	// подделанного события: инцидент заводится сразу, блок — со второго.
 	MinEvents int `yaml:"min_events"`
+	// BlockCap / BlockCapWindow — не больше стольких новых адресов одной подсети
+	// (/24 IPv4, /48 IPv6) правило блокирует за окно (по умолчанию 32 за 1h): скан с
+	// сотни адресов соседей не превращается в сотню блокировок. Дополнительно к
+	// max_targets на инцидент.
+	BlockCap       int    `yaml:"block_cap"`
+	BlockCapWindow string `yaml:"block_cap_window"`
+}
+
+// Потолок новых блокировок подсети по правилу за окно (respond.block_cap).
+const (
+	DefaultBlockCap       = 32
+	DefaultBlockCapWindow = time.Hour
+)
+
+// RespondCap — потолок новых блокировок подсети и его окно с учётом умолчаний.
+func (r *Rule) RespondCap() (n int, window time.Duration) {
+	n, window = DefaultBlockCap, DefaultBlockCapWindow
+	if r.Respond == nil {
+		return n, window
+	}
+	if r.Respond.BlockCap > 0 {
+		n = r.Respond.BlockCap
+	}
+	if d, err := time.ParseDuration(r.Respond.BlockCapWindow); err == nil && d > 0 {
+		window = d
+	}
+	return n, window
+}
+
+// CapSubnet — подсеть адреса для потолка блокировок: /24 у IPv4, /48 у IPv6.
+// Адрес — канонический (respond.CanonicalIP); не адрес — false.
+func CapSubnet(ip string) (string, bool) {
+	a, err := netip.ParseAddr(ip)
+	if err != nil {
+		return "", false
+	}
+	a = a.WithZone("").Unmap()
+	bits := 48
+	if a.Is4() {
+		bits = 24
+	}
+	p, err := a.Prefix(bits)
+	if err != nil {
+		return "", false
+	}
+	return p.String(), true
 }
 
 // RespondMinEvents — порог событий для автоблокировки с учётом умолчания.
@@ -142,6 +189,11 @@ func (r *Rule) RespondTargets(events []*model.Event) (targets []string, truncate
 	seen := map[string]bool{}
 	for _, e := range events {
 		v := strings.TrimSpace(get(e))
+		// Адрес — в канонической записи (netip, Unmap, без зоны): иначе ::ffff:a.b.c.d
+		// и a.b.c.d — два разных адреса в max_targets и два владельца блокировки.
+		if a, err := netip.ParseAddr(v); err == nil {
+			v = a.WithZone("").Unmap().String()
+		}
 		if v == "" || seen[v] {
 			continue
 		}
@@ -357,6 +409,14 @@ func LoadFile(path string) (*Rule, error) {
 		}
 		if r.Respond.MaxTargets < 0 {
 			return nil, fmt.Errorf("respond.max_targets: %d, ожидалось ≥ 0", r.Respond.MaxTargets)
+		}
+		if r.Respond.BlockCap < 0 {
+			return nil, fmt.Errorf("respond.block_cap: %d, ожидалось ≥ 0", r.Respond.BlockCap)
+		}
+		if w := r.Respond.BlockCapWindow; w != "" {
+			if d, err := time.ParseDuration(w); err != nil || d <= 0 {
+				return nil, fmt.Errorf("respond.block_cap_window: %q", w)
+			}
 		}
 	}
 	r.File = filepath.Base(path)

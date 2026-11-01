@@ -47,6 +47,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"reflect"
@@ -522,10 +523,106 @@ func (r *Responder) Auto(ctx context.Context, ip, incident, reason string, ttl t
 }
 
 func canonicalIP(ip string) string {
-	if parsed := net.ParseIP(ip); parsed != nil {
-		return parsed.String()
+	if c, ok := CanonicalIP(ip); ok {
+		return c
 	}
 	return ip
+}
+
+// ErrNotBlocked — Unblock: активной блокировки адреса нет (и в очереди повторов тоже).
+var ErrNotBlocked = errors.New("не найдена")
+
+// CanonicalIP — единственная запись адреса для ключей блокировки, журнала и
+// очереди: netip, IPv4 из ::ffff:… — как IPv4, без зоны. Строка из события
+// (src_ip — String) иначе давала бы разных владельцев одного адреса.
+func CanonicalIP(ip string) (string, bool) {
+	a, err := netip.ParseAddr(strings.TrimSpace(ip))
+	if err != nil {
+		return "", false
+	}
+	return a.WithZone("").Unmap().String(), true
+}
+
+// Outcome — итог одной попытки автоблокировки (Attempt).
+type Outcome int
+
+const (
+	OutcomeBlocked       Outcome = iota + 1 // хотя бы один исполнитель заблокировал
+	OutcomeNoop                             // адрес уже заблокирован (другим инцидентом или оператором)
+	OutcomeSimulated                        // режим simulate: исполнители не вызывались
+	OutcomeFailed                           // все исполнители отказали
+	OutcomeRefused                          // адрес нельзя блокировать (allowlist, never_block, служебный)
+	OutcomeReserveFailed                    // запись-резерв не сохранилась — исполнители не вызывались
+)
+
+// MaxAttempts и RetryDelay — расписание автоблокировки: первая попытка и maxRetries
+// повторов с паузами retryBackoff, как у очереди Retry; в движке повторы ведёт
+// автомат ключа (cmd/engine/respond_key.go).
+const MaxAttempts = maxRetries + 1
+
+func RetryDelay(attempt int) time.Duration {
+	return retryBackoff[min(max(attempt-1, 0), len(retryBackoff)-1)]
+}
+
+// Attempt — одна попытка автоблокировки в режиме mode, снятом вызывающим один раз
+// на попытку: переключение режима посреди попытки её не меняет. Очередь повторов
+// не используется — повтор вызывающий проводит тем же путём. В ips перед
+// исполнителями под блокировкой адреса вызывается reserve (запись вперёд); его
+// ошибка — исполнители не вызываются (OutcomeReserveFailed). Режим ids — ошибка:
+// решение «ничего не делать» принимает вызывающий.
+func (r *Responder) Attempt(ctx context.Context, mode, ip, incident, reason string, ttl time.Duration, reserve func() error) ([]Result, Outcome, error) {
+	ip = canonicalIP(ip)
+	unlock := r.lockIP(ip)
+	defer unlock()
+	switch mode {
+	case ModeSimulate, ModeIPS:
+	default:
+		return nil, 0, fmt.Errorf("режим %q: попытка блокировки не выполняется", mode)
+	}
+	if !r.Enabled() {
+		return nil, 0, errors.New("обратный канал не настроен (respond в argus.analyst.yml)")
+	}
+	if err := r.Check(ip); err != nil {
+		return []Result{{Executor: "argus", OK: true, IP: ip, Incident: incident, Detail: err.Error()}}, OutcomeRefused, nil
+	}
+	if ttl <= 0 {
+		ttl = r.ttl
+	}
+	if mode == ModeSimulate {
+		var results []Result
+		for _, name := range r.executors() {
+			results = append(results, Result{Executor: name, OK: true, DryRun: true, IP: ip, Incident: incident, Detail: fmt.Sprintf("симуляция: заблокировал бы %s на %s", ip, ttl)})
+		}
+		return results, OutcomeSimulated, nil
+	}
+	r.mu.Lock()
+	if b, ok := r.active[ip]; ok && (b.Until.IsZero() || b.Until.After(r.nowFn())) {
+		r.mu.Unlock()
+		until := "постоянно (снятие не настроено)"
+		if !b.Until.IsZero() {
+			until = "до " + b.Until.Format(time.RFC3339)
+			if b.Manual {
+				until += " (оператор)"
+			}
+		}
+		return []Result{{Executor: "argus", OK: true, Noop: true, IP: ip, Incident: incident, Detail: "уже заблокирован " + until}}, OutcomeNoop, nil
+	}
+	r.mu.Unlock()
+	if reserve != nil {
+		if err := reserve(); err != nil {
+			return nil, OutcomeReserveFailed, err
+		}
+	}
+	results := r.execute(ctx, ip, incident, reason)
+	ok := succeeded(results)
+	if len(ok) == 0 {
+		return results, OutcomeFailed, nil
+	}
+	r.mu.Lock()
+	delete(r.retry, ip)
+	r.active[ip] = Block{IP: ip, Incident: incident, Until: r.nowFn().Add(ttl), Executors: ok}
+	r.mu.Unlock()
+	return results, OutcomeBlocked, nil
 }
 
 // lockIP covers both the external request and its state update. r.mu alone
@@ -763,7 +860,7 @@ func (r *Responder) Unblock(ctx context.Context, ip, reason string) ([]Result, e
 		if queued {
 			return []Result{{Executor: "argus", OK: true, IP: ip, Detail: "адрес был только в очереди повторов — убран из неё"}}, nil
 		}
-		return nil, fmt.Errorf("блокировка %s не найдена", ip)
+		return nil, fmt.Errorf("блокировка %s %w", ip, ErrNotBlocked)
 	}
 	r.mu.Unlock()
 	var out []Result
