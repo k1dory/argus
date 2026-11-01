@@ -1,6 +1,7 @@
 import { apiGuard } from "@/lib/auth";
 import { incidentComments, incidentGet, incidentStateHistory, verdictGet } from "@/lib/argus-queries-export";
 import { incidentMarkdown } from "@/lib/shared/incident-wiki";
+import { blindComments, hideVerdicts } from "@/lib/blind";
 
 export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }): Promise<Response> {
   const guard = await apiGuard(req);
@@ -12,7 +13,8 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
       incidentGet(id), verdictGet(id), incidentStateHistory(id, 10_000), incidentComments(id, 10_000),
     ]);
     if (!incident) return Response.json({ error: "не найден" }, { status: 404 });
-    return new Response(incidentMarkdown(incident, verdict, history, comments), {
+    const blind = hideVerdicts(incident);
+    return new Response(incidentMarkdown(incident, blind ? null : verdict, history, blind ? blindComments(comments) : comments, { blind }), {
       headers: {
         "Content-Type": "text/markdown; charset=utf-8",
         "Content-Disposition": `attachment; filename="${id}.md"`,

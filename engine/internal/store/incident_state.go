@@ -22,6 +22,20 @@ type IncidentStateEvent struct {
 	Status     string `json:"status"`
 	Owner      string `json:"owner"`
 	Reason     string `json:"reason"`
+	ClosureLabel
+}
+
+// ClosureLabel — типизированный ответ человека при завершении (миграция 0033).
+// У переходов без завершения и у автоматики — нулевое значение: пустые строки,
+// null, LabeledByHuman=false.
+type ClosureLabel struct {
+	Disposition     string `json:"disposition"`
+	Escalate        *bool  `json:"escalate"`
+	SeverityCorrect *bool  `json:"severity_correct"`
+	OpsCause        string `json:"ops_cause"`
+	OpsAction       string `json:"ops_action"`
+	Blind           bool   `json:"blind"`
+	LabeledByHuman  bool   `json:"labeled_by_human"`
 }
 
 func (c *ClickHouse) CurrentIncident(ctx context.Context, id string) (*incidents.Incident, error) {
@@ -65,7 +79,7 @@ func newEventID() (string, error) {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[:4], b[4:6], b[6:8], b[8:10], b[10:]), nil
 }
 
-func (c *ClickHouse) AppendIncidentState(ctx context.Context, id, actor, kind, status, owner, reason string) (IncidentStateEvent, error) {
+func (c *ClickHouse) AppendIncidentState(ctx context.Context, id, actor, kind, status, owner, reason string, label ClosureLabel) (IncidentStateEvent, error) {
 	rev, err := c.IncidentRevision(ctx, id)
 	if err != nil {
 		return IncidentStateEvent{}, err
@@ -78,6 +92,7 @@ func (c *ClickHouse) AppendIncidentState(ctx context.Context, id, actor, kind, s
 		EventID: eventID, IncidentID: id, Revision: rev + 1,
 		ChangedAt: time.Now().UTC().Format("2006-01-02 15:04:05.000"),
 		Actor:     actor, Kind: kind, Status: status, Owner: owner, Reason: reason,
+		ClosureLabel: label,
 	}
 	if err := c.insert(ctx, "incident_state_events", []any{e}); err != nil {
 		return IncidentStateEvent{}, err

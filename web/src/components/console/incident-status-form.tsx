@@ -10,6 +10,7 @@ import {
   takeIncidentAction,
 } from "@/lib/incident-actions";
 import { INCIDENT_STATUSES } from "@/lib/shared/incidents";
+import { DISPOSITIONS, OPS_ACTIONS, OPS_CAUSES } from "@/lib/shared/closure-label";
 import { Button } from "@/components/ui/button";
 import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel, FieldLegend, FieldSet } from "@/components/ui/field";
 
@@ -51,7 +52,51 @@ function AssignForm({ incidentId, owner, users }: { incidentId: string; owner: s
   </form>;
 }
 
-function StatusForm({ incidentId, status, exceptions }: { incidentId: string; status: string; exceptions: { field: string; value: string; label: string }[] }) {
+const selectClass = "h-10 w-full border border-border bg-[var(--surface-deep)] px-2 text-sm";
+
+/** Выбор из словаря; пустое значение по умолчанию — ответ нельзя «проскочить». */
+function LabelSelect({ id, name, label, options, value, onChange, disabled }: {
+  id: string; name: string; label: string; options: Record<string, string>; value: string; onChange: (v: string) => void; disabled: boolean;
+}) {
+  return <Field data-disabled={disabled}>
+    <FieldLabel htmlFor={id}>{label}</FieldLabel>
+    <select id={id} name={name} required value={value} onChange={(e) => onChange(e.target.value)} disabled={disabled} className={selectClass}>
+      <option value="" disabled>Выберите…</option>
+      {Object.entries(options).map(([key, text]) => <option key={key} value={key}>{text}</option>)}
+    </select>
+  </Field>;
+}
+
+const YES_NO = { yes: "да", no: "нет" };
+
+/** Метка ответа при завершении: вердикт ИБ или причина и действие DevOps. */
+function ClosureLabelFields({ ops, status, disabled }: { ops: boolean; status: string; disabled: boolean }) {
+  const [disposition, setDisposition] = useState("");
+  const [escalate, setEscalate] = useState("");
+  const [severity, setSeverity] = useState("");
+  const [cause, setCause] = useState("");
+  const [action, setAction] = useState("");
+  // «Ложное срабатывание» в статусе и в метке — одно и то же решение.
+  const dispositionValue = status === "false_positive" ? "false_positive" : disposition === "false_positive" ? "" : disposition;
+  const dispositionOptions: Record<string, string> = status === "false_positive"
+    ? { false_positive: DISPOSITIONS.false_positive }
+    : { malicious: DISPOSITIONS.malicious, benign_authorized: DISPOSITIONS.benign_authorized };
+  if (ops) {
+    return <FieldSet className="grid gap-3 border border-border p-3 sm:grid-cols-2" disabled={disabled}>
+      <FieldLegend variant="label">Ответ DevOps</FieldLegend>
+      <LabelSelect id="inc-ops-cause" name="ops_cause" label="Причина" options={OPS_CAUSES} value={cause} onChange={setCause} disabled={disabled} />
+      <LabelSelect id="inc-ops-action" name="ops_action" label="Действие" options={OPS_ACTIONS} value={action} onChange={setAction} disabled={disabled} />
+    </FieldSet>;
+  }
+  return <FieldSet className="grid gap-3 border border-border p-3 sm:grid-cols-3" disabled={disabled}>
+    <FieldLegend variant="label">Ответ аналитика</FieldLegend>
+    <LabelSelect id="inc-disposition" name="disposition" label="Характер срабатывания" options={dispositionOptions} value={dispositionValue} onChange={setDisposition} disabled={disabled} />
+    <LabelSelect id="inc-escalate" name="escalate" label="Нужна эскалация" options={YES_NO} value={escalate} onChange={setEscalate} disabled={disabled} />
+    <LabelSelect id="inc-severity" name="severity_correct" label="Уровень правила верен" options={YES_NO} value={severity} onChange={setSeverity} disabled={disabled} />
+  </FieldSet>;
+}
+
+function StatusForm({ incidentId, status, ops, exceptions }: { incidentId: string; status: string; ops: boolean; exceptions: { field: string; value: string; label: string }[] }) {
   const [next, setNext] = useState(status);
   const [reason, setReason] = useState("");
   const [selectedExceptions, setSelectedExceptions] = useState<string[]>([]);
@@ -67,6 +112,7 @@ function StatusForm({ incidentId, status, exceptions }: { incidentId: string; st
       <Button type="submit" disabled={pending || next === status}>{pending ? "Сохраняю…" : "Изменить статус"}</Button>
     </div>
     </Field>
+    {isFinal(next) && <ClosureLabelFields ops={ops} status={next} disabled={pending} />}
     {isFinal(next) && <Field data-disabled={pending}>
       <FieldLabel htmlFor="inc-close-reason">Причина завершения</FieldLabel>
       <textarea id="inc-close-reason" name="reason" value={reason} onChange={(e) => setReason(e.target.value)} aria-describedby="inc-close-help" required minLength={10} maxLength={2000} rows={3} disabled={pending}
@@ -115,9 +161,11 @@ export function CommentForm({ incidentId }: { incidentId: string }) {
   </form>;
 }
 
-export function IncidentStatusForm({ incidentId, status, owner, currentUser, isAdmin, users, exceptions }: {
+export function IncidentStatusForm({ incidentId, status, ops, owner, currentUser, isAdmin, users, exceptions }: {
   incidentId: string;
   status: string;
+  /** Эксплуатационное правило (теги ops.*): при завершении — форма DevOps. */
+  ops: boolean;
   owner: string;
   currentUser: string;
   isAdmin: boolean;
@@ -130,7 +178,7 @@ export function IncidentStatusForm({ incidentId, status, owner, currentUser, isA
     {!open && <p className="text-sm text-muted-foreground">Инцидент завершён. Дополнительные сведения можно добавить в досье.</p>}
     {open && (!owner || mine && status !== "in_progress") && <TakeForm incidentId={incidentId} />}
     {open && isAdmin && <AssignForm incidentId={incidentId} owner={owner} users={users} />}
-    {open && mine && status !== "new" && status !== "waiting_owner" && <StatusForm key={status} incidentId={incidentId} status={status} exceptions={exceptions} />}
+    {open && mine && status !== "new" && status !== "waiting_owner" && <StatusForm key={status} incidentId={incidentId} status={status} ops={ops} exceptions={exceptions} />}
     {open && !mine && owner && !isAdmin && <p className="text-xs text-muted-foreground">Статус меняет ответственный: {owner}.</p>}
   </div>;
 }
