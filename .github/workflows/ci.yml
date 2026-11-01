@@ -148,9 +148,16 @@ jobs:
           while IFS= read -r -d '' path; do
             if [ "$path" = CHANGELOG.md ]; then touched=1; fi
           done < "$paths"
+          # Версия — содержимое обычного файла VERSION в коммите (mode 100644/100755).
+          # Симлинк хранит в blob путь цели, а не версию: такой VERSION не считается.
+          version_at() {
+            case "$(git ls-tree "$1" -- VERSION | cut -f1 | cut -d' ' -f1)" in
+              100644|100755) git cat-file blob "$1:VERSION" | tr -d '[:space:]' ;;
+            esac
+          }
           if [ "$touched" = 1 ]; then
-            old="$(git show "$mb:VERSION" 2>/dev/null | tr -d '[:space:]' || true)"
-            new="$(git show HEAD:VERSION 2>/dev/null | tr -d '[:space:]' || true)"
+            old="$(version_at "$mb")"
+            new="$(version_at HEAD)"
             if [ -z "$new" ] || [ "$new" = "$old" ]; then
               echo "::error file=CHANGELOG.md::CHANGELOG.md правится только в релизе вместе с новой версией в VERSION. Запись PR — отдельный файл в changes/unreleased/ (формат в changes/unreleased/README.md)."
               exit 1

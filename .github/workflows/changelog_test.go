@@ -375,3 +375,67 @@ func TestChangelogCIStaleEventBaseIgnoresNewerMain(t *testing.T) {
 		t.Fatalf("changes merged into main after the event were attributed to the PR: %v\n%s", err, out)
 	}
 }
+
+func TestChangelogCIRejectsSymlinkVersionWithUnchangedValue(t *testing.T) {
+	f := newWorkflowFixture(t)
+	base := f.gitOK("rev-parse", "HEAD")
+	f.gitOK("checkout", "-qb", "feature")
+	f.write("version-source", "2.0.0\n")
+	if err := os.Remove(filepath.Join(f.root, "VERSION")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("version-source", filepath.Join(f.root, "VERSION")); err != nil {
+		t.Fatal(err)
+	}
+	f.editChangelog()
+	feature := f.commit()
+	// Exercise the actual refs/pull/N/merge topology, not a PR head commit.
+	f.gitOK("checkout", "-q", "--detach", base)
+	f.gitOK("merge", "-q", "--no-ff", "-m", "synthetic PR merge", feature)
+	if data, err := os.ReadFile(filepath.Join(f.root, "VERSION")); err != nil || string(data) != "2.0.0\n" {
+		t.Fatalf("fixture changed the effective release version: data=%q error=%v", data, err)
+	}
+	if out, err := f.ci(base, "feature"); err == nil {
+		t.Fatalf("a symlink target pathname was accepted as a new version even though cat VERSION is unchanged:\n%s", out)
+	}
+}
+
+func TestReleaseGuardRejectsSymlinkedFragmentRoot(t *testing.T) {
+	f := newWorkflowFixture(t)
+	root := filepath.Join(f.root, "changes/unreleased")
+	if err := os.Rename(root, filepath.Join(f.root, "changes/pending")); err != nil {
+		t.Fatal(err)
+	}
+	f.write("changes/pending/change.md", "- still pending through the symlink\n")
+	if err := os.Symlink("pending", root); err != nil {
+		t.Fatal(err)
+	}
+	f.commit()
+	if out, err := f.release(); err == nil {
+		t.Errorf("a symlink used as find's starting point hid pending notes from the release guard:\n%s", out)
+	}
+	if data, _ := os.ReadFile(filepath.Join(f.root, "github-output")); strings.Contains(string(data), "version=") {
+		t.Error("the guard exported a release version without validating the fragment root")
+	}
+}
+
+func TestReleaseGuardRejectsIncompleteFragmentEnumeration(t *testing.T) {
+	f := newWorkflowFixture(t)
+	f.write("changes/unreleased/locked/hidden.md", "- pending note behind an unreadable directory\n")
+	locked := filepath.Join(f.root, "changes/unreleased/locked")
+	if err := os.Chmod(locked, 0000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0700) })
+	if _, err := os.ReadDir(locked); err == nil {
+		t.Skip("requires an unprivileged user for the unreadable directory fixture")
+	} else if !os.IsPermission(err) {
+		t.Fatal(err)
+	}
+	if out, err := f.release(); err == nil {
+		t.Errorf("a failing find pipeline was treated as an empty fragment set:\n%s", out)
+	}
+	if data, _ := os.ReadFile(filepath.Join(f.root, "github-output")); strings.Contains(string(data), "version=") {
+		t.Error("an incomplete fragment scan exported a release version")
+	}
+}

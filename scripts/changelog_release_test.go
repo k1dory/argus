@@ -351,3 +351,166 @@ func TestReleaseEmptyInputAndReadFailureLeaveChangelogUntouched(t *testing.T) {
 		}
 	})
 }
+
+// A regular leaf is not sufficient: an ancestor can redirect both cat and rm
+// outside the checkout. All targets here are synthetic files inside t.TempDir.
+func TestReleaseRejectsSymlinkedFragmentAncestors(t *testing.T) {
+	for _, name := range []string{"changes", "changes/unreleased"} {
+		t.Run(name, func(t *testing.T) {
+			f := newReleaseFixture(t)
+			const privateNote = "- ARGUS_QA_PRIVATE_NOTE: synthetic operator data\n"
+			externalDir := filepath.Join(f.scratch, "operator", "unreleased")
+			if err := os.MkdirAll(externalDir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			externalNote := filepath.Join(externalDir, "private.md")
+			if err := os.WriteFile(externalNote, []byte(privateNote), 0600); err != nil {
+				t.Fatal(err)
+			}
+			link := filepath.Join(f.root, filepath.FromSlash(name))
+			if err := os.Rename(link, filepath.Join(f.scratch, "original-fragments")); err != nil {
+				t.Fatal(err)
+			}
+			target := externalDir
+			if name == "changes" {
+				target = filepath.Dir(externalDir)
+			}
+			relative, err := filepath.Rel(filepath.Dir(link), target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(relative, link); err != nil {
+				t.Fatal(err)
+			}
+			f.commit()
+			index := f.gitOK("ls-files", "--stage")
+			out, err := f.release("2.0.0")
+			if err == nil {
+				t.Errorf("release accepted a symlinked fragment ancestor %q:\n%s", name, out)
+			}
+			if log := f.read("CHANGELOG.md"); log != legacyLog || strings.Contains(out, privateNote) {
+				t.Error("a symlinked ancestor changed the changelog or disclosed operator data")
+			}
+			if data, err := os.ReadFile(externalNote); err != nil || string(data) != privateNote {
+				t.Errorf("release consumed a file outside the checkout: data=%q error=%v", data, err)
+			}
+			if got := f.gitOK("ls-files", "--stage"); got != index {
+				t.Error("rejecting a symlinked ancestor changed the Git index")
+			}
+		})
+	}
+}
+
+func TestReleasePreservesFragmentsWhenChangelogCannotBeWritten(t *testing.T) {
+	for _, tracked := range []bool{false, true} {
+		t.Run(fmt.Sprintf("tracked=%t", tracked), func(t *testing.T) {
+			f := newReleaseFixture(t)
+			const fragment = "changes/unreleased/valuable.md"
+			const note = "- unique worktree note that is not recoverable from Git\n"
+			if tracked {
+				f.write(fragment, "- older committed note\n")
+			}
+			f.commit()
+			f.write(fragment, note)
+			logPath := filepath.Join(f.root, "CHANGELOG.md")
+			if err := os.Chmod(logPath, 0400); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.Chmod(logPath, 0600) })
+			probe, err := os.OpenFile(logPath, os.O_WRONLY, 0)
+			if err == nil {
+				probe.Close()
+				t.Skip("requires an unprivileged user for the read-only file fixture")
+			}
+			if !os.IsPermission(err) {
+				t.Fatalf("unexpected write probe error: %v", err)
+			}
+			index := f.gitOK("ls-files", "--stage")
+			out, err := f.release("2.0.0")
+			if err == nil {
+				// Replacing the file atomically is also acceptable: its parent is writable.
+				if strings.Count(f.read("CHANGELOG.md"), note) != 1 {
+					t.Fatalf("successful release lost the worktree note:\n%s", out)
+				}
+				f.absent(fragment)
+				return
+			}
+			if data, readErr := os.ReadFile(filepath.Join(f.root, fragment)); readErr != nil || string(data) != note {
+				t.Errorf("failed output write destroyed the only copy of a note: data=%q error=%v\n%s", data, readErr, out)
+			}
+			if f.read("CHANGELOG.md") != legacyLog {
+				t.Error("failed output write changed existing release history")
+			}
+			if got := f.gitOK("ls-files", "--stage"); got != index {
+				t.Error("failed output write left fragment deletions staged")
+			}
+		})
+	}
+}
+
+func TestReleaseRejectsIncompleteFragmentEnumeration(t *testing.T) {
+	f := newReleaseFixture(t)
+	const visible = "changes/unreleased/visible.md"
+	const note = "- visible note must survive an incomplete scan\n"
+	f.write(visible, note)
+	f.commit()
+	// Keep the inaccessible subtree untracked so Git's index refresh does not
+	// encounter it independently of the script's find traversal.
+	f.write("changes/unreleased/locked/hidden.md", "- pending hidden note\n")
+	locked := filepath.Join(f.root, "changes/unreleased/locked")
+	if err := os.Chmod(locked, 0000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0700) })
+	if _, err := os.ReadDir(locked); err == nil {
+		t.Skip("requires an unprivileged user for the unreadable directory fixture")
+	} else if !os.IsPermission(err) {
+		t.Fatal(err)
+	}
+	index := f.gitOK("ls-files", "--stage")
+	out, err := f.release("2.0.0")
+	if err == nil {
+		t.Errorf("an incomplete find traversal was accepted as a complete release:\n%s", out)
+	}
+	if f.read("CHANGELOG.md") != legacyLog {
+		t.Error("an enumeration error changed the changelog")
+	}
+	if data, err := os.ReadFile(filepath.Join(f.root, visible)); err != nil || string(data) != note {
+		t.Errorf("an enumeration error consumed a fragment: data=%q error=%v", data, err)
+	}
+	if got := f.gitOK("ls-files", "--stage"); got != index {
+		t.Error("an enumeration error changed the Git index")
+	}
+}
+
+func TestReleaseDoesNotLoseNotesWithBackslashInTempDirectory(t *testing.T) {
+	f := newReleaseFixture(t)
+	f.commit()
+	const fragment = "changes/unreleased/valuable.md"
+	const note = "- note stored under a literal temporary path\n"
+	f.write(fragment, note)
+	// This is a backslash followed by t, not a tab. awk -v decodes it unless
+	// the filename is passed through a channel that preserves literal bytes.
+	tmp := filepath.Join(f.scratch, "tmp\\tab")
+	if err := os.Mkdir(tmp, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for i, entry := range f.env {
+		if strings.HasPrefix(entry, "TMPDIR=") {
+			f.env[i] = "TMPDIR=" + tmp
+		}
+	}
+	out, err := f.release("2.0.0")
+	if err != nil {
+		// A refusal before mutation is safe as well.
+		if f.read("CHANGELOG.md") != legacyLog || f.read(fragment) != note {
+			t.Fatalf("rejecting the temporary path lost release notes:\n%s", out)
+		}
+		return
+	}
+	log := f.read("CHANGELOG.md")
+	if strings.Count(log, note) != 1 || strings.Count(log, "- legacy entry") != 1 {
+		t.Fatalf("release reported success but lost the body through a temporary filename escape:\n%s", log)
+	}
+	f.absent(fragment)
+}
