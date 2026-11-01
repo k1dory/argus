@@ -461,12 +461,10 @@ func main() {
 			case sig := <-sigs:
 				// Первый сигнал запускает (или не прерывает) штатный дренаж, второй — выход.
 				if received++; received >= 2 {
-					slog.Error("повторный сигнал — выход без дренажа", "signal", sig.String(), "unfinished", activeNames())
-					os.Exit(1)
+					forceExit("повторный сигнал — выход без дренажа", "signal", sig.String(), "unfinished", activeNames())
 				}
 			case <-deadline:
-				slog.Error("дренаж не уложился в ARGUS_SHUTDOWN_TIMEOUT — выход", "timeout", shutdownTimeout.String(), "unfinished", activeNames())
-				os.Exit(1)
+				forceExit("дренаж не уложился в ARGUS_SHUTDOWN_TIMEOUT — выход", "timeout", shutdownTimeout.String(), "unfinished", activeNames())
 			}
 		}
 	}()
@@ -791,6 +789,24 @@ func main() {
 		}
 	}
 }
+
+// forceExit — принудительный выход при зависшем дренаже. Запись в журнал может
+// заблокироваться сама (stderr — pipe, читатель встал), поэтому сообщение пишется
+// в отдельной горутине и ждётся не дольше forceExitLogWait: выход — в любом случае.
+func forceExit(msg string, args ...any) {
+	logged := make(chan struct{})
+	go func() {
+		slog.Error(msg, args...)
+		close(logged)
+	}()
+	select {
+	case <-logged:
+	case <-time.After(forceExitLogWait):
+	}
+	os.Exit(1)
+}
+
+const forceExitLogWait = time.Second
 
 // drainIdle — тишина в queue, после которой при остановке считаем остаток вычитанным.
 const drainIdle = 100 * time.Millisecond
