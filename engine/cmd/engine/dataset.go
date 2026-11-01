@@ -37,6 +37,8 @@ type datasetOpts struct {
 
 type datasetStats struct {
 	Labeled, Written, Capped, PIISkippedJev, ModelErrors int
+	SkippedLegacy                                        int // метки формы до 0036 (dataset.Legacy)
+	OmittedTechnique                                     int // техника вне кандидатов инцидента
 }
 
 // exportDataset пишет JSONL: одна строка на инцидент с меткой человека. Модели
@@ -52,7 +54,14 @@ func exportDataset(ctx context.Context, src labeledSource, w io.Writer, o datase
 	st.Labeled = len(rows)
 	var recs []*dataset.Record
 	for _, l := range rows {
+		if l.Label.LabeledByHuman && dataset.Legacy(l) {
+			st.SkippedLegacy++
+			continue
+		}
 		if r := dataset.Build(l, o.Source); r != nil {
+			if len(r.OmittedLabels) > 0 {
+				st.OmittedTechnique++
+			}
 			recs = append(recs, r)
 		}
 	}
@@ -207,7 +216,8 @@ func datasetCmd(args []string) int {
 		return 1
 	}
 	slog.Info("dataset export", "labeled", st.Labeled, "written", st.Written, "capped", st.Capped,
-		"pii_skipped_jev", st.PIISkippedJev, "model_errors", st.ModelErrors)
+		"pii_skipped_jev", st.PIISkippedJev, "model_errors", st.ModelErrors,
+		"skipped_legacy_label", st.SkippedLegacy, "omitted_technique", st.OmittedTechnique)
 	return 0
 }
 

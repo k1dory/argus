@@ -242,3 +242,41 @@ func TestCapPrefersDistinctGroups(t *testing.T) {
 		t.Fatal("0 — без потолка")
 	}
 }
+
+func TestBuildLegacyOpsAndOmittedTechnique(t *testing.T) {
+	ops := secIncident("INC-20", "")
+	ops.RuleID, ops.Tags = "ops-disk-high", []string{"ops.disk"}
+	legacy := human(ops, store.ClosureLabel{OpsCause: "planned_work", OpsAction: "no_action"})
+	if !Legacy(legacy) || Build(legacy, "prod") != nil {
+		t.Fatal("метка формы до 0036 не выгружается")
+	}
+	if Legacy(human(ops, store.ClosureLabel{OpsCause: "disk", OpsActNow: bp(true), OpsUrgency: u8(2)})) {
+		t.Fatal("метка v2 — не legacy")
+	}
+	// Техника из объединения тегов группы, которой нет среди кандидатов этого инцидента.
+	inc := secIncident("INC-21", "1.2.3.4")
+	inc.Tags = []string{"attack.credential_access", "attack.t1110.001"}
+	far := ""
+	for _, tc := range attack.Tactics() {
+		for _, id := range attack.Candidates(nil, tc.Shortname) {
+			if !slices.Contains(attack.Candidates(inc.Tags, "credential-access"), id) {
+				far = id
+				break
+			}
+		}
+		if far != "" {
+			break
+		}
+	}
+	r := Build(human(inc, store.ClosureLabel{Disposition: "malicious", Escalate: bp(true), SeverityLevel: u8(3),
+		AttackTactic: "credential-access", AttackTechnique: far}), "prod")
+	if r == nil || r.Labels["attack_tactic"] != "credential-access" {
+		t.Fatalf("запись и тактика остаются: %+v", r)
+	}
+	if _, ok := r.Labels["attack_technique"]; ok || len(r.OmittedLabels) != 1 {
+		t.Fatalf("техника вне кандидатов не выгружается, а отмечается: %+v %v", r.Labels, r.OmittedLabels)
+	}
+	if slices.Contains(r.Questions["attack_technique"].Options(), far) {
+		t.Fatal("метку не добавляют в варианты — это подсказка модели")
+	}
+}

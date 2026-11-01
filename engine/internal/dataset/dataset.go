@@ -168,6 +168,9 @@ type Record struct {
 	Questions  map[string]systemone.Question `json:"questions"`
 	Labels     map[string]string             `json:"labels"`
 	Models     map[string]ModelAnswers       `json:"models,omitempty"`
+	// OmittedLabels — метки человека, не выгруженные потому, что их нет среди
+	// вариантов вопроса (техника группового закрытия вне кандидатов инцидента).
+	OmittedLabels []string `json:"omitted_labels,omitempty"`
 }
 
 // HoldoutPercent — доля групп в отложенной выборке.
@@ -177,7 +180,7 @@ const HoldoutPercent = 25
 // поставлена не человеком (автозакрытие): такие инциденты не обучают.
 func Build(l store.LabeledIncident, source string) *Record {
 	inc := &l.Incident
-	if !l.Label.LabeledByHuman {
+	if !l.Label.LabeledByHuman || Legacy(l) {
 		return nil
 	}
 	scenario := Scenario(inc)
@@ -209,12 +212,34 @@ func Build(l store.LabeledIncident, source string) *Record {
 	if splitBucket(groupKey(inc)) < HoldoutPercent {
 		split = "holdout"
 	}
+	qs := Questions(scenario, inc.Tags, tactic)
+	// Групповое закрытие (#65) предлагает технику по объединению тегов группы,
+	// а она может не попасть в кандидаты этого инцидента. Добавить её в
+	// варианты нельзя: в работе движок строит кандидатов по тегам самого
+	// инцидента, и лишний вариант подсказал бы модели ответ. Такая метка
+	// техники не выгружается (тактика и остальные метки остаются).
+	var omitted []string
+	if tech, ok := labels["attack_technique"]; ok && !slices.Contains(qs["attack_technique"].Options(), tech) {
+		delete(labels, "attack_technique")
+		omitted = append(omitted, "attack_technique: outside incident candidates")
+	}
 	return &Record{
 		Schema: Schema, IncidentID: inc.IncidentID, GroupID: group, Split: split,
 		Scenario: scenario, Source: source, RuleID: recordRuleID(inc), Level: inc.Level, Tags: ruleTags(inc),
 		PII: inc.PII != 0, Blind: l.Label.Blind, LabeledAt: l.ChangedAt,
-		State: analyst.DecisionState(inc), Questions: Questions(scenario, inc.Tags, tactic), Labels: labels,
+		State: analyst.DecisionState(inc), Questions: qs, Labels: labels, OmittedLabels: omitted,
 	}
+}
+
+// Legacy — метка закрытия из формы до 0036 (ops_cause из прежних четырёх
+// вариантов: real_failure, planned_work, …): в вопросы v2 она не входит, такие
+// записи не выгружаются (datasetStats.SkippedLegacy).
+func Legacy(l store.LabeledIncident) bool {
+	if Scenario(&l.Incident) != Ops || l.Label.OpsCause == "" {
+		return false
+	}
+	_, ok := OpsCauses[l.Label.OpsCause]
+	return !ok
 }
 
 func put(m map[string]string, k, v string) {
