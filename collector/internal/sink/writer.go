@@ -72,6 +72,7 @@ type Queue struct {
 	restoredPending int
 	startedAt       time.Time
 	ackDebt         []Batch // записаны, но файл не удалён (spool.go: retryAcks)
+	ackRetrying     bool    // идёт ackRetryLoop
 }
 
 func NewQueue(maxRows int, st *Stats) *Queue {
