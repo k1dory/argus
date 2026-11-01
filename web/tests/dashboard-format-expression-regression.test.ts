@@ -19,7 +19,7 @@ for (const sql of [
 }
 
 test("панель с format() выполняется с заданным консолью JSONEachRow", async (t) => {
-  const { runPanelQuery } = await import("../src/lib/dashboards");
+  const { panelQuery, runPanelQuery } = await import("../src/lib/dashboards");
   const sql = "SELECT format('{} {}', 'Hello', 'World') AS message";
   let calls = 0;
   t.mock.method(globalThis, "fetch", async (input: URL | string | Request, init?: RequestInit) => {
@@ -27,7 +27,7 @@ test("панель с format() выполняется с заданным кон
     const url = new URL(input instanceof Request ? input.url : String(input));
     assert.equal(url.searchParams.get("default_format"), "JSONEachRow");
     assert.equal(url.searchParams.get("wait_end_of_query"), "1");
-    assert.equal(init?.body, sql);
+    assert.equal(init?.body, panelQuery(sql, "24h"));
     return new Response('{"message":"Hello World"}\n');
   });
   const data = await runPanelQuery(sql, "24h");

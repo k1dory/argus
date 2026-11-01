@@ -7,8 +7,15 @@
 // данных {"exception":"Code: 1."} (колонка с таким именем) — данные.
 const EXCEPTION_LINE = /^(?:\{"exception": ")?(?:Poco::Exception\. |std::exception\. )?Code: (\d+)[.,][^\n]*$/m;
 
-// Коды с собственным HTTP-статусом в 24.8 (exceptionCodeToHTTPStatus); прочие — 500.
-const STATUS: Record<number, number> = { 6: 400, 27: 400, 36: 400, 62: 400, 60: 404, 81: 404, 159: 408, 497: 403, 516: 403 };
+// HTTP-статус по коду исключения в 24.8 (exceptionCodeToHTTPStatus, HTTPHandler.cpp);
+// коды без особой ветки (в том числе ACCESS_DENIED 497) — 500.
+const STATUS: Record<number, number> = {
+  6: 400, 25: 400, 27: 400, 36: 400, 53: 400, 62: 400,
+  46: 404, 47: 404, 60: 404, 81: 404, 115: 404,
+  192: 403, 193: 403, 512: 403, 516: 403,
+  194: 401, 48: 501, 76: 503, 209: 503, 439: 503,
+  159: 408, 229: 413, 381: 411,
+};
 
 export function chHttp(body: string, init: ResponseInit = {}) {
   return async (input: URL | string | Request): Promise<Response> => {

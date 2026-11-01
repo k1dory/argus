@@ -42,11 +42,11 @@ for (const fixture of cases) {
   });
 
   test(`панель: ${fixture.name} не превращается в ошибку хранилища`, async (t) => {
-    const { runPanelQuery, validateSql } = await import("../src/lib/dashboards");
+    const { panelQuery, runPanelQuery, validateSql } = await import("../src/lib/dashboards");
     const logs: string[] = [];
     t.mock.method(console, "error", (...args: unknown[]) => { logs.push(format(...args)); });
     t.mock.method(globalThis, "fetch", async (_input: unknown, init?: RequestInit) => {
-      assert.equal(init?.body, fixture.sql);
+      assert.equal(init?.body, panelQuery(fixture.sql, "24h"));
       return new Response(body, { headers: { "X-ClickHouse-Format": "JSONEachRow" } });
     });
 

@@ -14,7 +14,7 @@ installNextMocks();
 const auth = loadAuth();
 /* eslint-disable @typescript-eslint/no-require-imports -- окружение и Next mocks до загрузки настоящего action */
 const { previewPanelAction } = require("../src/lib/dashboard-actions") as typeof import("../src/lib/dashboard-actions");
-const { panelCacheGet, runPanelQuery, stripPanelDetail, validateSql } = require("../src/lib/dashboards") as typeof import("../src/lib/dashboards");
+const { panelCacheGet, panelQuery, runPanelQuery, stripPanelDetail, validateSql } = require("../src/lib/dashboards") as typeof import("../src/lib/dashboards");
 /* eslint-enable @typescript-eslint/no-require-imports */
 
 const marker = "PrivateCompactExceptionFixture";
@@ -44,7 +44,7 @@ for (const fixture of fixtures) {
     const logs: string[] = [];
     t.mock.method(console, "error", (...args: unknown[]) => { logs.push(format(...args)); });
     t.mock.method(globalThis, "fetch", async (_input: unknown, init?: RequestInit) => {
-      assert.equal(init?.body, sql);
+      assert.equal(init?.body, panelQuery(sql, "24h"));
       return response(fixture.text);
     });
 
@@ -62,7 +62,9 @@ test("панель: JSON-массив с исключением не раскр�
   const ttlMs = 30_000;
   t.mock.method(console, "error", () => undefined);
   t.mock.method(globalThis, "fetch", async () => response(fixtures[0].text));
-  assert.ok(validateSql(cachedSql), "явный FORMAT в SQL панели запрещён: формат ставит консоль (JSONEachRow)");
+  // FORMAT внутри подзапроса отклоняет сам ClickHouse; здесь — страховка формой строк,
+  // если ответ всё же пришёл массивом.
+  assert.equal(validateSql(cachedSql), null);
 
   const result = await runPanelQuery(cachedSql, "24h", ttlMs);
   // DashboardPage применяет именно stripPanelDetail для роли viewer;
