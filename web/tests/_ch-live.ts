@@ -30,7 +30,25 @@ export function migrationStatements(file: string): string[] {
 }
 
 export async function runMigration(file: string): Promise<void> {
-  for (const stmt of migrationStatements(file)) await ch().chCommand(stmt);
+  for (const stmt of migrationStatements(file)) {
+    await ch().chCommand(stmt);
+    // MATERIALIZE (проекция 0031, индексы) — асинхронная мутация. Пока она идёт,
+    // консоль честно уходит на fallback (SOURCE_LAST_READY), и тест, читающий сразу
+    // после миграции, видел бы состояние «миграция ещё не доехала», а не то, что
+    // проверяет. Ждём, как ждёт оператор после migrate.sh.
+    if (/\bMATERIALIZE\b/i.test(stmt)) await waitMutations();
+  }
+}
+
+async function waitMutations(timeoutMs = 120_000): Promise<void> {
+  const until = Date.now() + timeoutMs;
+  for (;;) {
+    const [row] = await ch().chQuery<{ n: string | number }>(
+      "SELECT count() AS n FROM system.mutations WHERE database = currentDatabase() AND NOT is_done");
+    if (Number(row?.n ?? 0) === 0) return;
+    if (Date.now() > until) throw new Error("мутации миграции не завершились за 2 минуты");
+    await new Promise((r) => setTimeout(r, 200));
+  }
 }
 
 /** Все миграции по порядку имён — как migrate.sh на свежей установке. */
