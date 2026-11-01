@@ -638,3 +638,72 @@ func TestLiveWebhookDeliveries(t *testing.T) {
 		t.Fatalf("другой ключ: ok=%v %v", ok, err)
 	}
 }
+
+// Выгрузка меток для датасета: только последнее завершение, и только если
+// его сделал человек с меткой; переоткрытые и закрытые автоматикой — нет.
+func TestLiveLabeledIncidents(t *testing.T) {
+	c := liveStore(t)
+	applyMigrations(t, c)
+	ctx := context.Background()
+	sfx := suffix(t)
+	n := 800000000 + int(time.Now().UnixNano()%90000000)
+	labeledID, autoID, reopenedID, relabeledID := fmt.Sprintf("INC-%d", n), fmt.Sprintf("INC-%d", n-1), fmt.Sprintf("INC-%d", n-2), fmt.Sprintf("INC-%d", n-3)
+	rule := "rule." + sfx
+	now := time.Now().UTC()
+	var incs []*incidents.Incident
+	for _, id := range []string{labeledID, autoID, reopenedID, relabeledID} {
+		incs = append(incs, inc(id, rule, incidents.StatusNew, "high", "actor-"+sfx, "node-"+sfx, now.Add(-time.Hour)))
+	}
+	if err := c.InsertIncidents(ctx, incs); err != nil {
+		t.Fatal(err)
+	}
+	yes, no := true, false
+	sev, urg := uint8(4), uint8(2)
+	human := ClosureLabel{Disposition: "malicious", Escalate: &yes, SeverityLevel: &sev, SeverityCorrect: &no,
+		AttackTactic: "credential-access", AttackTechnique: "T1110.001", AttackVersion: "20.0",
+		OpsActNow: &no, OpsUrgency: &urg, Blind: true, LabeledByHuman: true}
+	step := func(id, kind, status string, l ClosureLabel) {
+		t.Helper()
+		if _, err := c.AppendIncidentState(ctx, id, "ivan", kind, status, "ivan", "причина завершения", l); err != nil {
+			t.Fatal(err)
+		}
+	}
+	step(labeledID, "status", incidents.StatusClosed, human)
+	step(autoID, "auto_close", incidents.StatusClosed, ClosureLabel{})
+	step(reopenedID, "status", incidents.StatusClosed, human)
+	step(reopenedID, "status", incidents.StatusInProgress, ClosureLabel{})
+	step(relabeledID, "status", incidents.StatusClosed, human)
+	step(relabeledID, "status", incidents.StatusInProgress, ClosureLabel{})
+	fp := ClosureLabel{Disposition: "false_positive", Escalate: &no, SeverityCorrect: &no, LabeledByHuman: true}
+	step(relabeledID, "status", incidents.StatusFalsePositive, fp)
+
+	got, err := c.LabeledIncidents(ctx, now.Add(-time.Minute).Format(time.RFC3339), 50000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mine := map[string]LabeledIncident{}
+	for _, l := range got {
+		if l.Incident.RuleID == rule {
+			mine[l.Incident.IncidentID] = l
+		}
+	}
+	if len(mine) != 2 {
+		t.Fatalf("ждали 2 размеченных (%s, %s), получили %v", labeledID, relabeledID, mine)
+	}
+	l := mine[labeledID]
+	if l.Label.Disposition != "malicious" || l.Label.Escalate == nil || !*l.Label.Escalate || l.Label.SeverityCorrect == nil || *l.Label.SeverityCorrect ||
+		!l.Label.Blind || !l.Label.LabeledByHuman || l.ChangedAt == "" || l.Incident.Status != incidents.StatusClosed || len(l.Incident.Chain) != 1 {
+		t.Fatalf("метка и инцидент: %+v", l)
+	}
+	if l.Label.SeverityLevel == nil || *l.Label.SeverityLevel != 4 || l.Label.AttackTactic != "credential-access" ||
+		l.Label.AttackTechnique != "T1110.001" || l.Label.AttackVersion != "20.0" ||
+		l.Label.OpsActNow == nil || *l.Label.OpsActNow || l.Label.OpsUrgency == nil || *l.Label.OpsUrgency != 2 {
+		t.Fatalf("поля плана разметки (0036): %+v", l.Label)
+	}
+	if r := mine[relabeledID]; r.Label.Disposition != "false_positive" || r.Incident.Status != incidents.StatusFalsePositive {
+		t.Fatalf("берётся последняя метка: %+v", r)
+	}
+	if got, err := c.LabeledIncidents(ctx, now.Add(time.Hour).Format(time.RFC3339), 10); err != nil || len(got) != 0 {
+		t.Fatalf("since в будущем: %v %d", err, len(got))
+	}
+}

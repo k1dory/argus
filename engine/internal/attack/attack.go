@@ -16,19 +16,18 @@ const Other = "other"
 var raw []byte
 
 type dictionary struct {
-	Version string `json:"version"`
-	Tactics []struct {
-		Shortname string `json:"shortname"`
-	} `json:"tactics"`
-	Techniques []struct {
-		ID string `json:"id"`
-	} `json:"techniques"`
+	Version    string          `json:"version"`
+	Tactics    []TacticInfo    `json:"tactics"`
+	Techniques []TechniqueInfo `json:"techniques"`
 }
 
 var (
-	version    string
-	tactics    = map[string]bool{}
-	techniques = map[string]bool{}
+	version       string
+	tactics       = map[string]bool{}
+	techniques    = map[string]bool{}
+	tacticList    []TacticInfo
+	techniqueList []TechniqueInfo // порядок файла — по возрастанию ID
+	byID          = map[string]TechniqueInfo{}
 )
 
 func init() {
@@ -37,11 +36,13 @@ func init() {
 		panic("attack: enterprise.json: " + err.Error())
 	}
 	version = d.Version
+	tacticList, techniqueList = d.Tactics, d.Techniques
 	for _, t := range d.Tactics {
 		tactics[t.Shortname] = true
 	}
 	for _, t := range d.Techniques {
 		techniques[t.ID] = true
+		byID[t.ID] = t
 	}
 	if version == "" || len(tactics) == 0 || len(techniques) == 0 {
 		panic("attack: enterprise.json пуст")

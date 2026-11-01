@@ -67,10 +67,10 @@ func (en *Enricher) Run(ctx context.Context, inc *incidents.Incident, spec []any
 		switch name {
 		case "edr.process_tree":
 			d := dur(arg, 2*time.Minute)
-			out = append(out, en.events(ctx, "edr", inc.Node, "", "", first.Add(-d), last.Add(d), "edr.process_tree")...)
+			out = append(out, en.events(ctx, inc, "edr", inc.Node, "", "", first.Add(-d), last.Add(d), "edr.process_tree")...)
 		case "ngfw.sessions":
 			d := dur(arg, 2*time.Minute)
-			out = append(out, en.events(ctx, "ngfw", "", inc.ActorName, ip, first.Add(-d), last.Add(d), "ngfw.sessions")...)
+			out = append(out, en.events(ctx, inc, "ngfw", "", inc.ActorName, ip, first.Add(-d), last.Add(d), "ngfw.sessions")...)
 		case "cmdb.owner":
 			if n, ok := en.cmdb[inc.Node]; ok {
 				out = append(out, fmt.Sprintf("cmdb: %s — владелец %s, команда %s, критичность %s %s",
@@ -85,7 +85,9 @@ func (en *Enricher) Run(ctx context.Context, inc *incidents.Incident, spec []any
 	return out
 }
 
-func (en *Enricher) events(ctx context.Context, class, node, actor, ip string, from, to time.Time, label string) []string {
+// events — события вокруг инцидента. Событие с ПДн (pii=1) помечает и
+// инцидент: его строки попадают в обогащение, а с ним — в облачные маршруты.
+func (en *Enricher) events(ctx context.Context, inc *incidents.Incident, class, node, actor, ip string, from, to time.Time, label string) []string {
 	if en.src == nil {
 		return nil
 	}
@@ -99,6 +101,9 @@ func (en *Enricher) events(ctx context.Context, class, node, actor, ip string, f
 	out := make([]string, 0, len(evs)+1)
 	out = append(out, fmt.Sprintf("%s: %d событий за окно", label, len(evs)))
 	for _, e := range evs {
+		if e.PII == 1 {
+			inc.PII = 1
+		}
 		ts := e.TS
 		if len(ts) >= 19 {
 			ts = ts[11:19]
