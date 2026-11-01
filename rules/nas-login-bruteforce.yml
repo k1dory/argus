@@ -1,0 +1,24 @@
+# Подбор пароля к NAS: неудачные входы журнала доступа QNAP (SMB, AFP, FTP,
+# веб-интерфейс, SSH) с одного адреса. Перебор учёток QNAP — первая ступень
+# кампаний Qlocker/DeadBolt, а гостевые и сервисные учётки на NAS часто живут
+# со слабыми паролями. Порог как у host-login-bruteforce: легитимных промахов
+# у человека — единицы, перебор даёт десятки.
+title: "NAS: login brute force"
+id: a41c-auth-033
+level: high
+tags: [attack.credential_access, attack.t1110.001]
+
+detection:
+  selection:
+    source: nas.qnap
+    action: auth.login
+    outcome: failure
+  threshold:
+    kind: count
+    count: 8
+    window: 10m
+    group_by: src.ip
+  condition: selection and threshold
+
+analyst:
+  profile: on-prem-strict

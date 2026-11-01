@@ -24,7 +24,7 @@ func wafHTTPBatch(t *testing.T, path, body, remote string) []model.Event {
 	h := &listen.HTTPHandlers{
 		Token: "waf-contract-token",
 		ParseLine: func(line string, peer listen.Peer) (model.Event, bool) {
-			return parseSyslogLine(n, line, peer)
+			return parseSyslogLine(n, nil, line, peer)
 		},
 		ParseWAFAudit: func(obj json.RawMessage, peer listen.Peer) (model.Event, bool) {
 			return wafAuditEvent(n, obj, peer)
@@ -137,7 +137,7 @@ func TestWAFModSecurityNumericHostNeverBecomesNode(t *testing.T) {
 					{line, "waf-from-config", "waf-from-config"},
 					{`<134>1 2026-10-30T12:00:03Z waf-from-syslog nginx - - - ` + line, "waf-from-config", "waf-from-syslog"},
 				} {
-					e, ok := parseSyslogLine(&normalize.Normalizer{}, tc.line, listen.Peer{Addr: "10.0.0.7", Node: tc.configured})
+					e, ok := parseSyslogLine(&normalize.Normalizer{}, nil, tc.line, listen.Peer{Addr: "10.0.0.7", Node: tc.configured})
 					if !ok || e.Node != tc.want || e.Attrs["http_host"] != host {
 						t.Fatalf("trusted node precedence: ok=%v want=%q event=%+v", ok, tc.want, e)
 					}
