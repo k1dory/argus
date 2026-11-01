@@ -103,10 +103,15 @@ func (f *releaseFixture) read(name string) string {
 
 func (f *releaseFixture) run(program string, args ...string) (string, error) {
 	f.t.Helper()
+	return f.runAt(f.root, program, args...)
+}
+
+func (f *releaseFixture) runAt(dir, program string, args ...string) (string, error) {
+	f.t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, program, args...)
-	cmd.Dir, cmd.Env = f.root, f.env
+	cmd.Dir, cmd.Env = dir, f.env
 	cmd.WaitDelay = time.Second
 	out, err := cmd.CombinedOutput()
 	if ctx.Err() != nil {
@@ -142,355 +147,281 @@ func (f *releaseFixture) absent(name string) {
 	}
 }
 
+// Контракт (scripts/changelog-release.sh): релиз только с чистого дерева —
+// фрагменты закоммичены, всё читается из индекса, при сбое печатается команда
+// отката, после неё повтор — обычная первая сборка. Регрессии ревью codex #26/#35.
+
+func (f *releaseFixture) unchanged(t *testing.T, log string, index string) {
+	t.Helper()
+	if f.read("CHANGELOG.md") != log {
+		t.Error("отказ изменил CHANGELOG.md")
+	}
+	if got := f.gitOK("ls-files", "--stage"); got != index {
+		t.Error("отказ изменил индекс Git")
+	}
+}
+
+func TestReleaseRefusesDirtyTree(t *testing.T) {
+	for _, kind := range []string{"untracked fragment", "ignored fragment", "staged fragment edit", "modified fragment", "modified changelog", "staged version"} {
+		t.Run(kind, func(t *testing.T) {
+			f := newReleaseFixture(t)
+			f.write("changes/unreleased/a.md", "- committed note\n")
+			f.write("VERSION", "1.0.0\n")
+			f.write(".gitignore", "*.ignored\n")
+			f.commit()
+			switch kind {
+			case "untracked fragment":
+				f.write("changes/unreleased/b.md", "- not committed\n")
+			case "ignored fragment":
+				f.write("changes/unreleased/b.ignored", "- ignored by git\n")
+			case "staged fragment edit":
+				f.write("changes/unreleased/a.md", "- staged\n")
+				f.gitOK("add", "--", "changes/unreleased/a.md")
+			case "modified fragment":
+				f.write("changes/unreleased/a.md", "- worktree only\n")
+			case "modified changelog":
+				f.write("CHANGELOG.md", legacyLog+"\n- local edit\n")
+			case "staged version":
+				f.write("VERSION", "2.0.0\n")
+				f.gitOK("add", "--", "VERSION")
+			}
+			log, index := f.read("CHANGELOG.md"), f.gitOK("ls-files", "--stage")
+			out, err := f.release("2.0.0")
+			if err == nil {
+				t.Fatalf("release ran on a dirty tree (%s):\n%s", kind, out)
+			}
+			f.unchanged(t, log, index)
+			if f.read("changes/unreleased/a.md") == "" {
+				t.Error("fragment was consumed")
+			}
+		})
+	}
+}
+
 func TestReleaseTreatsGitPathspecLiterally(t *testing.T) {
-	for _, name := range []string{"*.md", "READM?.md", "READM[E].md"} {
-		for _, tracked := range []bool{true, false} {
-			t.Run(fmt.Sprintf("%s/tracked=%t", name, tracked), func(t *testing.T) {
-				f := newReleaseFixture(t)
-				fragment := "changes/unreleased/" + name
-				if tracked {
-					f.write(fragment, "- literal fragment\n")
-				}
-				f.commit()
-				if !tracked {
-					f.write(fragment, "- literal fragment\n")
-				}
-				// This excluded file must survive, including changes not in Git.
-				const readme = "uncommitted documentation which must not be removed\n"
-				f.write("changes/unreleased/README.md", readme)
-				out, err := f.release("2.0.0")
-				if err != nil {
-					t.Fatalf("release failed for a literal filename: %v\n%s", err, out)
-				}
-				got, readErr := os.ReadFile(filepath.Join(f.root, "changes/unreleased/README.md"))
-				if readErr != nil || string(got) != readme {
-					t.Errorf("git pathspec %q destroyed excluded README changes: %v; got %q", name, readErr, got)
-				}
-				f.absent(fragment)
-				if strings.Count(f.read("CHANGELOG.md"), "- literal fragment") != 1 {
-					t.Error("the literal fragment must be included exactly once")
-				}
-			})
-		}
-	}
-}
-
-func TestReleaseDoesNotPublishSymlinkTargets(t *testing.T) {
-	f := newReleaseFixture(t)
-	const dummy = "ARGUS_QA_SECRET=synthetic-marker-not-a-real-secret\n"
-	f.write(".gitignore", ".env\n")
-	f.write(".env", dummy)
-	if err := os.Symlink("../../.env", filepath.Join(f.root, "changes/unreleased/link.md")); err != nil {
-		t.Fatal(err)
-	}
-	f.commit()
-	out, _ := f.release("2.0.0")
-	if strings.Contains(f.read("CHANGELOG.md"), dummy) || strings.Contains(out, dummy) {
-		t.Error("a fragment symlink copied an ignored operator file into published release data")
-	}
-	if f.read(".env") != dummy {
-		t.Error("the symlink target was modified")
-	}
-}
-
-func TestReleaseCanRetryAfterGitIndexLock(t *testing.T) {
-	f := newReleaseFixture(t)
-	f.write("changes/unreleased/change.md", "- retry marker\n")
-	f.commit()
-	f.write(".git/index.lock", "synthetic concurrent Git lock\n")
-	firstOut, firstErr := f.release("2.0.0")
-	if err := os.Remove(filepath.Join(f.root, ".git/index.lock")); err != nil {
-		t.Fatal(err)
-	}
-	if firstErr != nil {
-		out, err := f.release("2.0.0")
-		if err != nil {
-			t.Fatalf("release cannot recover after the lock is removed\nfirst: %v\n%s\nretry: %v\n%s", firstErr, firstOut, err, out)
-		}
-	}
-	f.absent("changes/unreleased/change.md")
-	log := f.read("CHANGELOG.md")
-	if strings.Count(log, "## 2.0.0 — ") != 1 || strings.Count(log, "- retry marker") != 1 {
-		t.Fatalf("retry must produce one complete release, got:\n%s", log)
-	}
-}
-
-func TestReleaseDoesNotSucceedWithUnconsumedFragments(t *testing.T) {
-	for _, name := range []string{".hidden.md", "feature/change.md"} {
+	for _, name := range []string{"*.md", "READM?.md", "READM[E].md", "-option.md"} {
 		t.Run(name, func(t *testing.T) {
 			f := newReleaseFixture(t)
-			fragment := "changes/unreleased/" + name
-			f.write(fragment, "- otherwise lost release note\n")
+			f.write("changes/unreleased/"+name, "- literal fragment\n")
 			f.commit()
-			out, err := f.release("2.0.0")
-			if err != nil {
-				// Rejecting unsupported paths before changing anything is also safe.
-				if f.read("CHANGELOG.md") != legacyLog || f.read(fragment) != "- otherwise lost release note\n" {
-					t.Fatalf("rejected fragment left a partial release:\n%s", out)
-				}
-				return
-			}
-			f.absent(fragment)
-			if strings.Count(f.read("CHANGELOG.md"), "- otherwise lost release note") != 1 {
-				t.Error("script reported success but omitted a fragment that release.yml will block on")
-			}
-		})
-	}
-}
-
-func TestReleaseComparesExistingVersionLiterally(t *testing.T) {
-	for _, versions := range [][2]string{
-		{"1.0.0-alpha-1", "1.0.0-alpha.1"},
-		{"1.0.0+build-1", "1.0.0+build.1"},
-	} {
-		t.Run(versions[1], func(t *testing.T) {
-			f := newReleaseFixture(t)
-			f.write("CHANGELOG.md", strings.ReplaceAll(legacyLog, "0.9.0", versions[0]))
-			out, err := f.release(versions[1])
-			if err != nil {
-				t.Fatalf("distinct valid versions were mistaken for the same version: %v\n%s", err, out)
-			}
-			log := f.read("CHANGELOG.md")
-			for _, version := range versions {
-				if strings.Count(log, "## "+version+" — ") != 1 {
-					t.Errorf("missing or duplicate literal version %q", version)
-				}
-			}
-		})
-	}
-}
-
-func TestReleasePreservesOrderAndLiteralShellNames(t *testing.T) {
-	for _, tracked := range []bool{true, false} {
-		t.Run(fmt.Sprintf("tracked=%t", tracked), func(t *testing.T) {
-			f := newReleaseFixture(t)
-			names := []string{
-				"space name.md", "line\nbreak.md", "quote'\".md", "-option.md",
-				"$(touch SHELL_INJECTED).md", "\x60touch BACKTICK_INJECTED\x60.md",
-				"back\\slash.md",
-			}
-			sort.Strings(names) // LC_ALL=C in the child process.
-			if !tracked {
-				f.commit()
-			}
-			for i, name := range names {
-				// Deliberately omit the last newline from alternating fragments.
-				body := fmt.Sprintf("- note-%02d", i)
-				if i%2 == 0 {
-					body += "\n"
-				}
-				f.write("changes/unreleased/"+name, body)
-			}
-			if tracked {
-				f.commit()
-			}
 			out, err := f.release("2.0.0")
 			if err != nil {
 				t.Fatalf("release: %v\n%s", err, out)
 			}
-			log := f.read("CHANGELOG.md")
-			previous := strings.Index(log, "- legacy entry")
-			if previous < 0 {
-				t.Fatal("legacy unreleased notes were lost")
-			}
-			for i, name := range names {
-				marker := fmt.Sprintf("- note-%02d", i)
-				index := strings.Index(log, marker)
-				if index <= previous || strings.Count(log, marker) != 1 {
-					t.Errorf("fragment %q missing, duplicated or out of order", name)
-				}
-				previous = index
-				f.absent("changes/unreleased/" + name)
-			}
-			if !strings.HasSuffix(log, "## 0.9.0 — 2026-01-01\n\n- released history\n") {
-				t.Error("an existing release was changed")
-			}
 			if f.read("changes/unreleased/README.md") != "fragment format documentation\n" {
-				t.Error("README was consumed")
+				t.Error("README was removed by a pathspec pattern")
 			}
-			f.absent("SHELL_INJECTED")
-			f.absent("BACKTICK_INJECTED")
-			if _, err := f.release("2.0.0"); err == nil {
-				t.Error("an existing release must not be emitted again")
-			}
-			if f.read("CHANGELOG.md") != log {
-				t.Error("rerunning an already completed release changed the changelog")
+			f.absent("changes/unreleased/" + name)
+			if strings.Count(f.read("CHANGELOG.md"), "- literal fragment") != 1 {
+				t.Error("the literal fragment must be included exactly once")
 			}
 		})
 	}
 }
 
-func TestReleaseEmptyInputAndReadFailureLeaveChangelogUntouched(t *testing.T) {
-	t.Run("empty", func(t *testing.T) {
-		f := newReleaseFixture(t)
-		empty := strings.Replace(legacyLog, "- legacy entry\n", "", 1)
-		f.write("CHANGELOG.md", empty)
-		if out, err := f.release("2.0.0"); err == nil {
-			t.Fatalf("empty release unexpectedly succeeded:\n%s", out)
-		}
-		if f.read("CHANGELOG.md") != empty {
-			t.Error("an empty release changed the changelog")
-		}
-	})
-	t.Run("read failure", func(t *testing.T) {
-		f := newReleaseFixture(t)
-		f.write("changes/unreleased/good.md", "- must be retained\n")
-		if err := os.Mkdir(filepath.Join(f.root, "changes/unreleased/not-a-file.md"), 0700); err != nil {
-			t.Fatal(err)
-		}
-		if out, err := f.release("2.0.0"); err == nil {
-			t.Fatalf("fragment read failure was ignored:\n%s", out)
-		}
-		if f.read("CHANGELOG.md") != legacyLog || f.read("changes/unreleased/good.md") != "- must be retained\n" {
-			t.Error("failed pipeline changed the changelog or consumed a fragment")
-		}
-		f.absent("CHANGELOG.md.new")
-		entries, err := os.ReadDir(filepath.Join(f.scratch, "tmp"))
-		if err != nil || len(entries) != 0 {
-			t.Errorf("temporary body was not cleaned up: entries=%v error=%v", entries, err)
-		}
-	})
-}
-
-// A regular leaf is not sufficient: an ancestor can redirect both cat and rm
-// outside the checkout. All targets here are synthetic files inside t.TempDir.
-func TestReleaseRejectsSymlinkedFragmentAncestors(t *testing.T) {
-	for _, name := range []string{"changes", "changes/unreleased"} {
-		t.Run(name, func(t *testing.T) {
+func TestReleaseRefusesSymlinks(t *testing.T) {
+	for _, kind := range []string{"fragment", "changes", "changes/unreleased"} {
+		t.Run(kind, func(t *testing.T) {
 			f := newReleaseFixture(t)
-			const privateNote = "- ARGUS_QA_PRIVATE_NOTE: synthetic operator data\n"
-			externalDir := filepath.Join(f.scratch, "operator", "unreleased")
-			if err := os.MkdirAll(externalDir, 0700); err != nil {
+			const secret = "ARGUS_QA_SECRET=synthetic\n"
+			outside := filepath.Join(f.scratch, "operator", "unreleased")
+			if err := os.MkdirAll(outside, 0700); err != nil {
 				t.Fatal(err)
 			}
-			externalNote := filepath.Join(externalDir, "private.md")
-			if err := os.WriteFile(externalNote, []byte(privateNote), 0600); err != nil {
+			if err := os.WriteFile(filepath.Join(outside, "private.md"), []byte(secret), 0600); err != nil {
 				t.Fatal(err)
 			}
-			link := filepath.Join(f.root, filepath.FromSlash(name))
-			if err := os.Rename(link, filepath.Join(f.scratch, "original-fragments")); err != nil {
-				t.Fatal(err)
-			}
-			target := externalDir
-			if name == "changes" {
-				target = filepath.Dir(externalDir)
-			}
-			relative, err := filepath.Rel(filepath.Dir(link), target)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := os.Symlink(relative, link); err != nil {
-				t.Fatal(err)
-			}
-			f.commit()
-			index := f.gitOK("ls-files", "--stage")
-			out, err := f.release("2.0.0")
-			if err == nil {
-				t.Errorf("release accepted a symlinked fragment ancestor %q:\n%s", name, out)
-			}
-			if log := f.read("CHANGELOG.md"); log != legacyLog || strings.Contains(out, privateNote) {
-				t.Error("a symlinked ancestor changed the changelog or disclosed operator data")
-			}
-			if data, err := os.ReadFile(externalNote); err != nil || string(data) != privateNote {
-				t.Errorf("release consumed a file outside the checkout: data=%q error=%v", data, err)
-			}
-			if got := f.gitOK("ls-files", "--stage"); got != index {
-				t.Error("rejecting a symlinked ancestor changed the Git index")
-			}
-		})
-	}
-}
-
-func TestReleasePreservesFragmentsWhenChangelogCannotBeWritten(t *testing.T) {
-	for _, tracked := range []bool{false, true} {
-		t.Run(fmt.Sprintf("tracked=%t", tracked), func(t *testing.T) {
-			f := newReleaseFixture(t)
-			const fragment = "changes/unreleased/valuable.md"
-			const note = "- unique worktree note that is not recoverable from Git\n"
-			if tracked {
-				f.write(fragment, "- older committed note\n")
-			}
-			f.commit()
-			f.write(fragment, note)
-			logPath := filepath.Join(f.root, "CHANGELOG.md")
-			if err := os.Chmod(logPath, 0400); err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() { _ = os.Chmod(logPath, 0600) })
-			probe, err := os.OpenFile(logPath, os.O_WRONLY, 0)
-			if err == nil {
-				probe.Close()
-				t.Skip("requires an unprivileged user for the read-only file fixture")
-			}
-			if !os.IsPermission(err) {
-				t.Fatalf("unexpected write probe error: %v", err)
-			}
-			index := f.gitOK("ls-files", "--stage")
-			out, err := f.release("2.0.0")
-			if err == nil {
-				// Replacing the file atomically is also acceptable: its parent is writable.
-				if strings.Count(f.read("CHANGELOG.md"), note) != 1 {
-					t.Fatalf("successful release lost the worktree note:\n%s", out)
+			f.write(".gitignore", ".env\n")
+			f.write(".env", secret)
+			switch kind {
+			case "fragment":
+				if err := os.Symlink("../../.env", filepath.Join(f.root, "changes/unreleased/link.md")); err != nil {
+					t.Fatal(err)
 				}
-				f.absent(fragment)
-				return
+			default:
+				link := filepath.Join(f.root, filepath.FromSlash(kind))
+				if err := os.RemoveAll(link); err != nil {
+					t.Fatal(err)
+				}
+				target := outside
+				if kind == "changes" {
+					target = filepath.Dir(outside)
+				}
+				rel, err := filepath.Rel(filepath.Dir(link), target)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(rel, link); err != nil {
+					t.Fatal(err)
+				}
 			}
-			if data, readErr := os.ReadFile(filepath.Join(f.root, fragment)); readErr != nil || string(data) != note {
-				t.Errorf("failed output write destroyed the only copy of a note: data=%q error=%v\n%s", data, readErr, out)
+			f.commit()
+			log, index := f.read("CHANGELOG.md"), f.gitOK("ls-files", "--stage")
+			out, err := f.release("2.0.0")
+			if err == nil {
+				t.Fatalf("release accepted a symlink (%s):\n%s", kind, out)
 			}
-			if f.read("CHANGELOG.md") != legacyLog {
-				t.Error("failed output write changed existing release history")
+			if strings.Contains(out, secret) {
+				t.Error("symlink target disclosed")
 			}
-			if got := f.gitOK("ls-files", "--stage"); got != index {
-				t.Error("failed output write left fragment deletions staged")
+			f.unchanged(t, log, index)
+			if data, err := os.ReadFile(filepath.Join(outside, "private.md")); err != nil || string(data) != secret {
+				t.Error("file outside the checkout was touched")
 			}
 		})
 	}
 }
 
-func TestReleaseRejectsIncompleteFragmentEnumeration(t *testing.T) {
+func TestReleaseOrderNestedHiddenAndShellNames(t *testing.T) {
 	f := newReleaseFixture(t)
-	const visible = "changes/unreleased/visible.md"
-	const note = "- visible note must survive an incomplete scan\n"
-	f.write(visible, note)
+	names := []string{
+		".hidden.md", "feature/change.md", "space name.md", "line\nbreak.md", "quote'\".md",
+		"$(touch SHELL_INJECTED).md", "\x60touch BACKTICK_INJECTED\x60.md", "back\\slash.md",
+		"tab\tname.md", "carriage\rreturn.md", "colon:name.md", ":(glob)*.md",
+	}
+	sort.Strings(names)
+	for i, name := range names {
+		body := fmt.Sprintf("- note-%02d", i)
+		if i%2 == 0 {
+			body += "\n"
+		}
+		f.write("changes/unreleased/"+name, body)
+	}
 	f.commit()
-	// Keep the inaccessible subtree untracked so Git's index refresh does not
-	// encounter it independently of the script's find traversal.
-	f.write("changes/unreleased/locked/hidden.md", "- pending hidden note\n")
-	locked := filepath.Join(f.root, "changes/unreleased/locked")
-	if err := os.Chmod(locked, 0000); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(locked, 0700) })
-	if _, err := os.ReadDir(locked); err == nil {
-		t.Skip("requires an unprivileged user for the unreadable directory fixture")
-	} else if !os.IsPermission(err) {
-		t.Fatal(err)
-	}
-	index := f.gitOK("ls-files", "--stage")
 	out, err := f.release("2.0.0")
-	if err == nil {
-		t.Errorf("an incomplete find traversal was accepted as a complete release:\n%s", out)
+	if err != nil {
+		t.Fatalf("release: %v\n%s", err, out)
+	}
+	log := f.read("CHANGELOG.md")
+	previous := strings.Index(log, "- legacy entry")
+	if previous < 0 {
+		t.Fatal("legacy unreleased notes were lost")
+	}
+	for i, name := range names {
+		marker := fmt.Sprintf("- note-%02d", i)
+		index := strings.Index(log, marker)
+		if index <= previous || strings.Count(log, marker) != 1 {
+			t.Errorf("fragment %q missing, duplicated or out of order", name)
+		}
+		previous = index
+		f.absent("changes/unreleased/" + name)
+	}
+	if !strings.HasSuffix(log, "## 0.9.0 — 2026-01-01\n\n- released history\n") {
+		t.Error("an existing release was changed")
+	}
+	if f.read("changes/unreleased/README.md") != "fragment format documentation\n" {
+		t.Error("README was consumed")
+	}
+	f.absent("SHELL_INJECTED")
+	f.absent("BACKTICK_INJECTED")
+	if strings.Contains(f.gitOK("status", "--porcelain", "--", "changes"), "??") {
+		t.Error("fragments must be removed from the index as well")
+	}
+	f.commit()
+	if _, err := f.release("2.0.0"); err == nil {
+		t.Error("an existing release must not be emitted again")
+	}
+}
+
+func TestReleaseComparesExistingVersionLiterally(t *testing.T) {
+	for _, versions := range [][2]string{{"1.0.0-alpha-1", "1.0.0-alpha.1"}, {"1.0.0+build-1", "1.0.0+build.1"}} {
+		t.Run(versions[1], func(t *testing.T) {
+			f := newReleaseFixture(t)
+			f.write("CHANGELOG.md", strings.ReplaceAll(legacyLog, "0.9.0", versions[0]))
+			f.commit()
+			if out, err := f.release(versions[1]); err != nil {
+				t.Fatalf("distinct versions were mistaken for the same version: %v\n%s", err, out)
+			}
+			for _, v := range versions {
+				if strings.Count(f.read("CHANGELOG.md"), "## "+v+" — ") != 1 {
+					t.Errorf("missing or duplicate literal version %q", v)
+				}
+			}
+		})
+	}
+}
+
+func TestReleaseEmptyIsRefused(t *testing.T) {
+	f := newReleaseFixture(t)
+	empty := strings.Replace(legacyLog, "- legacy entry\n", "", 1)
+	f.write("CHANGELOG.md", empty)
+	f.commit()
+	if out, err := f.release("2.0.0"); err == nil {
+		t.Fatalf("empty release succeeded:\n%s", out)
+	}
+	if f.read("CHANGELOG.md") != empty {
+		t.Error("empty release changed the changelog")
+	}
+}
+
+// index.lock: git rm падает до записи CHANGELOG — ничего не изменено, повтор проходит.
+func TestReleaseRetryAfterIndexLock(t *testing.T) {
+	f := newReleaseFixture(t)
+	f.write("changes/unreleased/change.md", "- retry marker\n")
+	f.commit()
+	f.write(".git/index.lock", "synthetic concurrent Git lock\n")
+	if out, err := f.release("2.0.0"); err == nil {
+		t.Fatalf("release ignored index.lock:\n%s", out)
+	}
+	if err := os.Remove(filepath.Join(f.root, ".git/index.lock")); err != nil {
+		t.Fatal(err)
 	}
 	if f.read("CHANGELOG.md") != legacyLog {
-		t.Error("an enumeration error changed the changelog")
+		t.Fatal("failed git rm changed the changelog")
 	}
-	if data, err := os.ReadFile(filepath.Join(f.root, visible)); err != nil || string(data) != note {
-		t.Errorf("an enumeration error consumed a fragment: data=%q error=%v", data, err)
+	if out, err := f.release("2.0.0"); err != nil {
+		t.Fatalf("retry: %v\n%s", err, out)
 	}
-	if got := f.gitOK("ls-files", "--stage"); got != index {
-		t.Error("an enumeration error changed the Git index")
+	if log := f.read("CHANGELOG.md"); strings.Count(log, "## 2.0.0 — ") != 1 || strings.Count(log, "- retry marker") != 1 {
+		t.Fatalf("retry must produce one release:\n%s", log)
 	}
 }
 
-func TestReleaseDoesNotLoseNotesWithBackslashInTempDirectory(t *testing.T) {
+// Сбой после git rm (запись CHANGELOG): напечатанная команда отката возвращает
+// чистое дерево, после неё повтор — обычная первая сборка без потерь.
+func TestReleaseFailureAfterRemovalPrintsWorkingRollback(t *testing.T) {
 	f := newReleaseFixture(t)
+	f.write("changes/unreleased/valuable.md", "- valuable note\n")
 	f.commit()
-	const fragment = "changes/unreleased/valuable.md"
-	const note = "- note stored under a literal temporary path\n"
-	f.write(fragment, note)
-	// This is a backslash followed by t, not a tab. awk -v decodes it unless
-	// the filename is passed through a channel that preserves literal bytes.
+	logPath := filepath.Join(f.root, "CHANGELOG.md")
+	if err := os.Chmod(logPath, 0400); err != nil {
+		t.Fatal(err)
+	}
+	if w, err := os.OpenFile(logPath, os.O_WRONLY, 0); err == nil {
+		w.Close()
+		t.Skip("requires an unprivileged user for the read-only file fixture")
+	}
+	out, err := f.release("2.0.0")
+	if err == nil {
+		t.Fatalf("release succeeded with a read-only changelog:\n%s", out)
+	}
+	const prefix = "откатить: "
+	i := strings.Index(out, prefix)
+	if i < 0 {
+		t.Fatalf("no rollback command printed:\n%s", out)
+	}
+	rollback := strings.TrimSpace(strings.SplitN(out[i+len(prefix):], "\n", 2)[0])
+	if err := os.Chmod(logPath, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if o, err := f.run(f.bash, "--noprofile", "--norc", "-c", rollback); err != nil {
+		t.Fatalf("rollback command failed: %v\n%s", err, o)
+	}
+	if st := f.gitOK("status", "--porcelain"); st != "" {
+		t.Fatalf("rollback left a dirty tree:\n%s", st)
+	}
+	if o, err := f.release("2.0.0"); err != nil {
+		t.Fatalf("release after rollback: %v\n%s", err, o)
+	}
+	if strings.Count(f.read("CHANGELOG.md"), "- valuable note") != 1 {
+		t.Error("note lost or duplicated after rollback and retry")
+	}
+}
+
+func TestReleaseBackslashInTempDirectory(t *testing.T) {
+	f := newReleaseFixture(t)
+	f.write("changes/unreleased/valuable.md", "- note under a literal temporary path\n")
+	f.commit()
 	tmp := filepath.Join(f.scratch, "tmp\\tab")
 	if err := os.Mkdir(tmp, 0700); err != nil {
 		t.Fatal(err)
@@ -500,17 +431,414 @@ func TestReleaseDoesNotLoseNotesWithBackslashInTempDirectory(t *testing.T) {
 			f.env[i] = "TMPDIR=" + tmp
 		}
 	}
-	out, err := f.release("2.0.0")
-	if err != nil {
-		// A refusal before mutation is safe as well.
-		if f.read("CHANGELOG.md") != legacyLog || f.read(fragment) != note {
-			t.Fatalf("rejecting the temporary path lost release notes:\n%s", out)
-		}
-		return
+	if out, err := f.release("2.0.0"); err != nil {
+		t.Fatalf("release: %v\n%s", err, out)
 	}
 	log := f.read("CHANGELOG.md")
-	if strings.Count(log, note) != 1 || strings.Count(log, "- legacy entry") != 1 {
-		t.Fatalf("release reported success but lost the body through a temporary filename escape:\n%s", log)
+	if strings.Count(log, "- note under a literal temporary path") != 1 || strings.Count(log, "- legacy entry") != 1 {
+		t.Fatalf("body lost through a temporary filename escape:\n%s", log)
 	}
-	f.absent(fragment)
+}
+
+// PR #37: Git's clean status is not proof that these bytes are in HEAD.
+// In particular, git rm also honors assume-unchanged and can unlink the only
+// copy of a local edit after cat-file has read the older index blob.
+func TestReleaseRefusesIndexHiddenLocalEdits(t *testing.T) {
+	const fragment = "changes/unreleased/valuable.md"
+	for _, tc := range []struct {
+		flag, path string
+	}{
+		{"--assume-unchanged", fragment},
+		{"--assume-unchanged", "CHANGELOG.md"},
+		{"--skip-worktree", "CHANGELOG.md"},
+		{"--skip-worktree", "VERSION"},
+	} {
+		t.Run(tc.flag+"/"+tc.path, func(t *testing.T) {
+			f := newReleaseFixture(t)
+			f.write(fragment, "- committed note\n")
+			f.write("VERSION", "1.0.0\n")
+			f.commit()
+			f.gitOK("update-index", tc.flag, "--", tc.path)
+			local := f.read(tc.path) + "\n- unique local edit absent from HEAD\n"
+			f.write(tc.path, local)
+			f.gitOK("diff", "--quiet", "--", "CHANGELOG.md", "VERSION", "changes")
+			log, index := f.read("CHANGELOG.md"), f.gitOK("ls-files", "--stage")
+			out, err := f.release("2.0.0")
+			if err == nil {
+				t.Errorf("release accepted an edit hidden by %s on %s:\n%s", tc.flag, tc.path, out)
+			}
+			f.unchanged(t, log, index)
+			if data, err := os.ReadFile(filepath.Join(f.root, tc.path)); err != nil || string(data) != local {
+				t.Errorf("local data lost: path=%s data=%q error=%v", tc.path, data, err)
+			}
+		})
+	}
+}
+
+// PR #37: grep -q stops reading at the first hidden index entry. With pipefail,
+// a large ls-files output can then turn a successful match into SIGPIPE from
+// Git, bypassing the refusal. git rm also trusts assume-unchanged, so this can
+// delete the only copy of a maintainer's local edits.
+func TestReleaseRefusesIndexHiddenLocalEditsWithLargeListing(t *testing.T) {
+	f := newReleaseFixture(t)
+	const fragment = "changes/unreleased/000-local.md"
+	const committed = "- committed release note\n"
+	const local = committed + "- unique maintainer draft absent from HEAD\n"
+	f.write(fragment, committed)
+	f.write("VERSION", "1.0.0\n")
+
+	// Real tracked archive files sort after the hidden entry and make ls-files
+	// write over 1 MiB, beyond ordinary pipe buffers. Keeping them outside
+	// unreleased avoids thousands of cat-file subprocesses during the release.
+	// Each filename stays below the 255-byte component limit on Linux and macOS.
+	for i := 0; i < 4096; i++ {
+		name := fmt.Sprintf("changes/zz-archive/%04d-%s.md", i, strings.Repeat("archive-note-", 18))
+		f.write(name, "- archived note\n")
+	}
+	f.commit()
+	f.gitOK("update-index", "--assume-unchanged", "--", fragment)
+	f.write(fragment, local)
+	f.gitOK("diff", "--quiet", "--", "CHANGELOG.md", "VERSION", "changes")
+	f.gitOK("diff", "--cached", "--quiet", "--", "CHANGELOG.md", "VERSION", "changes")
+	listing := f.gitOK("ls-files", "-v", "--", "CHANGELOG.md", "VERSION", "changes")
+	if len(listing) <= 1<<20 || !strings.Contains(listing, "\nh "+fragment+"\n") {
+		t.Fatal("fixture must contain a hidden local edit followed by a large tracked listing")
+	}
+	index := f.gitOK("ls-files", "--stage")
+
+	out, err := f.release("2.0.0")
+	if err == nil {
+		t.Errorf("release accepted an assume-unchanged edit with a large index listing:\n%s", out)
+	}
+	f.unchanged(t, legacyLog, index)
+	if data, err := os.ReadFile(filepath.Join(f.root, fragment)); err != nil || string(data) != local {
+		t.Errorf("release lost the only copy of local edits: data=%q error=%v\n%s", data, err, out)
+	}
+}
+
+// Fail the final cat after the shell has opened/truncated its destination.
+// Fragment reads still use the real cat. This models a failed output write
+// without exhausting the disk and works even when tests run as root.
+func (f *releaseFixture) failChangelogOutput() {
+	f.t.Helper()
+	bin := filepath.Join(f.scratch, "fail-write-bin")
+	if err := os.Mkdir(bin, 0700); err != nil {
+		f.t.Fatal(err)
+	}
+	stub := "#!/bin/sh\ncase \"${2-}\" in */new) exit 73 ;; esac\nexec /bin/cat \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "cat"), []byte(stub), 0700); err != nil {
+		f.t.Fatal(err)
+	}
+	for i, entry := range f.env {
+		if strings.HasPrefix(entry, "PATH=") {
+			f.env[i] = "PATH=" + bin + string(os.PathListSeparator) + strings.TrimPrefix(entry, "PATH=")
+			return
+		}
+	}
+	f.t.Fatal("fixture PATH is missing")
+}
+
+func printedReleaseRollback(out string) (string, bool) {
+	const prefix = "откатить: "
+	i := strings.Index(out, prefix)
+	if i < 0 {
+		return "", false
+	}
+	command := strings.TrimSpace(strings.SplitN(out[i+len(prefix):], "\n", 2)[0])
+	return command, command != ""
+}
+
+func TestReleaseDoesNotWriteThroughChangelogSymlink(t *testing.T) {
+	for _, failWrite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("write_failure=%t", failWrite), func(t *testing.T) {
+			f := newReleaseFixture(t)
+			outside := filepath.Join(f.scratch, "other-project-changelog.md")
+			if err := os.WriteFile(outside, []byte(legacyLog), 0600); err != nil {
+				t.Fatal(err)
+			}
+			logPath := filepath.Join(f.root, "CHANGELOG.md")
+			if err := os.Remove(logPath); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink("../other-project-changelog.md", logPath); err != nil {
+				t.Fatal(err)
+			}
+			f.write("changes/unreleased/valuable.md", "- release note\n")
+			f.write("VERSION", "1.0.0\n")
+			f.commit()
+			index := f.gitOK("ls-files", "--stage")
+			if failWrite {
+				f.failChangelogOutput()
+			}
+			out, err := f.release("2.0.0")
+			if err != nil {
+				if rollback, ok := printedReleaseRollback(out); ok {
+					if o, e := f.run(f.bash, "--noprofile", "--norc", "-c", rollback); e != nil {
+						t.Errorf("printed rollback failed: %v\n%s", e, o)
+					}
+				}
+				if got := f.gitOK("ls-files", "--stage"); got != index {
+					t.Error("refusal/rollback left the index changed")
+				}
+				if got := f.gitOK("status", "--porcelain"); got != "" {
+					t.Errorf("refusal/rollback left a dirty tree:\n%s", got)
+				}
+			}
+			// Git can report a clean tree while the symlink target remains lost.
+			if data, err := os.ReadFile(outside); err != nil || string(data) != legacyLog {
+				t.Errorf("release/rollback changed a file outside the checkout: data=%q error=%v\n%s", data, err, out)
+			}
+		})
+	}
+}
+
+func TestReleaseRefusesUntrackedReleaseInputs(t *testing.T) {
+	for _, name := range []string{"CHANGELOG.md", "VERSION"} {
+		for _, ignored := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/ignored=%t", name, ignored), func(t *testing.T) {
+				f := newReleaseFixture(t)
+				f.write("changes/unreleased/valuable.md", "- committed note\n")
+				f.write("VERSION", "1.0.0\n")
+				content := f.read(name)
+				if err := os.Remove(filepath.Join(f.root, name)); err != nil {
+					t.Fatal(err)
+				}
+				if ignored {
+					f.write(".gitignore", "/"+name+"\n")
+				}
+				f.commit()
+				f.write(name, content)
+				log, index := f.read("CHANGELOG.md"), f.gitOK("ls-files", "--stage")
+				out, err := f.release("2.0.0")
+				if err == nil {
+					t.Errorf("release accepted %s absent from HEAD (ignored=%t):\n%s", name, ignored, out)
+				}
+				f.unchanged(t, log, index)
+				if got := f.read("changes/unreleased/valuable.md"); got != "- committed note\n" {
+					t.Error("refusal consumed a fragment")
+				}
+			})
+		}
+	}
+}
+
+func TestReleaseRollbackWorksFromInvocationDirectory(t *testing.T) {
+	for _, caller := range []string{"scripts", "outside checkout"} {
+		t.Run(caller, func(t *testing.T) {
+			f := newReleaseFixture(t)
+			const fragment = "changes/unreleased/valuable.md"
+			f.write(fragment, "- valuable note\n")
+			f.write("VERSION", "1.0.0\n")
+			f.commit()
+			f.failChangelogOutput()
+			dir := filepath.Join(f.root, "scripts")
+			if caller == "outside checkout" {
+				dir = f.scratch
+			}
+			out, err := f.runAt(dir, f.bash, "--noprofile", "--norc", filepath.Join(f.root, "scripts/changelog-release.sh"), "2.0.0", releaseDate)
+			if err == nil {
+				t.Fatalf("injected output failure was ignored:\n%s", out)
+			}
+			rollback, ok := printedReleaseRollback(out)
+			if !ok {
+				t.Fatalf("missing rollback command:\n%s", out)
+			}
+			// The script's cd cannot change the caller's current directory.
+			if o, err := f.runAt(dir, f.bash, "--noprofile", "--norc", "-c", rollback); err != nil {
+				t.Errorf("printed rollback failed from %s: %v\n%s", caller, err, o)
+			}
+			if st := f.gitOK("status", "--porcelain"); st != "" {
+				t.Errorf("rollback left a dirty tree:\n%s", st)
+			}
+			if f.read("CHANGELOG.md") != legacyLog {
+				t.Error("rollback did not restore the changelog")
+			}
+			if data, err := os.ReadFile(filepath.Join(f.root, fragment)); err != nil || string(data) != "- valuable note\n" {
+				t.Errorf("rollback did not restore the fragment: data=%q error=%v", data, err)
+			}
+		})
+	}
+}
+
+func TestReleaseRollbackWithoutChangesDirectory(t *testing.T) {
+	f := newReleaseFixture(t)
+	if err := os.RemoveAll(filepath.Join(f.root, "changes")); err != nil {
+		t.Fatal(err)
+	}
+	f.write("VERSION", "1.0.0\n")
+	f.commit()
+	f.failChangelogOutput()
+	out, err := f.release("2.0.0")
+	if err == nil {
+		t.Fatalf("injected output failure was ignored:\n%s", out)
+	}
+	// A preflight refusal is safe, too: no snapshot or resume is needed.
+	if f.read("CHANGELOG.md") == legacyLog && f.gitOK("status", "--porcelain") == "" {
+		return
+	}
+	rollback, ok := printedReleaseRollback(out)
+	if !ok {
+		t.Fatalf("missing rollback command after mutation:\n%s", out)
+	}
+	if o, err := f.run(f.bash, "--noprofile", "--norc", "-c", rollback); err != nil {
+		t.Errorf("rollback cannot restore a changelog-only release: %v\n%s", err, o)
+	}
+	if st := f.gitOK("status", "--porcelain"); st != "" || f.read("CHANGELOG.md") != legacyLog {
+		t.Errorf("rollback did not restore the clean initial tree:\n%s", st)
+	}
+}
+
+func TestReleaseRefusesIncompleteUntrackedScan(t *testing.T) {
+	for _, kind := range []string{"unreadable directory", "FIFO"} {
+		t.Run(kind, func(t *testing.T) {
+			f := newReleaseFixture(t)
+			f.write("changes/unreleased/visible.md", "- committed visible note\n")
+			f.write("VERSION", "1.0.0\n")
+			f.commit()
+			if kind == "FIFO" {
+				mkfifo, err := exec.LookPath("mkfifo")
+				if err != nil {
+					t.Skip("requires POSIX mkfifo")
+				}
+				if out, err := f.run(mkfifo, "changes/unreleased/not-regular.md"); err != nil {
+					t.Fatalf("create FIFO fixture: %v\n%s", err, out)
+				}
+			} else {
+				f.write("changes/unreleased/locked/draft.md", "- unpublished local note\n")
+				locked := filepath.Join(f.root, "changes/unreleased/locked")
+				if err := os.Chmod(locked, 0000); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = os.Chmod(locked, 0700) })
+				if _, err := os.ReadDir(locked); err == nil {
+					t.Skip("requires an unprivileged user for the unreadable directory fixture")
+				} else if !os.IsPermission(err) {
+					t.Fatal(err)
+				}
+			}
+			index := f.gitOK("ls-files", "--stage")
+			out, err := f.release("2.0.0")
+			if err == nil {
+				t.Errorf("release accepted an incomplete untracked scan (%s):\n%s", kind, out)
+			}
+			f.unchanged(t, legacyLog, index)
+			if data, err := os.ReadFile(filepath.Join(f.root, "changes/unreleased/visible.md")); err != nil || string(data) != "- committed visible note\n" {
+				t.Errorf("visible fragment consumed despite incomplete scan: data=%q error=%v", data, err)
+			}
+		})
+	}
+}
+
+// Git can return success after the first unlink succeeds even if a subsequent
+// unlink fails. A successful release must not leave consumed fragments behind.
+func TestReleaseDetectsPartialGitRemoval(t *testing.T) {
+	f := newReleaseFixture(t)
+	f.write("changes/unreleased/a.md", "- first note\n")
+	f.write("changes/unreleased/z-locked/b.md", "- second note\n")
+	f.write("VERSION", "1.0.0\n")
+	f.commit()
+	locked := filepath.Join(f.root, "changes/unreleased/z-locked")
+	if err := os.Chmod(locked, 0500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0700) })
+	probe := filepath.Join(locked, "write-probe")
+	if w, err := os.OpenFile(probe, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600); err == nil {
+		w.Close()
+		if err := os.Remove(probe); err != nil {
+			t.Fatal(err)
+		}
+		t.Skip("requires an unprivileged user for the unwritable directory fixture")
+	} else if !os.IsPermission(err) {
+		t.Fatal(err)
+	}
+	out, err := f.release("2.0.0")
+	if err == nil {
+		t.Fatalf("release reported success despite a failed fragment removal:\n%s", out)
+	}
+	if err := os.Chmod(locked, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if rollback, ok := printedReleaseRollback(out); ok {
+		if o, err := f.run(f.bash, "--noprofile", "--norc", "-c", rollback); err != nil {
+			t.Fatalf("rollback after partial removal: %v\n%s", err, o)
+		}
+	}
+	if st := f.gitOK("status", "--porcelain"); st != "" || f.read("CHANGELOG.md") != legacyLog {
+		t.Errorf("refusal/rollback after partial removal did not restore the initial tree:\n%s", st)
+	}
+}
+
+// Coverage controls for the index-only enumeration: gitlinks must never be read
+// as blobs, and a sparse checkout must either consume all notes or roll back.
+func TestReleaseRefusesGitlinks(t *testing.T) {
+	for _, path := range []string{"changes", "changes/unreleased", "changes/unreleased/module"} {
+		t.Run(path, func(t *testing.T) {
+			f := newReleaseFixture(t)
+			f.write("VERSION", "1.0.0\n")
+			f.commit()
+			head := f.gitOK("rev-parse", "HEAD")
+			if path != "changes/unreleased/module" {
+				f.gitOK("rm", "-r", "--", path)
+			}
+			if err := os.MkdirAll(filepath.Join(f.root, path), 0700); err != nil {
+				t.Fatal(err)
+			}
+			// An unpopulated gitlink, using an existing local commit; no clone.
+			f.gitOK("update-index", "--add", "--cacheinfo", "160000", head, path)
+			f.gitOK("commit", "-qm", "QA gitlink fixture")
+			f.gitOK("diff", "--quiet", "--", "changes")
+			index := f.gitOK("ls-files", "--stage")
+			if out, err := f.release("2.0.0"); err == nil {
+				t.Fatalf("release accepted a gitlink at %s:\n%s", path, out)
+			}
+			f.unchanged(t, legacyLog, index)
+		})
+	}
+}
+
+func TestReleaseSparseCheckoutIsCompleteOrRollsBack(t *testing.T) {
+	for _, sparseIndex := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sparse_index=%t", sparseIndex), func(t *testing.T) {
+			f := newReleaseFixture(t)
+			const visible = "changes/unreleased/visible/a.md"
+			const hidden = "changes/unreleased/hidden/b.md"
+			f.write(visible, "- visible note\n")
+			f.write(hidden, "- sparse note\n")
+			f.write("VERSION", "1.0.0\n")
+			f.commit()
+			indexFlag := "--no-sparse-index"
+			if sparseIndex {
+				indexFlag = "--sparse-index"
+			}
+			f.gitOK("sparse-checkout", "init", "--cone", indexFlag)
+			f.gitOK("sparse-checkout", "set", "scripts", "changes/unreleased/visible")
+			f.absent(hidden)
+			out, err := f.release("2.0.0")
+			if err == nil {
+				log := f.read("CHANGELOG.md")
+				for _, note := range []string{"- visible note", "- sparse note"} {
+					if strings.Count(log, note) != 1 {
+						t.Errorf("sparse release lost or duplicated %q", note)
+					}
+				}
+				if got := f.gitOK("ls-files", "--", visible, hidden); got != "" {
+					t.Errorf("successful sparse release left fragments in the index:\n%s", got)
+				}
+				return
+			}
+			if rollback, ok := printedReleaseRollback(out); ok {
+				if o, err := f.run(f.bash, "--noprofile", "--norc", "-c", rollback); err != nil {
+					t.Fatalf("sparse rollback failed: %v\n%s", err, o)
+				}
+			}
+			if st := f.gitOK("status", "--porcelain"); st != "" || f.read("CHANGELOG.md") != legacyLog {
+				t.Errorf("sparse refusal/rollback left a dirty tree:\n%s", st)
+			}
+			f.gitOK("sparse-checkout", "disable")
+			if f.read(visible) != "- visible note\n" || f.read(hidden) != "- sparse note\n" {
+				t.Error("sparse refusal/rollback lost a fragment")
+			}
+		})
+	}
 }
