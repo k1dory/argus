@@ -367,7 +367,7 @@ test("список: пороги событий/инцидентов сужаю�
   assert.match(text, /Персон 3/, "сводные плитки — по всем персонам");
   // Точное окно: границы — параметрами from/to запроса событий, подпись — интервал.
   const seen: URLSearchParams[] = [];
-  routes = routes.map((r) => (r.when("ARRAY JOIN ps AS p FROM events") ? { ...r, rows: (p: URLSearchParams) => { seen.push(p); return r.rows(p); } } : r));
+  routes = routes.map((r) => (r.when("GROUP BY hits FROM events") ? { ...r, rows: (p: URLSearchParams) => { seen.push(p); return r.rows(p); } } : r));
   text = await pageText(await actorsPage.default(props({}, { from: "2026-10-28T00:00", to: "2026-10-29T00:00" })));
   assert.match(text, /активность интервал 2026-10-28 00:00 — 2026-10-29 00:00 UTC/);
   assert.equal(seen[0]?.get("param_from"), "2026-10-28 00:00:00.000");
