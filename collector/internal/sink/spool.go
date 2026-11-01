@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -220,8 +221,10 @@ func (q *Queue) shrink(b Batch, rows []any) (Batch, error) {
 		_ = os.Remove(tmp)
 		return b, err
 	}
+	// После rename на диске уже остаток: учёт и метаданные — по нему, даже если fsync
+	// каталога не удался (иначе место осталось бы занятым размером прежнего файла).
 	if err := syncDir(q.spool.dir); err != nil {
-		return b, err
+		slog.Warn("spool: fsync каталога после замены остатком не удался", "err", err, "file", b.file)
 	}
 	need := int64(len(data))
 	q.mu.Lock()

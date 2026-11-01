@@ -279,8 +279,16 @@ func (w *Writer) WriteBatch(ctx context.Context, b Batch) {
 			return
 		}
 		if isData(err) {
-			w.bisect(ctx, rows, err)
-			return
+			// Бисекция до строк; нерешённый транспортом остаток повторяется этим же
+			// циклом — с общим счётчиком попыток и паузой, без рекурсии.
+			rest, terr := w.resolve(ctx, rows, err, false)
+			if len(rest) == 0 {
+				return
+			}
+			rows, b.Rows, b.Bytes = rest, rest, SizeOf(rest)
+			if terr != nil {
+				err = terr
+			}
 		}
 		if ctx.Err() != nil {
 			slog.Error("остановка: батч не вставлен", "rows", len(rows), "err", short(err.Error()))
@@ -318,7 +326,7 @@ func (w *Writer) writeDurable(ctx context.Context, b Batch) {
 			return
 		}
 		if isData(err) {
-			rest := w.resolve(ctx, b.Rows, err, true)
+			rest, _ := w.resolve(ctx, b.Rows, err, true)
 			if len(rest) == 0 {
 				if err := w.Queue.ack(b); err != nil {
 					slog.Error("spool ack", "err", err, "file", b.file)
@@ -400,43 +408,56 @@ func (w *Writer) sleep(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// bisect — ошибка данных в очереди в памяти: бисекция до строк (resolve), нерешённый
-// транспортом остаток — в обычный цикл повторов.
-func (w *Writer) bisect(ctx context.Context, rows []any, err error) {
-	if rest := w.resolve(ctx, rows, err, false); len(rest) > 0 {
-		w.WriteBatch(ctx, Batch{Rows: rest, Bytes: SizeOf(rest), mark: w.Stats.Inserted.Load()})
-	}
-}
+// bisectBudget — потолок вставок событий на бисекцию одного батча. Без него шторм
+// ядовитых строк (500 из 500) стоил бы ~1000 INSERT; с ним — не больше 128, после чего
+// оставшиеся отвергнутые части уходят в ingest_rejects целиком. 128 хватает, чтобы при
+// 15 ядовитых строках из 100 сохранить все корректные (TestPoisonManyAndNoRejectsTable).
+const bisectBudget = 128
 
 // resolve — бисекция ошибки данных до отдельных строк: прошедшая часть вставлена,
 // отвергнутая как данные (241 и др. по размеру, 27/6/53/117 по содержимому) делится
-// дальше, одна строка уходит в ingest_rejects. Ядовитая строка не уносит с собой
-// корректных соседей; цена — около 2·k·log₂n вставок при k ядовитых строках на n.
-// Возвращает нерешённые строки: часть с транспортной ошибкой, остаток при остановке,
-// а при keepUnrejected — и строки, которые не удалось записать в ingest_rejects.
-func (w *Writer) resolve(ctx context.Context, rows []any, err error, keepUnrejected bool) []any {
-	if len(rows) == 1 {
-		if !w.deadLetter(rows, err) && keepUnrejected {
+// дальше, одна строка (или часть при исчерпанном bisectBudget) — отказ. Отказы
+// копятся и пишутся в ingest_rejects одним INSERT. Возвращает нерешённые строки —
+// части с транспортной ошибкой (и последнюю такую ошибку), остаток при остановке, а
+// при keepUnrejected — и отказы, которые не удалось записать.
+func (w *Writer) resolve(ctx context.Context, rows []any, err error, keepUnrejected bool) ([]any, error) {
+	var rejects []any
+	var terr error
+	budget := bisectBudget
+	var split func(rows []any, err error) []any
+	split = func(rows []any, err error) []any {
+		if len(rows) == 1 || budget <= 0 {
+			rejects = append(rejects, rows...)
+			return nil
+		}
+		if ctx.Err() != nil {
 			return rows
 		}
-		return nil
-	}
-	if ctx.Err() != nil {
-		return rows
+		mid := len(rows) / 2
+		var rest []any
+		for _, part := range [][]any{rows[:mid], rows[mid:]} {
+			if budget <= 0 {
+				rejects = append(rejects, part...)
+				continue
+			}
+			budget--
+			switch perr := w.insert(part); {
+			case perr == nil:
+			case isData(perr):
+				rest = append(rest, split(part, perr)...)
+			default:
+				terr = perr
+				rest = append(rest, part...)
+			}
+		}
+		return rest
 	}
 	slog.Warn("insert: ошибка данных, делю батч", "rows", len(rows), "err", short(err.Error()))
-	mid := len(rows) / 2
-	var rest []any
-	for _, part := range [][]any{rows[:mid], rows[mid:]} {
-		switch perr := w.insert(part); {
-		case perr == nil:
-		case isData(perr):
-			rest = append(rest, w.resolve(ctx, part, perr, keepUnrejected)...)
-		default:
-			rest = append(rest, part...)
-		}
+	rest := split(rows, err)
+	if len(rejects) > 0 && !w.deadLetter(rejects, err) && keepUnrejected {
+		rest = append(rest, rejects...)
 	}
-	return rest
+	return rest, terr
 }
 
 // deadLetter пишет строки в ingest_rejects одним INSERT.

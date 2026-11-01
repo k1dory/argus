@@ -114,13 +114,14 @@ func TestPoisonManyAndNoRejectsTable(t *testing.T) {
 	if m.rows() != 85 || st.DeadLetter.Load() != 15 {
 		t.Fatalf("rows=%d dead=%d", m.rows(), st.DeadLetter.Load())
 	}
-	if st.RejectsFailed.Load() != 15 || m.rejectCalls != 15 {
+	// отказы копятся и пишутся одним INSERT на батч
+	if st.RejectsFailed.Load() != 15 || m.rejectCalls != 1 {
 		t.Errorf("RejectsFailed=%d rejectCalls=%d", st.RejectsFailed.Load(), m.rejectCalls)
 	}
 }
 
 // Бисекция до строк и при ядовитых данных во всех строках: 8 строк — батч, 2, 4, 8
-// частей (15 вставок), каждая строка — отдельный отказ. Это цена того, что ядовитая
+// частей (15 вставок), отказы — одним INSERT на 8 строк. Это цена того, что ядовитая
 // строка не уносит корректных соседей (ревью codex #43).
 func TestBisectCapBothHalvesRejected(t *testing.T) {
 	m := &mockCH{}
@@ -133,7 +134,7 @@ func TestBisectCapBothHalvesRejected(t *testing.T) {
 	if m.calls != 15 {
 		t.Errorf("InsertEvents вызван %d раз, want 15 (1+2+4+8)", m.calls)
 	}
-	if m.rejectCalls != 8 || len(m.rejects) != 8 || st.DeadLetter.Load() != 8 {
+	if m.rejectCalls != 1 || len(m.rejects) != 8 || st.DeadLetter.Load() != 8 {
 		t.Errorf("rejectCalls=%d rejects=%d dead=%d", m.rejectCalls, len(m.rejects), st.DeadLetter.Load())
 	}
 	// одна ядовитая строка в хвосте: бисекция доходит до неё, остальное вставлено
@@ -349,5 +350,23 @@ func TestParseErrorAndIsPermanent(t *testing.T) {
 	}
 	if !IsUnknownTable(parseError("ingest_rejects", 404, "60", "")) {
 		t.Error("code 60 — unknown table")
+	}
+}
+
+// Шторм ядовитых строк: бисекция ограничена bisectBudget вставками событий, отказы —
+// одним INSERT; ни одна строка не теряется молча.
+func TestBisectBudgetBoundsPoisonStorm(t *testing.T) {
+	m := &mockCH{}
+	w, st := newTestWriter(m)
+	batch := make([]any, 0, 500)
+	for i := 0; i < 500; i++ {
+		batch = append(batch, ev("poison"))
+	}
+	w.Write(context.Background(), batch)
+	if m.calls > 1+bisectBudget {
+		t.Errorf("InsertEvents вызван %d раз, потолок %d", m.calls, 1+bisectBudget)
+	}
+	if m.rejectCalls != 1 || len(m.rejects) != 500 || st.DeadLetter.Load() != 500 {
+		t.Errorf("rejectCalls=%d rejects=%d dead=%d", m.rejectCalls, len(m.rejects), st.DeadLetter.Load())
 	}
 }
