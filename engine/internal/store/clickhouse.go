@@ -576,22 +576,24 @@ func (c *ClickHouse) OperatorStates(ctx context.Context, ids []string) (map[stri
 	return res, nil
 }
 
-// restoreGroupKeys — group_key открытых инцидентов (колонка incidents из
-// миграции 0034, в incidents_current её нет). Ошибка ClickHouse, в том числе
+// restoreGroupKeys — group_key и group_by открытых инцидентов (колонки incidents из
+// миграций 0034 и 0039, в incidents_current их нет). Ошибка ClickHouse, в том числе
 // пришедшая внутри ответа 200 (строкой {"exception":…} у JSONEachRow), возвращается:
 // с пустыми ключами разные группы одного узла слились бы в реестре под
 // «правило|субъект|узел», а старт движка повторяет попытку. ID уходят пачками:
 // параметры запроса идут в URL, а у ClickHouse он не длиннее 1 МиБ.
 func (c *ClickHouse) restoreGroupKeys(ctx context.Context, open []incidents.Incident) error {
 	const batch = 5000
-	keys := map[string]string{}
+	type groupRow struct{ key, by string }
+	keys := map[string]groupRow{}
 	for lo := 0; lo < len(open); lo += batch {
 		hi := min(lo+batch, len(open))
 		ids := make([]string, 0, hi-lo)
 		for i := lo; i < hi; i++ {
 			ids = append(ids, open[i].IncidentID)
 		}
-		out, err := c.do(ctx, `SELECT incident_id, argMax(group_key, (updated_at, event_count, last_ts)) AS group_key
+		out, err := c.do(ctx, `SELECT incident_id, argMax(group_key, (updated_at, event_count, last_ts)) AS group_key,
+			argMax(group_by, (updated_at, event_count, last_ts)) AS group_by
 		FROM incidents WHERE incident_id IN {ids:Array(String)} GROUP BY incident_id FORMAT JSONEachRow`, nil,
 			map[string]string{"ids": chArray(ids)})
 		if err != nil {
@@ -604,17 +606,19 @@ func (c *ClickHouse) restoreGroupKeys(ctx context.Context, open []incidents.Inci
 			var row struct {
 				IncidentID string `json:"incident_id"`
 				GroupKey   string `json:"group_key"`
+				GroupBy    string `json:"group_by"`
 				Exception  string `json:"exception"`
 			}
 			if err := json.Unmarshal(line, &row); err != nil || row.Exception != "" || row.IncidentID == "" {
 				// Без текста строки: это может быть исключение с цитатой данных.
 				return errors.New("restore group_key: неожиданная строка ответа ClickHouse")
 			}
-			keys[row.IncidentID] = row.GroupKey
+			keys[row.IncidentID] = groupRow{row.GroupKey, row.GroupBy}
 		}
 	}
 	for i := range open {
-		open[i].GroupKey = keys[open[i].IncidentID]
+		g := keys[open[i].IncidentID]
+		open[i].GroupKey, open[i].GroupBy = g.key, g.by
 	}
 	return nil
 }

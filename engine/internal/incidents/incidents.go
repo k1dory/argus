@@ -43,7 +43,12 @@ type Incident struct {
 	// GroupKey — значение явного group_by правила, если он не сводится к
 	// субъекту или узлу (node, object): иначе второй диск того же NAS склеивался
 	// с первым под ключом «правило|субъект|узел» и уведомления не было.
-	GroupKey   string   `json:"group_key"`
+	GroupKey string `json:"group_key"`
+	// GroupBy — group_by правила, по которому посчитан GroupKey (миграция 0039): по нему
+	// group_by_previous отличает инцидент, заведённый до смены group_by, от заведённого
+	// после — и после рестарта. Пусто — строка до 0039: по какому group_by она заведена,
+	// неизвестно (см. group_by_previous_before).
+	GroupBy    string   `json:"group_by"`
 	Sources    []string `json:"sources"`
 	EventCount uint32   `json:"event_count"`
 	FirstTS    string   `json:"first_ts"`
@@ -187,26 +192,39 @@ func (inc *Incident) regKey() string {
 }
 
 // previousGroup — открытый инцидент, заведённый до смены group_by (поле правила
-// group_by_previous): то же правило, субъект и узел, а group_key — ключ события
-// группы по прежнему group_by. Сравнение — по полям, а не по строке ключа реестра:
-// «|» внутри значения или субъекта не делает чужой инцидент своим. Без
-// group_by_previous — nil: смена ключа заводит новые инциденты.
+// group_by_previous): то же правило, субъект и узел, group_key — ключ события группы
+// по прежнему group_by (той же функцией eval.GroupKey, с её резервным значением), а
+// сам инцидент заведён по прежнему group_by: GroupBy записан и равен ему, либо
+// GroupBy пуст (строка до 0039) и инцидент создан раньше group_by_previous_before.
+// Инцидент, заведённый или уже перенесённый по текущему group_by, не подхватывается,
+// даже если его ключ совпал со старым ключом события. Сравнение — по полям, а не по
+// строке ключа реестра. Без group_by_previous — nil.
 func (r *Registry) previousGroup(d eval.Detection, inc *Incident) (*Incident, string) {
 	prev := strings.TrimSpace(d.Rule.Detection.GroupByPrevious)
-	if prev == "" || len(d.Events) == 0 || !explicitGroupBy(prev) {
+	if prev == "" || len(d.Events) == 0 {
 		return nil, ""
 	}
 	get := rules.Getter(prev)
 	if get == nil {
 		return nil, ""
 	}
-	old := get(d.Events[0])
-	if old == "" || old == "-" || old == inc.GroupKey {
-		return nil, ""
+	old := ""
+	if explicitGroupBy(prev) {
+		if old = eval.GroupKey(get, d.Events[0]); old == "-" {
+			old = ""
+		}
+	}
+	prevNorm, before := rules.NormGroupBy(prev), d.Rule.GroupByPreviousBefore()
+	underPrevious := func(ex *Incident) bool {
+		if ex.GroupBy != "" {
+			return ex.GroupBy == prevNorm
+		}
+		created := (&model.Event{TS: ex.CreatedAt}).Time()
+		return !before.IsZero() && !created.IsZero() && created.Before(before)
 	}
 	for k, ex := range r.open {
 		if ex.RuleID == d.Rule.ID && ex.ActorName == inc.ActorName && ex.Node == inc.Node &&
-			ex.GroupKey == old && !isFinal(ex.Status) {
+			ex.GroupKey == old && underPrevious(ex) && !isFinal(ex.Status) && k != inc.regKey() {
 			return ex, k
 		}
 	}
@@ -222,21 +240,22 @@ func (r *Registry) Apply(dets []eval.Detection, now time.Time) (created, updated
 	for _, d := range dets {
 		inc := build(d, now)
 		key := inc.regKey()
-		if _, ok := r.open[key]; !ok && inc.GroupKey != "" {
-			// Инцидент, заведённый до group_key (или восстановленный без него), —
-			// под старым ключом: его забирает первая сработка группы, а не новый инцидент.
+		if _, ok := r.open[key]; !ok {
 			legacy := d.Rule.ID + "|" + inc.ActorName + "|" + inc.Node
-			if ex, ok := r.open[legacy]; ok && ex.GroupKey == "" {
+			if ex, ok := r.open[legacy]; ok && ex.GroupKey == "" && inc.GroupKey != "" {
+				// Инцидент, заведённый до group_key (или восстановленный без него), —
+				// под старым ключом: его забирает первая сработка группы, а не новый инцидент.
 				delete(r.open, legacy)
-				ex.GroupKey = inc.GroupKey
+				ex.GroupKey, ex.GroupBy = inc.GroupKey, inc.GroupBy
 				r.open[key] = ex
 				ex.groupPending = true
 			} else if ex, lk := r.previousGroup(d, inc); ex != nil {
 				// group_by правила сменили (group_by_previous): открытый инцидент со
 				// старым ключом забирает первая группа нового ключа — без второго
-				// инцидента и с решениями оператора.
+				// инцидента и с решениями оператора. В том числе переход к группировке
+				// по субъекту, узлу или адресу: новый group_key пуст.
 				delete(r.open, lk)
-				ex.GroupKey = inc.GroupKey
+				ex.GroupKey, ex.GroupBy = inc.GroupKey, inc.GroupBy
 				r.open[key] = ex
 				ex.groupPending = true
 			}
@@ -688,6 +707,7 @@ func build(d eval.Detection, now time.Time) *Incident {
 	if explicitGroup(d.Rule) && d.Key != "" && d.Key != "-" {
 		inc.GroupKey = d.Key
 	}
+	inc.GroupBy = rules.NormGroupBy(d.Rule.GroupBy())
 	inc.Chain = chain(d.Events, 12)
 	if d.Reason != "" {
 		inc.Chain = append(inc.Chain, "→ "+d.Reason)
