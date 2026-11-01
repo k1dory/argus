@@ -848,8 +848,14 @@ policies:
 логов самого приложения; SSO и сеть этого не видят. Выборки паспорта отсекают гранулы bloom-индексом
 `idx_actor_keys` (миграция 0032) по массиву всех ключей поиска — `actor_name`, `lowerUTF8(actor_name)`,
 `src_ip`, `lowerUTF8(node)`: предфильтр `hasAny(…)` работает для любой смеси видов алиасов, в том
-числе login ИЛИ адрес, где отдельные индексы `idx_actor`/`idx_src_ip` бессильны. Миграция запускает
-материализацию индекса по старым партам фоновой мутацией; ход — `system.mutations`.
+числе login ИЛИ адрес, где отдельные индексы `idx_actor`/`idx_src_ip` бессильны. Индекс получают новые
+куски таблицы; по старым его строят один раз вручную — фоновая мутация по всей `events`, запускать в
+спокойное время (повтор миграции её не ставит). Ход — `system.mutations`:
+
+```sh
+docker compose exec clickhouse clickhouse-client --query "ALTER TABLE argus.events MATERIALIZE INDEX idx_actor_keys"
+docker compose exec clickhouse clickhouse-client --query "SELECT command, parts_to_do, is_done, latest_fail_reason FROM system.mutations WHERE table = 'events' AND NOT is_done"
+```
 
 ## Модуль Wazuh
 
