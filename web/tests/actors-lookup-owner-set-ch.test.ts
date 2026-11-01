@@ -28,11 +28,10 @@ test("PR #22: owner sets preserve event boundaries and the actor-key prefilter",
     url.searchParams.set("max_threads", "1");
     url.searchParams.set("max_memory_usage", String(128 * 1024 * 1024));
     url.searchParams.set("max_execution_time", "10");
-    if (typeof init?.body === "string" && /\bFROM events\b/.test(init.body)) {
-      // New parts contain the real 0032 index. Removing/bypassing the #10
-      // prefilter must fail as well as returning an incorrect event set.
-      url.searchParams.set("force_data_skipping_indices", "idx_actor_keys");
-    }
+    // Без force_data_skipping_indices: настройка действует на все таблицы запроса,
+    // в том числе на скалярные подзапросы к identity_aliases, где такого индекса нет
+    // (код 277 при рабочем предфильтре по events). Отсечение гранул idx_actor_keys у
+    // aliasSightings проверяет actors-query-cost-ch по EXPLAIN indexes=1.
     return nativeFetch(url, init);
   });
 
