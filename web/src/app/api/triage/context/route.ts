@@ -1,6 +1,7 @@
 import { apiGuard, triageRequestsLeft } from "@/lib/auth";
 import { incidentComments, incidentGet, incidentStateHistory, verdictGet } from "@/lib/argus-queries-export";
 import { relatedSummaries, ruleHistory } from "@/lib/triage-queries";
+import { blindComments, hideVerdicts } from "@/lib/blind";
 
 // GET /api/triage/context — карточка инцидента сессии разбора одним запросом:
 // инцидент, история статусов, комментарии, вердикт движка, связанные
@@ -24,8 +25,12 @@ export async function GET(req: Request): Promise<Response> {
       relatedSummaries(scope),
       ruleHistory(incident.rule_id, scope.incidentId),
     ]);
+    // Слепая выборка — как /api/incidents/{id}: до завершения ни анализа модели,
+    // ни копий вердикта агента в комментариях agent:*.
+    const blind = hideVerdicts(incident);
     return Response.json({
-      incident, history, comments, verdict, related, rule_history,
+      incident, history, comments: blind ? blindComments(comments) : comments, verdict: blind ? null : verdict,
+      ...(blind ? { verdict_hidden: true } : {}), related, rule_history,
       session: { session_id: scope.sessionId, incident_id: scope.incidentId, expires_at: scope.expiresAt, search_from: scope.searchFrom, requests_left: triageRequestsLeft(scope),
         anchors: scope.entities.map((e) => ({ kind: e.kind, value: e.value, ...(e.weak && { weak: true }) })) },
     }, { headers: { "Cache-Control": "no-store" } });
