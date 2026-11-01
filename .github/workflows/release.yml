@@ -72,8 +72,12 @@ jobs:
         with:
           context: ./${{ matrix.service }}
           # mcp: общий модуль triage/ (COPY --from=triage, replace ../triage).
-          # Остальным сервисам именованный контекст не мешает.
-          build-contexts: triage=./triage
+          # engine: поставляемый набор rules/ и fixtures/events — реестр
+          # internal/registry. Остальным сервисам именованные контексты не мешают.
+          build-contexts: |
+            triage=./triage
+            rules=./rules
+            fixtures=./fixtures/events
           load: true
           build-args: |
             APP_VERSION=${{ needs.check-version.outputs.version }}
@@ -95,8 +99,12 @@ jobs:
         with:
           context: ./${{ matrix.service }}
           # mcp: общий модуль triage/ (COPY --from=triage, replace ../triage).
-          # Остальным сервисам именованный контекст не мешает.
-          build-contexts: triage=./triage
+          # engine: поставляемый набор rules/ и fixtures/events — реестр
+          # internal/registry. Остальным сервисам именованные контексты не мешают.
+          build-contexts: |
+            triage=./triage
+            rules=./rules
+            fixtures=./fixtures/events
           push: true
           build-args: |
             APP_VERSION=${{ needs.check-version.outputs.version }}
