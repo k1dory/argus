@@ -39,10 +39,20 @@ func (q *Queue) clearStall(b *Batch) {
 }
 
 // StuckFor — сколько самый старый батч в очереди не продвигается (0 — таких нет).
+// Батч, поднятый из spool при старте, отметки ещё не имеет (она в памяти), но и
+// прогресса у него не было: пока он не записан и не сокращён, он считается
+// стоящим с момента старта — иначе нулевой возраст до первого прохода выглядел бы
+// восстановлением.
 func (q *Queue) StuckFor(now time.Time) time.Duration {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	var oldest time.Time
+	if q.restoredPending > 0 {
+		oldest = q.startedAt
+		if d := now.Sub(oldest); d <= 0 {
+			return time.Nanosecond
+		}
+	}
 	for m := range q.stalls {
 		if oldest.IsZero() || m.since.Before(oldest) {
 			oldest = m.since

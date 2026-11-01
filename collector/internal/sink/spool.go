@@ -42,6 +42,7 @@ func NewDurableQueue(dir string, maxBytes int64, st *Stats) (*Queue, error) {
 	}
 	q := NewQueueBytes(1, 1, st) // ограничения памяти в дисковом режиме не применяются
 	q.spool = &diskSpool{dir: dir, maxBytes: maxBytes}
+	q.startedAt = time.Now()
 	var names []string
 	for _, e := range entries {
 		if strings.HasPrefix(e.Name(), ".batch-") && strings.HasSuffix(e.Name(), ".tmp") && !e.IsDir() {
@@ -66,7 +67,8 @@ func NewDurableQueue(dir string, maxBytes int64, st *Stats) (*Queue, error) {
 		if err != nil {
 			return nil, fmt.Errorf("spool %s: %w", name, err)
 		}
-		b := Batch{file: path, diskSize: info.Size(), Count: len(rows), Bytes: SizeOf(rows)}
+		b := Batch{file: path, diskSize: info.Size(), Count: len(rows), Bytes: SizeOf(rows), restored: true}
+		q.restoredPending++
 		q.items = append(q.items, b)
 		q.add(b, 1)
 		q.spool.used += info.Size()
@@ -229,6 +231,10 @@ func (q *Queue) shrink(b Batch, rows []any) (Batch, error) {
 	need := int64(len(data))
 	q.mu.Lock()
 	q.spool.used += need - b.diskSize
+	if b.restored {
+		q.restoredPending-- // остаток сохранён меньшим — у батча был прогресс
+		b.restored = false
+	}
 	q.mu.Unlock()
 	b.diskSize, b.Rows = need, nil
 	b.Bytes, b.Count = SizeOf(rows), len(rows)
@@ -244,6 +250,9 @@ func (q *Queue) ack(b Batch) error {
 	}
 	q.mu.Lock()
 	q.spool.used -= b.diskSize
+	if b.restored {
+		q.restoredPending--
+	}
 	q.mu.Unlock()
 	return syncDir(q.spool.dir)
 }
