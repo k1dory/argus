@@ -1,0 +1,7 @@
+# 192.168.0.30 (часы +33 мин) сообщается трижды за день — один инцидент;
+# 192.168.0.31 — свой; событие с attrs.transport не internal (пришло через ingest) — не в счёт.
+rule: a41c-ops-067
+fixture: fixtures/events/collector-clock-skew.ndjson
+expect_incidents: 2
+expect_actor: 192.168.0.30
+min_events: 1

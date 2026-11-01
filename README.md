@@ -289,6 +289,9 @@ make replay                                   # залить записанны�
 `attrs.count`, `value` — наибольшее расхождение в секундах) и счётчик
 `argus_collector_clock_skew_total`. Пояс для RFC 3164 по-прежнему лучше задать в
 `SYSLOG_PEER_TZ`: замена ставит время приёма, а не настоящее.
+По этой сводке правило `a41c-ops-067` (`rules/ops/collector-clock-skew.yml`, low) заводит
+один инцидент на отправителя за сутки: RFC 3164 без пояса — задать `SYSLOG_PEER_TZ`, иначе
+настроить NTP на устройстве.
 Вебхуки требуют заголовок `X-Argus-Token: $ARGUS_INGEST_TOKEN` (стенд `ARGUS_DEV=1` — без
 него). Запись tcpdump: `docker compose exec collector /collector replay-pcap file.pcap`.
 Пропускная способность: `./scripts/bench-ingest.sh 200000` (см. CHANGELOG).

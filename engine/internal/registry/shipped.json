@@ -210,6 +210,14 @@
     "ops.ingest"
    ]
   },
+  "a41c-ops-067": {
+   "title": "Ops: source clock is ahead of the collector",
+   "tags": [
+    "argus.system",
+    "ops.ingest",
+    "ops.time"
+   ]
+  },
   "a41c-waf-050": {
    "title": "WAF: burst of web attacks from one address",
    "tags": [
@@ -277,6 +285,7 @@
   "auth.login",
   "auth.otp",
   "auth.ssh",
+  "collector.clock_skew",
   "collector.sink_recovered",
   "collector.sink_stalled",
   "config.update",
