@@ -96,13 +96,19 @@ test("больше 2000 молчащих: порядок при равном в�
   const sec = (ts: string) => Date.parse(ts.replace(" ", "T") + "Z") / 1000;
   const fmt = (x: number) => new Date(x * 1000).toISOString().slice(0, 19).replace("T", " ");
   const nowSQL = "SELECT toString(now() - toIntervalSecond({s:UInt32})) AS ts";
-  let waited = 0;
+  // «Сейчас» для расстановки — одно чтение now() ClickHouse на итерацию, после отчёта.
+  // Бюджет — длительность (часы процесса): ожидания и сами отчёты; проверяется и
+  // перед ожиданием, и после последнего отчёта — отчёт может оказаться медленнее прошлого.
+  const startMs = Date.now();
+  const elapsed = () => (Date.now() - startMs) / 1000;
+  let startCh: number | undefined;
   let beforeTotal: number;
   let capSec: number;
   for (;;) {
     const baseline = await q().sourcesHealthReport();
     const [chNowRow] = await c.chQuery<{ ts: string }>(nowSQL, { s: 0 });
     const chNow = sec(chNowRow.ts);
+    startCh ??= chNow;
     const lastOf = (s: { last_ts: string; silent_for_sec: number }) => (s.last_ts ? sec(s.last_ts) : chNow - s.silent_for_sec);
     const beforeQuiet = baseline.sources.filter((s) => s.events_1h === 0);
     beforeTotal = beforeQuiet.length + baseline.omitted;
@@ -113,17 +119,15 @@ test("больше 2000 молчащих: порядок при равном в�
       const leaves = lastOf(s) + 3600 - chNow; // через столько секунд источник выйдет из окна часа
       if (leaves <= BOUNDARY_SLACK) wait = Math.max(wait, leaves + 1);
     }
-    if (wait <= 0) break;
-    if (waited + wait > WAIT_MAX) {
-      const why = `чужой источник слишком свежий: место для cap освободится через ${wait} с, а ждать можно не больше ${WAIT_MAX} с`;
-      if (typeof (t as { skip?: unknown }).skip === "function") {
-        t.skip(why);
-        return;
-      }
-      throw new Error(why);
+    const spent = elapsed();
+    if (wait <= 0 ? spent > WAIT_MAX : spent + wait > WAIT_MAX) {
+      // Пропуск, а не ошибка: ни cap, ни проверок после него.
+      t.skip(`место для cap между молчащими источниками и окном часа освободится через ${Math.max(0, wait)} с, ` +
+        `а ждать можно не больше ${WAIT_MAX} с (уже ${Math.round(spent)} с)`);
+      return;
     }
+    if (wait <= 0) break;
     await new Promise((r) => setTimeout(r, wait * 1000));
-    waited += wait;
   }
   const stamp = { ts: fmt(capSec) };
   await c.chCommand(`INSERT INTO events (ts, received_at, source, source_class, action)

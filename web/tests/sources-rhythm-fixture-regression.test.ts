@@ -148,3 +148,14 @@ test("PR84: часы Node на 5 с впереди CH не делают cap ст
   const result = await runCapSetup(t, 65 * 60, 5);
   assertCapPlacement(result);
 });
+
+// PR97: дополнительные чтения часов для бюджета не меняют контракт размещения.
+// На HEAD callback доходит до правильного INSERT, но прежний проверяющий helper
+// отвергает его из-за stampQueries === 1; это ломает также семь тестов выше.
+test("PR97: измерение бюджета CH совместимо с проверкой корректного cap", { timeout: 5000 }, async (t) => {
+  const result = await runCapSetup(t, 61 * 60, 5);
+  assert.equal(result.failure, result.stopAfterInsert, "setup должен дойти до INSERT");
+  assert.equal(result.insertedSec, result.previousLastSec + 1, "cap новее предыдущего источника");
+  assert.doesNotThrow(() => assertCapPlacement(result),
+    "проверка размещения не должна отвергать правильный cap из-за дополнительных чтений часов CH");
+});
