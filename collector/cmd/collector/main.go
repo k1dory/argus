@@ -587,6 +587,7 @@ func main() {
 		}
 	}()
 
+	skew := newSkewWatch(clockSkewMax())
 	asnDB, err := openASN(ctx)
 	if err != nil {
 		slog.Error("ASN_DB", "err", err)
@@ -603,6 +604,8 @@ func main() {
 		e.Attrs["transport"] = transport
 		// ASN — тоже только свой: по src_asn движок склеивает сканы.
 		asn.Enrich(e.Attrs, e.SrcIP, e.DstIP, asnDB.Table())
+		// Часы источника впереди — ts = время приёма, исходное в attrs.ts_original.
+		skew.apply(&e, model.Now())
 		// Направление для любого события с двумя адресами (NGFW, firewall, syslog), не только
 		// NetFlow: правила про «снаружи внутрь» одни на все источники.
 		if e.SrcIP != "" && e.DstIP != "" && e.Attrs["scope"] == "" {
@@ -790,6 +793,7 @@ func main() {
 			}
 			events[i].Attrs["transport"] = "http"
 			asn.Enrich(events[i].Attrs, events[i].SrcIP, events[i].DstIP, asnDB.Table())
+			skew.apply(&events[i], model.Now())
 			// Направление — и для готовых событий NDJSON (агенты Vector, журналы фаерволов).
 			if events[i].SrcIP != "" && events[i].DstIP != "" && events[i].Attrs["scope"] == "" {
 				events[i].Attrs["scope"] = norm.FlowScope(events[i].SrcIP, events[i].DstIP)
@@ -818,8 +822,8 @@ func main() {
 				"queue": len(queue), "pending_rows": pq.Rows(), "pending_bytes": pq.Bytes(), "spool_bytes": pq.SpoolBytes(), "spool_capacity_bytes": pq.SpoolCapacityBytes(), "dead_letter": ws.DeadLetter.Load(), "panics": listen.Metrics.Panics.Load()}
 		},
 		Metrics: func(full bool) string {
-			return st.prometheus(len(queue), pq.Rows(), pq.Bytes(), ws, full) + fmt.Sprintf("argus_collector_spool_bytes %d\nargus_collector_spool_capacity_bytes %d\nargus_collector_spool_head_stuck_seconds %d\nargus_collector_sink_stalled_passes_total %d\nargus_collector_undeclared_format_total %d\nargus_collector_unrecognized_record_total %d\n",
-				pq.SpoolBytes(), pq.SpoolCapacityBytes(), int64(pq.StuckFor(time.Now()).Seconds()), ws.StalledPasses.Load(), undeclaredFormatTotal.Load(), unrecognizedRecordTotal.Load())
+			return st.prometheus(len(queue), pq.Rows(), pq.Bytes(), ws, full) + fmt.Sprintf("argus_collector_spool_bytes %d\nargus_collector_spool_capacity_bytes %d\nargus_collector_spool_head_stuck_seconds %d\nargus_collector_sink_stalled_passes_total %d\nargus_collector_undeclared_format_total %d\nargus_collector_unrecognized_record_total %d\nargus_collector_clock_skew_total %d\n",
+				pq.SpoolBytes(), pq.SpoolCapacityBytes(), int64(pq.StuckFor(time.Now()).Seconds()), ws.StalledPasses.Load(), undeclaredFormatTotal.Load(), unrecognizedRecordTotal.Load(), skew.total.Load())
 		},
 	}
 
@@ -905,6 +909,21 @@ func main() {
 	stall := &stallWatch{after: stallAfter(), stuck: pq.StuckFor, pending: pq.Rows,
 		passes: ws.StalledPasses.Load, insert: ch.InsertEvents}
 	run("sink-stall", func() error { listen.Guard("sink-stall", func() { stall.run(ctx) }); return nil })
+	// Сводка расхождения часов источников — раз в минуту, обычной очередью.
+	run("clock-skew", func() error {
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case now := <-t.C:
+				for _, e := range skew.flush(now) {
+					emit(e, "internal", "internal")
+				}
+			case <-ctx.Done():
+				return nil
+			}
+		}
+	})
 	// Heartbeat раз в минуту — источник виден живым даже без событий.
 	run("heartbeat", func() error {
 		t := time.NewTicker(time.Minute)

@@ -262,6 +262,7 @@ services:
       NETFLOW_EXPORTERS: ${NETFLOW_EXPORTERS:-}             # allow-list экспортеров (CIDR через запятую); пусто — все
       INTERNAL_NETS: ${INTERNAL_NETS:-}                     # свои сети для attrs.scope потоков; пусто — RFC 1918 и т.п.
       SYSLOG_PEER_TZ: ${SYSLOG_PEER_TZ:-}                   # пояс отправителей RFC 3164 без смещения: 192.168.0.59=Europe/Moscow,…
+      COLLECTOR_CLOCK_SKEW_MAX: ${COLLECTOR_CLOCK_SKEW_MAX:-10m} # ts дальше в будущем → время приёма, исходное в attrs.ts_original; 0 — выключено
       SYSLOG_PEER_FORMAT: ${SYSLOG_PEER_FORMAT:-}           # формат отправителей: 10.0.0.5=cef,10.1.0.0/16=leef (без объявления — syslog)
       FLOW_NAT_ADDRS: ${FLOW_NAT_ADDRS:-}                   # внешние адреса NAT: потоки с ними → attrs.post_nat=1 (копия уже учтённого)
       ASN_DB_FILE: ${ASN_DB_FILE:-}                         # таблица IP→ASN (iptoasn TSV/.gz в /asn): attrs.src_asn/dst_asn; пусто — без ASN
