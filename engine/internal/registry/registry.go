@@ -50,6 +50,12 @@ func get() *snapshot {
 	return &snapshot{}
 }
 
+// Stats — размер загруженного реестра (лог старта движка, проверка выкатки).
+func Stats() (rules, sources, actions int) {
+	s := get()
+	return len(s.rules), len(s.sources), len(s.actions)
+}
+
 // Loaded — реестр загружен (выгрузка датасета без него не запускается).
 func Loaded() bool { s := current.Load(); return s != nil && len(s.rules) > 0 }
 

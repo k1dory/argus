@@ -67,3 +67,13 @@ func TestLoadImageLayout(t *testing.T) {
 	}
 	_ = LoadRepo()
 }
+
+func TestStats(t *testing.T) {
+	if err := LoadRepo(); err != nil {
+		t.Fatal(err)
+	}
+	r, s, a := Stats()
+	if r == 0 || s == 0 || a == 0 {
+		t.Fatalf("stats: %d %d %d", r, s, a)
+	}
+}

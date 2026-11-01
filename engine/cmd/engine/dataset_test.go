@@ -6,7 +6,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/devitex-soft/argus/engine/internal/registry"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -257,5 +259,18 @@ func TestDatasetExportRequiresShippedRegistry(t *testing.T) {
 	t.Setenv("CLICKHOUSE_URL", "http://127.0.0.1:1")
 	if code := datasetCmd([]string{"export", "--out", filepath.Join(t.TempDir(), "x.jsonl")}); code != 2 {
 		t.Fatalf("код %d", code)
+	}
+}
+
+// Старт движка: реестр есть — info с размерами, нет — warn без отказа.
+func TestLogShippedRegistry(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev); _ = registry.LoadRepo() })
+	t.Setenv("ARGUS_SHIPPED_DIR", t.TempDir())
+	logShippedRegistry()
+	if !strings.Contains(buf.String(), "level=WARN") || !strings.Contains(buf.String(), "dataset export откажет") {
+		t.Fatalf("без набора — предупреждение: %s", buf.String())
 	}
 }
