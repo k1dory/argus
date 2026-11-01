@@ -446,11 +446,13 @@ type ResponseRow struct {
 func (c *ClickHouse) ResponsesSince(ctx context.Context, since, excludeSince time.Time) ([]ResponseRow, error) {
 	// ts без toString: псевдоним с именем колонки перекрыл бы её в WHERE, а DateTime
 	// в JSONEachRow и так строка «2006-01-02 15:04:05».
-	// Исключения адресов (step=exclude) и отложенные ими ключи (step=excluded) — за
-	// excludeSince: исключение живёт дольше окна решений, его отзыв всегда позже самого
-	// исключения, а ключ должен дожить до конца исключения.
+	// Исключения адресов (step=exclude) и вся история ключей, хоть раз отложенных
+	// исключением (step=excluded), — за excludeSince: исключение живёт дольше окна
+	// решений, его отзыв всегда позже самого исключения, а у такого ключа нужна и
+	// более поздняя строка (manual, blocked) — иначе старый excluded вернулся бы.
 	out, err := c.do(ctx, `SELECT ts, incident_id, rule_id, ip, mode, executor, dry_run, ok, detail, reason, actor, step, until
-		FROM response_log WHERE ip != '' AND step != '' AND (ts >= {since:DateTime} OR (step IN ('exclude', 'excluded') AND ts >= {exclude_since:DateTime}))
+		FROM response_log WHERE ip != '' AND step != '' AND (ts >= {since:DateTime} OR (ts >= {exclude_since:DateTime} AND (step = 'exclude'
+		  OR (incident_id, ip) IN (SELECT incident_id, ip FROM response_log WHERE step = 'excluded' AND ts >= {exclude_since:DateTime}))))
 		ORDER BY ts FORMAT JSONEachRow`, nil,
 		map[string]string{"since": since.UTC().Format("2006-01-02 15:04:05"), "exclude_since": excludeSince.UTC().Format("2006-01-02 15:04:05")})
 	if err != nil {
