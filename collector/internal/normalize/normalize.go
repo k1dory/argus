@@ -230,13 +230,26 @@ func (n *Normalizer) FromLEEF(l parse.LEEF, sl parse.Syslog, raw string) model.E
 	return e
 }
 
+// programTagRe — тег syslog, из которого можно строить имя источника: имя
+// программы (RFC 3164 TAG / RFC 5424 APP-NAME) — sshd, sudo, nginx. Всё прочее
+// (%%01DEVM/4/hwIfMonitor…(l), теги с пробелами, «:», «/», скобками) — не
+// программа, а часть сообщения: такой тег давал бы новый источник на каждую
+// мнемонику, со своим ритмом, «тишиной» и инцидентом clock_skew.
+var programTagRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_.-]{0,31}$`)
+
 // FromSyslog — обычный syslog без CEF/LEEF: всё, у чего нет агента.
 func (n *Normalizer) FromSyslog(sl parse.Syslog, raw string) model.Event {
+	app := sl.AppName
+	attrs := map[string]string{"format": sl.Format, "procid": sl.ProcID, "msgid": sl.MsgID}
+	if app != "" && !programTagRe.MatchString(app) {
+		attrs["tag"] = app
+		app = ""
+	}
 	e := model.Event{
-		Source: "syslog." + slug(firstNonEmpty(sl.AppName, "generic")), SourceClass: "syslog",
-		Vendor: "syslog", Product: sl.AppName, Node: sl.Hostname, Raw: raw,
-		Object: sl.Message, Action: "syslog." + slug(firstNonEmpty(sl.AppName, "message")),
-		Attrs: map[string]string{"format": sl.Format, "procid": sl.ProcID, "msgid": sl.MsgID},
+		Source: "syslog." + slug(firstNonEmpty(app, "generic")), SourceClass: "syslog",
+		Vendor: "syslog", Product: app, Node: sl.Hostname, Raw: raw,
+		Object: sl.Message, Action: "syslog." + slug(firstNonEmpty(app, "message")),
+		Attrs: attrs,
 	}
 	e.SetTS(sl.Timestamp, "")
 	if sl.Severity >= 0 {

@@ -15,7 +15,10 @@ import (
    текст и список Key=Value в скобках. */
 
 var (
-	vrpHeadRe = regexp.MustCompile(`^%%\d{2}([A-Z0-9_-]+)/(\d)/([A-Z0-9_-]+)\(([a-z])\)(?:\[(\d+)\])?:(?:CID=[0-9a-fx]+;)?\s*(.*)$`)
+	// Модуль и мнемоника — в любом регистре: у CloudEngine/S-серии бывают
+	// hwIfMonitorInputRateRising_active, hwICLogFileAging. Префикс до «;» —
+	// CID и его спутники (alarmID, clearType, OID) через «-».
+	vrpHeadRe = regexp.MustCompile(`^%%\d{2}([A-Za-z0-9_-]+)/(\d)/([A-Za-z0-9_.-]+)\(([a-z])\)(?:\[(\d+)\])?:(?:(CID=[^;\s]*);)?\s*(.*)$`)
 	vrpKVRe   = regexp.MustCompile(`([A-Za-z][A-Za-z0-9_-]*)=("[^"]*"|[^,()]*)`)
 )
 
@@ -30,11 +33,23 @@ func ParseVRP(sl Syslog) (model.Event, bool) {
 	if m == nil {
 		return model.Event{}, false
 	}
-	module, sevStr, mnemonic, kind, text := m[1], m[2], m[3], m[4], strings.TrimSpace(m[6])
+	module, sevStr, mnemonic, kind, text := m[1], m[2], m[3], m[4], strings.TrimSpace(m[7])
 	e := model.Event{
 		Source: "net.vrp", SourceClass: "network", Vendor: "Huawei", Product: "vrp",
 		Node: sl.Hostname, Raw: msg, Outcome: "unknown",
 		Attrs: map[string]string{"module": module, "mnemonic": mnemonic, "kind": kind},
+	}
+	// CID=0x80fc0101-alarmID=0x081300ae-clearType=service_resume → cid, alarmid, cleartype.
+	for _, part := range strings.Split(m[6], "-") {
+		if k, v, ok := strings.Cut(part, "="); ok && k != "" && v != "" {
+			e.Attrs[strings.ToLower(k)] = v
+		}
+	}
+	// Аварии VRP: <мнемоника>_active / _clear — одна авария, разные состояния.
+	if base, ok := strings.CutSuffix(mnemonic, "_active"); ok {
+		e.Attrs["alarm"], e.Attrs["alarm_state"] = base, "active"
+	} else if base, ok := strings.CutSuffix(mnemonic, "_clear"); ok {
+		e.Attrs["alarm"], e.Attrs["alarm_state"] = base, "clear"
 	}
 	if !sl.Timestamp.IsZero() {
 		e.SetTS(sl.Timestamp, "")
@@ -64,6 +79,8 @@ func ParseVRP(sl Syslog) (model.Event, bool) {
 
 	key := module + "/" + mnemonic
 	lower := strings.ToLower(msg)
+	// Сравнения ниже писались для заглавных мнемоник (LOGIN, LINK_STATE).
+	module, mnemonic = strings.ToUpper(module), strings.ToUpper(mnemonic)
 	switch {
 	case mnemonic == "LOGIN" || mnemonic == "SSH_USER_LOGIN" || strings.Contains(mnemonic, "LOGIN"):
 		e.Action, e.Outcome = "auth.login", "success"
