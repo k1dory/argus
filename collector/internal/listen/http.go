@@ -213,6 +213,18 @@ func writeIngestReadError(w http.ResponseWriter, source string, err error) {
 }
 
 func (h *HTTPHandlers) acceptEvents(w http.ResponseWriter, r *http.Request, events []model.Event) {
+	// Происхождение ставит только коллектор, как у syslog: peer — адрес соединения,
+	// присланные peer/peer_cn не принимаются (иначе держатель ingest-токена приписал
+	// бы свои события и сводки коллектора, например collector.clock_skew, чужому
+	// устройству).
+	addr := remoteHost(r)
+	for i := range events {
+		if events[i].Attrs == nil {
+			events[i].Attrs = map[string]string{}
+		}
+		events[i].Attrs["peer"] = addr
+		delete(events[i].Attrs, "peer_cn")
+	}
 	if h.EmitBatch != nil {
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
