@@ -548,7 +548,7 @@ export async function sourcesHealthReport(): Promise<SourcesReport> {
   type Num = number | string; // ClickHouse JSON: UInt32/Float64 приходят числами, count() — строкой
   type Hour = { source: string; source_class: string; events_1h: Num; eps_60s: Num; last_ts: string; last_sec: Num; pii_share: Num | null; now_sec: Num };
   type Rhythm = { source: string; events_window: Num; gap_q: Num | null; last_sec: Num; now_sec: Num };
-  type Stale = { source: string; source_class: string; last_ts: string; last_sec: Num; stale_total: Num };
+  type Stale = { source: string; source_class: string; last_ts: string; last_sec: Num; stale_total: Num; now_sec?: Num };
   const days = RHYTHM_WINDOW_DAYS;
   const [hour, rhythm, staleRows] = await Promise.all([
     chQuery<Hour>(
@@ -571,7 +571,7 @@ export async function sourcesHealthReport(): Promise<SourcesReport> {
     ),
     chQuery<Stale>(
       `SELECT source, any(source_class) AS source_class, max(received_at) AS last_ts,
-              toUnixTimestamp(max(received_at)) AS last_sec, count() OVER () AS stale_total
+              toUnixTimestamp(max(received_at)) AS last_sec, count() OVER () AS stale_total, toUnixTimestamp(now()) AS now_sec
        FROM events WHERE ${SOURCE_LAST_READY} GROUP BY source
        HAVING last_ts >= now() - INTERVAL {days:UInt32} DAY AND last_ts < now() - INTERVAL 1 HOUR
        ORDER BY last_ts DESC, source LIMIT {lim:UInt32}
@@ -607,7 +607,7 @@ export async function sourcesHealthReport(): Promise<SourcesReport> {
     type Named = Omit<Stale, "stale_total">;
     beyondLimit = (await chQuery<Named>(
       `SELECT source, any(source_class) AS source_class, max(received_at) AS last_ts,
-              toUnixTimestamp(max(received_at)) AS last_sec
+              toUnixTimestamp(max(received_at)) AS last_sec, toUnixTimestamp(now()) AS now_sec
        FROM events WHERE source IN {names:Array(String)} AND ${SOURCE_LAST_READY} GROUP BY source
        HAVING last_ts >= now() - INTERVAL {days:UInt32} DAY AND last_ts < now() - INTERVAL 1 HOUR
        SETTINGS force_optimize_projection = 1`,
@@ -630,9 +630,14 @@ export async function sourcesHealthReport(): Promise<SourcesReport> {
   const unionTotal = Math.max(projTotal, proj.length + beyondLimit.length) + heartbeatOnly.length;
   const omitted = Math.max(0, unionTotal - staleShown.length);
   const byStale = new Map(staleShown.map((r) => [r.source, r]));
+  // «Сейчас» — по часам ClickHouse, как last_sec: часы Node на другой машине (или в
+  // контейнере) могут расходиться с базой, и silent_for_sec сдвинулся бы на разницу.
+  // Date.now() — только если ни один запрос не вернул строк (тогда и источников нет).
+  const chNow = [hour[0]?.now_sec, rhythm[0]?.now_sec, staleRows?.[0]?.now_sec, beyondLimit[0]?.now_sec]
+    .map((v) => Number(v)).find((v) => Number.isFinite(v) && v > 0);
   const sources = [...hour.map((r) => r.source), ...staleShown.map((r) => r.source)].map((source) => {
     const h = byHour.get(source), rh = byRhythm.get(source), st = byStale.get(source);
-    const now = Number(h?.now_sec ?? rh?.now_sec ?? Math.floor(Date.now() / 1000));
+    const now = Number(h?.now_sec ?? rh?.now_sec ?? st?.now_sec ?? chNow ?? Math.floor(Date.now() / 1000));
     // Последнее событие: таблица событий точнее heartbeat (минутная гранулярность).
     const last = Number(h?.last_sec ?? st?.last_sec ?? rh?.last_sec ?? now);
     const lastTs = h?.last_ts ?? st?.last_ts ?? "";
