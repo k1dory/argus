@@ -106,7 +106,7 @@ export function closureLabelText(e: ClosureLabelView): string {
   if (e.attack_tactic) parts.push(e.attack_tactic === ATTACK_OTHER ? "тактика: другое" : ATTACK_TACTICS[e.attack_tactic] ?? e.attack_tactic);
   if (e.attack_technique) parts.push(e.attack_technique === ATTACK_OTHER ? "техника: другое" : e.attack_technique);
   if (e.ops_cause) parts.push(OPS_CAUSES[e.ops_cause as OpsCause] ?? e.ops_cause);
-  if (e.ops_act_now != null) parts.push(e.ops_act_now ? "действовать сейчас" : "не срочно");
+  if (e.ops_act_now != null) parts.push(e.ops_act_now ? "действовать сейчас: да" : "действовать сейчас: нет");
   if (e.ops_urgency != null) parts.push(`срочность ${e.ops_urgency}`);
   if (e.ops_action) parts.push(OPS_ACTIONS[e.ops_action as OpsAction] ?? e.ops_action);
   if (parts.length && e.blind) parts.push("вслепую");
