@@ -20,8 +20,8 @@ export type QueryMocks = {
   blockCandidatesFor: (inc: { actor_name: string; chain: string[]; tags?: string[] }) => string[];
   requestUnblockIp: (...args: unknown[]) => Promise<{ error?: string; results?: { executor: string; ok: boolean; detail: string }[] }>;
   requestReanalyze: (id: string) => Promise<string | null>;
-  requestExcludeIp: (...args: unknown[]) => Promise<{ error?: string; until?: string }>;
-  requestRevokeExclusion: (...args: unknown[]) => Promise<{ error?: string }>;
+  requestExcludeIp: typeof import("../src/lib/argus-queries").requestExcludeIp;
+  requestRevokeExclusion: typeof import("../src/lib/argus-queries").requestRevokeExclusion;
   addException: (...args: unknown[]) => Promise<void>;
   addIncidentComment: (...args: unknown[]) => Promise<void>;
   incidentCommentExists: (id: string, commentId: string) => Promise<boolean>;
