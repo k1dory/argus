@@ -10,7 +10,7 @@ import { SEARCH_SETTINGS } from "./search";
 import { chTs, LOG_COLUMNS, toLogItem, type LogItem } from "./shared/log-query";
 import type { TriageBinding } from "./shared/triage";
 import {
-  ACTOR_KEYS_EXPR, ACTOR_KINDS, activeAliases, aliasColumnExpr, aliasPredicate, aliasPrefilter, aliasActiveAt, aliasMatches, aliasKey, ambiguousAliases, bucketEvents, canonicalIp, canonicalPhone, chStringArray, clampWindow, SECTION_LABELS, SECTION_SQL, SECTIONS, CONFIRMED_NOTE_PREFIX, HOLD_NOTE_PREFIX, isAliasKind, isHeld, LOWERCASE_KINDS, normalizeAliasValue, rangeWindow, resolveStatus,
+  ACTOR_KEYS_EXPR, ACTOR_KINDS, activeAliases, aliasColumnExpr, aliasPredicate, aliasPrefilter, aliasActiveAt, aliasMatches, aliasKey, ambiguousAliases, bucketEvents, canonicalIp, canonicalPhone, chStringArray, clampWindow, SECTION_LABELS, SECTION_SQL, SECTIONS, CONFIRMED_NOTE_PREFIX, HOLD_CONFIDENCE, HOLD_NOTE_PREFIX, isAliasKind, isHeld, LOWERCASE_KINDS, normalizeAliasValue, rangeWindow, resolveStatus,
   type ActorIncident, type ActorRange, type ActorReport, type Alias, type AliasInput, type ClassCount, type IpStat, type NodeStat, type Person, type PersonInput, type ResolveMatch, type ResolveStatus, type SourceCoverage, type Window,
 } from "./shared/actors";
 
@@ -32,6 +32,14 @@ const ALIASES_LATEST = `
          argMax(confidence, updated_at) AS confidence, argMax(note, updated_at) AS note
   FROM identity_aliases GROUP BY alias_kind, alias_value, valid_from, person_id
   HAVING argMax(deleted, updated_at) = 0`;
+
+/** ALIASES_LATEST с условием до GROUP BY: фильтр по (alias_kind, alias_value) идёт по
+ *  первичному ключу, а не после свёртки всего справочника. */
+const aliasesLatestWhere = (where: string): string => {
+  const sql = ALIASES_LATEST.replace("FROM identity_aliases GROUP BY", `FROM identity_aliases WHERE ${where} GROUP BY`);
+  if (sql === ALIASES_LATEST) throw new Error("aliasesLatestWhere: ALIASES_LATEST changed shape");
+  return sql;
+};
 
 type PersonRow = { person_id: string; display: string; kind: string; team: string; note: string };
 type AliasRow = { person_id: string; alias_kind: string; alias_value: string; valid_from: string; valid_to_raw: string | null; source: string; confidence: number | string; note: string };
@@ -188,8 +196,10 @@ export async function aliasHistory(value: string, limit = 500): Promise<AliasHis
   return out;
 }
 
-/** Субъектные виды, которые сравниваются с actor_name без учёта регистра (login/email): константы, не ввод. */
+/** Субъектные виды, которые сравниваются с actor_name без учёта регистра (login/email)
+ *  и точно (uid/sid/peer; phone — отдельно, в E.164): константы, не ввод. */
 const CASE_INSENSITIVE_ACTOR_SQL = ACTOR_KINDS.filter((k) => LOWERCASE_KINDS.includes(k)).map((k) => `'${k}'`).join(", ");
+const CASE_SENSITIVE_ACTOR_SQL = ACTOR_KINDS.filter((k) => k !== "phone" && !LOWERCASE_KINDS.includes(k)).map((k) => `'${k}'`).join(", ");
 
 export type Sighting = { source: string; action: string; who: string; where: string; ips: string[]; events: number; first_ts: string; last_ts: string };
 export type VpnConnection = { actor_name: string; peer_name: string; peer_ip: string; events: number; first_ts: string; last_ts: string };
@@ -228,25 +238,39 @@ export async function aliasSightings(value: string, range: ActorRange, now = Dat
   }
   // Те же правила значения, что у алиасов (aliasColumn/compareValue): uid/sid/peer —
   // actor_name точно, phone — в E.164, host — node без учёта регистра. Без учёта
-  // регистра actor_name сравнивается, только если значение — зарегистрированный
-  // login/email: иначе uid CaseKey одной персоны подтягивал бы события casekey
-  // другой (и любого незарегистрированного cAsEkEy). Подзапрос идёт по первичному
-  // ключу identity_aliases (alias_kind, alias_value) — одна гранула, не весь справочник.
+  // регистра actor_name сравнивается, только если на ts события действует
+  // подтверждённый (не на удержании) login/email с этим значением — та же политика,
+  // что в резолве. Из этой ветки исключаются подтверждённые uid/sid/peer, действующие
+  // на ts события, если у их владельца в тот же момент нет такого login/email:
+  // login casekey персоны A не берёт события uid CaseKey персоны B.
+  // Интервалы собираются в массивы в самом ClickHouse (скалярные подзапросы, только
+  // пересекающие окно): длина запроса не зависит от истории алиасов. На строку —
+  // два прохода: владельцы действующих login/email (ci_at) и владельцы действующих
+  // точных алиасов этого actor_name; строка остаётся, если вторые ⊆ первых (hasAll).
+  // Без вложенных лямбд: память линейна по событиям × (ci + fx), а не × ci × fx. Справочник
+  // читается по первичному ключу (alias_kind, alias_value); uid/sid/peer — диапазон
+  // alias_kind с lowerUTF8(alias_value).
   // hasAny по idx_actor_keys (0032) отсекает гранулы: каждое из условий ниже — один из ключей.
   const v = value.trim();
   const pv = canonicalPhone(v) ?? v;
   const lv = v.toLowerCase();
+  const live = `confidence >= {hold:Float32} AND valid_from < parseDateTime64BestEffort({to:String}, 3, 'UTC')
+    AND (valid_to_raw IS NULL OR valid_to_raw > parseDateTime64BestEffort({from:String}, 3, 'UTC'))`;
+  const activeAt = (t: string, from: string, to: string) => `ts >= ${t}.${from} AND (isNull(${t}.${to}) OR ts < ${t}.${to})`;
   const rows = await chQuery<Row>(
-    `SELECT source, action, actor_name AS who, node AS at_node, groupUniqArray(5)(src_ip) AS ips, count() AS events, toString(min(ts)) AS first_ts, toString(max(ts)) AS last_ts
+    `WITH
+       (SELECT groupArray((person_id, valid_from, valid_to_raw)) FROM (${aliasesLatestWhere(`alias_kind IN (${CASE_INSENSITIVE_ACTOR_SQL}) AND alias_value = {lv:String}`)}) WHERE ${live}) AS ci,
+       (SELECT groupArray((alias_value, person_id, valid_from, valid_to_raw)) FROM (${aliasesLatestWhere(`alias_kind IN (${CASE_SENSITIVE_ACTOR_SQL}) AND lowerUTF8(alias_value) = {lv:String}`)}) WHERE ${live}) AS fx
+     SELECT source, action, actor_name AS who, node AS at_node, groupUniqArray(5)(src_ip) AS ips, count() AS events, toString(min(ts)) AS first_ts, toString(max(ts)) AS last_ts
      FROM events WHERE ${ts}
        AND hasAny(${ACTOR_KEYS_EXPR}, {keys:Array(String)})
        AND (actor_name IN ({v:String}, {pv:String})
-         OR (lowerUTF8(actor_name) = {lv:String} AND {lv:String} IN (
-               SELECT alias_value FROM identity_aliases WHERE alias_kind IN (${CASE_INSENSITIVE_ACTOR_SQL}) AND alias_value = {lv:String}
-               GROUP BY alias_kind, alias_value, valid_from, person_id HAVING argMax(deleted, updated_at) = 0))
+         OR (lowerUTF8(actor_name) = {lv:String}
+             AND notEmpty(arrayMap(c -> c.1, arrayFilter(c -> ${activeAt("c", "2", "3")}, ci)) AS ci_at)
+             AND hasAll(ci_at, arrayMap(x -> x.2, arrayFilter(x -> actor_name = x.1 AND ${activeAt("x", "3", "4")}, fx))))
          OR lowerUTF8(node) = {lv:String})
      GROUP BY source, action, actor_name, node ORDER BY last_ts DESC LIMIT 100`,
-    { ...win, v, pv, lv, keys: chStringArray([...new Set([v, pv, lv])].sort()) },
+    { ...win, v, pv, lv, hold: HOLD_CONFIDENCE, keys: chStringArray([...new Set([v, pv, lv])].sort()) },
   );
   return { kind: "actor", rows: rows.map(toSighting), vpn: [] };
 }
