@@ -45,11 +45,12 @@ func pr80ClockSkewFixture(t *testing.T) (*rules.Rule, []*model.Event) {
 // and restart with a persisted group key. No ClickHouse connection is needed.
 func TestPR80ClockSkewFixtureCreatesTwoLowIncidents(t *testing.T) {
 	rule, events := pr80ClockSkewFixture(t)
-	if rule.Window() != 24*time.Hour || rule.GroupBy() != "attrs.peer" {
+	if rule.Window() != 24*time.Hour || rule.GroupBy() != "attrs.peer, attrs.source" {
 		t.Fatalf("unexpected dedupe contract: window=%s group_by=%q", rule.Window(), rule.GroupBy())
 	}
 	detections := eval.Run([]*rules.Rule{rule}, events)
-	wantCounts := map[string]int{"192.168.0.30": 3, "192.168.0.31": 1}
+	// Key is "peer|source": sources behind one relay (127.0.0.1) are separate devices.
+	wantCounts := map[string]int{"192.168.0.30|net.vrp": 3, "192.168.0.31|net.vrp": 1, "127.0.0.1|idp.authentik": 1, "127.0.0.1|vpn.netbird": 1}
 	if len(detections) != len(wantCounts) {
 		t.Fatalf("fixture: got %d detections, want %d", len(detections), len(wantCounts))
 	}
@@ -61,7 +62,7 @@ func TestPR80ClockSkewFixtureCreatesTwoLowIncidents(t *testing.T) {
 		}
 		seen[d.Key] = true
 		for _, e := range d.Events {
-			if e.Attrs["transport"] != "internal" || e.Attrs["peer"] != d.Key {
+			if e.Attrs["transport"] != "internal" || e.Attrs["peer"]+"|"+e.Attrs["source"] != d.Key {
 				t.Fatalf("mixed or external evidence in peer %q: %+v", d.Key, e)
 			}
 		}
@@ -69,7 +70,7 @@ func TestPR80ClockSkewFixtureCreatesTwoLowIncidents(t *testing.T) {
 	now := time.Date(2026, 11, 1, 18, 1, 0, 0, time.UTC)
 	registry := NewRegistry(0, nil)
 	created, updated, dropped := registry.Apply(detections, now)
-	if len(created) != 2 || len(updated) != 0 || len(dropped) != 0 {
+	if len(created) != len(wantCounts) || len(updated) != 0 || len(dropped) != 0 {
 		t.Fatalf("fixture incidents: created=%d updated=%d dropped=%v", len(created), len(updated), dropped)
 	}
 	var persisted []Incident
@@ -126,7 +127,7 @@ func TestPR80ClockSkewDedupeIncludes24HourBoundary(t *testing.T) {
 		t.Fatalf("same peer: want three events in the first 24h window and a new detection after it; got %+v", detections)
 	}
 	for _, d := range detections {
-		if d.Key != first.Attrs["peer"] {
+		if d.Key != first.Attrs["peer"]+"|"+first.Attrs["source"] {
 			t.Fatalf("dedupe changed peer: %q", d.Key)
 		}
 	}
@@ -139,8 +140,8 @@ func TestPR80ClockSkewDedupeIncludes24HourBoundary(t *testing.T) {
 func TestPR80ClockSkewIncidentShowsAffectedPeer(t *testing.T) {
 	rule, events := pr80ClockSkewFixture(t)
 	created, _, _ := NewRegistry(0, nil).Apply(eval.Run([]*rules.Rule{rule}, events), events[len(events)-1].Time())
-	if len(created) != 2 {
-		t.Fatalf("fixture must create two incidents, got %d", len(created))
+	if len(created) != 4 {
+		t.Fatalf("fixture must create four incidents, got %d", len(created))
 	}
 	for _, inc := range created {
 		peer := inc.Events[0].Attrs["peer"]

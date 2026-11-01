@@ -19,7 +19,7 @@ import (
 // выключено) от момента приёма, ts = время приёма, исходное — в attrs.ts_original.
 // Значение ts_original из тела события не принимается никогда (его ставит только
 // коллектор, как transport). Счётчик — argus_collector_clock_skew_total; раз в
-// минуту по каждому отправителю с расхождением — событие argus.collector /
+// минуту по каждой паре (отправитель, источник) с расхождением — событие argus.collector /
 // collector.clock_skew (attrs.peer, attrs.source, attrs.count, value — наибольшее
 // расхождение в секундах). Дальше суток в будущем ts и раньше заменял Ensure
 // (attrs.ts_raw) — там ts уже «сейчас», и сюда такое событие не попадает.
@@ -42,7 +42,10 @@ func clockSkewMax() time.Duration {
 // skewPeersMax — потолок отправителей в сводке за минуту: сверх — в «прочие».
 const skewPeersMax = 256
 
+// skewPeer — сводка по паре (отправитель, источник): за одним посредником (Vector на
+// loopback, обратный прокси) — разные устройства с разными часами.
 type skewPeer struct {
+	peer    string
 	source  string
 	count   uint64
 	maxSkew time.Duration
@@ -85,19 +88,20 @@ func (w *skewWatch) apply(e *model.Event, now time.Time) {
 	if peer == "" {
 		peer = e.Attrs["transport"] + ":" + e.Source
 	}
+	key := peer + "\x00" + e.Source
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	p := w.peers[peer]
+	p := w.peers[key]
 	if p == nil {
 		if len(w.peers) >= skewPeersMax {
-			peer = "other"
-			if p = w.peers[peer]; p == nil {
-				p = &skewPeer{source: "*"}
-				w.peers[peer] = p
+			key = "other"
+			if p = w.peers[key]; p == nil {
+				p = &skewPeer{peer: "other", source: "*"}
+				w.peers[key] = p
 			}
 		} else {
-			p = &skewPeer{source: e.Source}
-			w.peers[peer] = p
+			p = &skewPeer{peer: peer, source: e.Source}
+			w.peers[key] = p
 		}
 	}
 	p.count++
@@ -126,16 +130,16 @@ func (w *skewWatch) flush(now time.Time) []model.Event {
 			// object — устройство с убежавшими часами: его видно в цепочке инцидента и
 			// уведомлении. node остаётся коллектором: сводка — его телеметрия, и по
 			// node с ним считается молчание узла (a41c-ops-061).
-			Action: "collector.clock_skew", Outcome: "failure", ActorName: "argus-collector", ActorKind: "system", Node: "argus-collector", Object: name,
+			Action: "collector.clock_skew", Outcome: "failure", ActorName: "argus-collector", ActorKind: "system", Node: "argus-collector", Object: p.peer,
 			Value: math.Round(p.maxSkew.Seconds()), Unit: "seconds", Severity: 4,
 			Attrs: map[string]string{
-				"peer": name, "source": p.source, "count": strconv.FormatUint(p.count, 10),
+				"peer": p.peer, "source": p.source, "count": strconv.FormatUint(p.count, 10),
 				"threshold_sec": strconv.Itoa(int(w.max.Seconds())), "transport": "internal",
 			},
 		}
 		e.Sanitize()
 		out = append(out, e)
-		slog.Warn("часы источника впереди: ts заменён временем приёма", "peer", name, "source", p.source, "events", p.count, "max_skew", p.maxSkew.Round(time.Second))
+		slog.Warn("часы источника впереди: ts заменён временем приёма", "peer", p.peer, "source", p.source, "events", p.count, "max_skew", p.maxSkew.Round(time.Second))
 	}
 	return out
 }

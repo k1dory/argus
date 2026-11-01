@@ -84,6 +84,14 @@ function stripNodeColumn(line: string): string {
   return [...cols.slice(0, 2), ...cols.slice(3)].join("  ");
 }
 
+/** Инцидент эксплуатации (теги ops.* без attack.*): диск, молчание узла, часы источника.
+ *  Адреса в его цепочке — наши устройства и экспортёры телеметрии, а не атакующие:
+ *  блокировать их нечего (устройство с убежавшими часами блокировать нельзя). */
+export function isOpsIncident(tags: readonly string[] | undefined): boolean {
+  if (!tags?.length) return false;
+  return tags.some((t) => t.startsWith("ops.")) && !tags.some((t) => t.startsWith("attack."));
+}
+
 /** Кандидаты на блокировку из карточки инцидента.
  *  - Субъект — публичный адрес (правила с group_by по src.ip/dst.ip: сканы, перебор
  *    снаружи): предлагается только он — остальные адреса цепочки наши цели и экспортёры.
