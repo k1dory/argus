@@ -12,7 +12,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { parseRange, safeQuery } from "@/lib/clickhouse";
+import { safeQuery } from "@/lib/clickhouse";
 import { agentsSummary } from "@/lib/queries";
 import { fmtNum, formatAgo, formatTs } from "@/lib/shared/time";
 import { requirePageSession } from "@/lib/auth";
@@ -26,9 +26,10 @@ export const metadata: Metadata = { title: "Агенты Wazuh" };
 export default async function AgentsPage({ searchParams }: PageProps<"/wazuh/agents">) {
   await requirePageSession();
   const sp = await searchParams;
-  const range = parseRange(sp.range as string | undefined);
   // Окно и уровень — какие алерты считаются; алертов/критичных — пороги итогов по агенту.
   const ranges = parseAgentRanges(sp);
+  // Активный пресет — из того же разобранного окна, что уходит в SQL (range или синоним period).
+  const range = ranges.time.range ?? "24h";
   const filtersText = describeChips(agentRangeChips(ranges));
   const r = await safeQuery(() => agentsSummary(ranges.time, { level: ranges.level, alerts: ranges.alerts, critical: ranges.critical }));
   const now = new Date();

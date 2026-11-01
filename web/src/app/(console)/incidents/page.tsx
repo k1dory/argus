@@ -74,8 +74,11 @@ export default async function IncidentsPage({ searchParams }: PageProps<"/incide
 
   const href = (patch: Record<string, string | undefined>) => {
     const qs = new URLSearchParams();
+    // Ссылки листания (page/gpage/spage, раскрытие подсети) сохраняют страницы групп; смена
+    // фильтра (статус, уровень, очередь, вид сканов) начинает все списки с первой страницы.
+    const paging = Object.keys(patch).every((k) => k === "page" || k === "gpage" || k === "spage" || k === "subnet");
     const next = { status, level, q, queue, scans: scansList ? "list" : undefined, subnet,
-      gpage: gpage > 1 ? String(gpage) : undefined, spage: spage > 1 ? String(spage) : undefined, ...Object.fromEntries(new URLSearchParams(rangeQs)),
+      gpage: paging && gpage > 1 ? String(gpage) : undefined, spage: paging && spage > 1 ? String(spage) : undefined, ...Object.fromEntries(new URLSearchParams(rangeQs)),
       page: undefined as string | undefined, ...patch };
     for (const [k, v] of Object.entries(next)) if (v) qs.set(k, v);
     const s = qs.toString();

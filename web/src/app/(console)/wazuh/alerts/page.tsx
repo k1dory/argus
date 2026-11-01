@@ -20,7 +20,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { muteRuleAction } from "@/lib/actions";
-import { parseRange, safeQuery } from "@/lib/clickhouse";
+import { safeQuery } from "@/lib/clickhouse";
 import { agentNames, alertsList, ALERTS_MAX_PAGE, ALERTS_PAGE_SIZE, mutedRuleIds, parseAlertDir, parseAlertSort } from "@/lib/queries";
 import { clampPage } from "@/lib/shared/limits";
 import { RangeFilters } from "@/components/console/range-filters";
@@ -38,9 +38,10 @@ export default async function AlertsPage({ searchParams }: PageProps<"/wazuh/ale
   const session = await requirePageSession();
   const canEdit = ROLE_RANK[session.role] >= ROLE_RANK.analyst;
   const params = await searchParams;
-  const range = parseRange(str(params.range));
   // Окно (пресет или точный from/to), уровень не ниже/не выше; прежний level=N — «не ниже N».
   const ranges = parseAlertRanges(params);
+  // Активный пресет — из того же разобранного окна, что уходит в SQL (range или синоним period).
+  const range = ranges.time.range ?? "24h";
   const showMuted = params.muted === "1";
   const sort = parseAlertSort(params.sort);
   const dir = parseAlertDir(params.dir);

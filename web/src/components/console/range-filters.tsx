@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import type { RangeField } from "@/lib/shared/filters";
+import { PAGINATION_KEYS, type RangeField } from "@/lib/shared/filters";
 
 export type { RangeField };
 
@@ -57,7 +57,8 @@ function RangeFiltersForm({ time = false, timeLabel = "Точный интерв
       const superseded = f ? keysOf(f).some((key) => val(key)) : false;
       if (reset || superseded) next.delete(k);
     }
-    next.delete("page");
+    // Новые фильтры — с первой страницы всех списков: старый OFFSET групп (gpage) и подсети (spage) прятал бы выборку.
+    for (const k of PAGINATION_KEYS) next.delete(k);
     // Точный интервал главнее пресета: пресет снимается, чтобы ссылка читалась однозначно.
     if (time && (next.get("from") || next.get("to"))) {
       next.delete("range");

@@ -4,6 +4,7 @@ import { useState, useTransition } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { Button } from "@/components/ui/button";
 import { RANGES, type RangeKey } from "@/lib/shared/ranges";
+import { PAGINATION_KEYS } from "@/lib/shared/filters";
 
 const ALL = "__all";
 
@@ -24,7 +25,8 @@ export function RangePicker({ value, keys, anyLabel }: { value?: RangeKey; keys?
     const next = new URLSearchParams(params);
     if (key === ALL) next.delete("range");
     else next.set("range", key);
-    for (const k of ["period", "from", "to", "page"]) next.delete(k); // новый диапазон — с первой страницы
+    // Новый диапазон — с первой страницы всех списков (очередь, группы сканов, подсеть).
+    for (const k of ["period", "from", "to", ...PAGINATION_KEYS]) next.delete(k);
     setTarget(key);
     const qs = next.toString();
     start(() => router.push(qs ? `${pathname}?${qs}` : pathname));

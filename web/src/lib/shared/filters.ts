@@ -285,7 +285,11 @@ export function describeChips(chips: (FilterChip | null | undefined)[]): string 
   return chips.filter((c): c is FilterChip => Boolean(c)).map((c) => `${c.label} ${c.value}`).join(", ");
 }
 
-/** Ссылка со сменой параметров: undefined/"" — убрать; page сбрасывается, если не задан явно. */
+/** Параметры пагинации списков: очередь (page), группы сканов (gpage), раскрытая подсеть (spage).
+ *  Любая смена фильтра или диапазона сбрасывает все — старый OFFSET скрыл бы новую выборку. */
+export const PAGINATION_KEYS = ["page", "gpage", "spage"] as const;
+
+/** Ссылка со сменой параметров: undefined/"" — убрать; страницы (PAGINATION_KEYS) сбрасываются, если не заданы явно. */
 export function patchHref(path: string, current: SearchParamsLike, patch: Record<string, string | undefined>): string {
   const next = new URLSearchParams();
   if (current instanceof URLSearchParams) current.forEach((v, k) => next.set(k, v));
@@ -293,7 +297,7 @@ export function patchHref(path: string, current: SearchParamsLike, patch: Record
     const s = Array.isArray(v) ? v[0] : v;
     if (typeof s === "string" && s !== "") next.set(k, s);
   }
-  if (!("page" in patch)) next.delete("page");
+  for (const k of PAGINATION_KEYS) if (!(k in patch)) next.delete(k);
   for (const [k, v] of Object.entries(patch)) {
     if (v === undefined || v === "") next.delete(k);
     else next.set(k, v);

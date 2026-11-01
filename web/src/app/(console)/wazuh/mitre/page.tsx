@@ -11,7 +11,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { parseRange, safeQuery } from "@/lib/clickhouse";
+import { safeQuery } from "@/lib/clickhouse";
 import { topTactics, topTechniques } from "@/lib/queries";
 import { fmtNum } from "@/lib/shared/time";
 import { requirePageSession } from "@/lib/auth";
@@ -25,9 +25,10 @@ export const metadata: Metadata = { title: "MITRE ATT&CK" };
 export default async function MitrePage({ searchParams }: PageProps<"/wazuh/mitre">) {
   await requirePageSession();
   const sp = await searchParams;
-  const range = parseRange(sp.range as string | undefined);
   // Окно (пресет или from/to) и уровень правила: техники считаются только по алертам в пороге.
   const ranges = parseAlertRanges(sp);
+  // Активный пресет — из того же разобранного окна, что уходит в SQL (range или синоним period).
+  const range = ranges.time.range ?? "24h";
   const filtersText = describeChips(alertRangeChips(ranges));
   const r = await safeQuery(() => Promise.all([topTactics(ranges.time, 14, ranges.level), topTechniques(ranges.time, 20, ranges.level)]));
 
