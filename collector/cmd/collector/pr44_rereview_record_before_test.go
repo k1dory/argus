@@ -32,6 +32,9 @@ func TestPR44ReReviewVendorMarkerOrderSurvivesSyslogParsing(t *testing.T) {
 				t.Run(record.format+"/"+data.name+"/"+envelope.name, func(t *testing.T) {
 					line := envelope.prefix + record.body + record.suffix + data.value
 					events := wafHTTPBatchAs(t, "/ingest/syslog", line, "192.0.2.20:31000", record.format)
+					if outsideRecordForms(t, envelope.name, events) {
+						return
+					}
 					if len(events) != 1 {
 						t.Fatalf("accepted=%d, want one vendor event", len(events))
 					}
@@ -67,6 +70,9 @@ func TestPR44ReReviewModSecurityTagCannotPromoteEmbeddedRecord(t *testing.T) {
 			t.Run(record.format+"/"+envelope.name, func(t *testing.T) {
 				line := envelope.prefix + message
 				events := wafHTTPBatchAs(t, "/ingest/syslog", line, "192.0.2.20:31000", record.format)
+				if outsideRecordForms(t, envelope.name, events) {
+					return
+				}
 				if len(events) != 1 {
 					t.Fatalf("accepted=%d, want one searchable ModSecurity record", len(events))
 				}

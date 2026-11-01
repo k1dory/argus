@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/devitex-soft/argus/collector/internal/model"
+)
 
 // CEF and LEEF can immediately follow the syslog hostname, without an app tag:
 // https://www.microfocus.com/documentation/arcsight/arcsight-smartconnectors-8.3/pdfdoc/cef-implementation-standard/cef-implementation-standard.pdf
@@ -40,6 +44,9 @@ func TestPR16Round3CEFLEEFHeadersSurviveSyslogEnvelopes(t *testing.T) {
 			t.Run(format.name+"/"+envelope.name, func(t *testing.T) {
 				line := envelope.prefix + format.payload
 				events := wafHTTPBatchAs(t, "/ingest/syslog", line, "192.0.2.20:31000", formatOf(line))
+				if outsideRecordForms(t, envelope.name, events) {
+					return
+				}
 				if len(events) != 1 {
 					t.Fatalf("accepted %d events, want one vendor event", len(events))
 				}
@@ -53,4 +60,19 @@ func TestPR16Round3CEFLEEFHeadersSurviveSyslogEnvelopes(t *testing.T) {
 			})
 		}
 	}
+}
+
+// outsideRecordForms — обёртка вне трёх форм записи объявленного CEF/LEEF (appRecord):
+// ISO-дата RFC 3164 и строка файла без PRI. Такая строка — syslog без полей вендора.
+func outsideRecordForms(t *testing.T, envelope string, events []model.Event) bool {
+	t.Helper()
+	switch envelope {
+	case "rsyslog_iso_without_app", "iso_without_app", "file_without_pri", "no_pri_coraza_tag", "no_pri_app_control", "no_pri_no_app_control":
+	default:
+		return false
+	}
+	if len(events) != 1 || events[0].SourceClass != "syslog" || events[0].Attrs["signature"] != "" || events[0].Attrs["event_id"] != "" {
+		t.Errorf("обёртка %s вне форм записи должна дать syslog: %+v", envelope, events)
+	}
+	return true
 }

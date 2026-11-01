@@ -77,6 +77,9 @@ func TestPR44Round3RawRequestDataCannotReplaceOuterRecord(t *testing.T) {
 				t.Run(format.name+"/"+request.name+"/"+envelope.name, func(t *testing.T) {
 					line := envelope.prefix + body
 					events := wafHTTPBatchAs(t, "/ingest/syslog", line, "192.0.2.20:31000", format.name)
+					if outsideRecordForms(t, envelope.name, events) {
+						return
+					}
 					if len(events) != 1 {
 						t.Fatalf("accepted=%d, want one original vendor event", len(events))
 					}

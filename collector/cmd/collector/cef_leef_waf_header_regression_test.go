@@ -1,6 +1,8 @@
 package main
 
-import "testing"
+import (
+	"testing"
+)
 
 // A syslog TAG/APP-NAME or HOSTNAME is not the application payload. In
 // particular, "Coraza: " in the envelope must not veto a genuine CEF/LEEF
@@ -35,6 +37,9 @@ func TestPR16Round4CEFLEEFIgnoreWAFMarkersInSyslogHeader(t *testing.T) {
 				t.Run(format.name+"/"+envelope.name+"/"+extension.name, func(t *testing.T) {
 					line := envelope.prefix + format.payload + extension.value
 					events := wafHTTPBatchAs(t, "/ingest/syslog", line, "192.0.2.20:31000", formatOf(line))
+					if outsideRecordForms(t, envelope.name, events) {
+						return
+					}
 					if len(events) != 1 {
 						t.Fatalf("vendor event discarded as an intermediate WAF warning: accepted=%d, want=1", len(events))
 					}

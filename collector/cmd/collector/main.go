@@ -209,6 +209,7 @@ func parseSyslogLine(norm *normalize.Normalizer, zones parse.PeerZones, line str
 		}
 		unparsedWAF = isWAFText(line, payload)
 		e = norm.FromSyslog(sl, line)
+		unrecognizedRecord(peer, format)
 	case parse.FormatLEEF:
 		if rec, ok := appRecord(line, sl, "LEEF:"); ok {
 			if l, ok := parse.ParseLEEF(rec); ok {
@@ -218,6 +219,7 @@ func parseSyslogLine(norm *normalize.Normalizer, zones parse.PeerZones, line str
 		}
 		unparsedWAF = isWAFText(line, payload)
 		e = norm.FromSyslog(sl, line)
+		unrecognizedRecord(peer, format)
 	case parse.FormatWAFCoraza:
 		wf, ok := parse.ParseCorazaLine(payload)
 		if !ok {
@@ -237,9 +239,11 @@ func parseSyslogLine(norm *normalize.Normalizer, zones parse.PeerZones, line str
 			e = qn
 			break
 		}
-		if isWAFText(line, payload) {
-			// msg/uri строки WAF («/credentials», запись CEF) — данные запроса.
-			unparsedWAF = true
+		// Запись CEF/LEEF (в тех же трёх формах, что у объявленного) или строка WAF без
+		// объявления — syslog с предупреждением, раньше вендорных разборщиков: URL
+		// запроса в ней («/credentials») не должен выбрать Jenkins.
+		if waf := isWAFText(line, payload); waf || recordMarker(line, sl) != "" {
+			unparsedWAF = waf
 			e = norm.FromSyslog(sl, line)
 			undeclaredFormat(peer)
 		} else if sq, ok := parse.ParseSquid(sl.Message, sl.Hostname); ok {
@@ -737,7 +741,7 @@ func main() {
 				"queue": len(queue), "pending_rows": pq.Rows(), "pending_bytes": pq.Bytes(), "spool_bytes": pq.SpoolBytes(), "spool_capacity_bytes": pq.SpoolCapacityBytes(), "dead_letter": ws.DeadLetter.Load(), "panics": listen.Metrics.Panics.Load()}
 		},
 		Metrics: func(full bool) string {
-			return st.prometheus(len(queue), pq.Rows(), pq.Bytes(), ws, full) + fmt.Sprintf("argus_collector_spool_bytes %d\nargus_collector_spool_capacity_bytes %d\nargus_collector_undeclared_format_total %d\n", pq.SpoolBytes(), pq.SpoolCapacityBytes(), undeclaredFormatTotal.Load())
+			return st.prometheus(len(queue), pq.Rows(), pq.Bytes(), ws, full) + fmt.Sprintf("argus_collector_spool_bytes %d\nargus_collector_spool_capacity_bytes %d\nargus_collector_undeclared_format_total %d\nargus_collector_unrecognized_record_total %d\n", pq.SpoolBytes(), pq.SpoolCapacityBytes(), undeclaredFormatTotal.Load(), unrecognizedRecordTotal.Load())
 		},
 	}
 
@@ -1063,46 +1067,68 @@ func undeclaredFormat(peer listen.Peer) {
 		"peer", peer.Addr, "transport", peer.Transport)
 }
 
-// appRecord — запись объявленного CEF/LEEF без эвристик пробела и TAG:
-//   - RFC 5424: только в начале MSG, после SD, которую выделил парсер (BOM и пробелы не в
-//     счёт). Значения SD — данные;
-//   - RFC 3164, только PRI, сырая строка: запись — первое вхождение маркера во всей строке,
-//     и оно должно стоять там, где начинается сообщение приложения: в начале строки, в
-//     начале MSG или на месте TAG («CEF:» парсер принимает за TAG). Заголовок 3164 маркера
-//     не содержит; всё вложенное (msg запроса, поле JSON, текст после TAG «ModSecurity:»)
-//     стоит позже и остаётся данными. Строка файла без PRI проверяется как заголовок 3164.
+// unrecognizedRecord — формат cef/leef объявлен, но строка не в форме записи
+// (appRecord): разобрана как syslog. Счётчик в /metrics и предупреждение не чаще
+// раза в минуту на отправителя (та же таблица, что у undeclaredFormat).
+var unrecognizedRecordTotal atomic.Uint64
+
+func unrecognizedRecord(peer listen.Peer, format string) {
+	unrecognizedRecordTotal.Add(1)
+	now := time.Now()
+	key := "declared|" + peer.Addr
+	if last, ok := undeclaredWarned.Load(key); ok && now.Sub(last.(time.Time)) < time.Minute {
+		return
+	}
+	if undeclaredStores.Load() >= undeclaredMaxPeers {
+		return // таблица полна: предупреждение о необъявленном формате важнее
+	}
+	if _, known := undeclaredWarned.Swap(key, now); !known {
+		undeclaredStores.Add(1)
+	}
+	slog.Warn("объявлен "+format+", запись не распознана: строка разобрана как syslog", "peer", peer.Addr, "transport", peer.Transport)
+}
+
+// appRecord — запись CEF/LEEF ровно в трёх формах, всё остальное — не запись:
+//  1. RFC 5424: MSG (после SD, её выделил парсер) начинается с маркера; BOM и
+//     пробелы перед ним допустимы;
+//  2. строка или строка после PRI начинается прямо с маркера (допустим BOM);
+//  3. строгий заголовок RFC 3164: PRI, дата «Mmm dd hh:mm:ss» (обязательна), HOSTNAME
+//     из ограниченного алфавита (без «{», кавычек и пробелов), необязательный TAG
+//     «имя[pid]: » — и сразу маркер. Так пишут FortiGate и Check Point.
+//
+// Ни «первого вхождения», ни места TAG сверх этого: по RFC 3164 §4.3.2 после PRI
+// без даты идёт CONTENT, и JSON-префикс не становится HOSTNAME, а маркер в нём — TAG.
 func appRecord(line string, sl parse.Syslog, marker string) (string, bool) {
 	line = strings.TrimRight(line, "\r\n")
-	switch sl.Format {
-	case "rfc5424":
+	if sl.Format == "rfc5424" {
 		if msg := strings.TrimLeft(sl.Message, "\ufeff "); strings.HasPrefix(msg, marker) {
 			return msg, true
 		}
 		return "", false
-	case "raw":
-		if strings.HasPrefix(strings.TrimLeft(line, "\ufeff "), marker) {
-			return line[strings.Index(line, marker):], true
+	}
+	for _, re := range recordForms {
+		if m := re.FindStringSubmatchIndex(line); m != nil && line[m[2]:m[3]]+":" == marker {
+			return line[m[2]:], true
 		}
-		if alt, _ := parse.ParseSyslog("<13>" + line); alt.Format == "rfc3164" {
-			return appRecord("<13>"+line, alt, marker)
+	}
+	return "", false
+}
+
+// recordForms — формы 2 и 3 appRecord; первая группа — маркер без двоеточия.
+var recordForms = []*regexp.Regexp{
+	regexp.MustCompile(`^(?:<\d{1,3}>)?\x{FEFF}?(CEF|LEEF):`),
+	regexp.MustCompile(`^<\d{1,3}>[A-Z][a-z]{2} [ 0-3]\d \d\d:\d\d:\d\d [A-Za-z0-9._:-]{1,255} (?:[A-Za-z0-9._/-]{1,48}(?:\[\d+\])?: )?(CEF|LEEF):`),
+}
+
+// recordMarker — строка в одной из форм записи CEF/LEEF (appRecord): «CEF:»,
+// «LEEF:» или "" — не запись.
+func recordMarker(line string, sl parse.Syslog) string {
+	for _, m := range []string{"CEF:", "LEEF:"} {
+		if _, ok := appRecord(line, sl, m); ok {
+			return m
 		}
-		return "", false
 	}
-	i := strings.Index(line, marker)
-	if i < 0 || !strings.HasSuffix(line, sl.Message) {
-		return "", false
-	}
-	start := len(line) - len(sl.Message) // начало MSG
-	lead := strings.TrimLeft(line[start:], "\ufeff ")
-	switch {
-	case i == len(line)-len(lead): // MSG начинается с записи
-	case strings.HasPrefix(line, "<") && strings.IndexByte(line, '>')+1 == i: // только PRI
-	case sl.AppName+":" == marker && i+len(marker) <= start && strings.TrimSpace(line[i+len(marker):start]) == "":
-		// запись сразу за HOSTNAME: «CEF:» стал TAG
-	default:
-		return "", false
-	}
-	return line[i:], true
+	return ""
 }
 
 // isWAFText — строка error-лога WAF: маркер в строке (в том числе TAG «ModSecurity:»)
