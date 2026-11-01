@@ -25,6 +25,12 @@ func TestGroupKeyRestoreFailureMustNotSeedLegacyRegistry(t *testing.T) {
 	}{
 		{"http_error", http.StatusInternalServerError, "Code: 241. DB::Exception: Memory limit exceeded"},
 		{"streamed_error", http.StatusOK, "Code: 159. DB::Exception: Timeout exceeded"},
+		// ClickHouse 24.8 (the compose image) defaults to
+		// http_write_exception_in_output_format=1. JSONEachRow writes a valid
+		// JSON exception row after the response headers have already been sent:
+		// https://github.com/ClickHouse/ClickHouse/blob/v24.8.14.39-lts/src/Processors/Formats/Impl/JSONEachRowRowOutputFormat.cpp#L73-L82
+		{"json_exception", http.StatusOK, `{"exception":"Code: 241. DB::Exception: Memory limit exceeded"}`},
+		{"partial_keys_then_json_exception", http.StatusOK, "{\"incident_id\":\"INC-7\",\"group_key\":\"QNAP-2|disk3\"}\n" + `{"exception":"Code: 159. DB::Exception: Timeout exceeded"}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
