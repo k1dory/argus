@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Справочник ATT&CK Enterprise для формы закрытия: компактный JSON из STIX MITRE.
 
-    python3 -I scripts/attack-enterprise.py enterprise-attack-20.0.json 20.0 <url>
+    python3 -I scripts/attack-enterprise.py enterprise-attack-20.0.json 20.0 <url> 2026-10-13
 
-STIX: https://github.com/mitre-attack/attack-stix-data (enterprise-attack/*.json).
+STIX: https://github.com/mitre-attack/attack-stix-data (enterprise-attack/*.json); версия
+и дата выпуска — из index.json того же репозитория.
 Пишет одинаковые файлы в engine/internal/attack/enterprise.json (go:embed, проверка
 метки) и web/src/lib/shared/attack-enterprise.json (кандидаты формы). Тактики — в
 порядке матрицы, техники и подтехники без revoked и deprecated, по возрастанию ID.
@@ -13,7 +14,7 @@ import json
 import pathlib
 import sys
 
-src, version, url = sys.argv[1], sys.argv[2], sys.argv[3]
+src, version, url, released = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 raw = pathlib.Path(src).read_bytes()
 objs = json.loads(raw)["objects"]
 
@@ -43,6 +44,7 @@ modified = max(o.get("modified", "") for o in objs if o["type"] in ("attack-patt
 doc = {
     "source": "MITRE ATT&CK Enterprise (attack-stix-data)",
     "version": version,
+    "released": released,
     "url": url,
     "sha256": hashlib.sha256(raw).hexdigest(),
     "modified": modified,

@@ -1,6 +1,7 @@
 {
  "source": "MITRE ATT&CK Enterprise (attack-stix-data)",
  "version": "20.0",
+ "released": "2026-10-13",
  "url": "https://raw.githubusercontent.com/mitre-attack/attack-stix-data/master/enterprise-attack/enterprise-attack-20.0.json",
  "sha256": "81113ba98afa2928f3dcff62022539f7ce30c315c32e14422f11ff95ce534352",
  "modified": "2026-10-12T19:59:30.798Z",

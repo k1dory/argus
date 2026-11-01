@@ -15,5 +15,10 @@
   - **Выгрузка и метрики.** `GET /api/incidents/labels` и история инцидента отдают
     новые поля. Ответы DevOps теперь входят в долю ложных срабатываний на
     `/rules/agreement`.
+  - **Справочник** — ATT&CK Enterprise v20.0 (attack-stix-data, выпуск 13.10.2026), 15
+    тактик: Defense Evasion разделена на Stealth и Defense Impairment. У правила
+    `rules/wazuh/agent-silence.yml` тег `attack.defense_evasion` заменён на
+    `attack.defense_impairment`. Справочник описан в README, раздел «Метка закрытия и
+    справочник ATT&CK».
   - **Обновление.** Миграция 0036 добавляет колонки. Прежние метки (0033) остаются
     как есть: на стенде размеченных закрытий нет.

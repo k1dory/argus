@@ -24,6 +24,8 @@ const rules = ruleFiles(path.join(ROOT, "rules")).map((f) => ({ file: path.relat
 
 test("справочник: версия, источник, тактики в порядке матрицы, техники с тактиками", () => {
   assert.match(dictionary.version, /^\d+\.\d+$/);
+  assert.match(dictionary.released, /^\d{4}-\d{2}-\d{2}$/);
+  assert.equal(Object.keys(ATTACK_TACTICS).length, 15, "v20: Defense Evasion разделена на Stealth и Defense Impairment");
   assert.match(dictionary.url, /^https:\/\/raw\.githubusercontent\.com\/mitre-attack\/attack-stix-data\//);
   assert.match(dictionary.sha256, /^[0-9a-f]{64}$/);
   assert.equal(Object.keys(ATTACK_TACTICS)[0], "reconnaissance");
@@ -38,6 +40,8 @@ test("справочник: версия, источник, тактики в п
 });
 
 test("теги правил: каждая техника из attack.tNNNN есть в справочнике", () => {
+  const staleTactics = rules.flatMap((r) => (r.tags ?? []).filter((t) => /^attack\.[a-z_]+$/.test(t) && !ruleTactics([t]).length).map((t) => `${r.file}: ${t}`));
+  assert.deepEqual(staleTactics, [], "тег тактики не из справочника: тактика по умолчанию не подставится");
   const missing = rules.flatMap((r) => (r.tags ?? []).filter((t) => /^attack\.t\d{4}/i.test(t))
     .filter((t) => !ruleTechniques([t]).length).map((t) => `${r.file}: ${t}`));
   assert.deepEqual(missing, [], "обновите справочник или тег правила");
@@ -78,6 +82,7 @@ test("тактика по умолчанию — из тегов attack.<tactic>
   assert.equal(defaultTactic(["ops.storage"]), "");
   // defense_evasion в v20 разделена на stealth и defense-impairment: подставлять нечего.
   assert.equal(defaultTactic(["attack.defense_evasion"]), Object.hasOwn(ATTACK_TACTICS, "defense-evasion") ? "defense-evasion" : "");
+  assert.equal(defaultTactic(["attack.defense_impairment", "attack.t1489"]), "defense-impairment");
   const opts = attackFormOptions(["attack.credential_access", "attack.t1110"]);
   assert.equal(opts.defaultTactic, "credential-access");
   assert.deepEqual(Object.keys(opts.candidates), [...Object.keys(ATTACK_TACTICS), ATTACK_OTHER]);
