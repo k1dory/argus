@@ -57,6 +57,10 @@ const pick = (blind: boolean, from = 870_000_000): number => {
 const blindOpen = `INC-${pick(true)}`;
 const blindClosed = `INC-${pick(true, pick(true) + 1)}`;
 const plainOpen = `INC-${pick(false)}`;
+// Вердикт есть, а строки инцидента нет (удалён TTL, запись раньше инцидента): слепой
+// скрыт — «завершён» не доказан; не слепой виден.
+const blindOrphan = `INC-${pick(true, pick(true, pick(true) + 1) + 1)}`;
+const plainOrphan = `INC-${pick(false, pick(false) + 1)}`;
 const marker = `BlindRo${suffix}`;
 
 test("blind: argus_ro не читает вердикт и его копии по слепому открытому инциденту", { skip }, async () => {
@@ -89,6 +93,11 @@ test("blind: argus_ro не читает вердикт и его копии по
         ('analyst', 'incident.comment', {id:String}, concat('human-', {m:String}))`, p);
     }
 
+    for (const id of [blindOrphan, plainOrphan]) {
+      await ch().chCommand("INSERT INTO agent_verdicts (incident_id, session_id, agent, created_at, verdict, markdown) VALUES ({id:String}, 'fixture', 'fixture-bot', now(), 'true_positive', {m:String})",
+        { id, m: `${marker}-${id}` });
+    }
+
     await auth.createSession(`sso:blind-ro-${suffix}`, "analyst", true);
     const preview = async (sql: string) => {
       const result = await previewPanelAction({ data: null, error: null }, formData({ sql, range: "24h" }));
@@ -104,6 +113,33 @@ test("blind: argus_ro не читает вердикт и его копии по
         assert.ok(text.includes(`human-${marker}-${blindOpen}`), `${table}: записи людей по слепому инциденту остаются`);
       }
     }
+    // Политика действует на чтение таблицы в любом месте запроса: JOIN, подзапрос, merge().
+    const hiddenVia = async (label: string, sql: string) => {
+      const text = await preview(sql);
+      assert.ok(!text.includes(`${marker}-${blindOpen}`), `${label}: слепой открытый инцидент скрыт`);
+      assert.ok(text.includes(`${marker}-${plainOpen}`), `${label}: контроль — не слепой виден`);
+    };
+    await hiddenVia("JOIN", `SELECT v.markdown FROM incidents AS i INNER JOIN agent_verdicts AS v ON v.incident_id = i.incident_id
+      WHERE position(v.markdown, '${marker}') > 0`);
+    await hiddenVia("подзапрос", `SELECT markdown FROM (SELECT * FROM agent_verdicts) WHERE position(markdown, '${marker}') > 0`);
+    // Табличные функции argus_ro не доступны вовсе (нужен CREATE TEMPORARY TABLE): отказ.
+    const merged = await previewPanelAction({ data: null, error: null },
+      formData({ sql: `SELECT markdown FROM merge('argus', '^agent_verdicts$') WHERE position(markdown, '${marker}') > 0`, range: "24h" }));
+    assert.match(String(merged.error), /497|ACCESS_DENIED|запрещ/i, "merge() отклонён");
+    assert.ok(!JSON.stringify(merged).includes(`${marker}-${blindOpen}`));
+    const orphans = await preview(`SELECT markdown FROM agent_verdicts WHERE position(markdown, '${marker}') > 0`);
+    assert.ok(!orphans.includes(`${marker}-${blindOrphan}`), "слепой вердикт без строки инцидента скрыт");
+    assert.ok(orphans.includes(`${marker}-${plainOrphan}`), "не слепой вердикт без строки инцидента виден");
+    // Системные таблицы (query_log хранит текст INSERT с вердиктом) закрыты дважды:
+    // validateSql отвергает «system.», а у argus_ro нет грантов на system.*.
+    const sys = await previewPanelAction({ data: null, error: null },
+      formData({ sql: `SELECT query FROM system.query_log WHERE position(query, '${marker}') > 0`, range: "24h" }));
+    assert.ok(sys.error, "system.query_log недоступен предпросмотру");
+    assert.ok(!JSON.stringify(sys).includes(`${marker}-${blindOpen}`));
+    const [{ allowed }] = await ch().chQuery<{ allowed: number }>(
+      `SELECT count() AS allowed FROM system.grants WHERE user_name = {user:String} AND (database = 'system' OR database IS NULL)`, { user });
+    assert.equal(Number(allowed), 0, "у профиля argus_ro нет грантов на system.*");
+
     // Агрегаты встроенного дашборда argus-siem по-прежнему считаются.
     assert.match(await preview(`SELECT count() AS n FROM incident_verdicts WHERE position(summary_ru, '${marker}') > 0`), /"n":2\b/);
   } finally {

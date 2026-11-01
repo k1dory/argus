@@ -233,7 +233,9 @@ export async function incidentLabels(since: string, limit: number, after?: Label
               severity_correct, ops_cause, ops_action, blind, reason
        FROM incident_state_events
        WHERE labeled_by_human AND kind = 'status' AND status IN ('closed', 'false_positive')
-         AND changed_at >= parseDateTime64BestEffort({since:String}, 3, 'UTC')
+         -- Точность 9: since с долями мельче миллисекунды не округляется вниз и не
+         -- захватывает более ранние метки (changed_at — DateTime64(3)).
+         AND changed_at >= parseDateTime64BestEffort({since:String}, 9, 'UTC')
          AND (changed_at, incident_id, toString(event_id))
              > (parseDateTime64BestEffort({after_ts:String}, 3, 'UTC'), {after_inc:String}, {after_id:String})
        ORDER BY changed_at, incident_id, toString(event_id) LIMIT {limit:UInt32}
