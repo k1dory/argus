@@ -3,8 +3,10 @@
   («адрес|CIDR=cef|leef|waf-coraza»), `files[].format` (`waf-audit`, `waf-coraza`, `lines`) или
   SD-параметр агента `[argus format="…"]` (только от доверенного агента — HTTP-приём с токеном
   или TLS с клиентским сертификатом — и только если формат не задан конфигурацией), — а не по
-  содержимому строки: «CEF:», «LEEF:»,
-  «Coraza:» в данных (имя файла, User-Agent) больше не меняют разборщик. Строки
+  содержимому строки. Объявленный формат — только его разборщик: `cef`/`leef` — запись, с
+  которой начинается сообщение приложения, `waf-coraza` — только JSON Caddy; маркеры
+  «ModSecurity:», «CEF:», «LEEF:», «Coraza:» в данных (msg, имя файла, User-Agent) разборщик
+  не меняют. Без объявления — syslog и вендорные разборщики. Строки
   `ModSecurity: …` из error-лога nginx/Apache — обычный syslog с `attrs.waf_unparsed=1`, без
   `http.attack`, `rule_ids` и решения: их `msg`/`uri` не экранированы и подделываются запросом.
   **Перед обновлением:** ModSecurity — включите `SecAuditLogFormat JSON` и шлите audit-лог

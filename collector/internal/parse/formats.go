@@ -98,9 +98,3 @@ func ParseCorazaLine(line string) (WAF, bool) {
 	}
 	return w, true
 }
-
-// IsModSecurityLine — строка error-лога ModSecurity (в том числе в обёртке syslog).
-// Такая строка — всегда syslog с attrs.waf_unparsed=1, до любых других разборщиков.
-func IsModSecurityLine(line string) bool {
-	return strings.Contains(line, "ModSecurity: ")
-}
