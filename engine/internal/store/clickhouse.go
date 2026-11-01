@@ -380,7 +380,9 @@ func (c *ClickHouse) OpenIncidents(ctx context.Context) ([]incidents.Incident, i
 			open = append(open, inc)
 		}
 	}
-	c.restoreGroupKeys(ctx, open)
+	if err := c.restoreGroupKeys(ctx, open); err != nil {
+		return nil, 0, err
+	}
 	return open, maxN, nil
 }
 
@@ -500,12 +502,13 @@ func (c *ClickHouse) OperatorStates(ctx context.Context, ids []string) (map[stri
 }
 
 // restoreGroupKeys — group_key открытых инцидентов (колонка incidents из
-// миграции 0034, в incidents_current её нет). Без колонки или при ошибке ключи
-// остаются пустыми: реестр примет такие инциденты под старым ключом
-// «правило|субъект|узел» и передаст первой сработке группы.
-func (c *ClickHouse) restoreGroupKeys(ctx context.Context, open []incidents.Incident) {
+// миграции 0034, в incidents_current её нет). Ошибка ClickHouse, в том числе
+// пришедшая внутри ответа 200, возвращается: с пустыми ключами разные группы
+// одного узла слились бы в реестре под «правило|субъект|узел», а старт движка
+// повторяет попытку.
+func (c *ClickHouse) restoreGroupKeys(ctx context.Context, open []incidents.Incident) error {
 	if len(open) == 0 {
-		return
+		return nil
 	}
 	ids := make([]string, len(open))
 	for i := range open {
@@ -515,21 +518,26 @@ func (c *ClickHouse) restoreGroupKeys(ctx context.Context, open []incidents.Inci
 	FROM incidents WHERE incident_id IN {ids:Array(String)} GROUP BY incident_id FORMAT JSONEachRow`, nil,
 		map[string]string{"ids": chArray(ids)})
 	if err != nil {
-		return
+		return fmt.Errorf("restore group_key: %w", err)
 	}
 	keys := map[string]string{}
 	for _, line := range bytes.Split(out, []byte("\n")) {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
 		var row struct {
 			IncidentID string `json:"incident_id"`
 			GroupKey   string `json:"group_key"`
 		}
-		if json.Unmarshal(line, &row) == nil {
-			keys[row.IncidentID] = row.GroupKey
+		if err := json.Unmarshal(line, &row); err != nil {
+			return fmt.Errorf("restore group_key: %.200s", bytes.TrimSpace(line))
 		}
+		keys[row.IncidentID] = row.GroupKey
 	}
 	for i := range open {
 		open[i].GroupKey = keys[open[i].IncidentID]
 	}
+	return nil
 }
 
 func (c *ClickHouse) InsertIncidents(ctx context.Context, incs []*incidents.Incident) error {

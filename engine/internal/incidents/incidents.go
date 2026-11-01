@@ -192,6 +192,7 @@ func (r *Registry) Apply(dets []eval.Detection, now time.Time) (created, updated
 	for _, d := range dets {
 		inc := build(d, now)
 		key := inc.regKey()
+		var adopted *Incident
 		if _, ok := r.open[key]; !ok && inc.GroupKey != "" {
 			// Инцидент, заведённый до group_key (или восстановленный без него), —
 			// под старым ключом: его забирает первая сработка группы, а не новый инцидент.
@@ -200,15 +201,24 @@ func (r *Registry) Apply(dets []eval.Detection, now time.Time) (created, updated
 				delete(r.open, legacy)
 				ex.GroupKey = inc.GroupKey
 				r.open[key] = ex
+				adopted = ex
 			}
 		}
 		if ex, ok := r.open[key]; ok && isFinal(ex.Status) && inc.LastTS <= ex.LastTS {
 			// Закрытый инцидент по той же сработке без новых событий: absence
 			// и склеенные окна иначе заводили бы новый инцидент каждый цикл.
+			if adopted != nil {
+				updated = append(updated, adopted.bumpUpdated(now))
+			}
 			continue
 		}
 		if ex, ok := r.open[key]; ok && !isFinal(ex.Status) {
 			if inc.EventCount <= ex.EventCount && inc.LastTS <= ex.LastTS {
+				// Присвоенный group_key записывается отдельной версией строки и без
+				// новых событий: иначе после рестарта инцидент снова окажется без ключа.
+				if adopted != nil {
+					updated = append(updated, adopted.bumpUpdated(now))
+				}
 				continue // ничего нового
 			}
 			ex.EventCount, ex.LastTS, ex.Chain, ex.Sources, ex.Events = inc.EventCount, inc.LastTS, inc.Chain, inc.Sources, inc.Events
@@ -231,6 +241,19 @@ func (r *Registry) Apply(dets []eval.Detection, now time.Time) (created, updated
 		created = append(created, inc)
 	}
 	return created, updated, dropped
+}
+
+// bumpUpdated продвигает updated_at к now, а если now не позже — на секунду
+// вперёд: новая версия строки должна победить в argMax по updated_at.
+func (inc *Incident) bumpUpdated(now time.Time) *Incident {
+	ts := model.FormatTS(now)[:19]
+	if ts <= inc.UpdatedAt {
+		if t, err := time.Parse("2006-01-02 15:04:05", inc.UpdatedAt); err == nil {
+			ts = model.FormatTS(t.Add(time.Second))[:19]
+		}
+	}
+	inc.UpdatedAt = ts
+	return inc
 }
 
 // Prune убирает из реестра финальные инциденты старше ttl после закрытия:
