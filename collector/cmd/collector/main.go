@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -413,6 +414,62 @@ func main() {
 	// от compose stop посреди дозаписи батча убивал бы процесс и терял батч.
 	ctx, cancel := context.WithCancel(sigCtx)
 	defer cancel()
+	// Дренаж ограничен: источник, который не слушает отмену (зависшее чтение файла
+	// курсора, сетевой вызов без контекста), иначе держал бы wg.Wait вечно — процесс
+	// без приёма, но живой, и compose его не перезапускает. После ARGUS_SHUTDOWN_TIMEOUT
+	// или по второму SIGINT/SIGTERM — лог с незавершёнными задачами и выход с кодом 1;
+	// принятое уже лежит в spool на диске и дошлётся после перезапуска.
+	shutdownTimeout := 30 * time.Second
+	if raw := os.Getenv("ARGUS_SHUTDOWN_TIMEOUT"); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d <= 0 {
+			slog.Error("ARGUS_SHUTDOWN_TIMEOUT: нужна положительная длительность, например 30s", "value", raw)
+			os.Exit(1)
+		}
+		shutdownTimeout = d
+	}
+	var activeMu sync.Mutex
+	active := map[string]int{}
+	activeNames := func() []string {
+		activeMu.Lock()
+		defer activeMu.Unlock()
+		names := make([]string, 0, len(active))
+		for name, n := range active {
+			if n > 0 {
+				names = append(names, name)
+			}
+		}
+		sort.Strings(names)
+		return names
+	}
+	sigs := make(chan os.Signal, 4)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigs)
+	drained := make(chan struct{})
+	defer close(drained)
+	go func() {
+		var deadline <-chan time.Time
+		done := ctx.Done()
+		received := 0
+		for {
+			select {
+			case <-drained:
+				return
+			case <-done:
+				done = nil
+				deadline = time.After(shutdownTimeout)
+			case sig := <-sigs:
+				// Первый сигнал запускает (или не прерывает) штатный дренаж, второй — выход.
+				if received++; received >= 2 {
+					slog.Error("повторный сигнал — выход без дренажа", "signal", sig.String(), "unfinished", activeNames())
+					os.Exit(1)
+				}
+			case <-deadline:
+				slog.Error("дренаж не уложился в ARGUS_SHUTDOWN_TIMEOUT — выход", "timeout", shutdownTimeout.String(), "unfinished", activeNames())
+				os.Exit(1)
+			}
+		}
+	}()
 
 	queue := make(chan queuedEvent, cfg.Batch.PendingRows)
 	// emit всегда сам проставляет attrs.transport: значение из тела события
@@ -633,8 +690,16 @@ func main() {
 	var listenerFailed atomic.Bool
 	run := func(name string, f func() error) {
 		wg.Add(1)
+		activeMu.Lock()
+		active[name]++
+		activeMu.Unlock()
 		go func() {
 			defer wg.Done()
+			defer func() {
+				activeMu.Lock()
+				active[name]--
+				activeMu.Unlock()
+			}()
 			if err := f(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				slog.Error(name, "err", err)
 			}

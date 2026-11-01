@@ -28,7 +28,7 @@ func TestPR23StalledShutdownCanBeForced(t *testing.T) {
 	const returned = "regression: main returned after source recovery"
 	scenario := os.Getenv(collectorRegressionChildEnv)
 	if !strings.HasPrefix(scenario, prefix) {
-		for _, name := range []string{"source_recovers", "sigterm", "sigint"} {
+		for _, name := range []string{"source_recovers", "sigterm", "sigint", "deadline"} {
 			t.Run(name, func(t *testing.T) {
 				out, err := runCollectorRegressionChild(t,
 					"TestPR23StalledShutdownCanBeForced", prefix+name, 20*time.Second)
@@ -38,6 +38,16 @@ func TestPR23StalledShutdownCanBeForced(t *testing.T) {
 				if name == "source_recovers" {
 					if err != nil || !strings.Contains(out, returned) {
 						t.Fatalf("source recovery did not unblock main: %v\n%s", err, out)
+					}
+					return
+				}
+				if name == "deadline" {
+					// Без сигналов: дренаж ограничен ARGUS_SHUTDOWN_TIMEOUT, затем exit 1.
+					var exitErr *exec.ExitError
+					// Строку лога не проверяем: stderr здесь перехвачен pipe-копировщиком,
+					// и os.Exit опережает его. Ребёнок сам падает, если дедлайна нет.
+					if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 || strings.Contains(out, "shutdown deadline did not terminate") {
+						t.Fatalf("hung drain did not exit by deadline: %v\n%s", err, out)
 					}
 					return
 				}
@@ -95,6 +105,9 @@ batch:
 	t.Setenv("SINK_SPOOL_BYTES", "1048576")
 	t.Setenv("CLICKHOUSE_URL", "http://clickhouse.invalid")
 	t.Setenv("LOG_LEVEL", "error")
+	if scenario == prefix+"deadline" {
+		t.Setenv("ARGUS_SHUTDOWN_TIMEOUT", "300ms")
+	}
 	// No network request is expected: S3 reads its state before checking ctx,
 	// and the invalid HTTP port fails without binding or resolving a hostname.
 	// Fail closed if a future change unexpectedly reaches an HTTP client.
@@ -184,6 +197,14 @@ batch:
 		return
 	}
 
+	if scenario == prefix+"deadline" {
+		select {
+		case <-done:
+			t.Fatal("main returned instead of exiting by the shutdown deadline")
+		case <-time.After(5 * time.Second):
+			t.Fatal("shutdown deadline did not terminate the stalled drain")
+		}
+	}
 	sig := syscall.SIGTERM
 	if scenario == prefix+"sigint" {
 		sig = syscall.SIGINT
