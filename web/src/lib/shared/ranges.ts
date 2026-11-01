@@ -9,5 +9,10 @@ export const RANGES: Record<RangeKey, { label: string; hours: number; bucketMinu
 };
 
 export function parseRange(value: string | undefined): RangeKey {
-  return value && value in RANGES ? (value as RangeKey) : "24h";
+  // Только собственные ключи: "constructor"/"toString"/"__proto__" есть у любого объекта через прототип.
+  return isRangeKey(value) ? value : "24h";
+}
+
+export function isRangeKey(value: unknown): value is RangeKey {
+  return typeof value === "string" && Object.prototype.hasOwnProperty.call(RANGES, value);
 }

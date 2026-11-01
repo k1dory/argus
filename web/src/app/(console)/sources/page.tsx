@@ -21,7 +21,7 @@ import { describeThreshold, formatRhythm, RHYTHM_WINDOW_DAYS } from "@/lib/share
 import { fmtNum, formatAgo, formatTs } from "@/lib/shared/time";
 import { RangeFilters } from "@/components/console/range-filters";
 import { RangePicker } from "@/components/console/range-picker";
-import { describeChips, inRange, inTime } from "@/lib/shared/filters";
+import { describeChips, inRange, inTime, patchHref, type SearchParamsLike } from "@/lib/shared/filters";
 import { parseSourceRanges, SOURCE_FEED_FIELDS, SOURCE_HEALTH_FIELDS, sourceFeedChips, sourceHealthChips, type SourceRanges } from "@/lib/shared/page-filters";
 
 export const dynamic = "force-dynamic";
@@ -42,12 +42,12 @@ export default async function SourcesPage({ searchParams }: PageProps<"/sources"
       <PageHeader title="Источники">
         <span className="c-label">коллектор · syslog 5514 · netflow 2055 · webhooks HTTPS</span>
       </PageHeader>
-      {!r.ok ? <StorageUnavailable reason={r.error} /> : <SourcesBody health={r.data[0].sources} omitted={r.data[0].omitted} events={r.data[1]} source={source} ingestBase={ingestBase} ranges={ranges} />}
+      {!r.ok ? <StorageUnavailable reason={r.error} /> : <SourcesBody health={r.data[0].sources} omitted={r.data[0].omitted} events={r.data[1]} source={source} ingestBase={ingestBase} ranges={ranges} sp={params} />}
     </>
   );
 }
 
-function SourcesBody({ health, omitted, events, source, ingestBase, ranges }: { health: Awaited<ReturnType<typeof sourcesHealthReport>>["sources"]; omitted: number; events: Awaited<ReturnType<typeof eventsRecent>>; source?: string; ingestBase: string; ranges: SourceRanges }) {
+function SourcesBody({ health, omitted, events, source, ingestBase, ranges, sp }: { health: Awaited<ReturnType<typeof sourcesHealthReport>>["sources"]; omitted: number; events: Awaited<ReturnType<typeof eventsRecent>>; source?: string; ingestBase: string; ranges: SourceRanges; sp: SearchParamsLike }) {
   const alive = health.filter((h) => h.alive === 1).length;
   const eps = health.reduce((a, h) => a + h.eps_60s, 0);
   const classes = new Set(health.map((h) => h.source_class));
@@ -104,7 +104,7 @@ function SourcesBody({ health, omitted, events, source, ingestBase, ranges }: { 
                       <TableCell className="font-mono text-xs">
                         <span className="flex items-center gap-2">
                           {active && <span className="text-[var(--ring)]" aria-hidden>▸</span>}
-                          <Copyable value={h.source} href={`/sources?source=${encodeURIComponent(h.source)}`} label="Источник" />
+                          <Copyable value={h.source} href={patchHref("/sources", sp, { source: h.source })} label="Источник" />
                         </span>
                       </TableCell>
                       <TableCell className="font-mono text-xs">{h.source_class}</TableCell>
@@ -132,7 +132,7 @@ function SourcesBody({ health, omitted, events, source, ingestBase, ranges }: { 
         label={source ? `События · ${source}` : "События · последние по всем источникам"}
         meta={
           source ? (
-            <Button asChild variant="ghost" size="xs"><Link href="/sources">сбросить фильтр</Link></Button>
+            <Button asChild variant="ghost" size="xs"><Link href={patchHref("/sources", sp, { source: undefined })}>сбросить фильтр</Link></Button>
           ) : (
             "единая схема: субъект · объект · действие · узел"
           )

@@ -16,7 +16,7 @@ import { searchHref } from "@/lib/shared/search-href";
 import { fmtNum, formatAgo, formatTs } from "@/lib/shared/time";
 import { RangeFilters } from "@/components/console/range-filters";
 import { describeChips, inRange, timeBounds, timeLabel } from "@/lib/shared/filters";
-import { ACTOR_RANGE_FIELDS, actorRangeChips, parseActorRanges } from "@/lib/shared/page-filters";
+import { ACTOR_RANGE_FIELDS, actorRangeChips, parseActorRanges, pickParams } from "@/lib/shared/page-filters";
 
 export const dynamic = "force-dynamic";
 export const metadata: Metadata = { title: "Субъекты" };
@@ -24,9 +24,12 @@ export const metadata: Metadata = { title: "Субъекты" };
 export default async function ActorsPage({ searchParams }: PageProps<"/actors">) {
   const session = await requireActorAccess();
   const sp = await searchParams;
-  const range = parseActorRange(typeof sp.range === "string" ? sp.range : undefined);
   // Точное окно активности (не шире 30 дней) главнее пресета; пороги событий и инцидентов — по итогам за окно.
+  // Пресет — из общего парсера (range или синоним period), по умолчанию 7 дней.
   const ranges = parseActorRanges(sp);
+  const range = parseActorRange(ranges.time.range);
+  // Смена пресета сохраняет числовые пороги и снимает точное окно.
+  const keep = pickParams(sp, ["events_min", "events_max", "incidents_min", "incidents_max"]);
   const bounds = ranges.time.from ? timeBounds(ranges.time) : null;
   const window = bounds ? { fromMs: bounds.startMs, toMs: bounds.endMs } : null;
   const periodLabel = window ? `интервал ${timeLabel(ranges.time)}` : `за ${RANGES[range].label}`;
@@ -38,7 +41,7 @@ export default async function ActorsPage({ searchParams }: PageProps<"/actors">)
   return (
     <>
       <PageHeader title="Субъекты" subtitle="Паспорт — срез журнала по человеку или служебной учётке за период с учётом времени действия алиасов. Каждый просмотр паспорта записывается в журнал действий.">
-        <ActorRangeLinks current={window ? "" : range} base="/actors" />
+        <ActorRangeLinks current={window ? "" : range} base={keep ? `/actors?${keep}` : "/actors"} />
       </PageHeader>
 
       <Panel label="Кому принадлежит" meta="почта, логин, телефон, IP, хост — чей сейчас, чей раньше, где встречался">

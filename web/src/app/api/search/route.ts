@@ -1,12 +1,12 @@
 import { apiGuard, outOfScope } from "@/lib/auth";
-import { parseRange } from "@/lib/shared/ranges";
+import { parseTimeFilter } from "@/lib/shared/filters";
 import { clampInt } from "@/lib/shared/limits";
 import { checkTriageSearch, stripHidden } from "@/lib/shared/triage";
 import { clampPage, MAX_QUERY_LEN, PAGE_SIZE, parseIndex, search, searchExport, toCsv } from "@/lib/search";
 import { wazuhEnabled } from "@/lib/integrations";
 import { parseSearchLevel } from "@/lib/shared/page-filters";
 
-// GET /api/search?index=alerts|events&q=...&range=24h[&from=&to=][&level_min=&level_max=][&page=N][&format=json|csv|export][&limit=N][&raw=0]
+// GET /api/search?index=alerts|events&q=...&range=24h (period= — синоним)[&from=&to=][&level_min=&level_max=][&page=N][&format=json|csv|export][&limit=N][&raw=0]
 // format=json (по умолчанию): страница результатов + гистограмма + фасеты, как в консоли.
 // format=export / csv: до 10 000 строк для отчёта (лимит 5 запросов в минуту).
 // Доступ: сессия консоли или bearer ARGUS_API_TOKEN; 60 запросов в минуту.
@@ -21,12 +21,15 @@ export async function GET(req: Request): Promise<Response> {
   if (g("index") === "alerts" && !wazuhEnabled()) return Response.json({ error: "index=alerts недоступен: модуль Wazuh выключен" }, { status: 400 });
   const index = parseIndex(g("index"));
   const level = parseSearchLevel(u.searchParams, index);
+  // Окно — тем же парсером, что страница: period — синоним range, несуществующие даты
+  // отброшены, границы по порядку, ширина не больше 400 дней, один to — сутки (пресет) до него.
+  const time = parseTimeFilter(u.searchParams, { defaultRange: "24h" });
   const input = {
     index,
     q: (g("q") ?? "").slice(0, MAX_QUERY_LEN),
-    range: parseRange(g("range")),
-    from: g("from"),
-    to: g("to"),
+    range: time.range ?? "24h",
+    from: time.from,
+    to: time.to,
     page: clampPage(g("page")),
     showMuted: g("muted") === "1",
     levelMin: level.min,

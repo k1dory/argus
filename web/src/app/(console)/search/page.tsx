@@ -18,7 +18,6 @@ import {
   searchErrorMessage, searchFacets, searchPage, searchSeries, seriesTotal, SERIES_SETTINGS, type Facet, type IndexKey, type SearchPlan,
 } from "@/lib/search";
 import type { SeriesPoint } from "@/lib/queries";
-import { parseRange } from "@/lib/shared/ranges";
 import { appendTerm } from "@/lib/shared/search-query";
 import { fmtMs, fmtNum, isLongRange } from "@/lib/shared/time";
 import { RangeFilters } from "@/components/console/range-filters";
@@ -41,12 +40,12 @@ export default async function SearchPage({ searchParams }: PageProps<"/search">)
   const g = (k: string) => (typeof sp[k] === "string" ? (sp[k] as string) : undefined);
   const index = parseIndex(g("index"));
   // Точный интервал (невалидные даты отброшены, границы по порядку) и порог уровня индекса.
-  const time = parseTimeFilter(sp);
+  const time = parseTimeFilter(sp, { defaultRange: "24h" });
   const level = parseSearchLevel(sp, index);
   const input = {
     index,
     q: (g("q") ?? "").slice(0, MAX_QUERY_LEN),
-    range: parseRange(g("range") ?? g("period")),
+    range: time.range ?? "24h",
     from: time.from,
     to: time.to,
     page: clampPage(g("page")),
