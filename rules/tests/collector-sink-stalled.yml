@@ -1,0 +1,6 @@
+# Коллектор сообщил о застрявшей записи в 12:10 — один инцидент на узел коллектора.
+rule: a41c-ops-066
+fixture: fixtures/events/collector-stall.ndjson
+expect_incidents: 1
+expect_actor: argus-collector
+min_events: 1
