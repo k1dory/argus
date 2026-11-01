@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	_ "time/tzdata" // пояса SYSLOG_PEER_TZ и в образе без /usr/share/zoneinfo
 
 	"gopkg.in/yaml.v3"
 
@@ -169,10 +170,16 @@ func mergeAttrs(e *model.Event, attrs map[string]string) {
 // error-лог, вендорные разборщики, иначе syslog. Происхождение (peer, peer_cn,
 // scope) ставит только коллектор; в конце — повторная чистка значений, записанных
 // после Ensure нормализатора.
-func parseSyslogLine(norm *normalize.Normalizer, line string, peer listen.Peer) (model.Event, bool) {
+func parseSyslogLine(norm *normalize.Normalizer, zones parse.PeerZones, line string, peer listen.Peer) (model.Event, bool) {
 	sl, _ := parse.ParseSyslog(line)
+	sl = sl.InZone(zones.Lookup(peer.Addr))
 	var e model.Event
+	// QNAP опознаётся по заголовку (qulogd), а не по тексту: имя файла в журнале доступа
+	// может содержать «CEF:», «LEEF:» или «ModSecurity:» и не должно менять разборщик.
+	qn, isQNAP := parse.ParseQNAP(sl)
 	switch {
+	case isQNAP:
+		e = qn
 	case hasCEF(line, sl.Message):
 		c, _ := parse.ParseCEF(line)
 		e = norm.FromCEF(c, sl, line)
@@ -457,7 +464,15 @@ func main() {
 		os.Exit(2)
 	}
 
-	parseLine := func(line string, peer listen.Peer) (model.Event, bool) { return parseSyslogLine(norm, line, peer) }
+	// Пояс отправителей, у которых в заголовке RFC 3164 местное время без смещения.
+	peerZones, err := parse.ParsePeerZones(os.Getenv("SYSLOG_PEER_TZ"))
+	if err != nil {
+		slog.Error("SYSLOG_PEER_TZ", "err", err)
+		os.Exit(1)
+	}
+	parseLine := func(line string, peer listen.Peer) (model.Event, bool) {
+		return parseSyslogLine(norm, peerZones, line, peer)
+	}
 	lines := func(line string, peer listen.Peer) {
 		if e, ok := parseLine(line, peer); ok {
 			emit(e, "syslog", peer.Transport)

@@ -30,7 +30,7 @@ func TestCorazaPartialAllowDoesNotEmitFinalTransaction(t *testing.T) {
 			}
 			var events []model.Event
 			for _, line := range lines {
-				e, ok := parseSyslogLine(&normalize.Normalizer{}, line, listen.Peer{Addr: "192.0.2.10", Node: "waf-01", Transport: "file"})
+				e, ok := parseSyslogLine(&normalize.Normalizer{}, nil, line, listen.Peer{Addr: "192.0.2.10", Node: "waf-01", Transport: "file"})
 				if ok {
 					events = append(events, e)
 				}

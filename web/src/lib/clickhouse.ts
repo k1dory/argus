@@ -175,7 +175,10 @@ async function chFetchWithSlot(sql: string, params: Record<string, string | numb
   const exception = /^Code:\s*\d+\.\s*DB::Exception:/m.exec(text);
   const headerCode = Number(resp.headers.get("X-ClickHouse-Exception-Code"));
   if (!resp.ok || exception || headerCode > 0) {
-    console.error(`clickhouse ${resp.status}:`, text.slice(0, 2000), "\nSQL:", sql.slice(0, 500));
+    // В лог — только текст исключения. При HTTP 200 до него идут уже отданные строки
+    // результата (комментарии, вердикты): им не место в журнале контейнера.
+    const detail = exception ? text.slice(exception.index, exception.index + 2000) : resp.ok ? "(тело ответа не логируется)" : text.slice(0, 2000);
+    console.error(`clickhouse ${resp.status}:`, detail, "\nSQL:", sql.slice(0, 500));
     const { message, code } = shortChError(exception ? text.slice(exception.index) : text, resp.status);
     throw new ClickHouseError(headerCode > 0 && code == null ? `код ${headerCode}: запрос не выполнен` : message, resp.status, code ?? (headerCode > 0 ? headerCode : null));
   }

@@ -26,6 +26,38 @@ func freePort(t *testing.T) int {
 	return l.Addr().(*net.TCPAddr).Port
 }
 
+// waitHealthy ждёт 200 от /healthz с экспоненциальной паузой 50 мс → 1 с. Под -race на
+// общем раннере CI старт коллектора (spool, приёмники, первый запрос к «ClickHouse»)
+// занимал больше прежних 10 с — тест падал ложно. Если main() завершился раньше
+// (порт из freePort успели занять, ошибка конфига), ждать нечего: падаем сразу.
+func waitHealthy(t *testing.T, url string, exited <-chan struct{}, timeout time.Duration) {
+	t.Helper()
+	client := &http.Client{Timeout: 2 * time.Second}
+	start, pause := time.Now(), 50*time.Millisecond
+	var last string
+	for {
+		r, err := client.Get(url)
+		if err == nil {
+			r.Body.Close()
+			if r.StatusCode == http.StatusOK {
+				return
+			}
+			last = r.Status
+		} else {
+			last = err.Error()
+		}
+		if time.Since(start) > timeout {
+			t.Fatalf("коллектор не поднялся за %s: %s", timeout, last)
+		}
+		select {
+		case <-exited:
+			t.Fatalf("коллектор завершился до готовности /healthz: %s", last)
+		case <-time.After(pause):
+		}
+		pause = min(2*pause, time.Second)
+	}
+}
+
 // Процесс целиком: конфиг из файла с ${ENV}, приёмники syslog UDP/TCP, HTTP и
 // файл, запись через spool в «ClickHouse» (httptest), /healthz и /metrics,
 // остановка по SIGTERM без потери принятых событий. os.Exit в main вызывается
@@ -96,19 +128,7 @@ batch:
 	go func() { defer close(done); main() }()
 
 	base := fmt.Sprintf("http://127.0.0.1:%d", httpPort)
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		if r, err := http.Get(base + "/healthz"); err == nil {
-			r.Body.Close()
-			if r.StatusCode == http.StatusOK {
-				break
-			}
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("коллектор не поднялся за 10 с")
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
+	waitHealthy(t, base+"/healthz", done, 60*time.Second)
 
 	// UDP и TCP syslog. /healthz отвечает раньше, чем привязаны сокеты
 	// приёмников: датаграмма в ещё не открытый порт пропадает молча, поэтому
@@ -180,7 +200,8 @@ batch:
 	// Ждём не число строк, а каждый транспорт: udp, tcp, http (CEF, LEEF,
 	// событие), файл. UDP пересылается раз в полсекунды, пока не дошёл.
 	markers := []string{`"transport":"udp"`, `"transport":"tcp"`, `"transport":"http"`, `"transport":"file"`, `"source":"vector.test"`, `"scope":"outbound"`}
-	deadline = time.Now().Add(15 * time.Second)
+	// Ожидание до готовности, а не пауза: 60 с стоят времени только при сбое (под -race на раннере).
+	deadline := time.Now().Add(60 * time.Second)
 	var all string
 	for tick := 0; ; tick++ {
 		mu.Lock()
