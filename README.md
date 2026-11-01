@@ -36,7 +36,10 @@ API. Wazuh подключается как модуль, а не как цент
   коллектор считает это застреванием: `argus_collector_spool_head_stuck_seconds`,
   `argus_collector_sink_stalled_passes_total`, а дольше `SINK_STALL_AFTER` (10m; `0` —
   выключено) — ERROR в журнал и событие `argus.collector` / `collector.sink_stalled`,
-  инцидент `a41c-ops-066` (закрывается событием `collector.sink_recovered`).
+  инцидент `a41c-ops-066` (закрывается событием `collector.sink_recovered`). События
+  доставляются по одному за такт и по порядку, недоставленные ждут следующего такта. После
+  старта коллектор, как только застрявших батчей нет, один раз шлёт `sink_recovered`
+  (`attrs.startup=1`): инцидент, открытый до перезапуска, не остаётся висеть.
 - `engine/` — Go. Ядро корреляции: Sigma-подобные правила из `rules/*.yml`
   (selection / filter / threshold с окнами и distinct), инциденты со статусами
   отработки, LLM-аналитик по строгой JSON-схеме за интерфейсом `analyst.Backend`
