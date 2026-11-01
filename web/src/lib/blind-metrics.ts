@@ -4,7 +4,8 @@ import "server-only";
 // инциденты: последняя закрывающая метка человека попадает в окно, и сейчас
 // инцидент closed / false_positive в incidents_current. Вердикт агента — вердикт
 // последней сессии разбора, начатой не позже этой метки (одна сессия — один вердикт,
-// как в карточке). Метки DevOps (правила ops.*, без disposition) не участвуют. Запрос
+// как в карточке). Ответы DevOps (правила ops.*, без disposition) входят в число ответов
+// и в долю ложных (ops_cause = false_positive), в согласие с агентом — нет. Запрос
 // уходит без настроек, даже без умолчания консоли (max_execution_time: null), и
 // исполним от argus_ro: его политики argus_ro_blind скрывают только незавершённые
 // слепые инциденты, а они сюда не входят.
@@ -22,6 +23,7 @@ export const AGREEMENT_SQL = `WITH
   closes AS (
     SELECT incident_id,
            argMax(disposition, (changed_at, revision)) AS disposition,
+           argMax(ops_cause, (changed_at, revision)) AS ops_cause,
            argMax(blind, (changed_at, revision)) AS blind,
            max(changed_at) AS closed_at
     FROM incident_state_events
@@ -29,7 +31,7 @@ export const AGREEMENT_SQL = `WITH
     GROUP BY incident_id
     HAVING closed_at >= parseDateTime64BestEffort({from:String}, 3, 'UTC')
        AND closed_at < parseDateTime64BestEffort({to:String}, 3, 'UTC')
-       AND disposition != ''
+       AND (disposition != '' OR ops_cause != '')
   ),
   done AS (
     SELECT incident_id, rule_id, rule_title
@@ -56,11 +58,11 @@ export const AGREEMENT_SQL = `WITH
   )
 SELECT d.rule_id AS rule_id, any(d.rule_title) AS rule_title, c.blind AS blind,
        count() AS labeled,
-       countIf(c.disposition = 'false_positive') AS fp,
-       countIf(transform(v.verdict, [${VERDICTS}], [${DISPOSITIONS}], '') != '') AS compared,
-       countIf(transform(v.verdict, [${VERDICTS}], [${DISPOSITIONS}], '') = c.disposition) AS agreed,
-       countIf(v.verdict = 'undetermined') AS undetermined,
-       countIf(v.verdict = '') AS no_verdict
+       countIf(c.disposition = 'false_positive' OR c.ops_cause = 'false_positive') AS fp,
+       countIf(c.disposition != '' AND transform(v.verdict, [${VERDICTS}], [${DISPOSITIONS}], '') != '') AS compared,
+       countIf(c.disposition != '' AND transform(v.verdict, [${VERDICTS}], [${DISPOSITIONS}], '') = c.disposition) AS agreed,
+       countIf(c.disposition != '' AND v.verdict = 'undetermined') AS undetermined,
+       countIf(c.disposition != '' AND v.verdict = '') AS no_verdict
 FROM closes AS c
 INNER JOIN done AS d ON d.incident_id = c.incident_id
 LEFT JOIN verdicts AS v ON v.incident_id = c.incident_id

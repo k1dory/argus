@@ -37,6 +37,7 @@ test("incidentLabels: точность since не расширяет перио�
     await ch().chCommand(fixtureDDL("0014_incident_state_events.sql", /^CREATE TABLE IF NOT EXISTS argus\.incident_state_events\b/));
     await ch().chCommand(fixtureDDL("0016_incident_closure_reason.sql", /^ALTER TABLE argus\.incident_state_events\b/));
     await ch().chCommand(fixtureDDL("0033_incident_labels.sql", /^ALTER TABLE argus\.incident_state_events\b/));
+    await ch().chCommand(fixtureDDL("0036_incident_label_plan.sql", /^ALTER TABLE argus\.incident_state_events\b/));
     await ch().chCommand(`INSERT INTO incidents
       (incident_id, created_at, updated_at, rule_id, rule_title, level, tags, status, first_ts, last_ts)
       VALUES ({id:String}, now(), now(), 'fixture-since', 'Since fixture', 'high', [], 'new', now64(3), now64(3))`, { id });

@@ -110,7 +110,7 @@ export default async function AgreementPage({ searchParams }: PageProps<"/rules/
             )}
           </Panel>
           <p className="text-xs text-muted-foreground">
-            Сопоставление: true_positive — «вредоносная активность», benign_true_positive — «легитимно, разрешено», false_positive — «ложное срабатывание». Берётся последний вердикт агента до закрытия. Метки DevOps (правила ops.*) не учитываются. Интервал — Уилсона, 95 %. JSON — <span className="font-mono">GET /api/incidents/agreement?window={window}</span>.
+            Сопоставление: true_positive — «вредоносная активность», benign_true_positive — «легитимно, разрешено», false_positive — «ложное срабатывание». Берётся последний вердикт агента до закрытия. Ответы DevOps (правила ops.*) входят в долю ложных (причина «ложное срабатывание»), в согласие с агентом — нет. Интервал — Уилсона, 95 %. JSON — <span className="font-mono">GET /api/incidents/agreement?window={window}</span>.
           </p>
         </>
       )}

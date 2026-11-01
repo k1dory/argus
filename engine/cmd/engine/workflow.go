@@ -103,7 +103,7 @@ func (e *engine) transitionIncident(ctx context.Context, id string, in workflowR
 	if err != nil {
 		return store.IncidentStateEvent{}, err
 	}
-	event, err := e.ch.AppendIncidentState(ctx, id, in.Actor, in.Kind, status, owner, strings.TrimSpace(in.Reason), storeLabel(id, in.Label))
+	event, err := e.ch.AppendIncidentState(ctx, id, in.Actor, in.Kind, status, owner, strings.TrimSpace(in.Reason), storeLabel(inc, in.Label))
 	if err == nil && status == incidents.StatusEscalated && inc.Status != incidents.StatusEscalated {
 		esc := *inc
 		esc.Status, esc.Owner = status, owner

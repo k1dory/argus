@@ -361,6 +361,38 @@ test("incident-status-form: взять/назначить без владель�
   assert.match(stripTags(html(h(statusForm.CommentForm, { incidentId: "INC-7" }))), /запис|комментар/i);
 });
 
+test("метка закрытия: вопросы плана разметки, тактика из тегов, кандидаты техники и «другое»", async () => {
+  const { attackFormOptions } = await import("../src/lib/shared/attack");
+  const attack = attackFormOptions(["attack.credential_access", "attack.t1110.001"]);
+  const sec = html(h(statusForm.ClosureLabelFields, { ops: false, status: "closed", attack, disabled: false }));
+  const t = stripTags(sec);
+  assert.match(t, /Характер срабатывания/);
+  assert.match(t, /Какой уровень правильный/);
+  assert.match(sec, /<option value="4">критический \(critical\)<\/option>/);
+  assert.match(sec, /<select[^>]*name="attack_tactic"[^>]*required/, "тактика обязательна, кроме ложного");
+  assert.match(sec, /<option value="credential-access" selected="">Credential Access<\/option>/, "тактика по умолчанию — из тегов правила");
+  assert.match(sec, /<option value="T1110.001">T1110.001 [^<]+<\/option>/, "техника из тегов — первой");
+  const techniqueSelect = /<select[^>]*name="attack_technique"[\s\S]*?<\/select>/.exec(sec)?.[0] ?? "";
+  const techniques = [...techniqueSelect.matchAll(/<option value="(T\d{4}(?:\.\d{3})?|other)">/g)].map((m) => m[1]);
+  assert.equal(techniques[0], "T1110.001");
+  assert.equal(techniques.at(-1), "other");
+  assert.ok(techniques.length <= 21, `не больше 20 кандидатов и «другое»: ${techniques.length}`);
+  assert.match(t, new RegExp(`ATT&CK Enterprise ${attack.version.replace(".", "\\.")}`));
+  assert.doesNotMatch(sec, /name="severity_correct"/, "severity_correct вычисляет движок");
+  const fp = html(h(statusForm.ClosureLabelFields, { ops: false, status: "false_positive", attack, disabled: false }));
+  assert.doesNotMatch(fp, /<select[^>]*name="attack_tactic"[^>]*required/, "у ложного срабатывания тактика необязательна");
+  const ops = html(h(statusForm.ClosureLabelFields, { ops: true, status: "closed", attack, disabled: false }));
+  const o = stripTags(ops);
+  assert.match(o, /Причина/);
+  assert.match(o, /Действовать сейчас/);
+  assert.match(o, /Срочность/);
+  assert.match(o, /Что сделали/);
+  assert.doesNotMatch(ops, /<select[^>]*name="ops_action"[^>]*required/, "«что сделали» — необязательно");
+  assert.match(ops, /<option value="process_crash">процесс упал<\/option>/);
+  assert.doesNotMatch(ops, /value="false_positive"/, "ложное — только вместе со статусом «ложное срабатывание»");
+  assert.match(html(h(statusForm.ClosureLabelFields, { ops: true, status: "false_positive", attack, disabled: false })), /<option value="false_positive" selected="">ложное срабатывание<\/option>/);
+});
+
 test("прочие формы: пользователи, режим реагирования, блокировки, повторный разбор, пароль, TOTP, Wazuh, дашборды, алиасы", () => {
   assert.match(stripTags(html(h(usersForm.CreateUserForm, {}))), /Имя Роль Создать/);
   assert.match(html(h(usersForm.ResetPasswordButton, { name: "u1" })), /u1/);

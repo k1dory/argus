@@ -25,14 +25,22 @@ type IncidentStateEvent struct {
 	ClosureLabel
 }
 
-// ClosureLabel — типизированный ответ человека при завершении (миграция 0033).
+// ClosureLabel — типизированный ответ человека при завершении (миграции 0033, 0036).
 // У переходов без завершения и у автоматики — нулевое значение: пустые строки,
 // null, LabeledByHuman=false.
 type ClosureLabel struct {
-	Disposition     string `json:"disposition"`
-	Escalate        *bool  `json:"escalate"`
+	Disposition string `json:"disposition"`
+	Escalate    *bool  `json:"escalate"`
+	// SeverityLevel — какой уровень правильный (1–4, миграция 0036); SeverityCorrect
+	// вычисляется движком: совпал ли он с уровнем правила (null — уровень не из шкалы).
+	SeverityLevel   *uint8 `json:"severity_level"`
 	SeverityCorrect *bool  `json:"severity_correct"`
+	AttackTactic    string `json:"attack_tactic"`
+	AttackTechnique string `json:"attack_technique"`
+	AttackVersion   string `json:"attack_version"`
 	OpsCause        string `json:"ops_cause"`
+	OpsActNow       *bool  `json:"ops_act_now"`
+	OpsUrgency      *uint8 `json:"ops_urgency"`
 	OpsAction       string `json:"ops_action"`
 	Blind           bool   `json:"blind"`
 	LabeledByHuman  bool   `json:"labeled_by_human"`
