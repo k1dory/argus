@@ -8,10 +8,11 @@ export type IncidentMember = { ip: string; first: string; last: string; events: 
 
 export type MemberBlockRow = { ip: string; executor: string; mode: string; dry_run: number; ok: number; detail: string };
 
-export type MemberBlockState = "blocked" | "simulated" | "capped" | "ids" | "waiting" | "refused" | "failed" | "none";
+export type MemberBlockState = "blocked" | "released" | "simulated" | "capped" | "ids" | "waiting" | "refused" | "failed" | "none";
 
 export const MEMBER_BLOCK_LABEL: Record<MemberBlockState, string> = {
   blocked: "заблокирован",
+  released: "блок снят (TTL или оператор)",
   simulated: "симуляция блока",
   capped: "потолок блокировок — решение за аналитиком",
   ids: "IDS: автоответ выключен",
@@ -51,6 +52,8 @@ export function parseMembers(raw: unknown): IncidentMember[] {
  */
 export function memberBlockState(row: MemberBlockRow | undefined): MemberBlockState {
   if (!row) return "none";
+  // Снятие (по TTL или оператором) пишет исполнитель «<имя>.unblock».
+  if (row.executor.endsWith(".unblock")) return row.ok ? "released" : "failed";
   if (row.executor !== "argus") {
     if (!row.ok) return "failed";
     return row.dry_run || row.mode === "simulate" ? "simulated" : "blocked";
@@ -58,5 +61,7 @@ export function memberBlockState(row: MemberBlockRow | undefined): MemberBlockSt
   if (row.detail.startsWith("потолок блокировок инцидента")) return "capped";
   if (row.detail.startsWith("режим IDS")) return "ids";
   if (row.detail.startsWith("ожидание:")) return "waiting";
+  // Адрес уже заблокирован другим инцидентом или оператором — блок есть, это не отказ.
+  if (row.detail.startsWith("уже заблокирован")) return "blocked";
   return "refused";
 }

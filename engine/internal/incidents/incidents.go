@@ -79,8 +79,10 @@ type Incident struct {
 	// groupPending — group_key присвоен старому инциденту, но ещё не записан:
 	// Apply отдаёт инцидент на запись каждый цикл, пока движок не вызовет Persisted.
 	groupPending bool
-	// parts — сработки участников склеенного инцидента «правило|адрес» (collapse.go).
-	parts map[string]*part
+	// parts — сработки участников склеенного инцидента «правило|адрес» (collapse.go);
+	// droppedIPs — адреса, вытесненные из Members (счёт MembersDropped без повторов).
+	parts      map[string]*part
+	droppedIPs map[string]bool
 	// reviewNoted — ротация без подтверждения уже отмечена заметкой.
 	reviewNoted bool
 	// Review — причина пометки «закрыт автоматикой, нужна проверка» для

@@ -76,19 +76,28 @@ func (m *MemberList) UnmarshalJSON(b []byte) error {
 }
 
 // part — последняя сработка одного правила по одному адресу.
+// События части держатся, только пока укладываются в общий бюджет инцидента
+// (maxCollapsedEvents); у остальных частей остаются время и число событий —
+// этого хватает, чтобы понять, есть ли у сработки новое.
 type part struct {
 	rule, ip    string
 	level       string
 	title       string
 	tags        []string
 	first, last string
+	count       int
 	events      []*model.Event
 }
 
 func newPart(d eval.Detection) *part {
 	return &part{rule: d.Rule.ID, ip: d.Key, level: d.Rule.Level, title: d.Rule.Title, tags: d.Rule.Tags,
-		first: model.FormatTS(d.First), last: model.FormatTS(d.Last), events: d.Events}
+		first: model.FormatTS(d.First), last: model.FormatTS(d.Last), count: len(d.Events), events: d.Events}
 }
+
+// maxDroppedIPs — сколько вытесненных из списка адресов помнить, чтобы не
+// посчитать один адрес в members_dropped дважды (только в памяти; сверх потолка
+// и после рестарта счёт приблизительный, с запасом вверх).
+const maxDroppedIPs = 4096
 
 // applyCollapsed — сработка правила со склейкой: дописать участника в открытый
 // инцидент подсети или завести новый. done=false — склеивать нечего (ключ не
@@ -98,10 +107,10 @@ func (r *Registry) applyCollapsed(d eval.Detection, net string, now time.Time, c
 	pk := d.Rule.ID + "|" + d.Key
 	last := model.FormatTS(d.Last)
 	if ex, ok := r.open[key]; ok {
-		if p := ex.parts[pk]; p != nil && len(d.Events) <= len(p.events) && last <= p.last {
+		if p := ex.parts[pk]; p != nil && len(d.Events) <= p.count && last <= p.last {
 			return // ничего нового
 		}
-		if ex.parts[pk] == nil && ex.memberCovers(d.Key, last, len(d.Events)) {
+		if ex.parts[pk] == nil && ex.memberCovers(d.Rule.ID, d.Key, last, len(d.Events)) {
 			// Восстановленный после рестарта инцидент: адрес уже записан с этими
 			// событиями — запомнить сработку, но не переписывать инцидент.
 			ex.setPart(newPart(d))
@@ -141,32 +150,45 @@ func (inc *Incident) setPart(p *part) {
 	inc.parts[p.rule+"|"+p.ip] = p
 }
 
-// memberCovers — адрес уже есть в записанном списке участников с не меньшим
-// числом событий и не раньше last.
-func (inc *Incident) memberCovers(ip, last string, events int) bool {
+// memberCovers — сработка правила rule по адресу уже записана в списке участников
+// (восстановленный инцидент): то же правило, не раньше last, не меньше событий.
+// Другое правило по тому же адресу — новая сработка: старший обход хостов не
+// прячется за уже записанной долбёжкой.
+func (inc *Incident) memberCovers(rule, ip, last string, events int) bool {
 	for _, m := range inc.Members {
 		if m.IP == ip {
-			return m.Last >= last && int(m.Events) >= events
+			return containsStr(m.Rules, rule) && m.Last >= last && int(m.Events) >= events
 		}
 	}
 	return false
 }
 
-// aggregate пересчитывает инцидент по участникам: события — объединение без
-// повторов (обход хостов и скан портов одного адреса — одни и те же потоки),
-// время — по крайним, уровень — старший из правил, список адресов.
+// aggregate пересчитывает инцидент по участникам. Записанная история адреса
+// (первое появление, правила, число событий) только дополняется сработками из
+// буфера: после рестарта буфер короче, и меньшее окно не должно её стирать.
+// События — объединение без повторов (обход хостов и скан портов одного адреса —
+// одни и те же потоки) в пределах maxCollapsedEvents; уровень — старший из правил.
 func (inc *Incident) aggregate() {
-	seen := map[*model.Event]bool{}
-	var evs []*model.Event
-	var rep *part
 	byIP := map[string]*Member{}
+	for _, m := range inc.Members {
+		cp := m
+		cp.Rules = append([]string(nil), m.Rules...)
+		byIP[m.IP] = &cp
+	}
 	ipEvents := map[string]map[*model.Event]bool{}
+	var rep *part
 	for _, p := range inc.parts {
 		m := byIP[p.ip]
 		if m == nil {
 			m = &Member{IP: p.ip, First: p.first, Last: p.last}
 			byIP[p.ip] = m
-			ipEvents[p.ip] = map[*model.Event]bool{}
+			if inc.droppedIPs[p.ip] {
+				// Вытесненный адрес вернулся в список: в счёте вытесненных его больше нет.
+				delete(inc.droppedIPs, p.ip)
+				if inc.MembersDropped > 0 {
+					inc.MembersDropped--
+				}
+			}
 		}
 		if p.first < m.First {
 			m.First = p.first
@@ -177,12 +199,14 @@ func (inc *Incident) aggregate() {
 		if !containsStr(m.Rules, p.rule) {
 			m.Rules = append(m.Rules, p.rule)
 		}
+		if uint32(p.count) > m.Events {
+			m.Events = uint32(p.count)
+		}
+		if ipEvents[p.ip] == nil {
+			ipEvents[p.ip] = map[*model.Event]bool{}
+		}
 		for _, e := range p.events {
 			ipEvents[p.ip][e] = true
-			if !seen[e] {
-				seen[e] = true
-				evs = append(evs, e)
-			}
 		}
 		// Инцидент представляет старшее правило группы (при равенстве — более
 		// раннее): обход хостов важнее долбёжки в один порт того же адреса.
@@ -194,16 +218,11 @@ func (inc *Incident) aggregate() {
 	if rep != nil && (inc.RuleID == "" || rankOf(rep.level) > rankOf(inc.Level)) {
 		inc.RuleID, inc.RuleTitle, inc.Tags, inc.Level = rep.rule, rep.title, rep.tags, rep.level
 	}
-	// Записанные участники, чьих сработок уже нет в буфере (рестарт, давняя
-	// активность), остаются в списке как были.
-	members := make([]Member, 0, len(byIP)+len(inc.Members))
-	for _, m := range inc.Members {
-		if byIP[m.IP] == nil {
-			members = append(members, m)
-		}
-	}
+	members := make([]Member, 0, len(byIP))
 	for ip, m := range byIP {
-		m.Events = uint32(len(ipEvents[ip]))
+		if n := uint32(len(ipEvents[ip])); n > m.Events {
+			m.Events = n
+		}
 		sort.Strings(m.Rules)
 		members = append(members, *m)
 	}
@@ -214,11 +233,54 @@ func (inc *Incident) aggregate() {
 		return members[i].IP < members[j].IP
 	})
 	if len(members) > maxMembers {
-		inc.MembersDropped += uint32(len(members) - maxMembers)
+		// Вытесненные — самые давние: их сработки уходят из памяти вместе с ними,
+		// а в счёт members_dropped каждый адрес попадает один раз.
+		for _, m := range members[maxMembers:] {
+			if !inc.droppedIPs[m.IP] {
+				if inc.droppedIPs == nil {
+					inc.droppedIPs = map[string]bool{}
+				}
+				if len(inc.droppedIPs) < maxDroppedIPs {
+					inc.droppedIPs[m.IP] = true
+				}
+				inc.MembersDropped++
+			}
+			for k, p := range inc.parts {
+				if p.ip == m.IP {
+					delete(inc.parts, k)
+				}
+			}
+		}
 		members = members[:maxMembers]
 	}
 	inc.Members = members
 
+	// Бюджет событий: свежие сработки держат события, у давних остаётся только счёт.
+	parts := make([]*part, 0, len(inc.parts))
+	for _, p := range inc.parts {
+		parts = append(parts, p)
+	}
+	sort.Slice(parts, func(i, j int) bool { return parts[i].last > parts[j].last })
+	seen := map[*model.Event]bool{}
+	var evs []*model.Event
+	for _, p := range parts {
+		fresh := 0
+		for _, e := range p.events {
+			if !seen[e] {
+				fresh++
+			}
+		}
+		if len(evs)+fresh > maxCollapsedEvents {
+			p.events = nil
+			continue
+		}
+		for _, e := range p.events {
+			if !seen[e] {
+				seen[e] = true
+				evs = append(evs, e)
+			}
+		}
+	}
 	sort.SliceStable(evs, func(i, j int) bool { return evs[i].TS < evs[j].TS })
 	count := uint32(0)
 	for _, m := range members {
@@ -226,9 +288,6 @@ func (inc *Incident) aggregate() {
 	}
 	if count > inc.EventCount {
 		inc.EventCount = count
-	}
-	if len(evs) > maxCollapsedEvents {
-		evs = evs[len(evs)-maxCollapsedEvents:]
 	}
 	inc.Events = evs
 	srcSet := map[string]bool{}

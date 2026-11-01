@@ -220,9 +220,10 @@ func TestScanCollapseIPv6(t *testing.T) {
 	}
 }
 
-// Рестарт: склеенный инцидент восстанавливается по group_key и members;
-// записанный адрес не блокируется заново, новый адрес подсети — блокируется
-// и дописывается в тот же инцидент.
+// Рестарт: склеенный инцидент восстанавливается по group_key и members, решения
+// по адресам — по response_log; заблокированный до рестарта адрес не блокируется
+// заново (один блок за всё время), новый адрес подсети — блокируется и
+// дописывается в тот же инцидент.
 func TestScanCollapseRestart(t *testing.T) {
 	f := newFakeCH(t)
 	srv, blocks := ngfw(t)
@@ -232,6 +233,12 @@ func TestScanCollapseRestart(t *testing.T) {
 	if len(created) != 1 {
 		t.Fatal("нет инцидента")
 	}
+	e.autoRespond(context.Background(), snapshotIncidents(created), now)
+	f.waitRows(t, "response_log", 1)
+	// response_log переживает рестарт: по нему восстанавливается, кого блокировали.
+	f.mu.Lock()
+	f.selects["FROM response_log"] = strings.Join(f.inserts["response_log"], "\n") + "\n"
+	f.mu.Unlock()
 	// Строка incidents так, как её записал движок, и обратно — как после рестарта.
 	raw, err := json.Marshal(created[0])
 	if err != nil {
@@ -254,9 +261,9 @@ func TestScanCollapseRestart(t *testing.T) {
 		t.Fatalf("после рестарта: created=%d updated=%+v", len(created2), updated)
 	}
 	e.autoRespond(context.Background(), snapshotIncidents(updated), now.Add(time.Minute))
-	rows := f.waitRows(t, "response_log", 1)
+	rows := f.waitRows(t, "response_log", 2)
 	time.Sleep(50 * time.Millisecond)
-	if got := blockedIPs(f.rows("response_log")); got["203.0.113.10"] != 0 || got["203.0.113.30"] != 1 || *blocks != 1 {
+	if got := blockedIPs(f.rows("response_log")); got["203.0.113.10"] != 1 || got["203.0.113.30"] != 1 || *blocks != 2 {
 		t.Fatalf("блоки после рестарта: %v rows=%v", got, rows)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
 
@@ -138,22 +139,91 @@ func (e *engine) capRelease(id string, at time.Time) {
 // restoreRespState — после рестарта: открытые инциденты с правилом respond
 // считаются решёнными (done). Их дописывание иначе вызвало бы исполнителей
 // заново: список активных блокировок в памяти и после рестарта пуст.
+// Склеенный по подсети решается по адресам: решения и потраченный потолок
+// восстанавливаются из response_log (членство в инциденте само по себе не
+// значит, что адрес блокировали). Если журнал недоступен — осторожно: все
+// записанные адреса решены, потолок окна считается исчерпанным.
 func (e *engine) restoreRespState(open []incidents.Incident, now time.Time) int {
 	n := 0
+	var collapsed []string
+	byID := map[string]*incidents.Incident{}
 	for i := range open {
-		if r := e.ruleFor(open[i].RuleID); r != nil && r.Respond != nil {
+		r := e.ruleFor(open[i].RuleID)
+		if incidents.IsCollapsedKey(open[i].GroupKey) {
+			collapsed = append(collapsed, open[i].IncidentID)
+			byID[open[i].IncidentID] = &open[i]
+			n++
+			continue
+		}
+		if r != nil && r.Respond != nil {
 			e.setRespStatus(open[i].IncidentID, "done", now)
-			// У склеенного — каждый записанный адрес: новый адрес подсети после
-			// рестарта блокируется, уже бывшие — нет.
-			if incidents.IsCollapsedKey(open[i].GroupKey) {
-				for _, ip := range open[i].MemberIPs() {
-					e.setRespStatus(open[i].IncidentID+"|"+ip, "done", now)
-				}
-			}
 			n++
 		}
 	}
+	if len(collapsed) == 0 {
+		return n
+	}
+	rows, err := e.ch.ResponsesFor(context.Background(), collapsed, now.Add(-respStateTTL))
+	if err != nil {
+		slog.Warn("ips: решения склеенных инцидентов не восстановлены — адреса считаются решёнными, потолок исчерпанным", "err", err)
+		for _, id := range collapsed {
+			inc := byID[id]
+			for _, ip := range inc.MemberIPs() {
+				e.setRespStatus(id+"|"+ip, "done", now)
+			}
+			if r := e.ruleFor(inc.RuleID); r != nil {
+				limit, _ := r.IncidentCap()
+				e.respMu.Lock()
+				e.respCap[id] = slices.Repeat([]time.Time{now}, limit)
+				e.respMu.Unlock()
+			}
+		}
+		return n
+	}
+	for _, row := range rows {
+		key := row.IncidentID + "|" + row.IP
+		at, perr := time.ParseInLocation("2006-01-02 15:04:05", row.TS, time.UTC)
+		if perr != nil {
+			at = now
+		}
+		switch state := restoredState(row); state {
+		case "blocked":
+			e.setRespStatus(key, "done", now)
+			e.respMu.Lock()
+			e.respCap[row.IncidentID] = append(e.respCap[row.IncidentID], at)
+			e.respMu.Unlock()
+		case "failed":
+			// Блок не вышел, повтор responder'а после рестарта потерян: адрес не решён,
+			// но место в потолке он держал — держит и теперь.
+			e.respMu.Lock()
+			e.respCap[row.IncidentID] = append(e.respCap[row.IncidentID], at)
+			e.respMu.Unlock()
+		case "":
+		default:
+			e.setRespStatus(key, state, now)
+		}
+	}
 	return n
+}
+
+// restoredState — что значила запись response_log для решения по адресу:
+// blocked (блок или симуляция — done и место в потолке), failed (сбой
+// исполнителя — только место), done/capped — решение без блока, "" — ожидание.
+func restoredState(row store.ResponseRow) string {
+	switch {
+	case strings.HasSuffix(row.Executor, ".unblock"):
+		return "done" // блок был и уже снят
+	case row.Executor != "argus" && row.OK == 1:
+		return "blocked"
+	case row.Executor != "argus":
+		return "failed"
+	case strings.HasPrefix(row.Detail, "потолок блокировок"):
+		return "capped"
+	case strings.HasPrefix(row.Detail, "ожидание:"), strings.HasPrefix(row.Detail, "предупреждение:"), strings.HasPrefix(row.Detail, "адресов больше"):
+		return ""
+	default:
+		return "done" // IDS, уже заблокирован, отказ по allowlist/never_block
+	}
 }
 
 // respUnit — что решается автоответом отдельно: инцидент целиком или, у
@@ -237,7 +307,8 @@ func (e *engine) autoRespond(ctx context.Context, incs []*incidents.Incident, no
 			if collapsed {
 				r = nil
 				for _, id := range inc.MemberRules(u.ip) {
-					if rr := e.ruleFor(id); respondsAt(rr, rr.Level) {
+					// Правило могли удалить reload'ом, а его id остался в истории адреса.
+					if rr := e.ruleFor(id); rr != nil && respondsAt(rr, rr.Level) {
 						r = rr
 						break
 					}
@@ -312,8 +383,12 @@ func (e *engine) autoRespond(ctx context.Context, incs []*incidents.Incident, no
 				for _, res := range results {
 					rows = append(rows, respRow(ts, mode, "argus-engine", res, r.ID, reason))
 				}
-				if applied || mode == respond.ModeSimulate {
-					reserved = false // место потрачено
+				// Место потрачено блоком или симуляцией. Сбой всех исполнителей тоже держит
+				// место: responder повторит блок сам (Retry), и повтор должен уложиться в
+				// тот же потолок. Возвращается место только без блока: отказ по
+				// allowlist/never_block, IDS, адрес уже заблокирован.
+				if applied || mode == respond.ModeSimulate || (!respond.Noop(results) && len(results) > 0) {
+					reserved = false
 				}
 				switch {
 				case applied:
