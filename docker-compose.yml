@@ -414,7 +414,9 @@ services:
       SMTP_TO: ${SMTP_TO:-}
       RISK_REPORT_INTERVAL: ${RISK_REPORT_INTERVAL:-}
     volumes:
-      - ./rules:/rules:ro
+      # Прод: неизменяемый снимок правил по хешу (роль argus, ARGUS_RULES_HOST_DIR), а не
+      # живой ./rules checkout — обновление кода не меняет правила под запущенным движком.
+      - ${ARGUS_RULES_HOST_DIR:-./rules}:/rules:ro
       - ./cmdb.yml:/etc/argus/cmdb.yml:ro
       - ./identities.yml:/etc/argus/identities.yml:ro
       - ./caddy/certs:/certs:ro
