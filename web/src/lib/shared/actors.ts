@@ -251,15 +251,58 @@ export function aliasInterval(a: Pick<Alias, "valid_from" | "valid_to">, w: Wind
  * prefix — чтобы два предиката в одном запросе не делили имена параметров;
  * tsColumn — колонка времени (first_ts для инцидентов).
  */
-export function aliasPredicate(aliases: Alias[], window: Window, prefix = "", tsColumn = "ts"): Predicate {
+/** Алиасов в предикате больше стольких — компактная форма (aliasPredicate). */
+export const PREDICATE_OR_MAX = 64;
+
+export function aliasPredicate(aliases: Alias[], window: Window, prefix = "", tsColumn = "ts", form: "auto" | "or" | "arrays" = "auto"): Predicate {
   const w = clampWindow(window);
   const params: Record<string, string | number> = {};
+  const live = aliases.flatMap((a) => {
+    if (isHeld(a)) return []; // удержанный алиас не сшивает события
+    const iv = aliasInterval(a, w);
+    return iv ? [{ a, iv }] : [];
+  });
+  if (form === "arrays" || (form === "auto" && live.length > PREDICATE_OR_MAX)) {
+    // Компактная форма, как activityPlan: интервалы одного значения пронумерованы подряд,
+    // transform по колонке сравнения даёт отрезок их номеров (хеш-поиск), лямбда проходит
+    // только по нему. Массивы — параметрами (arrayParam делит их на части), текст SQL не
+    // растёт с числом алиасов. Ветки OR позволяют индексу отсекать гранулы, но строки и
+    // так отбирает aliasPrefilter, а тысячи веток не помещались в max_query_size
+    // (256 КиБ) и в поле формы ClickHouse. Массивы значений — не аргументами
+    // arrayExists: те ClickHouse разворачивает на каждую строку (тысячи значений ×
+    // строки — гигабайты).
+    const byColumn = new Map<string, Map<string, { fromMs: number; toMs: number }[]>>();
+    for (const { a, iv } of live) {
+      const col = aliasColumnExpr(a.kind);
+      const byValue = byColumn.get(col) ?? new Map<string, { fromMs: number; toMs: number }[]>();
+      byColumn.set(col, byValue);
+      byValue.set(a.value, [...(byValue.get(a.value) ?? []), iv]);
+    }
+    const from: string[] = [], to: string[] = [];
+    const lookups: string[] = [];
+    [...byColumn].forEach(([col, byValue], j) => {
+      const keys: string[] = [], spans: string[] = [];
+      for (const [value, ivs] of byValue) {
+        keys.push(chStringLiteral(value));
+        spans.push(span(from.length + 1, ivs.length));
+        for (const iv of ivs) {
+          from.push(String(iv.fromMs));
+          to.push(String(iv.toMs));
+        }
+      }
+      const k = arrayParam(params, `${prefix}ck${j}`, "Array(String)", keys);
+      const r = arrayParam(params, `${prefix}cr${j}`, "Array(UInt64)", spans);
+      lookups.push(spanRange(`transform(${col}, ${k}, ${r}, toUInt64(0))`));
+    });
+    if (!lookups.length) return { sql: "0", params };
+    const f = arrayParam(params, `${prefix}cf`, "Array(Int64)", from);
+    const t = arrayParam(params, `${prefix}ct`, "Array(Int64)", to);
+    const ms = `toUnixTimestamp64Milli(${tsColumn})`;
+    return { sql: `arrayExists(c -> ${ms} >= ${f}[c] AND ${ms} < ${t}[c], arrayConcat(${lookups.join(", ")}))`, params };
+  }
   const parts: string[] = [];
   let i = 0;
-  for (const a of aliases) {
-    if (isHeld(a)) continue; // удержанный алиас не сшивает события
-    const iv = aliasInterval(a, w);
-    if (!iv) continue;
+  for (const { a, iv } of live) {
     const an = `${prefix}a${i}`, fn = `${prefix}f${i}`, tn = `${prefix}t${i}`;
     params[an] = a.value;
     params[fn] = chTs(iv.fromMs);
@@ -285,9 +328,11 @@ export type ActivityPlan = {
   params: Record<string, string | number>;
 };
 
-/** Часть массива-параметра не больше стольких байт UTF-8: длинный параметр уходит телом
- *  multipart (clickhouse.ts), а у поля формы есть предел значения (Poco HTMLForm,
- *  http_max_field_value_size — 128 КиБ на 24.8, в байтах; из URL не поднимается). */
+/** Часть массива-параметра не больше стольких байт в виде, в каком она уходит в URL
+ *  (application/x-www-form-urlencoded, как сериализует URLSearchParams), — значит, и в
+ *  сыром UTF-8 не больше. У поля формы ClickHouse предел значения (Poco HTMLForm,
+ *  http_max_field_value_size — 128 КиБ на 24.8; из URL не поднимается), и в URL он
+ *  меряется до percent-decoding: часть годится и для URL, и для multipart (clickhouse.ts). */
 export const ARRAY_PARAM_CHUNK = 60_000;
 
 /** Длина строки в байтах UTF-8 (без Buffer: модуль общий с клиентом). */
@@ -297,30 +342,49 @@ export function utf8Bytes(s: string): number {
     const c = s.charCodeAt(i);
     if (c < 0x80) n += 1;
     else if (c < 0x800) n += 2;
-    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length) { n += 4; i++; } // суррогатная пара
+    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length && s.charCodeAt(i + 1) >= 0xdc00 && s.charCodeAt(i + 1) <= 0xdfff) { n += 4; i++; } // суррогатная пара
     else n += 3;
+  }
+  return n;
+}
+
+/** Длина строки после сериализации URLSearchParams: буквы, цифры и «*-._» как есть,
+ *  пробел — «+», остальное — %XX на каждый байт UTF-8 (в том числе «~», «'», «,»). */
+export function formEncodedBytes(s: string): number {
+  let n = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if ((c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || c === 0x2a || c === 0x2d || c === 0x2e || c === 0x5f || c === 0x20) n += 1;
+    else if (c < 0x80) n += 3;
+    else if (c < 0x800) n += 6;
+    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length && s.charCodeAt(i + 1) >= 0xdc00 && s.charCodeAt(i + 1) <= 0xdfff) { n += 12; i++; }
+    else n += 9; // в том числе непарный суррогат: URLSearchParams отправляет U+FFFD (3 байта)
   }
   return n;
 }
 
 /**
  * Массив-параметр из готовых литералов элементов: одним параметром {name:Type}, а если
- * длиннее ARRAY_PARAM_CHUNK байт — частями name_0, name_1… и arrayConcat в SQL. Делится
+ * в URL он длиннее ARRAY_PARAM_CHUNK байт (formEncodedBytes) — частями name_0, name_1… и arrayConcat в SQL. Делится
  * только между элементами, поэтому элементы — скаляры (вложенные массивы не годятся:
  * один элемент мог бы сам превысить предел поля). Склейка констант — константа: её
  * принимают transform и IN.
  */
 export function arrayParam(params: Record<string, string | number>, name: string, type: string, elements: string[]): string {
+  // Бюджет части: скобки «[» «]» (%5B %5D — 6 байт), элементы и «,» (%2C) между ними.
+  const BRACKETS = 6, COMMA = 3;
   const chunks: string[][] = [[]];
-  let len = 0;
+  let len = BRACKETS;
   for (const el of elements) {
-    const bytes = utf8Bytes(el) + 1;
-    if (len + bytes > ARRAY_PARAM_CHUNK && chunks[chunks.length - 1].length) {
-      chunks.push([]);
-      len = 0;
+    const bytes = formEncodedBytes(el);
+    const cur = chunks[chunks.length - 1];
+    if (cur.length && len + COMMA + bytes > ARRAY_PARAM_CHUNK) {
+      chunks.push([el]);
+      len = BRACKETS + bytes;
+      continue;
     }
-    chunks[chunks.length - 1].push(el);
-    len += bytes;
+    cur.push(el);
+    len += (cur.length > 1 ? COMMA : 0) + bytes;
   }
   if (chunks.length === 1) {
     params[name] = `[${chunks[0].join(",")}]`;

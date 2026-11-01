@@ -44,8 +44,28 @@ test("chQuery: SQL длиннее поля формы — телом text/plain,
   assert.equal(seen[0].type, "text/plain", "query полем формы не пройдёт: предел 128 КиБ");
   assert.equal(seen[0].body, sql);
   assert.equal(seen[0].url.searchParams.get("param_v"), big);
-  // Параметры не помещаются и в URI — остаётся multipart (ClickHouse ответит явной ошибкой).
-  const huge = "z".repeat(ch.URI_PARAMS_MAX + 1);
-  await ch.chQuery(sql, { v: huge });
-  assert.match(seen[1].type, /^multipart\/form-data/);
+  // Ни поле формы, ни URL не принимают — явная ошибка до отправки, а не 414 или
+  // «Field value too long» от сервера.
+  const parts = Object.fromEntries(Array.from({ length: 10 }, (_, i) => [`p${i}`, "z".repeat(110 * 1024)]));
+  await assert.rejects(ch.chQuery(sql + Object.keys(parts).map((k) => `{${k}:String}`).join(""), parts), /не помещается в HTTP ClickHouse/);
+  assert.equal(seen.length, 1, "запрос не отправлен");
+});
+
+test("chQuery: предел поля URL — по percent-encoded строке, URI — как его сериализует URLSearchParams", async (t) => {
+  const seen: { url: URL; type: string }[] = [];
+  t.mock.method(globalThis, "fetch", async (input: URL | string | Request, init?: RequestInit) => {
+    seen.push({ url: new URL(String(input)), type: String(new Headers(init?.headers).get("content-type")) });
+    return new Response("");
+  });
+  const ch = await import("../src/lib/clickhouse");
+  const sql = `SELECT {v:String} /* ${"x".repeat(ch.FORM_FIELD_MAX)} */`;
+  // 60 000 «é» — 120 КБ UTF-8, но 360 КБ в URL: поле в URL не пройдёт, а SQL — полем формы.
+  await assert.rejects(ch.chQuery(sql, { v: "é".repeat(60_000) }), /не помещается/);
+  // «~» — %7E в URLSearchParams: по encodeURIComponent URI укладывался бы, по факту — нет.
+  const tilde = Object.fromEntries(Array.from({ length: 9 }, (_, i) => [`t${i}`, "~".repeat(38_000)]));
+  const tsql = sql + Object.keys(tilde).map((k) => `{${k}:String}`).join("");
+  const estimate = Object.entries(tilde).reduce((n, [k, v]) => n + k.length + 8 + encodeURIComponent(v).length, 0);
+  assert.ok(estimate < 1024 * 1024, "оценка encodeURIComponent укладывается в 1 MiB");
+  await assert.rejects(ch.chQuery(tsql, tilde), /не помещается/);
+  assert.equal(seen.length, 0);
 });
