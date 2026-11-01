@@ -23,6 +23,7 @@ function engineError(scope: string, err: unknown): string {
 export { INCIDENT_STATUSES, EXCEPTION_FIELDS, isIncidentStatus, type IncidentStatus } from "./shared/incidents";
 import { isIncidentStatus, type IncidentStatus } from "./shared/incidents";
 import type { ClosureLabel } from "./shared/closure-label";
+import { blockState, isSubnetKey, levelOfRank, SCAN_GROUP_RULES, subnetSQL, type BlockRow, type BlockState } from "./shared/scan-groups";
 import { AGENT_VERDICT_SESSION_ORDER } from "./shared/triage-verdict";
 
 
@@ -52,13 +53,11 @@ export type IncidentRow = {
 
 const LATEST = `SELECT * FROM incidents_current`;
 
-export async function incidentsList(
-  filter: { status?: string; level?: string; q?: string; page?: number; pageSize?: number; queue?: "open" | "mine" | "unassigned" | "overdue"; user?: string } = {},
-): Promise<{ rows: IncidentRow[]; total: number; page: number; pageSize: number }> {
+type IncidentFilter = { status?: string; level?: string; q?: string; page?: number; pageSize?: number; queue?: "open" | "mine" | "unassigned" | "overdue"; user?: string; groupScans?: boolean };
+
+/** Условия очереди (поиск, статус, уровень, очередь) — общие для списка и групп сканов. */
+function incidentConditions(filter: IncidentFilter, params: Record<string, string | number>): string[] {
   const having: string[] = [];
-  const pageSize = clampInt(filter.pageSize, 10, 200, 50);
-  let page = clampPage(filter.page);
-  const params: Record<string, string | number> = { limit: pageSize, offset: (page - 1) * pageSize };
   if (filter.q) {
     having.push(`(positionCaseInsensitiveUTF8(concat(incident_id, ' ', rule_title, ' ', rule_id, ' ', actor_name, ' ', node, ' ', arrayStringConcat(sources, ' ')), {q:String}) > 0)`);
     params.q = filter.q;
@@ -83,6 +82,25 @@ export async function incidentsList(
     // Срок первичной реакции: только ещё не взятые в работу инциденты.
     having.push("status = 'new' AND dateDiff('second', created_at, now()) > multiIf(level = 'critical', 900, level = 'high', 3600, level = 'medium', 14400, 86400)");
   }
+  return having;
+}
+
+/** Открытый инцидент сканов снаружи с адресом источника — попадает в группу подсети. */
+const SCAN_GROUPED = `(rule_id IN {scan_rules:Array(String)} AND status NOT IN ('closed', 'false_positive') AND ${subnetSQL("actor_name")} != '')`;
+const scanRulesParam = (): string => `[${SCAN_GROUP_RULES.map((r) => `'${r}'`).join(",")}]`;
+
+export async function incidentsList(
+  filter: IncidentFilter = {},
+): Promise<{ rows: IncidentRow[]; total: number; page: number; pageSize: number }> {
+  const pageSize = clampInt(filter.pageSize, 10, 200, 50);
+  let page = clampPage(filter.page);
+  const params: Record<string, string | number> = { limit: pageSize, offset: (page - 1) * pageSize };
+  const having = incidentConditions(filter, params);
+  if (filter.groupScans) {
+    // Сканы снаружи показаны группами по подсети (scanGroups) — в очереди их нет.
+    having.push(`NOT ${SCAN_GROUPED}`);
+    params.scan_rules = scanRulesParam();
+  }
   const where = having.length ? "WHERE " + having.join(" AND ") : "";
   const listSQL = `${LATEST} ${where} ORDER BY created_at DESC, incident_id DESC LIMIT {limit:UInt32} OFFSET {offset:UInt32}`;
   const [initialRows, cnt] = await Promise.all([
@@ -100,6 +118,64 @@ export async function incidentsList(
     rows = total > 0 ? await chQuery<IncidentRow>(listSQL, { ...params, offset: (page - 1) * pageSize }) : [];
   }
   return { rows: rows.map(normalizeIncident), total, page, pageSize };
+}
+
+export type ScanGroup = {
+  subnet: string; incidents: number; addresses: number; rules: string[];
+  first_ts: string; last_ts: string; level: string; unassigned: number;
+};
+
+/**
+ * Открытые инциденты сканов снаружи (SCAN_GROUP_RULES) по подсети источника под
+ * теми же условиями очереди: свёрнутая строка «подсеть: N адресов». Подсеть
+ * считается в запросе (subnetSQL) — инциденты и движок не меняются.
+ */
+export async function scanGroups(filter: IncidentFilter = {}, limit = 100): Promise<ScanGroup[]> {
+  const params: Record<string, string | number> = { scan_rules: scanRulesParam(), limit: clampInt(limit, 1, 500, 100) };
+  const having = [SCAN_GROUPED, ...incidentConditions(filter, params)];
+  const rows = await chQuery<ScanGroup & { level_rank: number | string; incidents: number | string; addresses: number | string; unassigned: number | string }>(
+    // Агрегаты под своими именами и переименование снаружи: псевдоним first_ts над
+    // min(first_ts) в том же SELECT перекрыл бы колонку внутри агрегата (184).
+    `SELECT subnet, incidents, addresses, rules, toString(f) AS first_ts, toString(l) AS last_ts, level_rank, unassigned FROM (
+       SELECT ${subnetSQL("actor_name")} AS subnet, count() AS incidents, uniqExact(actor_name) AS addresses,
+              arraySort(groupUniqArray(rule_id)) AS rules, min(first_ts) AS f, max(last_ts) AS l,
+              max(multiIf(level = 'critical', 4, level = 'high', 3, level = 'medium', 2, 1)) AS level_rank,
+              countIf(owner = '') AS unassigned
+       FROM (${LATEST} WHERE ${having.join(" AND ")})
+       GROUP BY subnet)
+     ORDER BY l DESC, subnet LIMIT {limit:UInt32}`,
+    params,
+  );
+  return rows.map((r) => ({
+    subnet: r.subnet, incidents: Number(r.incidents), addresses: Number(r.addresses), rules: r.rules,
+    first_ts: r.first_ts, last_ts: r.last_ts, level: levelOfRank(Number(r.level_rank)), unassigned: Number(r.unassigned),
+  }));
+}
+
+/** Инциденты одной подсети группы сканов как есть, свежие сверху (до 500). */
+export async function scanGroupIncidents(subnet: string, filter: IncidentFilter = {}): Promise<IncidentRow[]> {
+  if (!isSubnetKey(subnet)) return [];
+  const params: Record<string, string | number> = { scan_rules: scanRulesParam(), subnet };
+  const having = [SCAN_GROUPED, `${subnetSQL("actor_name")} = {subnet:String}`, ...incidentConditions(filter, params)];
+  const rows = await chQuery<IncidentRow>(
+    `${LATEST} WHERE ${having.join(" AND ")} ORDER BY last_ts DESC, incident_id DESC LIMIT 500`,
+    params,
+  );
+  return rows.map(normalizeIncident);
+}
+
+/** Статус блока каждого инцидента — по последней записи его response_log. */
+export async function incidentBlockStates(ids: string[]): Promise<Record<string, BlockState>> {
+  if (ids.length === 0) return {};
+  const rows = await chQuery<BlockRow & { incident_id: string }>(
+    `SELECT incident_id, argMax(executor, ts) AS executor, argMax(mode, ts) AS mode, argMax(dry_run, ts) AS dry_run,
+            argMax(ok, ts) AS ok, argMax(detail, ts) AS detail
+     FROM response_log WHERE incident_id IN {ids:Array(String)} AND ip != '' GROUP BY incident_id`,
+    { ids: `[${ids.map((id) => `'${id.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`).join(",")}]` },
+  );
+  const out: Record<string, BlockState> = {};
+  for (const r of rows) out[r.incident_id] = blockState({ ...r, dry_run: Number(r.dry_run), ok: Number(r.ok) });
+  return out;
 }
 
 export async function incidentGet(id: string): Promise<IncidentRow | null> {

@@ -16,9 +16,12 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { requirePageSession } from "@/lib/auth";
+import { listUsers, requirePageSession } from "@/lib/auth";
+import { ScanGroupActions } from "@/components/console/scan-group-actions";
+import { BLOCK_LABEL, isSubnetKey, SCAN_GROUP_RULES } from "@/lib/shared/scan-groups";
+import { ROLE_RANK } from "@/lib/shared/incidents";
 import { safeQuery } from "@/lib/clickhouse";
-import { INCIDENT_STATUSES, incidentClosuresFor, incidentStats, incidentsList, verdictsFor, type VerdictRow } from "@/lib/argus-queries";
+import { INCIDENT_STATUSES, incidentBlockStates, incidentClosuresFor, incidentStats, incidentsList, scanGroupIncidents, scanGroups, verdictsFor, type VerdictRow } from "@/lib/argus-queries";
 import { isIncidentStatus } from "@/lib/shared/incidents";
 import { reactionDeadline, reactionOverdue } from "@/lib/shared/incident-sla";
 import { verdictState, type VerdictState } from "@/lib/shared/incidents";
@@ -52,19 +55,35 @@ export default async function IncidentsPage({ searchParams }: PageProps<"/incide
   const q = typeof params.q === "string" ? params.q.trim().slice(0, 200) : undefined;
   const page = clampPage(params.page);
   const queue = params.queue === "open" || params.queue === "mine" || params.queue === "unassigned" || params.queue === "overdue" ? params.queue : undefined;
+  // Сканы снаружи (правила inbound-scan) по умолчанию свёрнуты по подсети источника;
+  // scans=list — показать их в очереди по одному, как раньше.
+  const scansList = params.scans === "list";
+  const subnet = typeof params.subnet === "string" && isSubnetKey(params.subnet) ? params.subnet : undefined;
+  const canEdit = ROLE_RANK[session.role] >= ROLE_RANK.analyst;
 
   const href = (patch: Record<string, string | undefined>) => {
     const qs = new URLSearchParams();
-    const next = { status, level, q, queue, page: undefined as string | undefined, ...patch };
+    const next = { status, level, q, queue, scans: scansList ? "list" : undefined, subnet, page: undefined as string | undefined, ...patch };
     for (const [k, v] of Object.entries(next)) if (v) qs.set(k, v);
     const s = qs.toString();
     return s ? `/incidents?${s}` : "/incidents";
   };
 
   const r = await safeQuery(async () => {
-    const [list, stats] = await Promise.all([incidentsList({ status, level, q, page, queue, user: session.user }), incidentStats()]);
+    const [list, stats] = await Promise.all([incidentsList({ status, level, q, page, queue, user: session.user, groupScans: !scansList }), incidentStats()]);
     return { list, stats };
   });
+  const filter = { status, level, q, queue, user: session.user } as const;
+  // Группы и раскрытая подсеть — отдельно: их недоступность не мешает очереди.
+  const groups = r.ok && !scansList ? await safeQuery(() => scanGroups(filter)) : null;
+  const expanded = r.ok && !scansList && subnet ? await safeQuery(async () => {
+    const rows = await scanGroupIncidents(subnet, filter);
+    const [blocks, users] = await Promise.all([
+      incidentBlockStates(rows.map((x) => x.incident_id)),
+      session.role === "admin" ? listUsers() : Promise.resolve([]),
+    ]);
+    return { rows, blocks, users };
+  }) : null;
   const verdicts = r.ok ? await safeQuery(() => verdictsFor(r.data.list.rows.map((x) => x.incident_id))) : null;
   const closures = r.ok ? await safeQuery(() => incidentClosuresFor(r.data.list.rows.map((x) => x.incident_id))) : null;
   const now = new Date();
@@ -88,6 +107,85 @@ export default async function IncidentsPage({ searchParams }: PageProps<"/incide
             <StatTile label="Эскалация" value={fmtNum(r.data.stats.escalated)} href="/incidents?status=escalated" led={r.data.stats.escalated > 0 ? "var(--status-err)" : "var(--status-ok)"} />
             <StatTile label="С ПДн" value={fmtNum(r.data.stats.pii)} />
           </div>
+
+          {groups && (
+            <Panel label="Сканы снаружи · по подсетям" meta={groups.ok ? `${fmtNum(groups.data.length)} подсетей · правила ${SCAN_GROUP_RULES.join(", ")}` : "временно недоступно"}>
+              <div className="mb-3 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                Открытые инциденты скана портов, обхода хостов и долбёжки сервиса свёрнуты по подсети источника (/24, IPv6 /48); в очереди ниже их нет.
+                <Link href={href({ scans: "list", subnet: undefined })} className="text-[var(--ring)] hover:underline">показать списком</Link>
+              </div>
+              {!groups.ok ? <p className="text-xs text-destructive">Группы сканов временно недоступны; очередь ниже — без них.</p>
+                : groups.data.length === 0 ? <p className="font-mono text-xs text-muted-foreground">открытых сканов нет</p>
+                : <div className="c-well overflow-x-auto p-2">
+                  <Table className="min-w-[900px]">
+                    <TableHeader>
+                      <TableRow className="border-border/60">
+                        <TableHead className="c-label">Подсеть</TableHead>
+                        <TableHead className="c-label">Адресов / инцидентов</TableHead>
+                        <TableHead className="c-label">Правила</TableHead>
+                        <TableHead className="c-label">Первое — последнее (UTC)</TableHead>
+                        <TableHead className="c-label">Уровень</TableHead>
+                        <TableHead className="c-label">Без ответственного</TableHead>
+                        <TableHead className="c-label"></TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {groups.data.map((g) => {
+                        const open = g.subnet === subnet;
+                        return <TableRow key={g.subnet} className="border-border/40 align-top">
+                          <TableCell className="font-mono text-xs">{g.subnet}</TableCell>
+                          <TableCell className="font-mono text-xs">{fmtNum(g.addresses)} / {fmtNum(g.incidents)}</TableCell>
+                          <TableCell className="font-mono text-xs whitespace-normal">{g.rules.join(", ")}</TableCell>
+                          <TableCell className="font-mono text-xs whitespace-nowrap">{formatTs(g.first_ts, "datetime")} — {formatTs(g.last_ts, "datetime")}</TableCell>
+                          <TableCell><LevelBadge level={g.level} /></TableCell>
+                          <TableCell className="font-mono text-xs">{fmtNum(g.unassigned)}</TableCell>
+                          <TableCell className="text-xs">
+                            <Link href={href({ subnet: open ? undefined : g.subnet })} aria-expanded={open} className="text-[var(--ring)] hover:underline">{open ? "свернуть" : "раскрыть"}</Link>
+                          </TableCell>
+                        </TableRow>;
+                      })}
+                    </TableBody>
+                  </Table>
+                </div>}
+              {subnet && expanded && (!expanded.ok ? <p className="mt-3 text-xs text-destructive">Инциденты подсети {subnet} временно недоступны.</p> : <div className="mt-4">
+                <div className="c-label mb-2">Подсеть {subnet} · {fmtNum(expanded.data.rows.length)} открытых инцидентов</div>
+                <div className="c-well overflow-x-auto p-2">
+                  <Table className="min-w-[900px]">
+                    <TableHeader>
+                      <TableRow className="border-border/60">
+                        <TableHead className="c-label">Инцидент</TableHead>
+                        <TableHead className="c-label">Адрес</TableHead>
+                        <TableHead className="c-label">Правило</TableHead>
+                        <TableHead className="c-label">Последнее (UTC)</TableHead>
+                        <TableHead className="c-label">Уровень</TableHead>
+                        <TableHead className="c-label">Статус</TableHead>
+                        <TableHead className="c-label">Ответственный</TableHead>
+                        <TableHead className="c-label">Блокировка</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {expanded.data.rows.map((row) => {
+                        const st = expanded.data.blocks[row.incident_id] ?? "none";
+                        return <TableRow key={row.incident_id} className="border-border/40">
+                          <TableCell className="font-mono text-xs"><Link href={`/incidents/${row.incident_id}`} className="text-[var(--ring)] hover:underline">{row.incident_id}</Link></TableCell>
+                          <TableCell className="font-mono text-xs">{row.actor_name}</TableCell>
+                          <TableCell className="font-mono text-xs">{row.rule_id}</TableCell>
+                          <TableCell className="font-mono text-xs whitespace-nowrap">{formatTs(row.last_ts, "datetime")}</TableCell>
+                          <TableCell><LevelBadge level={row.level} /></TableCell>
+                          <TableCell><StatusBadge status={row.status} /></TableCell>
+                          <TableCell className="font-mono text-xs">{row.owner || "не назначен"}</TableCell>
+                          <TableCell className={st === "blocked" ? "text-xs text-[var(--status-err)]" : st === "failed" ? "text-xs text-[var(--status-warn)]" : "text-xs text-muted-foreground"}>{BLOCK_LABEL[st]}</TableCell>
+                        </TableRow>;
+                      })}
+                    </TableBody>
+                  </Table>
+                </div>
+                {canEdit && expanded.data.rows.length > 0 && <ScanGroupActions subnet={subnet} count={expanded.data.rows.length}
+                  isAdmin={session.role === "admin"} users={expanded.data.users.map((u) => ({ name: u.name, role: u.role }))} />}
+              </div>)}
+            </Panel>
+          )}
+          {scansList && <p className="text-xs text-muted-foreground">Сканы снаружи показаны в очереди по одному · <Link href={href({ scans: undefined })} className="text-[var(--ring)] hover:underline">свернуть по подсетям</Link></p>}
 
           <Panel label={`Очередь · ${fmtNum(r.data.list.total)} инцидентов`} meta={`страница ${r.data.list.page} из ${Math.max(1, Math.ceil(r.data.list.total / r.data.list.pageSize))}`}>
             {verdicts && !verdicts.ok && (

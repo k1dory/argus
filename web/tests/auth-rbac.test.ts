@@ -396,3 +396,35 @@ function currentCode(secret: string): string {
   const o = mac[19] & 15;
   return String((((mac[o] & 127) << 24) | (mac[o + 1] << 16) | (mac[o + 2] << 8) | mac[o + 3]) % 1e6).padStart(6, "0");
 }
+
+test("scanGroupAction: подтверждение, сверка размера группы, чужие инциденты не трогает, завершение с меткой", async () => {
+  const writes: unknown[][] = [];
+  mocks.queries.incidentTransition = async (...args) => void writes.push(args);
+  const group = [
+    { incident_id: "INC-51", status: "new", owner: "", rule_id: "a41c-net-070", actor_name: "203.0.113.7" },
+    { incident_id: "INC-52", status: "in_progress", owner: "analyst2", rule_id: "a41c-net-071", actor_name: "203.0.113.9" },
+  ];
+  mocks.queries.scanGroupIncidents = async () => group;
+  await login("viewer1");
+  assert.match((await incidents.scanGroupAction({ error: null }, formData({ op: "take", subnet: "203.0.113.0/24", expected: "2", confirm: "yes" }))).error ?? "", /Недостаточно прав/);
+  await login("analyst1");
+  const base = { subnet: "203.0.113.0/24", expected: "2" };
+  assert.match((await incidents.scanGroupAction({ error: null }, formData({ ...base, op: "take" }))).error ?? "", /Подтвердите/);
+  assert.match((await incidents.scanGroupAction({ error: null }, formData({ ...base, op: "take", subnet: "x", confirm: "yes" }))).error ?? "", /Некорректная подсеть/);
+  assert.match((await incidents.scanGroupAction({ error: null }, formData({ ...base, op: "take", expected: "1", confirm: "yes" }))).error ?? "", /Группа изменилась/);
+  assert.equal(writes.length, 0, "без подтверждения и при изменившейся группе ничего не меняется");
+  const took = await incidents.scanGroupAction({ error: null }, formData({ ...base, op: "take", confirm: "yes" }));
+  assert.equal(took.error, null);
+  assert.match(took.message ?? "", /выполнено 1, пропущено 1/);
+  assert.deepEqual(writes, [[{ id: "INC-51", kind: "take", actor: "analyst1", role: "analyst" }]], "чужой INC-52 не тронут");
+  writes.length = 0;
+  assert.match((await incidents.scanGroupAction({ error: null }, formData({ ...base, op: "close", confirm: "yes", status: "closed", reason: "коротко" }))).error ?? "", /причину от 10/);
+  assert.match((await incidents.scanGroupAction({ error: null }, formData({ ...base, op: "close", confirm: "yes", status: "closed", reason: "Фоновый скан интернета, блок не нужен" }))).error ?? "", /Укажите характер/);
+  const closed = await incidents.scanGroupAction({ error: null }, formData({ ...base, op: "close", confirm: "yes", status: "closed", reason: "Фоновый скан интернета, блок не нужен",
+    disposition: "benign_authorized", escalate: "no", severity_correct: "yes" }));
+  assert.equal(closed.error, null);
+  assert.deepEqual(writes.map((w) => (w[0] as { kind: string; id: string }).kind + ":" + (w[0] as { id: string }).id), ["take:INC-51", "status:INC-51"]);
+  assert.deepEqual((writes[1][0] as { label?: unknown }).label, { disposition: "benign_authorized", escalate: false, severity_correct: true });
+  assert.match((await incidents.scanGroupAction({ error: null }, formData({ ...base, op: "assign", confirm: "yes", owner: "analyst2" }))).error ?? "", /Недостаточно прав/);
+  mocks.queries.scanGroupIncidents = async () => [];
+});
