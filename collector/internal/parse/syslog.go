@@ -263,34 +263,42 @@ func ParsePeerZones(spec string) (PeerZones, error) {
 			return nil, fmt.Errorf("syslog tz: %q — нужно адрес=пояс", item)
 		}
 		addr, zone = strings.TrimSpace(addr), strings.TrimSpace(zone)
-		if !strings.Contains(addr, "/") {
-			ip, err := netip.ParseAddr(addr)
-			if err != nil {
-				return nil, fmt.Errorf("syslog tz: %q: %w", addr, err)
-			}
-			// Отправитель сравнивается без зоны интерфейса, поэтому fe80::59%eth0
-			// молча действовал бы на всех интерфейсах — такая настройка отклоняется.
-			if ip.Zone() != "" {
-				return nil, fmt.Errorf("syslog tz: %q — зона интерфейса не поддерживается, укажите адрес без %%%s", addr, ip.Zone())
-			}
-			addr = netip.PrefixFrom(ip, ip.BitLen()).String()
-		}
-		pfx, err := netip.ParsePrefix(addr)
+		pfx, err := peerPrefix("syslog tz", addr)
 		if err != nil {
-			return nil, fmt.Errorf("syslog tz: %q: %w", addr, err)
-		}
-		// Адрес отправителя сравнивается в виде IPv4 (Unmap), поэтому и
-		// ::ffff:a.b.c.d/N из настройки приводится к a.b.c.d/(N-96).
-		if pfx.Addr().Is4In6() && pfx.Bits() >= 96 {
-			pfx = netip.PrefixFrom(pfx.Addr().Unmap(), pfx.Bits()-96)
+			return nil, err
 		}
 		loc, err := time.LoadLocation(zone)
 		if err != nil {
 			return nil, fmt.Errorf("syslog tz: %q: %w", zone, err)
 		}
-		z = append(z, peerZone{pfx: pfx.Masked(), loc: loc})
+		z = append(z, peerZone{pfx: pfx, loc: loc})
 	}
 	return z, nil
+}
+
+// peerPrefix — «адрес или CIDR» отправителя из настройки: адрес без зоны интерфейса,
+// ::ffff:a.b.c.d/N приводится к a.b.c.d/(N-96) (отправитель сравнивается в виде IPv4).
+func peerPrefix(label, addr string) (netip.Prefix, error) {
+	if !strings.Contains(addr, "/") {
+		ip, err := netip.ParseAddr(addr)
+		if err != nil {
+			return netip.Prefix{}, fmt.Errorf("%s: %q: %w", label, addr, err)
+		}
+		// Отправитель сравнивается без зоны интерфейса, поэтому fe80::59%eth0
+		// молча действовал бы на всех интерфейсах — такая настройка отклоняется.
+		if ip.Zone() != "" {
+			return netip.Prefix{}, fmt.Errorf("%s: %q — зона интерфейса не поддерживается, укажите адрес без %%%s", label, addr, ip.Zone())
+		}
+		addr = netip.PrefixFrom(ip, ip.BitLen()).String()
+	}
+	pfx, err := netip.ParsePrefix(addr)
+	if err != nil {
+		return netip.Prefix{}, fmt.Errorf("%s: %q: %w", label, addr, err)
+	}
+	if pfx.Addr().Is4In6() && pfx.Bits() >= 96 {
+		pfx = netip.PrefixFrom(pfx.Addr().Unmap(), pfx.Bits()-96)
+	}
+	return pfx.Masked(), nil
 }
 
 // Lookup — пояс отправителя; при пересечении побеждает самый узкий префикс.

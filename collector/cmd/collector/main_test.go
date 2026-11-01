@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"github.com/devitex-soft/argus/collector/internal/parse"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -278,7 +279,7 @@ func TestParseSyslogLineSanitizesLateWrites(t *testing.T) {
 	// WAF-строка в обёртке syslog: узел — hostname заголовка, тоже после Ensure.
 	host := "waf\x1b[31m" + strs(9000, "h")
 	waf := `<134>1 2026-10-29T08:40:44Z ` + host + ` caddy - - - {"level":"error","logger":"http.handlers.waf","msg":"[client \"93.123.109.247\"] Coraza: Access denied with code 403 (phase 2). [file \"x\"] [id \"949110\"] [msg \"Inbound Anomaly Score Exceeded (Total Score: 5)\"] [severity \"emergency\"] [hostname \"172.19.0.4\"] [uri \"/.env\"]"}`
-	e, ok := parseSyslogLine(n, nil, waf, listen.Peer{Addr: "203.0.113.7", Transport: "udp"})
+	e, ok := parseSyslogLine(n, nil, waf, listen.Peer{Addr: "203.0.113.7", Transport: "udp", Format: parse.FormatWAFCoraza})
 	if !ok || e.SourceClass != "waf" {
 		t.Fatalf("WAF-строка: ok=%v %+v", ok, e)
 	}
@@ -298,16 +299,18 @@ func TestWAFNodeOrder(t *testing.T) {
 		peer       listen.Peer
 		want       string
 	}{
-		{"coraza в файле с WAF_NODE", coraza, listen.Peer{Addr: "waf.error", Transport: "file", Node: "waf-01"}, "waf-01"},
-		{"coraza в файле без WAF_NODE — адрес сервера", coraza, listen.Peer{Addr: "waf.error", Transport: "file"}, "172.19.0.4"},
-		{"coraza от агента: hostname syslog важнее node:", `<134>1 2026-10-29T08:40:44Z waf-host caddy - - [argus container="caddy"] ` + coraza, listen.Peer{Addr: "10.0.0.5", Transport: "tls", Node: "cfg-node"}, "waf-host"},
-		{"атакующий Host: dc01.corp, без WAF_NODE — адрес отправителя", nginx, listen.Peer{Addr: "10.0.0.7", Transport: "udp"}, "10.0.0.7"},
-		{"атакующий Host: dc01.corp, WAF_NODE перебивает", nginx, listen.Peer{Addr: "nginx.error", Transport: "file", Node: "nginx-01"}, "nginx-01"},
+		{"coraza в файле с WAF_NODE", coraza, listen.Peer{Addr: "waf.error", Transport: "file", Node: "waf-01", Format: parse.FormatWAFCoraza}, "waf-01"},
+		{"coraza в файле без WAF_NODE — адрес сервера", coraza, listen.Peer{Addr: "waf.error", Transport: "file", Format: parse.FormatWAFCoraza}, "172.19.0.4"},
+		{"coraza от агента (формат в SD, HTTP с токеном): hostname syslog важнее node:", `<134>1 2026-10-29T08:40:44Z waf-host caddy - - [argus container="caddy" format="waf-coraza"] ` + coraza, listen.Peer{Addr: "10.0.0.5", Transport: "http", Node: "cfg-node"}, "waf-host"},
+		// Error-лог ModSecurity — не WAF (только JSON-аудит): syslog, узел — отправитель.
+		{"ModSecurity: атакующий Host: dc01.corp не узел, событие не WAF", nginx, listen.Peer{Addr: "10.0.0.7", Transport: "udp"}, "10.0.0.7"},
+		{"ModSecurity: node: источника перебивает, событие не WAF", nginx, listen.Peer{Addr: "nginx.error", Transport: "file", Node: "nginx-01", Format: parse.FormatWAFCoraza}, "nginx-01"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e, ok := parseSyslogLine(n, nil, tc.line, tc.peer)
-			if !ok || e.SourceClass != "waf" {
-				t.Fatalf("не WAF: ok=%v %+v", ok, e)
+			wantWAF := strings.Contains(tc.line, "Coraza: ")
+			if !ok || (e.SourceClass == "waf") != wantWAF {
+				t.Fatalf("класс WAF=%v, ожидалось %v: ok=%v %+v", e.SourceClass == "waf", wantWAF, ok, e)
 			}
 			if e.Node != tc.want {
 				t.Fatalf("узел %q, ожидалось %q (attrs %+v)", e.Node, tc.want, e.Attrs)

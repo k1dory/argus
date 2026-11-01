@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/devitex-soft/argus/collector/internal/parse"
 	"strings"
 	"testing"
 )
@@ -26,7 +27,7 @@ func TestPR16CorazaFinalRuleIDDoesNotMakePartialAllowFinal(t *testing.T) {
 				}
 				lines[i] = string(body)
 			}
-			events := wafHTTPBatch(t, "/ingest/syslog", strings.Join(lines, "\n"), "192.0.2.10:31000")
+			events := wafHTTPBatchAs(t, "/ingest/syslog", strings.Join(lines, "\n"), "192.0.2.10:31000", parse.FormatWAFCoraza)
 			if len(events) != 1 {
 				t.Fatalf("allow:phase on rule %s produced %d events for one denied transaction; want only the final deny: %+v", id, len(events), events)
 			}
