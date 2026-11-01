@@ -88,7 +88,7 @@ func exportDataset(ctx context.Context, src labeledSource, w io.Writer, o datase
 			}
 			if c.Name == "jev" && r.PII {
 				st.PIISkippedJev++
-				r.Models[c.Name] = dataset.ModelAnswers{Model: c.Model, Error: "pii: не отправлялся в облако"}
+				r.Models[c.Name] = dataset.ModelAnswers{Error: "pii: не отправлялся в облако"}
 				return
 			}
 			cctx, cancel := context.WithTimeout(ctx, 90*time.Second)
@@ -96,7 +96,7 @@ func exportDataset(ctx context.Context, src labeledSource, w io.Writer, o datase
 			ma, err := askModel(cctx, c, r)
 			if err != nil {
 				st.ModelErrors++
-				r.Models[c.Name] = dataset.ModelAnswers{Model: c.Model, Error: err.Error()}
+				r.Models[c.Name] = dataset.ModelAnswers{Error: err.Error()}
 				return
 			}
 			r.Models[c.Name] = ma
@@ -129,7 +129,7 @@ func askModel(ctx context.Context, c *systemone.Client, r *dataset.Record) (data
 	// конфигурации (c.Model) ревизию не подтверждает: за ним выкатывают новые
 	// версии, а eval разделяет ответы по ревизии (ModelAnswers.Model).
 	rev := strings.TrimSpace(resp.Model)
-	if rev == "" {
+	if !reportedRevision(rev) {
 		return dataset.ModelAnswers{}, errors.New("systemone " + c.Name + ": model revision not reported")
 	}
 	ma := dataset.ModelAnswers{Model: rev, Answers: resp.Answers}
@@ -150,6 +150,17 @@ func askModel(ctx context.Context, c *systemone.Client, r *dataset.Record) (data
 	ma.Answers["attack_technique"] = resp2.Answers["attack_technique"]
 	ma.Questions = map[string]systemone.Question{"attack_technique": tq}
 	return ma, nil
+}
+
+// backendNames — имена бэкендов, которые приходят в model вместо ревизии:
+// upstream laya-serve (laya/agent.py, Agent.predict_batch) отвечает
+// «laya-rl-agent» для любого чекпойнта, и смена модели за ним невидима.
+// laya-serve для ARGUS должен отдавать в model версию или хеш чекпойнта.
+var backendNames = map[string]bool{"laya-rl-agent": true}
+
+// reportedRevision — модель сообщила ревизию, а не пустоту и не имя бэкенда.
+func reportedRevision(rev string) bool {
+	return rev != "" && !backendNames[strings.ToLower(rev)]
 }
 
 // choiceOf — выбранный вариант: choice, а без него — наибольшая вероятность.
