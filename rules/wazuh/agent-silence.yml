@@ -3,7 +3,7 @@
 title: Wazuh agent went silent
 id: a41c-ops-040
 level: medium
-tags: [attack.defense_impairment, attack.t1489]   # ATT&CK v20: Defense Evasion разделена, отключение агента — Defense Impairment
+tags: [attack.defense_impairment, attack.t1685]   # ATT&CK v20: Defense Evasion разделена; отключение агента — Disable or Modify Tools (Defense Impairment)
 
 detection:
   selection:

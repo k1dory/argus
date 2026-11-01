@@ -4,7 +4,7 @@
 title: "Network: inbound port scan"
 id: a41c-net-070
 level: medium
-tags: [attack.reconnaissance, attack.t1046]
+tags: [attack.reconnaissance, attack.t1595]   # ATT&CK v20: скан снаружи — Active Scanning (T1046 — разведка изнутри, тактика discovery)
 
 detection:
   selection:

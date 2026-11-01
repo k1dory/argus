@@ -10,7 +10,7 @@
 title: "WAF: critical RCE/LFI attempt with high anomaly score"
 id: a41c-waf-053
 level: critical
-tags: [attack.execution, attack.t1190, attack.t1059]
+tags: [attack.execution, attack.initial_access, attack.t1190, attack.t1059]   # T1190 — initial access, T1059 — execution; тактика по умолчанию прежняя
 
 detection:
   selection:

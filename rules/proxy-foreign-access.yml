@@ -4,7 +4,7 @@
 title: "Proxy: access to a published service from outside the expected country"
 id: a41c-net-076
 level: low
-tags: [attack.reconnaissance]
+tags: [attack.reconnaissance, attack.t1595]   # ATT&CK v20: повторные обращения извне к опубликованному сервису — Active Scanning
 
 detection:
   selection:
