@@ -226,6 +226,12 @@ export type IncidentLabelRow = {
  *  одного инцидента — отдельная строка (переоткрытия в консоли нет, но журнал
  *  append-only). Правило, уровень и теги — последняя версия инцидента.
  *  max_result_rows консоли — 20000 (MAX 100000): порция до limit поднимает его на запрос. */
+/** since → граница миллисекундной точности и признак ненулевого остатка мельче мс. */
+function sinceBound(since: string): { since: string; since_sub_ms: number } {
+  const frac = /\.(\d+)/.exec(since)?.[1] ?? "";
+  return { since: since.replace(/\.(\d{1,3})\d*/, ".$1"), since_sub_ms: /[1-9]/.test(frac.slice(3)) ? 1 : 0 };
+}
+
 export async function incidentLabels(since: string, limit: number, after?: LabelCursor): Promise<IncidentLabelRow[]> {
   return chQuery<IncidentLabelRow>(
     `WITH labels AS (
@@ -233,9 +239,11 @@ export async function incidentLabels(since: string, limit: number, after?: Label
               severity_correct, ops_cause, ops_action, blind, reason
        FROM incident_state_events
        WHERE labeled_by_human AND kind = 'status' AND status IN ('closed', 'false_positive')
-         -- Точность 9: since с долями мельче миллисекунды не округляется вниз и не
-         -- захватывает более ранние метки (changed_at — DateTime64(3)).
-         AND changed_at >= parseDateTime64BestEffort({since:String}, 9, 'UTC')
+         -- changed_at — DateTime64(3). Доли мельче миллисекунды в since не округляются
+         -- вниз: при ненулевом остатке граница строгая. Точность 9 не годится — её
+         -- диапазон кончается в 2262 году, а since проверен лишь как дата ISO.
+         AND (changed_at > parseDateTime64BestEffort({since:String}, 3, 'UTC')
+              OR (NOT {since_sub_ms:UInt8} AND changed_at = parseDateTime64BestEffort({since:String}, 3, 'UTC')))
          AND (changed_at, incident_id, toString(event_id))
              > (parseDateTime64BestEffort({after_ts:String}, 3, 'UTC'), {after_inc:String}, {after_id:String})
        ORDER BY changed_at, incident_id, toString(event_id) LIMIT {limit:UInt32}
@@ -248,7 +256,7 @@ export async function incidentLabels(since: string, limit: number, after?: Label
        FROM incidents WHERE incident_id IN (SELECT incident_id FROM labels) GROUP BY incident_id
      ) AS i USING incident_id
      ORDER BY l.changed_at, l.incident_id, toString(l.event_id)`,
-    { since, limit, after_ts: after?.changedAt ?? "1970-01-01 00:00:00.000", after_inc: after?.incidentId ?? "", after_id: after?.eventId ?? "" },
+    { ...sinceBound(since), limit, after_ts: after?.changedAt ?? "1970-01-01 00:00:00.000", after_inc: after?.incidentId ?? "", after_id: after?.eventId ?? "" },
     { max_result_rows: Math.max(limit, 1) },
   );
 }

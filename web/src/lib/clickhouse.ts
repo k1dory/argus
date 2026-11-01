@@ -1,4 +1,5 @@
 import "server-only";
+import { CH_ERROR_NAMES } from "./clickhouse-error-names";
 
 // Серверный доступ к ClickHouse по HTTP-интерфейсу — тот же путь,
 // которым пишут shipper и policyd. Чтение — chQuery, единственная запись
@@ -89,15 +90,38 @@ export class ClickHouseError extends Error {
   }
 }
 
-/** «Code: 60. DB::Exception: Table argus.x does not exist … while processing …» → короткая причина. */
-export function shortChError(text: string, status: number | null): { message: string; code: number | null } {
-  const code = Number(/Code:\s*(\d+)/.exec(text)?.[1] ?? NaN);
-  const m = /DB::Exception:\s*([^\n]*?)(?:\s*:? ?while processing|\s*\(version|\s*\([A-Z_]+\)\s*$|$)/m.exec(text);
-  const reason = (m?.[1] ?? "").trim().slice(0, 160);
-  if (Number.isFinite(code)) return { message: reason ? `код ${code}: ${reason}` : `код ${code}`, code };
+/** Строковые литералы SQL → «…» (для журнала: SQL пишет консоль, но литерал мог прийти
+ *  от пользователя). К тексту исключений ClickHouse не применяется — он не выводится. */
+function maskSqlLiterals(sql: string): string {
+  return sql.replace(/'(?:\\.|''|[^'\\])*'/g, "'…'");
+}
+
+/** Ошибка ClickHouse для журнала и пользователя: только код, имя исключения из
+ *  константного списка ClickHouse 24.8 по этому коду и HTTP-статус. Текст исключения
+ *  не выводится вовсе: он цитирует данные запроса (строку INSERT, параметр, значение
+ *  колонки) — замаскировать его регулярками надёжно нельзя (вложенные кавычки, обрезка,
+ *  JSON-обёртка). Полный текст — в system.query_log по query_id. */
+/** Код в теле ответа-ошибки (HTTP не 2xx): «Code: N. DB::Exception», «Poco::Exception.
+ *  Code: N,», «std::exception. Code: N,», в том числе в {"exception": "…"}. Тело успешного
+ *  ответа на исключение не разбирается: с wait_end_of_query=1 ClickHouse при любой ошибке
+ *  отвечает HTTP-ошибкой с X-ClickHouse-Exception-Code, а «Code: 1.» в данных — это данные. */
+const CH_ERROR_CODE_RE = /^(?:\{"exception":\s*")?(?:Poco::Exception\. |std::exception\. )?Code:\s*(\d+)[.,]/m;
+
+/** X-ClickHouse-Exception-Code — только целое число; иначе (мусор, «__proto__») — нет кода. */
+export function headerChCode(value: string | null): number | null {
+  return value && /^\d{1,6}$/.test(value.trim()) && Number(value) > 0 ? Number(value) : null;
+}
+
+export function shortChError(text: string, status: number | null, headerCode: number | null = null): { message: string; code: number | null } {
+  const parsed = Number(CH_ERROR_CODE_RE.exec(text)?.[1] ?? NaN);
+  const code = headerCode && headerCode > 0 ? headerCode : Number.isFinite(parsed) ? parsed : null;
+  if (code != null) {
+    const name = Object.hasOwn(CH_ERROR_NAMES, code) ? CH_ERROR_NAMES[code] : undefined;
+    return { message: name ? `код ${code} (${name})` : `код ${code}`, code };
+  }
   if (status === 401 || status === 403) return { message: "доступ к ClickHouse отклонён (учётные данные консоли)", code: null };
   if (status) return { message: `ClickHouse ответил HTTP ${status}`, code: null };
-  return { message: reason || "запрос не выполнен", code: null };
+  return { message: "запрос не выполнен", code: null };
 }
 
 function connectionError(e: unknown): ClickHouseError {
@@ -145,6 +169,9 @@ async function chFetchWithSlot(sql: string, params: Record<string, string | numb
   for (const [key, value] of Object.entries({ ...DEFAULT_SETTINGS, ...settings })) url.searchParams.set(key, String(value));
   url.searchParams.set("database", CH_DB);
   if (format) url.searchParams.set("default_format", format);
+  // Ответ буферизуется на сервере до конца запроса: ошибка посреди выдачи приходит HTTP-
+  // ошибкой с X-ClickHouse-Exception-Code, а не строкой в конце тела со статусом 200.
+  url.searchParams.set("wait_end_of_query", "1");
   const types = paramTypes(sql);
   for (const [key, value] of Object.entries(params)) url.searchParams.set(`param_${key}`, encodeParam(value, types.get(key)));
   let resp: Response;
@@ -172,33 +199,45 @@ async function chFetchWithSlot(sql: string, params: Record<string, string | numb
   }
   // ClickHouse may append an exception after sending HTTP 200. JSONEachRow
   // escapes newlines within values: only a standalone exception line counts.
-  const exception = /^Code:\s*\d+\.\s*DB::Exception:/m.exec(text);
-  const headerCode = Number(resp.headers.get("X-ClickHouse-Exception-Code"));
-  if (!resp.ok || exception || headerCode > 0) {
-    // В лог — только текст исключения. При HTTP 200 до него идут уже отданные строки
-    // результата (комментарии, вердикты): им не место в журнале контейнера.
-    const detail = exception ? text.slice(exception.index, exception.index + 2000) : resp.ok ? "(тело ответа не логируется)" : text.slice(0, 2000);
-    console.error(`clickhouse ${resp.status}:`, detail, "\nSQL:", sqlForLog(sql));
-    const { message, code } = shortChError(exception ? text.slice(exception.index) : text, resp.status);
-    throw new ClickHouseError(headerCode > 0 && code == null ? `код ${headerCode}: запрос не выполнен` : message, resp.status, code ?? (headerCode > 0 ? headerCode : null));
+  // Ошибка — только по HTTP-статусу и заголовку (wait_end_of_query=1, см. выше).
+  const headerCode = headerChCode(resp.headers.get("X-ClickHouse-Exception-Code"));
+  if (!resp.ok || headerCode != null) {
+    // Ни тело ответа, ни текст исключения в журнал не идут (строки результата и
+    // цитаты данных) — только код, имя, статус, query_id и SQL без данных.
+    const { message, code } = shortChError(resp.ok ? "" : text, resp.status, headerCode);
+    const queryId = resp.headers.get("X-ClickHouse-Query-Id") ?? "";
+    console.error(`clickhouse ${resp.status}: ${message}${queryId ? ` query_id=${queryId}` : ""}`, "\nSQL:", sqlForLog(sql));
+    throw new ClickHouseError(message, resp.status, code);
   }
   return text;
 }
 
-/** SQL для журнала: INSERT … FORMAT JSONEachRow несёт строки в теле запроса (вердикт
- *  агента, комментарий) — в лог идёт только заголовок до имени формата. */
+/** SQL для журнала. INSERT несёт данные в теле (FORMAT JSONEachRow, VALUES, SELECT с
+ *  литералами) — в лог идёт только заголовок «INSERT INTO таблица (колонки)». В прочих
+ *  запросах строковые литералы заменяются на «…»; значения параметров идут в URL и сюда
+ *  не попадают. */
 export function sqlForLog(sql: string): string {
-  const format = /\bFORMAT\s+\w+/i.exec(sql);
-  return (format ? `${sql.slice(0, format.index + format[0].length)} <данные не логируются>` : sql).slice(0, 500);
+  const insert = /^\s*INSERT\b/i.test(sql) ? /\b(FORMAT|VALUES|SELECT|WITH)\b|\/\*|--/i.exec(sql) : null;
+  const head = insert ? `${sql.slice(0, insert.index).trimEnd()} <данные не логируются>` : maskSqlLiterals(sql);
+  return head.slice(0, 500);
 }
 
 /** settings — серверные настройки ClickHouse на запрос (max_execution_time и т.п.). */
 export async function chQuery<T>(sql: string, params: Record<string, string | number> = {}, settings: Record<string, string | number> = {}): Promise<T[]> {
   const text = await chFetch(sql, params, settings, "JSONEachRow");
-  return text
-    .split("\n")
-    .filter(Boolean)
-    .map((line) => JSON.parse(line) as T);
+  try {
+    return text
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as T);
+  } catch (e) {
+    // SyntaxError JSON.parse цитирует фрагмент входа (данные) в message и stack.
+    if (e instanceof SyntaxError) {
+      console.error("clickhouse: ответ не JSONEachRow", "\nSQL:", sqlForLog(sql));
+      throw new ClickHouseError("ответ ClickHouse не JSON");
+    }
+    throw e;
+  }
 }
 
 /** Запрос без результата (INSERT/DDL); параметры — тем же server-side binding. */
