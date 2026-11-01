@@ -85,12 +85,25 @@ test("больше 2000 молчащих: порядок при равном в�
   const beforeQuiet = baseline.sources.filter((s) => s.events_1h === 0);
   const beforeTotal = beforeQuiet.length + baseline.omitted;
   // Общая живая база хранит молчащие источники прошлых прогонов (других файлов и этого):
-  // фикстура cap ставится на секунду новее самого свежего из них, но не ближе 61 минуты
-  // к «сейчас», чтобы за время теста не попасть в events_1h. Иначе прогон через час
-  // после предыдущего ловил чужие источники среди своих.
-  const freshest = Math.min(70 * 60, ...beforeQuiet.map((s) => s.silent_for_sec)) - 2;
-  assert.ok(freshest > 61 * 60, `молчащий источник прошлого прогона слишком свежий (${freshest + 2} с) — повторите через минуту`);
-  const [stamp] = await c.chQuery<{ ts: string }>("SELECT toString(now() - toIntervalSecond({s:UInt32})) AS ts", { s: freshest });
+  // фикстура cap ставится на секунду новее самого свежего из них — иначе прогон через час
+  // после предыдущего ловил бы чужие источники среди своих, — но не ближе CAP_MIN_AGE к
+  // «сейчас», чтобы за время теста не попасть в events_1h. Всё — по часам ClickHouse:
+  // last_ts пишет CH, «сейчас» — его now(); silent_for_sec считается по часам Node.
+  const CAP_MIN_AGE = 3600 + 30;
+  const sec = (ts: string) => Date.parse(ts.replace(" ", "T") + "Z") / 1000;
+  const fmt = (x: number) => new Date(x * 1000).toISOString().slice(0, 19).replace("T", " ");
+  const nowSQL = "SELECT toString(now() - toIntervalSecond({s:UInt32})) AS ts";
+  let [chNowRow] = await c.chQuery<{ ts: string }>(nowSQL, { s: 0 });
+  const chNowAtBaseline = sec(chNowRow.ts);
+  const freshestLast = Math.max(0, ...beforeQuiet.map((s) => (s.last_ts ? sec(s.last_ts) : chNowAtBaseline - s.silent_for_sec)));
+  const capSec = Math.max(freshestLast + 1, chNowAtBaseline - 65 * 60);
+  if (capSec > chNowAtBaseline - CAP_MIN_AGE) {
+    // Чужой источник моложе границы: ждём, пока место для cap не освободится.
+    await new Promise((r) => setTimeout(r, (capSec - (chNowAtBaseline - CAP_MIN_AGE) + 1) * 1000));
+    [chNowRow] = await c.chQuery<{ ts: string }>(nowSQL, { s: 0 });
+    assert.ok(capSec <= sec(chNowRow.ts) - CAP_MIN_AGE, "cap не помещается между молчащими источниками и окном events_1h");
+  }
+  const stamp = { ts: fmt(capSec) };
   await c.chCommand(`INSERT INTO events (ts, received_at, source, source_class, action)
     SELECT toDateTime({ts:String}), toDateTime({ts:String}), concat({prefix:String}, leftPad(toString(number), 5, '0')), 'system', 'x'
     FROM numbers({n:UInt32}) ORDER BY number DESC`, { ts: stamp.ts, prefix, n });
