@@ -89,9 +89,13 @@ services:
       CLICKHOUSE_POLICYD_PASSWORD: ${CLICKHOUSE_POLICYD_PASSWORD:?CLICKHOUSE_POLICYD_PASSWORD не задан — ./scripts/argus init}
       CLICKHOUSE_ENGINE_PASSWORD: ${CLICKHOUSE_ENGINE_PASSWORD:?CLICKHOUSE_ENGINE_PASSWORD не задан — ./scripts/argus init}
       ARGUS_DEV: ${ARGUS_DEV:-0}   # 1 — стенд: дефолтные пароли только предупреждение
+      # Статус прогона (JSON без SQL и текста исключений) — его читает роль argus при
+      # выкатке вместо лога migrator, где упавший запрос содержит хеши паролей.
+      MIGRATE_STATUS_DIR: /status
     volumes:
       - ./clickhouse/migrations:/migrations:ro
       - ./scripts/migrate.sh:/migrate.sh:ro
+      - ./run/migrator:/status
     networks: [data]
     <<: [*harden, *logging]
     depends_on:

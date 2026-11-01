@@ -17,9 +17,49 @@ DEV="${ARGUS_DEV:-0}"
 # Пароль админа clickhouse-client берёт из окружения (CLICKHOUSE_PASSWORD),
 # в argv он не попадает — /proc/*/cmdline его не покажет.
 export CLICKHOUSE_PASSWORD="${CLICKHOUSE_PASSWORD:-}"
+
+# ── Статус для выкатки ─────────────────────────────────────────────────────
+# При выходе (trap EXIT) — один JSON в $MIGRATE_STATUS_DIR/migrate.json: код выхода,
+# этап, файл миграции (имя из каталога, не из вывода), последняя применённая, код
+# ошибки ClickHouse и его имя (errorCodeToName на сервере), имена переменных с
+# дефолтными паролями, id запуска (hostname контейнера). Роль argus читает только
+# его: лог migrator содержит упавший SQL (ALTER USER … хеш и соль), его не выводят.
+STATUS_DIR="${MIGRATE_STATUS_DIR:-}"
+stage="check" current="" last="" fail_code=""
+weak_vars=()
+
 ch() {
-    clickhouse-client --host "$HOST" --user "$ADMIN_USER" "$@"
+    local err rc=0
+    fail_code=""
+    err="$(mktemp)"
+    clickhouse-client --host "$HOST" --user "$ADMIN_USER" "$@" 2>"$err" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        # Только число: «Code: N.» из первой строки исключения.
+        fail_code="$(sed -n 's/^.*Code: \([0-9][0-9]*\)\..*$/\1/p' "$err" | head -n 1)"
+        cat "$err" >&2
+    fi
+    rm -f "$err"
+    return "$rc"
 }
+
+safe() { [[ "$1" =~ ^[0-9A-Za-z_.-]{1,128}$ ]] && printf '%s' "$1"; return 0; }
+
+write_status() {
+    local rc="$1" name="" code=null vars="" v
+    [ -n "$STATUS_DIR" ] && [ -d "$STATUS_DIR" ] && [ -w "$STATUS_DIR" ] || return 0
+    if [[ "$fail_code" =~ ^[0-9]{1,6}$ ]]; then
+        code="$fail_code"
+        name="$(clickhouse-client --host "$HOST" --user "$ADMIN_USER" --query "SELECT errorCodeToName($fail_code)" 2>/dev/null || true)"
+        [[ "$name" =~ ^[A-Z0-9_]{1,64}$ ]] || name=""
+    fi
+    for v in "${weak_vars[@]}"; do
+        [[ "$v" =~ ^CLICKHOUSE_[A-Z_]{1,40}$ ]] && vars="${vars:+$vars,}\"$v\""
+    done
+    printf '{"exit":%d,"stage":"%s","file":"%s","last_applied":"%s","code":%s,"name":"%s","weak_vars":[%s],"run":"%s"}\n' \
+        "$rc" "$(safe "$stage")" "$(safe "$current")" "$(safe "$last")" "$code" "$name" "$vars" "$(safe "${HOSTNAME:-}")" \
+        > "$STATUS_DIR/.migrate.json.tmp" && mv -f "$STATUS_DIR/.migrate.json.tmp" "$STATUS_DIR/migrate.json"
+}
+trap 'write_status $?' EXIT
 
 # ── Отказ на дефолтных паролях ──────────────────────────────────────────
 # argus / argus-* / change-me* — значения из старых примеров и документации.
@@ -42,10 +82,12 @@ if [ ${#bad[@]} -gt 0 ]; then
         echo "migrate: ВНИМАНИЕ — дефолтные пароли (${bad[*]}); допустимо только на стенде (ARGUS_DEV=1)" >&2
     else
         echo "migrate: ОТКАЗ — дефолтные пароли в ${bad[*]}. Сгенерируйте: ./scripts/argus init (или openssl rand -hex 24)" >&2
+        weak_vars=("${bad[@]}")
         exit 1
     fi
 fi
 
+stage="wait"
 echo "migrate: waiting for clickhouse at $HOST ..."
 for _ in $(seq 1 60); do
     ch --query "SELECT 1" >/dev/null 2>&1 && break
@@ -60,18 +102,24 @@ ch --query "CREATE TABLE IF NOT EXISTS argus.schema_migrations
 
 applied=$(ch --query "SELECT name FROM argus.schema_migrations")
 
+stage="migrations"
 for f in "$DIR"/*.sql; do
     name=$(basename "$f")
+    current="$name"
     if printf '%s\n' "$applied" | grep -qx "$name"; then
         echo "migrate: skip $name (already applied)"
+        last="$name"
         continue
     fi
     echo "migrate: apply $name"
     ch --multiquery <"$f"
     ch --query "INSERT INTO argus.schema_migrations (name) VALUES ('$name')"
+    last="$name"
 done
+current=""
 
 echo "migrate: done"
+stage="users"
 
 # ── Служебные пользователи с минимальными правами ─────────────────────────
 # Пароль в SQL не попадает: в ClickHouse уходит sha256(password + salt) и
@@ -169,3 +217,5 @@ mkuser argus_engine "${CLICKHOUSE_ENGINE_PASSWORD:-}" "$SVC_LIMITS" \
     "INSERT ON argus.risk_report_deliveries" "INSERT ON argus.webhook_deliveries" \
     "INSERT ON argus.identities" "INSERT ON argus.identity_aliases" \
     "SELECT ON system.disks"
+
+stage="done"
