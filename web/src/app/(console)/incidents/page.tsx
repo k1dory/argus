@@ -18,7 +18,7 @@ import {
 } from "@/components/ui/table";
 import { listUsers, requirePageSession } from "@/lib/auth";
 import { ScanGroupActions } from "@/components/console/scan-group-actions";
-import { BLOCK_LABEL, isSubnetKey, SCAN_GROUP_RULES } from "@/lib/shared/scan-groups";
+import { BLOCK_LABEL, GROUP_ACTION_MAX, GROUP_ROWS_PAGE, GROUPS_PAGE, isSubnetKey, SCAN_GROUP_RULES } from "@/lib/shared/scan-groups";
 import { ROLE_RANK } from "@/lib/shared/incidents";
 import { safeQuery } from "@/lib/clickhouse";
 import { INCIDENT_STATUSES, incidentBlockStates, incidentClosuresFor, incidentStats, incidentsList, scanGroupIncidents, scanGroups, verdictsFor, type VerdictRow } from "@/lib/argus-queries";
@@ -59,11 +59,14 @@ export default async function IncidentsPage({ searchParams }: PageProps<"/incide
   // scans=list — показать их в очереди по одному, как раньше.
   const scansList = params.scans === "list";
   const subnet = typeof params.subnet === "string" && isSubnetKey(params.subnet) ? params.subnet : undefined;
+  const gpage = clampPage(params.gpage);
+  const spage = clampPage(params.spage);
   const canEdit = ROLE_RANK[session.role] >= ROLE_RANK.analyst;
 
   const href = (patch: Record<string, string | undefined>) => {
     const qs = new URLSearchParams();
-    const next = { status, level, q, queue, scans: scansList ? "list" : undefined, subnet, page: undefined as string | undefined, ...patch };
+    const next = { status, level, q, queue, scans: scansList ? "list" : undefined, subnet,
+      gpage: gpage > 1 ? String(gpage) : undefined, spage: spage > 1 ? String(spage) : undefined, page: undefined as string | undefined, ...patch };
     for (const [k, v] of Object.entries(next)) if (v) qs.set(k, v);
     const s = qs.toString();
     return s ? `/incidents?${s}` : "/incidents";
@@ -75,9 +78,9 @@ export default async function IncidentsPage({ searchParams }: PageProps<"/incide
   });
   const filter = { status, level, q, queue, user: session.user } as const;
   // Группы и раскрытая подсеть — отдельно: их недоступность не мешает очереди.
-  const groups = r.ok && !scansList ? await safeQuery(() => scanGroups(filter)) : null;
+  const groups = r.ok && !scansList ? await safeQuery(() => scanGroups({ ...filter, page: gpage }, GROUPS_PAGE)) : null;
   const expanded = r.ok && !scansList && subnet ? await safeQuery(async () => {
-    const rows = await scanGroupIncidents(subnet, filter);
+    const rows = await scanGroupIncidents(subnet, { ...filter, page: spage });
     const [blocks, users] = await Promise.all([
       incidentBlockStates(rows.map((x) => x.incident_id)),
       session.role === "admin" ? listUsers() : Promise.resolve([]),
@@ -147,8 +150,17 @@ export default async function IncidentsPage({ searchParams }: PageProps<"/incide
                     </TableBody>
                   </Table>
                 </div>}
+              {groups.ok && (gpage > 1 || groups.data.length === GROUPS_PAGE) && (
+                <div className="mt-2 flex flex-wrap gap-3 text-xs">
+                  <span className="text-muted-foreground">группы {fmtNum((gpage - 1) * GROUPS_PAGE + 1)}–{fmtNum((gpage - 1) * GROUPS_PAGE + groups.data.length)}</span>
+                  {gpage > 1 && <Link href={href({ gpage: gpage > 2 ? String(gpage - 1) : undefined, subnet: undefined, spage: undefined })} className="text-[var(--ring)] hover:underline">← предыдущие группы</Link>}
+                  {groups.data.length === GROUPS_PAGE && <Link href={href({ gpage: String(gpage + 1), subnet: undefined, spage: undefined })} className="text-[var(--ring)] hover:underline">следующие группы →</Link>}
+                </div>
+              )}
               {subnet && expanded && (!expanded.ok ? <p className="mt-3 text-xs text-destructive">Инциденты подсети {subnet} временно недоступны.</p> : <div className="mt-4">
-                <div className="c-label mb-2">Подсеть {subnet} · {fmtNum(expanded.data.rows.length)} открытых инцидентов</div>
+                <div className="c-label mb-2">Подсеть {subnet} · {spage > 1 || expanded.data.rows.length === GROUP_ROWS_PAGE
+                  ? `инциденты ${fmtNum((spage - 1) * GROUP_ROWS_PAGE + 1)}–${fmtNum((spage - 1) * GROUP_ROWS_PAGE + expanded.data.rows.length)}`
+                  : `${fmtNum(expanded.data.rows.length)} открытых инцидентов`}</div>
                 <div className="c-well overflow-x-auto p-2">
                   <Table className="min-w-[900px]">
                     <TableHeader>
@@ -180,8 +192,18 @@ export default async function IncidentsPage({ searchParams }: PageProps<"/incide
                     </TableBody>
                   </Table>
                 </div>
-                {canEdit && expanded.data.rows.length > 0 && <ScanGroupActions subnet={subnet} count={expanded.data.rows.length}
+                {(spage > 1 || expanded.data.rows.length === GROUP_ROWS_PAGE) && (
+                  <div className="mt-2 flex flex-wrap gap-3 text-xs">
+                    {spage > 1 && <Link href={href({ spage: spage > 2 ? String(spage - 1) : undefined })} className="text-[var(--ring)] hover:underline">← предыдущие</Link>}
+                    {expanded.data.rows.length === GROUP_ROWS_PAGE && <Link href={href({ spage: String(spage + 1) })} className="text-[var(--ring)] hover:underline">следующие →</Link>}
+                  </div>
+                )}
+                {canEdit && spage === 1 && expanded.data.rows.length > 0 && expanded.data.rows.length <= GROUP_ACTION_MAX && <ScanGroupActions subnet={subnet}
+                  ids={expanded.data.rows.map((x) => x.incident_id)} filter={{ status, level, q, queue }}
                   isAdmin={session.role === "admin"} users={expanded.data.users.map((u) => ({ name: u.name, role: u.role }))} />}
+                {canEdit && (spage > 1 || expanded.data.rows.length > GROUP_ACTION_MAX) && (
+                  <p className="mt-2 text-xs text-muted-foreground">Групповые действия — для группы до {GROUP_ACTION_MAX} инцидентов: уточните фильтр (уровень, очередь) или работайте с инцидентами по одному.</p>
+                )}
               </div>)}
             </Panel>
           )}
@@ -197,6 +219,7 @@ export default async function IncidentsPage({ searchParams }: PageProps<"/incide
               {status && <input type="hidden" name="status" value={status} />}
               {level && <input type="hidden" name="level" value={level} />}
               {queue && <input type="hidden" name="queue" value={queue} />}
+              {scansList && <input type="hidden" name="scans" value="list" />}
               <div className="w-full space-y-1 sm:w-96">
                 <Label htmlFor="inc-q" className="c-label">Поиск</Label>
                 <Input id="inc-q" name="q" defaultValue={q ?? ""} maxLength={200} placeholder="INC-…, правило, субъект, узел, источник" className="h-10 px-3" />

@@ -406,12 +406,12 @@ test("scanGroupAction: подтверждение, сверка размера �
   ];
   mocks.queries.scanGroupIncidents = async () => group;
   await login("viewer1");
-  assert.match((await incidents.scanGroupAction({ error: null }, formData({ op: "take", subnet: "203.0.113.0/24", expected: "2", confirm: "yes" }))).error ?? "", /Недостаточно прав/);
+  assert.match((await incidents.scanGroupAction({ error: null }, formData({ op: "take", subnet: "203.0.113.0/24", ids: "INC-51,INC-52", confirm: "yes" }))).error ?? "", /Недостаточно прав/);
   await login("analyst1");
-  const base = { subnet: "203.0.113.0/24", expected: "2" };
+  const base = { subnet: "203.0.113.0/24", ids: "INC-51,INC-52" };
   assert.match((await incidents.scanGroupAction({ error: null }, formData({ ...base, op: "take" }))).error ?? "", /Подтвердите/);
   assert.match((await incidents.scanGroupAction({ error: null }, formData({ ...base, op: "take", subnet: "x", confirm: "yes" }))).error ?? "", /Некорректная подсеть/);
-  assert.match((await incidents.scanGroupAction({ error: null }, formData({ ...base, op: "take", expected: "1", confirm: "yes" }))).error ?? "", /Группа изменилась/);
+  assert.match((await incidents.scanGroupAction({ error: null }, formData({ ...base, op: "take", ids: "INC-51", confirm: "yes" }))).error ?? "", /Группа изменилась/);
   assert.equal(writes.length, 0, "без подтверждения и при изменившейся группе ничего не меняется");
   const took = await incidents.scanGroupAction({ error: null }, formData({ ...base, op: "take", confirm: "yes" }));
   assert.equal(took.error, null);

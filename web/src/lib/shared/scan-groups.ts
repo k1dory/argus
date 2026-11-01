@@ -7,16 +7,31 @@
 /** Правила группы inbound-scan: скан портов, обход хостов, долбёжка сервиса. */
 export const SCAN_GROUP_RULES = ["a41c-net-070", "a41c-net-071", "a41c-net-072"] as const;
 
+// Канонический адрес в SQL (ClickHouse 24.8). Пробелы по краям не в счёт; IPv6 —
+// в каноническом виде; IPv4 в любой записи IPv6 (::ffff:a.b.c.d, ::ffff:cb00:7107,
+// полная форма) — IPv4. Конверсии *OrDefault: ClickHouse может вычислить ветку
+// заранее, и toIPv6 на «exporter-1» уронил бы запрос.
+const trimmed = (col: string) => `trimBoth(${col})`;
+const v6SQL = (col: string) => `if(isIPv6String(${trimmed(col)}), IPv6NumToString(toIPv6OrDefault(${trimmed(col)})), '')`;
+const v4SQL = (col: string) => {
+  const v6 = v6SQL(col);
+  return `multiIf(isIPv4String(${trimmed(col)}), IPv4NumToString(toIPv4OrDefault(${trimmed(col)})),`
+    + ` startsWith(${v6}, '::ffff:') AND isIPv4String(substring(${v6}, 8)), substring(${v6}, 8), '')`;
+};
+
+/** Канонический адрес источника в SQL: IPv4 или IPv6, "" — не адрес. */
+export function addrSQL(col: string): string {
+  return `if(${v4SQL(col)} != '', ${v4SQL(col)}, ${v6SQL(col)})`;
+}
+
 /**
- * Подсеть адреса источника в SQL (ClickHouse 24.8): /24 у IPv4, /48 у IPv6, IPv4 в
- * записи IPv6 (::ffff:) — IPv4, пробелы по краям не в счёт, не адрес — "".
- * Адрес источника у этих правил — субъект инцидента (group_by: src.ip).
+ * Подсеть адреса источника в SQL: /24 у IPv4 (в любой записи), /48 у IPv6, не
+ * адрес — "". Адрес источника у правил сканов — субъект инцидента (group_by: src.ip).
  */
 export function subnetSQL(col: string): string {
-  const t = `trimBoth(${col})`;
-  const v = `if(startsWith(lower(${t}), '::ffff:') AND isIPv4String(substring(${t}, 8)), substring(${t}, 8), ${t})`;
-  return `multiIf(isIPv4String(${v}), concat(IPv4NumToString(tupleElement(IPv4CIDRToRange(toIPv4(${v}), 24), 1)), '/24'),`
-    + ` isIPv6String(${v}), concat(IPv6NumToString(tupleElement(IPv6CIDRToRange(toIPv6(${v}), 48), 1)), '/48'), '')`;
+  const v4 = v4SQL(col), v6 = v6SQL(col);
+  return `multiIf(${v4} != '', concat(IPv4NumToString(tupleElement(IPv4CIDRToRange(toIPv4OrDefault(${v4}), 24), 1)), '/24'),`
+    + ` ${v6} != '', concat(IPv6NumToString(tupleElement(IPv6CIDRToRange(toIPv6OrDefault(${v6}), 48), 1)), '/48'), '')`;
 }
 
 /** Подсеть, как её считает subnetSQL: проверка параметра URL и тесты. */
@@ -26,10 +41,11 @@ export function isSubnetKey(s: string): boolean {
 
 export type BlockRow = { executor: string; mode: string; dry_run: number; ok: number; detail: string };
 
-export type BlockState = "blocked" | "released" | "simulated" | "ids" | "waiting" | "refused" | "failed" | "none";
+export type BlockState = "blocked" | "unblock_failed" | "released" | "simulated" | "ids" | "waiting" | "refused" | "failed" | "none";
 
 export const BLOCK_LABEL: Record<BlockState, string> = {
   blocked: "заблокирован",
+  unblock_failed: "заблокирован — снять не удалось",
   released: "блок снят (TTL или оператор)",
   simulated: "симуляция блока",
   ids: "IDS: автоответ выключен",
@@ -46,7 +62,8 @@ export const BLOCK_LABEL: Record<BlockState, string> = {
  */
 export function blockState(row: BlockRow | undefined): BlockState {
   if (!row) return "none";
-  if (row.executor.endsWith(".unblock")) return row.ok ? "released" : "failed";
+  // Неудачное снятие оставляет блок активным (респондер держит адрес в active).
+  if (row.executor.endsWith(".unblock")) return row.ok ? "released" : "unblock_failed";
   if (row.executor !== "argus") {
     if (!row.ok) return "failed";
     return row.dry_run || row.mode === "simulate" ? "simulated" : "blocked";
@@ -60,3 +77,20 @@ export function blockState(row: BlockRow | undefined): BlockState {
 
 const LEVEL_RANK: Record<string, number> = { low: 1, medium: 2, high: 3, critical: 4 };
 export const levelOfRank = (n: number): string => Object.keys(LEVEL_RANK).find((k) => LEVEL_RANK[k] === n) ?? "low";
+
+/** Групп на страницу и инцидентов на страницу раскрытия. */
+export const GROUPS_PAGE = 100;
+export const GROUP_ROWS_PAGE = 500;
+/**
+ * Групповое действие — над группой не больше страницы раскрытия: сервер читает до
+ * GROUP_ACTION_MAX + 1 строки и сверяет весь состав с подтверждённым; лишняя строка
+ * значит, что группа больше и целиком не подтверждена.
+ */
+export const GROUP_ACTION_MAX = GROUP_ROWS_PAGE;
+
+/** Список инцидентов из формы группового действия; null — не тот формат. */
+export function parseIncidentIds(raw: string): string[] | null {
+  const ids = raw.split(",").map((x) => x.trim()).filter(Boolean);
+  if (ids.length === 0 || ids.length > GROUP_ACTION_MAX || ids.some((x) => !/^INC-\d{1,9}$/.test(x))) return null;
+  return [...new Set(ids)].sort();
+}

@@ -10,9 +10,10 @@ test("isSubnetKey: только то, что выдаёт subnetSQL", () => {
 
 test("subnetSQL: /24, /48, ::ffff: → IPv4, пробелы, не адрес → ''", () => {
   const sql = subnetSQL("actor_name");
-  assert.match(sql, /IPv4CIDRToRange\(toIPv4\(.*\), 24\)/);
-  assert.match(sql, /IPv6CIDRToRange\(toIPv6\(.*\), 48\)/);
-  assert.match(sql, /startsWith\(lower\(trimBoth\(actor_name\)\), '::ffff:'\)/);
+  assert.match(sql, /IPv4CIDRToRange\(toIPv4OrDefault\(.*\), 24\)/);
+  assert.match(sql, /IPv6CIDRToRange\(toIPv6OrDefault\(.*\), 48\)/);
+  assert.match(sql, /startsWith\(.*, '::ffff:'\)/, "IPv4 в записи IPv6 — после канонизации IPv6NumToString");
+  assert.match(sql, /trimBoth\(actor_name\)/);
   assert.match(sql, /, ''\)$/);
 });
 

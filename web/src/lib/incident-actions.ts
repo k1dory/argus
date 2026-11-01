@@ -21,7 +21,7 @@ import {
   scanGroupIncidents,
   triageVerdictClaim,
 } from "./argus-queries";
-import { isSubnetKey } from "./shared/scan-groups";
+import { GROUP_ACTION_MAX, isSubnetKey, parseIncidentIds } from "./shared/scan-groups";
 import { isIncidentStatus } from "./shared/incidents";
 import { closureLabelText, isOpsIncident, parseClosureLabel, type ClosureLabel } from "./shared/closure-label";
 
@@ -281,10 +281,12 @@ export async function reopenTriageAction(_prev: FormState, formData: FormData): 
 
 /**
  * Групповое действие над открытыми инцидентами одной подсети группы сканов:
- * взять в работу, назначить (администратор) или завершить с меткой. Список
- * инцидентов сервер берёт сам по подсети (а не из формы) и сверяет его размер с
- * числом, которое аналитик подтвердил: выросла группа — ничего не делаем. Каждый
- * инцидент проходит те же переходы движка, что и в карточке, с записью в аудит.
+ * взять в работу, назначить (администратор) или завершить с меткой. Форма передаёт
+ * показанный состав (список incident_id) и условия очереди, при которых он показан;
+ * сервер пересчитывает группу при тех же условиях и выполняет действие, только если
+ * состав совпал. Иначе — ничего, «группа изменилась». Группа не меньше страницы
+ * раскрытия (500) целиком не сверяется — для неё групповое действие недоступно.
+ * Каждый инцидент проходит те же переходы движка, что и в карточке, с аудитом.
  */
 export async function scanGroupAction(_prev: FormState, formData: FormData): Promise<FormState> {
   const op = String(formData.get("op") ?? "");
@@ -294,7 +296,16 @@ export async function scanGroupAction(_prev: FormState, formData: FormData): Pro
   const subnet = String(formData.get("subnet") ?? "");
   if (!isSubnetKey(subnet)) return { error: "Некорректная подсеть" };
   if (formData.get("confirm") !== "yes") return { error: "Подтвердите действие над всей группой" };
-  const expected = Number(formData.get("expected") ?? -1);
+  const shown = parseIncidentIds(String(formData.get("ids") ?? ""));
+  if (!shown) return { error: `Групповое действие — для группы до ${GROUP_ACTION_MAX} инцидентов; обновите страницу` };
+  const fq = String(formData.get("f_queue") ?? "");
+  const filter = {
+    status: String(formData.get("f_status") ?? "") || undefined,
+    level: String(formData.get("f_level") ?? "") || undefined,
+    q: String(formData.get("f_q") ?? "").trim().slice(0, 200) || undefined,
+    queue: fq === "open" || fq === "mine" || fq === "unassigned" || fq === "overdue" ? fq : undefined,
+    user: s.user,
+  } as const;
   let label: ClosureLabel | undefined;
   const status = String(formData.get("status") ?? "");
   const reason = String(formData.get("reason") ?? "").trim();
@@ -316,9 +327,10 @@ export async function scanGroupAction(_prev: FormState, formData: FormData): Pro
       const users = await listUsers();
       if (!users.some((u) => u.name === owner && (u.role === "analyst" || u.role === "admin"))) return { error: "Выберите аналитика или администратора из списка" };
     }
-    const incs = await scanGroupIncidents(subnet);
-    if (incs.length !== expected) {
-      return { error: `Группа изменилась: сейчас ${incs.length} открытых инцидентов вместо ${expected} — обновите страницу и подтвердите снова` };
+    const incs = await scanGroupIncidents(subnet, { ...filter, page: 1 }, GROUP_ACTION_MAX + 1);
+    const now = [...new Set(incs.map((x) => x.incident_id))].sort();
+    if (incs.length > GROUP_ACTION_MAX || now.join(",") !== shown.join(",")) {
+      return { error: `Группа изменилась (сейчас ${incs.length > GROUP_ACTION_MAX ? `больше ${GROUP_ACTION_MAX}` : incs.length} инцидентов, подтверждено ${shown.length}) — обновите страницу и подтвердите снова` };
     }
     for (const inc of incs) {
       const id = inc.incident_id;

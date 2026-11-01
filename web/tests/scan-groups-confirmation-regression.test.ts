@@ -191,6 +191,8 @@ test("PR65 control: расширенная группа не передаёт с
   };
   const tree = await page.default({ searchParams: Promise.resolve({ subnet }) });
   assert.doesNotMatch(await pageText(tree), new RegExp(marker));
-  assert.doesNotMatch(JSON.stringify(tree), new RegExp(marker));
+  // type элемента в тестовой среде бывает модулем с default на самого себя (цикл) —
+  // props без type, их и проверяем.
+  assert.doesNotMatch(JSON.stringify(tree, (k, v) => k === "type" ? undefined : v), new RegExp(marker));
   assert.ok(requests.every((ids) => !ids.includes("INC-4")));
 });

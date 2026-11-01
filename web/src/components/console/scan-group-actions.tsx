@@ -24,18 +24,29 @@ function Confirm({ count }: { count: number }) {
   </label>;
 }
 
-function Hidden({ op, subnet, count }: { op: string; subnet: string; count: number }) {
+export type GroupFilter = { status?: string; level?: string; q?: string; queue?: string };
+
+/**
+ * Показанный состав (incident_id) и условия очереди, при которых он показан:
+ * сервер пересчитает группу при тех же условиях и сверит состав.
+ */
+function Hidden({ op, subnet, ids, filter }: { op: string; subnet: string; ids: string[]; filter: GroupFilter }) {
   return <>
     <input type="hidden" name="op" value={op} />
     <input type="hidden" name="subnet" value={subnet} />
-    <input type="hidden" name="expected" value={count} />
+    <input type="hidden" name="ids" value={ids.join(",")} />
+    <input type="hidden" name="f_status" value={filter.status ?? ""} />
+    <input type="hidden" name="f_level" value={filter.level ?? ""} />
+    <input type="hidden" name="f_q" value={filter.q ?? ""} />
+    <input type="hidden" name="f_queue" value={filter.queue ?? ""} />
   </>;
 }
 
 /** Групповые действия над открытыми инцидентами одной подсети сканов — по выбору аналитика. */
-export function ScanGroupActions({ subnet, count, isAdmin, users }: {
-  subnet: string; count: number; isAdmin: boolean; users: { name: string; role: string }[];
+export function ScanGroupActions({ subnet, ids, filter, isAdmin, users }: {
+  subnet: string; ids: string[]; filter: GroupFilter; isAdmin: boolean; users: { name: string; role: string }[];
 }) {
+  const count = ids.length;
   const [takeState, takeAction, taking] = useActionState(scanGroupAction, initial);
   const [assignState, assignAction, assigning] = useActionState(scanGroupAction, initial);
   const [closeState, closeAction, closing] = useActionState(scanGroupAction, initial);
@@ -43,14 +54,14 @@ export function ScanGroupActions({ subnet, count, isAdmin, users }: {
   return <div className="mt-3 grid gap-4 md:grid-cols-3">
     <form action={takeAction} aria-busy={taking} className="space-y-2 border border-border p-3">
       <div className="c-label">Взять все в работу</div>
-      <Hidden op="take" subnet={subnet} count={count} />
+      <Hidden op="take" subnet={subnet} ids={ids} filter={filter} />
       <Confirm count={count} />
       <Button type="submit" size="sm" variant="secondary" disabled={taking}>{taking ? "Беру…" : "Взять"}</Button>
       <Result state={takeState} />
     </form>
     {isAdmin && <form action={assignAction} aria-busy={assigning} className="space-y-2 border border-border p-3">
       <div className="c-label">Назначить все</div>
-      <Hidden op="assign" subnet={subnet} count={count} />
+      <Hidden op="assign" subnet={subnet} ids={ids} filter={filter} />
       <select name="owner" required defaultValue="" aria-label="Ответственный" className={selectClass}>
         <option value="" disabled>Выберите сотрудника</option>
         {analysts.map((u) => <option key={u.name} value={u.name}>{u.name}</option>)}
@@ -61,7 +72,7 @@ export function ScanGroupActions({ subnet, count, isAdmin, users }: {
     </form>}
     <form action={closeAction} aria-busy={closing} className="space-y-2 border border-border p-3">
       <div className="c-label">Завершить все</div>
-      <Hidden op="close" subnet={subnet} count={count} />
+      <Hidden op="close" subnet={subnet} ids={ids} filter={filter} />
       <select name="status" required defaultValue="" aria-label="Статус завершения" className={selectClass}>
         <option value="" disabled>Статус</option>
         <option value="closed">закрыт</option>
