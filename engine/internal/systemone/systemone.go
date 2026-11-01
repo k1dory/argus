@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -137,28 +138,78 @@ func (c *Client) Decide(ctx context.Context, state string, qs map[string]Questio
 	noRedirect.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	resp, err := noRedirect.Do(req)
 	if err != nil {
-		return Response{}, fmt.Errorf("systemone %s: %w", c.Name, err)
+		return Response{}, c.fail(transportClass(ctx, err), 0)
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponse+1))
 	if err != nil {
-		return Response{}, fmt.Errorf("systemone %s: %w", c.Name, err)
+		return Response{}, c.fail(transportClass(ctx, err), 0)
 	}
 	if len(raw) > maxResponse {
-		return Response{}, fmt.Errorf("systemone %s: ответ больше %d байт", c.Name, maxResponse)
+		return Response{}, c.fail(ClassTooLarge, 0)
 	}
 	if resp.StatusCode != http.StatusOK {
-		// Тело ошибки не логируем целиком: провайдер может вернуть эхо запроса.
-		return Response{}, fmt.Errorf("systemone %s: HTTP %d", c.Name, resp.StatusCode)
+		return Response{}, c.fail(ClassHTTP, resp.StatusCode)
 	}
 	var out Response
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return Response{}, fmt.Errorf("systemone %s: разбор ответа: %w", c.Name, err)
+		return Response{}, c.fail(ClassBadJSON, 0)
 	}
 	if err := Validate(qs, out); err != nil {
-		return Response{}, fmt.Errorf("systemone %s: %w", c.Name, err)
+		// Validate не подставляет в текст строки из ответа — только id вопросов.
+		return Response{}, &Error{Model: c.Name, Class: ClassInvalid, Detail: err.Error()}
 	}
 	return out, nil
+}
+
+// Классы ошибок Decide. Текст ответа, заголовки (Location, Content-Type) и
+// ошибки транспорта наружу не отдаются: в них бывает эхо запроса и ключа, а
+// ошибка пишется в лог и в запись датасета.
+const (
+	ClassTransport = "transport"
+	ClassTimeout   = "timeout"
+	ClassCanceled  = "canceled"
+	ClassTooLarge  = "response too large"
+	ClassHTTP      = "http"
+	ClassBadJSON   = "malformed response"
+	ClassInvalid   = "invalid answer"
+)
+
+// Error — ошибка Decide: модель, класс, HTTP-статус; Detail — только для
+// ClassInvalid и только из наших данных (id вопроса, число вариантов).
+type Error struct {
+	Model  string
+	Class  string
+	Status int
+	Detail string
+}
+
+func (e *Error) Error() string {
+	switch {
+	case e.Class == ClassHTTP:
+		return fmt.Sprintf("systemone %s: HTTP %d", e.Model, e.Status)
+	case e.Detail != "":
+		return fmt.Sprintf("systemone %s: %s: %s", e.Model, e.Class, e.Detail)
+	}
+	return fmt.Sprintf("systemone %s: %s", e.Model, e.Class)
+}
+
+func (c *Client) fail(class string, status int) error {
+	return &Error{Model: c.Name, Class: class, Status: status}
+}
+
+func transportClass(ctx context.Context, err error) string {
+	switch {
+	case errors.Is(ctx.Err(), context.Canceled):
+		return ClassCanceled
+	case errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded):
+		return ClassTimeout
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return ClassTimeout
+	}
+	return ClassTransport
 }
 
 // probTolerance — допуск суммы распределения (округление провайдера).
@@ -174,7 +225,7 @@ func Validate(qs map[string]Question, r Response) error {
 			return fmt.Errorf("нет ответа на %q", id)
 		}
 		if a.Type != q.Type {
-			return fmt.Errorf("%q: тип %q вместо %q", id, a.Type, q.Type)
+			return fmt.Errorf("%q: тип ответа не %q", id, q.Type)
 		}
 		switch q.Type {
 		case Noul:
@@ -208,7 +259,7 @@ func Validate(qs map[string]Question, r Response) error {
 				return fmt.Errorf("%q: score вне шкалы", id)
 			}
 		default:
-			return fmt.Errorf("%q: неизвестный тип %q", id, q.Type)
+			return fmt.Errorf("%q: неизвестный тип вопроса", id)
 		}
 	}
 	return nil

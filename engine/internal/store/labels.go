@@ -36,6 +36,8 @@ type labelRow struct {
 func (c *ClickHouse) LabeledIncidents(ctx context.Context, since string, limit int) ([]LabeledIncident, error) {
 	// toString(changed_at) — только во внешнем запросе: псевдоним с тем же
 	// именем в ClickHouse подменяет колонку и в WHERE (String >= DateTime64).
+	// since сравнивается с точностью до наносекунд: при точности 3 граница
+	// .1231 округлялась бы до .123 и выдавала метку раньше неё.
 	out, err := c.do(ctx, `SELECT incident_id, toString(ts) AS changed_at, disposition, escalate,
 	       severity_correct, ops_cause, ops_action, blind, labeled_by_human
 	FROM (
@@ -47,7 +49,7 @@ func (c *ClickHouse) LabeledIncidents(ctx context.Context, since string, limit i
 			ORDER BY incident_id, revision DESC
 			LIMIT 1 BY incident_id
 		)
-		WHERE labeled_by_human AND changed_at >= parseDateTime64BestEffort({since:String}, 3, 'UTC')
+		WHERE labeled_by_human AND toDateTime64(changed_at, 9, 'UTC') >= parseDateTime64BestEffort({since:String}, 9, 'UTC')
 	)
 	ORDER BY ts, incident_id
 	LIMIT {limit:UInt32}

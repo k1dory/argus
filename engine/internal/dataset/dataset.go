@@ -217,9 +217,18 @@ func bucket(s string) int {
 // научат модель одному правилу «скан = шум» (DECISIONS §5).
 const MaxPerRule = 100
 
+// capOrder — порядок выбора групп под потолком. Хеш с другой солью, чем
+// bucket (разбиение train/holdout): иначе первыми шли бы группы с малым
+// bucket, то есть только holdout, и при сотне групп train оставался пустым.
+func capOrder(group string) uint64 {
+	sum := sha256.Sum256([]byte("cap|" + group))
+	return binary.BigEndian.Uint64(sum[:8])
+}
+
 // Cap оставляет не больше max записей на правило. Выбор детерминирован (по
-// хешу group_id, затем incident_id) и сначала берёт разные группы: из сотни
-// записей одного правила — как можно больше разных случаев.
+// хешу group_id, независимому от разбиения, затем incident_id) и не зависит
+// от порядка входа; сначала берёт разные группы: из сотни записей одного
+// правила — как можно больше разных случаев.
 func Cap(recs []*Record, max int) []*Record {
 	if max <= 0 {
 		return recs
@@ -232,11 +241,12 @@ func Cap(recs []*Record, max int) []*Record {
 		}
 		byRule[r.RuleID] = append(byRule[r.RuleID], r)
 	}
+	sort.Strings(order)
 	var out []*Record
 	for _, rule := range order {
 		rs := byRule[rule]
 		sort.SliceStable(rs, func(i, j int) bool {
-			bi, bj := bucket(rs[i].GroupID), bucket(rs[j].GroupID)
+			bi, bj := capOrder(rs[i].GroupID), capOrder(rs[j].GroupID)
 			if bi != bj {
 				return bi < bj
 			}

@@ -18,7 +18,11 @@ func secIncident(id, actor string) incidents.Incident {
 		Tags: []string{"attack.credential_access", "attack.t1110.001"}, Status: incidents.StatusClosed,
 		Owner: "ivan.petrov", Note: "это пентест Ивана, закрыто", ActorName: actor, Node: "db-prod-01.corp.local",
 		Sources: []string{"journald"}, EventCount: 12,
-		Chain: []string{"10:00 auth.ssh db-prod-01.corp.local failure ivan.petrov@corp.local from 192.168.0.44, phone +7 912 345-67-89"},
+		Chain: []string{
+			fmt.Sprintf("%s  %-16s %-14s %-24s %s", "10:00:01", "journald", "db-prod-01.co…", "auth.ssh.failure", "192.168.0.44:22"),
+			fmt.Sprintf("%s  %-16s %-14s %-24s %s", "10:00:02", "journald", "db-prod-01.co…", "auth.ssh.failure", "ivan.petrov"),
+			"10:00 free text ivan.petrov@corp.local phone +7 912 345-67-89",
+		},
 	}
 }
 
@@ -50,12 +54,14 @@ func TestBuildSecurityRecord(t *testing.T) {
 		t.Fatalf("вопросы: %+v", r.Questions)
 	}
 	// Состояние: ни ответа человека, ни ПДн.
-	for _, leak := range []string{"INC-1", "пентест", "ivan.petrov", "db-prod-01", "192.168.0.44", "912 345", "closed"} {
+	for _, leak := range []string{"INC-1", "пентест", "ivan", "db-prod-01", "192.168.0.44", "912 345", "closed", "corp.local"} {
 		if strings.Contains(r.State, leak) {
 			t.Fatalf("в состоянии %q:\n%s", leak, r.State)
 		}
 	}
-	if !strings.Contains(r.State, "a41c-auth-031") || !strings.Contains(r.State, "192.168.0.0/16") {
+	if !strings.Contains(r.State, "a41c-auth-031") || !strings.Contains(r.State, "auth.ssh.failure") ||
+		!strings.Contains(r.State, "ip-private-") || !strings.Contains(r.State, ":22") || !strings.Contains(r.State, "user-") ||
+		!strings.Contains(r.State, "1 lines of unrecognized format omitted") {
 		t.Fatalf("состояние без правила или сети:\n%s", r.State)
 	}
 }

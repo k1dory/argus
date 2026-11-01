@@ -142,7 +142,7 @@ func TestEvaluateRecordsSplitsAndBlind(t *testing.T) {
 		rec("holdout", false, "false_positive", "malicious"), // не слепая — не в замере
 	}
 	reps := EvaluateRecords(recs, EvalOpts{CalibSplit: "train", EvalSplit: "holdout", BlindOnly: true, TargetAuto: 0.99, TargetHint: 0.9, MinN: 1})
-	if len(reps) != 1 || reps[0].Model != "laya" || reps[0].Question != "disposition" {
+	if len(reps) != 1 || reps[0].Source != "laya" || reps[0].Model != "m" || reps[0].Question != "disposition" {
 		t.Fatalf("отчёты: %+v", reps)
 	}
 	if reps[0].Raw.N != 2 || reps[0].Raw.Acc != 1 || reps[0].CalibN != 1 {

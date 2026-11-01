@@ -213,7 +213,10 @@ func datasetEvalCmd(args []string, w io.Writer) int {
 	if *asJSON {
 		enc := json.NewEncoder(w)
 		enc.SetIndent("", "  ")
-		_ = enc.Encode(reps)
+		if err := enc.Encode(reps); err != nil {
+			slog.Error("dataset eval: запись отчёта", "err", err)
+			return 1
+		}
 		return 0
 	}
 	pct := dataset.FormatPct
@@ -223,12 +226,18 @@ func datasetEvalCmd(args []string, w io.Writer) int {
 		}
 		return fmt.Sprintf("≥%.2f: %s%% / %s%%", l.Fit.Conf, pct(l.Coverage), pct(l.Acc))
 	}
-	fmt.Fprintf(w, "%-6s %-17s %5s %6s %6s %6s %6s %5s %6s %6s  %-24s %-24s\n",
-		"model", "question", "n", "acc", "soft", "brier", "ece", "T", "ece_T", "soft_T", "auto: cov / acc", "hint: cov / acc")
+	bw := bufio.NewWriter(w)
+	fmt.Fprintf(bw, "%-6s %-20s %-17s %5s %6s %6s %6s %6s %5s %6s %6s  %-24s %-24s\n",
+		"source", "model", "question", "n", "acc", "soft", "brier", "ece", "T", "ece_T", "soft_T", "auto: cov / acc", "hint: cov / acc")
 	for _, r := range reps {
-		fmt.Fprintf(w, "%-6s %-17s %5d %6s %6s %6.3f %6.3f %5.2f %6.3f %6s  %-24s %-24s\n",
-			r.Model, r.Question, r.Raw.N, pct(r.Raw.Acc), pct(r.Raw.SoftAcc), r.Raw.Brier, r.Raw.ECE,
+		fmt.Fprintf(bw, "%-6s %-20s %-17s %5d %6s %6s %6.3f %6.3f %5.2f %6.3f %6s  %-24s %-24s\n",
+			r.Source, r.Model, r.Question, r.Raw.N, pct(r.Raw.Acc), pct(r.Raw.SoftAcc), r.Raw.Brier, r.Raw.ECE,
 			r.Temperature, r.Calibrated.ECE, pct(r.Calibrated.SoftAcc), level(r.Auto), level(r.Hint))
+	}
+	// bufio запоминает первую ошибку записи и возвращает её из Flush.
+	if err := bw.Flush(); err != nil {
+		slog.Error("dataset eval: запись отчёта", "err", err)
+		return 1
 	}
 	return 0
 }

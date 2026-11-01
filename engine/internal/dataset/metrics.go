@@ -44,9 +44,11 @@ type Sample struct {
 	Label string
 }
 
-// Samples — наблюдения модели по вопросу из записей, подходящих под keep.
-// Записи без метки, без ответа модели или с ошибкой модели пропускаются.
-func Samples(recs []Record, model, question string, keep func(*Record) bool) []Sample {
+// Samples — наблюдения источника (laya, jev) по вопросу из записей, подходящих
+// под keep. version — ModelAnswers.Model: разные версии одной модели (до и
+// после переобучения) не смешиваются; "" — любая. Записи без метки, без
+// ответа или с ошибкой модели пропускаются.
+func Samples(recs []Record, model, version, question string, keep func(*Record) bool) []Sample {
 	var out []Sample
 	for i := range recs {
 		r := &recs[i]
@@ -58,7 +60,7 @@ func Samples(recs []Record, model, question string, keep func(*Record) bool) []S
 			continue
 		}
 		ma, ok := r.Models[model]
-		if !ok || ma.Error != "" {
+		if !ok || ma.Error != "" || (version != "" && ma.Model != version) {
 			continue
 		}
 		a, ok := ma.Answers[question]
@@ -252,7 +254,8 @@ func ApplyThreshold(ss []Sample, t, conf float64) (coverage, acc float64, n int)
 
 // Report — замер одной модели по одному вопросу.
 type Report struct {
-	Model       string  `json:"model"`
+	Source      string  `json:"source"` // laya | jev — кто спрошен
+	Model       string  `json:"model"`  // версия модели из ответа (ModelAnswers.Model)
 	Question    string  `json:"question"`
 	Temperature float64 `json:"temperature"` // подобрана на калибровочной части
 	CalibN      int     `json:"calib_n"`
@@ -282,11 +285,14 @@ type EvalOpts struct {
 
 // Evaluate по всем моделям и вопросам, встреченным в записях.
 func EvaluateRecords(recs []Record, o EvalOpts) []Report {
-	models := map[string]bool{}
+	type sv struct{ source, version string }
+	models := map[sv]bool{}
 	questions := map[string]bool{}
 	for _, r := range recs {
-		for m := range r.Models {
-			models[m] = true
+		for m, ma := range r.Models {
+			if ma.Error == "" {
+				models[sv{m, ma.Model}] = true
+			}
 		}
 		for q := range r.Labels {
 			questions[q] = true
@@ -295,14 +301,24 @@ func EvaluateRecords(recs []Record, o EvalOpts) []Report {
 	calib := func(r *Record) bool { return r.Split == o.CalibSplit }
 	eval := func(r *Record) bool { return r.Split == o.EvalSplit && (!o.BlindOnly || r.Blind) }
 	var out []Report
-	for _, m := range sortedKeys(models) {
+	keys := make([]sv, 0, len(models))
+	for k := range models {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].source != keys[j].source {
+			return keys[i].source < keys[j].source
+		}
+		return keys[i].version < keys[j].version
+	})
+	for _, m := range keys {
 		for _, q := range sortedKeys(questions) {
-			cs, es := Samples(recs, m, q, calib), Samples(recs, m, q, eval)
+			cs, es := Samples(recs, m.source, m.version, q, calib), Samples(recs, m.source, m.version, q, eval)
 			if len(cs) == 0 && len(es) == 0 {
 				continue
 			}
 			t := FitTemperature(cs)
-			rep := Report{Model: m, Question: q, Temperature: t, CalibN: len(cs), Raw: Evaluate(es, 1), Calibrated: Evaluate(es, t)}
+			rep := Report{Source: m.source, Model: m.version, Question: q, Temperature: t, CalibN: len(cs), Raw: Evaluate(es, 1), Calibrated: Evaluate(es, t)}
 			for _, lv := range []struct {
 				dst    *Level
 				target float64
