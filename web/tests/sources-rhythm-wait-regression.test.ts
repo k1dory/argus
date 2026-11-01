@@ -267,3 +267,27 @@ test("PR89: истечение окна 30 суток не маскирует р
   assert.equal(result.reports[0].omitted, 0);
   assertWrongOmittedRejected(result);
 });
+
+// Ревью дельты 94eeffe..HEAD: граница бюджета и результат setup должны
+// проверяться явно. Одного requestedMs < LOCK_WAIT_MS недостаточно:
+// runFixture перехватывает исключения, а его FixtureContext не передаёт skip.
+test("PR89: ожидание ровно 90 с допустимо и выполняет все проверки cap", { timeout: 5000 }, async (t) => {
+  const result = await runFixture(t, {
+    events: [], heartbeats: [{ source: "heartbeat.only", ageSec: HOUR - 59 }],
+  });
+  assertFixturePass(result);
+  assert.deepEqual(result.waits, [90_000]);
+});
+
+for (const ageSec of [HOUR - 60, 60, -86400]) {
+  test(`PR89: отказ от ожидания для heartbeat возрастом ${ageSec} с не маскирует исключение callback`, { timeout: 5000 }, async (t) => {
+    const result = await runFixture(t, {
+      events: [], heartbeats: [{ source: "heartbeat.only", ageSec }],
+    });
+    assert.equal(result.failure, undefined,
+      `исчерпание бюджета должно моделировать node:test skip, а не проглатывать исключение: ${String(result.failure)}`);
+    assert.deepEqual(result.waits, [], "ожидание дольше 90 с отклоняется до таймера");
+    assert.equal(result.cap, undefined, "пропущенная фикстура не вставляется");
+    assert.equal(result.subtests.length, 0, "проверки cap после skip не выполняются");
+  });
+}
