@@ -98,7 +98,7 @@ async function runCapSetup(t: TestContext, ageSec: number, nodeAheadSec = 0) {
     },
   };
   // VM изолирует регистрацию callback; это не ОС-песочница безопасности.
-  const context = createContext({ Date });
+  const context = createContext({ Date, performance });
   const evaluate = new Script(
     `(function(require, module, exports, __dirname, __filename) {\n${compiled}\n})`,
     { filename: fixtureFile },
