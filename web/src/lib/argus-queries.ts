@@ -377,9 +377,12 @@ export type SourcesReport = {
  *  берёт проекцию из новых партов и сырые строки из старых, и запрос сканирует историю.
  *  Скалярный подзапрос к system.parts (строка на парт) вычисляется до выбора партов: не
  *  готово — WHERE 0, проекция не применяется, force_optimize_projection даёт
- *  PROJECTION_NOT_USED без чтения events. */
+ *  PROJECTION_NOT_USED без чтения events. Пустые парты (rows = 0) не считаются: DELETE
+ *  оставляет активный парт без строк и без файлов проекции, сканировать в нём нечего,
+ *  а без этого исключения список молчащих источников пропадал до ближайшего слияния. */
 const SOURCE_LAST_READY = `(SELECT count() FROM system.parts
-         WHERE database = currentDatabase() AND table = 'events' AND active AND NOT has(projections, 'p_source_last')) = 0`;
+         WHERE database = currentDatabase() AND table = 'events' AND active AND rows > 0
+           AND NOT has(projections, 'p_source_last')) = 0`;
 const PROJECTION_NOT_USED = 584;
 
 /** Ритм по журналу heartbeat (collector_health_log) — единственное место расчёта, тесты гоняют его на живом ClickHouse.
