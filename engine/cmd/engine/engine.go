@@ -87,6 +87,11 @@ type engine struct {
 	respFlight   map[string]bool                 // ключ → идёт попытка (единственный владелец)
 	respSlots    map[string]map[string]time.Time // потолок «режим|правило|подсеть» → ключ → время места
 	respRestored bool                            // решения из response_log прочитаны
+	// respRestoreMu — одно восстановление журнала на движок; под ним же — очередь
+	// инцидентов, отложенных до чтения журнала.
+	respRestoreMu     sync.Mutex
+	respDeferred      map[string]*incidents.Incident
+	respDeferredOrder []string
 
 	// absence — последние события групп правил «молчание», вне буфера кандидатов:
 	// потолок буфера (ENGINE_BUFFER_MAX) их не выбрасывает. Пишет и читает только
@@ -239,9 +244,10 @@ func newEngine(ctx context.Context, rulesDir string, rs []*rules.Rule, acfg anal
 		storms:    map[string]*incidents.Incident{},
 		respState: map[string]respEntry{},
 		respKeys:  map[string]*respKey{}, respFlight: map[string]bool{}, respSlots: map[string]map[string]time.Time{},
-		excWarned: map[string]bool{},
-		identFile: env("IDENTITIES_FILE", ""),
-		absence:   eval.NewAbsenceState(0),
+		respDeferred: map[string]*incidents.Incident{},
+		excWarned:    map[string]bool{},
+		identFile:    env("IDENTITIES_FILE", ""),
+		absence:      eval.NewAbsenceState(0),
 	}
 	e.rules.Store(&rs)
 	var identStore identity.Store

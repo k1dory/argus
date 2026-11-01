@@ -529,6 +529,9 @@ func canonicalIP(ip string) string {
 	return ip
 }
 
+// ErrNotBlocked — Unblock: активной блокировки адреса нет (и в очереди повторов тоже).
+var ErrNotBlocked = errors.New("не найдена")
+
 // CanonicalIP — единственная запись адреса для ключей блокировки, журнала и
 // очереди: netip, IPv4 из ::ffff:… — как IPv4, без зоны. Строка из события
 // (src_ip — String) иначе давала бы разных владельцев одного адреса.
@@ -857,7 +860,7 @@ func (r *Responder) Unblock(ctx context.Context, ip, reason string) ([]Result, e
 		if queued {
 			return []Result{{Executor: "argus", OK: true, IP: ip, Detail: "адрес был только в очереди повторов — убран из неё"}}, nil
 		}
-		return nil, fmt.Errorf("блокировка %s не найдена", ip)
+		return nil, fmt.Errorf("блокировка %s %w", ip, ErrNotBlocked)
 	}
 	r.mu.Unlock()
 	var out []Result

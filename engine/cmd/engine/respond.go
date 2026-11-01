@@ -141,18 +141,22 @@ func (e *engine) autoRespond(ctx context.Context, incs []*incidents.Incident, no
 	var rows []store.ResponseRow
 	ts := model.FormatTS(now)[:19]
 	mode, _ := e.resp.Mode()
-	ready := false
+	// Без прочитанного журнала решения по адресам неизвестны: новых блоков нет,
+	// инциденты с respond откладываются и решаются, когда журнал прочитается
+	// (expireBlocks), — даже если их события больше не приходят.
+	var eligible []*incidents.Incident
+	for _, inc := range incs {
+		if r := e.ruleFor(inc.RuleID); r != nil && r.Respond != nil {
+			eligible = append(eligible, inc)
+		}
+	}
+	if len(eligible) > 0 && !e.respReadyOrDefer(ctx, now, eligible) {
+		return
+	}
 	for _, inc := range incs {
 		r := e.ruleFor(inc.RuleID)
 		if r == nil || r.Respond == nil {
 			continue
-		}
-		// Без прочитанного журнала решения по адресам неизвестны: новых блоков нет,
-		// инцидент не помечается — решит следующий цикл, когда журнал прочитается.
-		if !ready {
-			if ready = e.respReady(ctx, now); !ready {
-				break
-			}
 		}
 		minLevel := r.Respond.MinLevel
 		if minLevel == "" {
@@ -225,6 +229,10 @@ func (e *engine) expireBlocks(ctx context.Context, now time.Time) {
 		rows = append(rows, respRow(ts, "ips", "argus-engine", res, "", "TTL истёк"))
 	}
 	if e.respReady(ctx, now) {
+		if deferred := e.takeDeferred(); len(deferred) > 0 {
+			slog.Info("ips: журнал прочитан — решаю отложенные инциденты", "incidents", len(deferred))
+			e.autoRespond(ctx, deferred, now)
+		}
 		rows = append(rows, e.retryKeys(ctx, now)...)
 	}
 	if len(rows) == 0 {

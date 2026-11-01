@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/devitex-soft/argus/engine/internal/incidents"
 	"github.com/devitex-soft/argus/engine/internal/model"
 	"github.com/devitex-soft/argus/engine/internal/respond"
 	"github.com/devitex-soft/argus/engine/internal/rules"
@@ -37,6 +38,7 @@ const (
 	keyCapped        = "capped"         // потолок; решение за аналитиком
 	keyRefused       = "refused"        // allowlist / never_block / служебный адрес
 	keyIDS           = "ids"            // режим IDS
+	keyManual        = "manual"         // оператор заблокировал или снял адрес вручную
 )
 
 // Шаги в response_log.step (миграция 0037).
@@ -50,6 +52,7 @@ const (
 	stepCapped    = "capped"
 	stepRefused   = "refused"
 	stepIDS       = "ids"
+	stepManual    = "manual"
 )
 
 // reserveRetry — пауза перед новой попыткой после незаписанного резерва.
@@ -73,7 +76,7 @@ func keyOf(incident, ip string) string { return incident + "|" + ip }
 
 func terminal(state string) bool {
 	switch state {
-	case keyDone, keyExhausted, keyCapped, keyRefused, keyIDS:
+	case keyDone, keyExhausted, keyCapped, keyRefused, keyIDS, keyManual:
 		return true
 	}
 	return false
@@ -110,6 +113,9 @@ func (e *engine) keySnapshot(key string) *respKey {
 func (e *engine) storeKey(key string, k respKey) {
 	e.respMu.Lock()
 	defer e.respMu.Unlock()
+	if cur := e.respKeys[key]; cur != nil && cur.state == keyManual {
+		return // оператор решил, пока шла попытка
+	}
 	e.respKeys[key] = &k
 }
 
@@ -319,22 +325,55 @@ func (e *engine) retryKeys(ctx context.Context, now time.Time) []store.ResponseR
 }
 
 // stepPriority — какая строка последней секунды определяет состояние: итог
-// главнее резерва, блок главнее отказа.
-var stepPriority = []string{stepBlocked, stepExhausted, stepFailed, stepNoop, stepSimulated, stepCapped, stepRefused, stepIDS, stepReserve}
+// главнее резерва, блок главнее отказа, решение оператора главнее всего.
+var stepPriority = []string{stepManual, stepBlocked, stepExhausted, stepFailed, stepNoop, stepSimulated, stepCapped, stepRefused, stepIDS, stepReserve}
+
+// respRetention — сколько хранить и читать решения: не меньше respStateTTL и не
+// меньше самого длинного окна потолка среди правил (block_cap_window может быть
+// длиннее 48 ч — место не должно теряться ни при чистке, ни при рестарте).
+func (e *engine) respRetention() time.Duration {
+	keep := respStateTTL
+	for _, r := range e.current() {
+		if r.Respond == nil {
+			continue
+		}
+		if _, w := r.RespondCap(); w > keep {
+			keep = w
+		}
+	}
+	return keep
+}
 
 // restoreKeys — решения по ключам и места в потолке из журнала (рестарт).
 // Состояние определяет только ПОСЛЕДНЯЯ запись ключа (при равном ts — по
-// stepPriority), место — по её времени. Журнал не прочитан — false: новых
-// блоков нет, пока чтение не удастся (повтор — на каждом цикле).
+// stepPriority), место — по её времени, число попыток — по числу неудачных
+// попыток ключа в журнале. Восстановление одно на движок (respRestoreMu): два
+// цикла expireBlocks после неудачного стартового чтения не применяют журнал
+// дважды, и запоздавший ответ не перезаписывает свежее локальное состояние —
+// ключи и места, уже известные в памяти, журнал не трогает. Журнал не прочитан —
+// false: новых блоков нет, пока чтение не удастся (повтор — на каждом цикле).
 func (e *engine) restoreKeys(ctx context.Context, now time.Time) bool {
-	rows, err := e.ch.ResponsesSince(ctx, now.Add(-respStateTTL))
+	e.respRestoreMu.Lock()
+	defer e.respRestoreMu.Unlock()
+	return e.restoreKeysLocked(ctx, now)
+}
+
+func (e *engine) restoreKeysLocked(ctx context.Context, now time.Time) bool {
+	e.respMu.Lock()
+	done := e.respRestored
+	e.respMu.Unlock()
+	if done {
+		return true
+	}
+	rows, err := e.ch.ResponsesSince(ctx, now.Add(-e.respRetention()))
 	if err != nil {
 		slog.Warn("ips: решения автоответа не восстановлены из response_log — новые блокировки отложены до чтения журнала", "err", err)
 		return false
 	}
 	type last struct {
-		at   time.Time
-		rows []store.ResponseRow // строки с ts == at
+		at       time.Time
+		rows     []store.ResponseRow // строки с ts == at
+		failures int                 // неудачных попыток ключа (по сводной строке argus)
 	}
 	byKey := map[string]*last{}
 	for _, row := range rows {
@@ -350,15 +389,25 @@ func (e *engine) restoreKeys(ctx context.Context, now time.Time) bool {
 		row.IP = ip
 		l := byKey[key]
 		switch {
-		case l == nil || at.After(l.at):
-			byKey[key] = &last{at: at, rows: []store.ResponseRow{row}}
+		case l == nil:
+			l = &last{at: at, rows: []store.ResponseRow{row}}
+			byKey[key] = l
+		case at.After(l.at):
+			l.at, l.rows = at, []store.ResponseRow{row}
 		case at.Equal(l.at):
 			l.rows = append(l.rows, row)
+		}
+		// У каждой неудачной попытки — одна сводная строка argus с шагом failed/exhausted.
+		if row.Executor == "argus" && (row.Step == stepFailed || row.Step == stepExhausted) {
+			l.failures++
 		}
 	}
 	doubtful := 0
 	e.respMu.Lock()
 	for key, l := range byKey {
+		if _, known := e.respKeys[key]; known {
+			continue // свежее локальное состояние главнее журнала
+		}
 		var row store.ResponseRow
 	pick:
 		for _, step := range stepPriority {
@@ -387,8 +436,14 @@ func (e *engine) restoreKeys(ctx context.Context, now time.Time) bool {
 		case stepNoop:
 			k.state = keyDone
 		case stepFailed:
-			// повтор — сразу, тем же путём; место — то же
-			k.state, k.attempts, holdsSlot = keyFailed, 1, true
+			// повтор — по прежнему расписанию от времени последней неудачи; место — то же
+			k.state, holdsSlot = keyFailed, true
+			k.attempts = max(l.failures, 1)
+			if k.attempts >= respond.MaxAttempts {
+				k.state = keyExhausted
+			} else {
+				k.next = l.at.Add(respond.RetryDelay(k.attempts))
+			}
 		case stepExhausted:
 			k.state, k.attempts, holdsSlot = keyExhausted, respond.MaxAttempts, true
 		case stepCapped:
@@ -397,6 +452,8 @@ func (e *engine) restoreKeys(ctx context.Context, now time.Time) bool {
 			k.state = keyRefused
 		case stepIDS:
 			k.state = keyIDS
+		case stepManual:
+			k.state = keyManual
 		default:
 			continue
 		}
@@ -408,7 +465,9 @@ func (e *engine) restoreKeys(ctx context.Context, now time.Time) bool {
 				slots = map[string]time.Time{}
 				e.respSlots[ck] = slots
 			}
-			slots[key] = l.at
+			if _, known := slots[key]; !known {
+				slots[key] = l.at
+			}
 		}
 	}
 	e.respRestored = true
@@ -421,25 +480,103 @@ func (e *engine) restoreKeys(ctx context.Context, now time.Time) bool {
 
 // respReady — журнал прочитан; иначе — ещё одна попытка чтения.
 func (e *engine) respReady(ctx context.Context, now time.Time) bool {
-	e.respMu.Lock()
-	ok := e.respRestored
-	e.respMu.Unlock()
-	if ok {
-		return true
-	}
-	return e.restoreKeys(ctx, now)
+	return e.respReadyOrDefer(ctx, now, nil)
 }
 
-// pruneKeysLocked — конечные ключи старше ttl и пустые потолки.
+// respDeferredMax — сколько инцидентов ждут чтения журнала: сверх — самые старые
+// отбрасываются с предупреждением (их адреса не блокируются, решение за аналитиком).
+const respDeferredMax = 10000
+
+// respReadyOrDefer — журнал прочитан; иначе инциденты incs откладываются до чтения.
+// Откладывание — под тем же замком, что и чтение: восстановление в expireBlocks
+// не может проскочить между неудачным чтением и записью в очередь, и отложенный
+// инцидент не теряется, даже если его события больше не приходят.
+func (e *engine) respReadyOrDefer(ctx context.Context, now time.Time, incs []*incidents.Incident) bool {
+	e.respRestoreMu.Lock()
+	defer e.respRestoreMu.Unlock()
+	if e.restoreKeysLocked(ctx, now) {
+		return true
+	}
+	if len(incs) == 0 {
+		return false
+	}
+	e.respMu.Lock()
+	defer e.respMu.Unlock()
+	for _, inc := range incs {
+		if _, queued := e.respDeferred[inc.IncidentID]; !queued {
+			e.respDeferredOrder = append(e.respDeferredOrder, inc.IncidentID)
+		}
+		e.respDeferred[inc.IncidentID] = inc
+	}
+	if drop := len(e.respDeferredOrder) - respDeferredMax; drop > 0 {
+		for _, id := range e.respDeferredOrder[:drop] {
+			delete(e.respDeferred, id)
+		}
+		e.respDeferredOrder = append([]string(nil), e.respDeferredOrder[drop:]...)
+		slog.Warn("ips: очередь отложенных до чтения журнала инцидентов переполнена — старые отброшены", "dropped", drop)
+	}
+	return false
+}
+
+// takeDeferred — отложенные инциденты в порядке поступления (очередь очищается).
+func (e *engine) takeDeferred() []*incidents.Incident {
+	e.respMu.Lock()
+	defer e.respMu.Unlock()
+	out := make([]*incidents.Incident, 0, len(e.respDeferredOrder))
+	for _, id := range e.respDeferredOrder {
+		if inc := e.respDeferred[id]; inc != nil {
+			out = append(out, inc)
+		}
+	}
+	e.respDeferred, e.respDeferredOrder = map[string]*incidents.Incident{}, nil
+	return out
+}
+
+// operatorOverride — ручная блокировка или снятие адреса: все ключи адреса
+// переходят в конечное «решение оператора» (с записью в журнал, чтобы пережить
+// рестарт) и отдают места; автоповтор их больше не трогает. Возвращает строки
+// журнала и число ключей, по которым ещё ждала автоблокировка.
+func (e *engine) operatorOverride(ip, actor, reason string, now time.Time) (rows []store.ResponseRow, pending int) {
+	ip, ok := respond.CanonicalIP(ip)
+	if !ok {
+		return nil, 0
+	}
+	ts := model.FormatTS(now)[:19]
+	e.respMu.Lock()
+	defer e.respMu.Unlock()
+	for key, k := range e.respKeys {
+		if k.ip != ip || k.state == keyManual {
+			continue
+		}
+		if !terminal(k.state) {
+			pending++
+		}
+		if k.slotSpace != "" {
+			ck := capKey(k.slotSpace, k.ruleID, k.ip)
+			if slots := e.respSlots[ck]; slots != nil {
+				delete(slots, key)
+			}
+		}
+		k.state, k.at = keyManual, now
+		row := respRow(ts, "manual", actor, respond.Result{Executor: "argus", OK: true, IP: ip, Incident: k.incident,
+			Detail: "решение оператора: автоблокировка адреса по инциденту отменена"}, k.ruleID, reason)
+		row.Step = stepManual
+		rows = append(rows, row)
+	}
+	return rows, pending
+}
+
+// pruneKeysLocked — конечные ключи старше ttl и места старше окна хранения.
 func (e *engine) pruneKeysLocked(now time.Time, ttl time.Duration) {
 	for key, k := range e.respKeys {
 		if terminal(k.state) && now.Sub(k.at) > ttl {
 			delete(e.respKeys, key)
 		}
 	}
+	keep := max(ttl, e.respRetention())
 	for ck, slots := range e.respSlots {
 		for key, at := range slots {
-			if now.Sub(at) > ttl {
+			if now.Sub(at) > keep {
 				delete(slots, key)
 			}
 		}

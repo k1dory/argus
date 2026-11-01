@@ -432,7 +432,7 @@ type ResponseRow struct {
 	Reason     string `json:"reason"`
 	Actor      string `json:"actor"` // argus-engine | оператор
 	// Step — шаг автомата автоблокировки (миграция 0037): reserve | blocked | noop |
-	// simulated | failed | exhausted | capped | refused | ids; пусто — служебная
+	// simulated | failed | exhausted | capped | refused | ids | manual; пусто — служебная
 	// строка или ручное действие. По нему движок восстанавливает решения после рестарта.
 	Step string `json:"step"`
 }

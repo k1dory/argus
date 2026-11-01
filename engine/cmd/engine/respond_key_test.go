@@ -404,7 +404,11 @@ func TestRespondKeyRestoreFromLastJournalRow(t *testing.T) {
 		x.available.Store(true)
 		r := keyEngine(t, f, x, 4)
 		r.autoRespond(ctx, []*incidents.Incident{capInc("INC-1", "203.0.113.7")}, cycleAt.Add(time.Second))
-		r.expireBlocks(ctx, cycleAt.Add(2*time.Second))
+		r.expireBlocks(ctx, cycleAt.Add(2*time.Second)) // по расписанию ещё рано: две неудачи — следующий повтор через 5 мин
+		if x.calls.Load() != 2 {
+			t.Fatal("после рестарта расписание повторов сохраняется")
+		}
+		r.expireBlocks(ctx, cycleAt.Add(respond.RetryDelay(2)+time.Second))
 		if x.blocks.Load() != 1 {
 			t.Fatalf("отказ после рестарта стал конечным: %q", keyState(r, "INC-1", "203.0.113.7"))
 		}
@@ -510,5 +514,87 @@ func TestRespondKeyRetryAfterWindowRenewsSlot(t *testing.T) {
 	e.autoRespond(ctx, []*incidents.Incident{capInc("INC-2", "203.0.113.8")}, t1.Add(time.Minute))
 	if got := x.blocks.Load(); got != 1 || keyState(e, "INC-2", "203.0.113.8") != keyCapped {
 		t.Fatalf("место повтора не обновлено: блоков %d за окно при block_cap=1", got)
+	}
+}
+
+// Две независимые защиты от запоздалого восстановления (каждая закрывает гонку
+// TestPR67ConcurrentJournalRestoreKeepsSuccessfulBlockSlot сама по себе):
+// журнал не перезаписывает ключи и места, уже известные в памяти…
+func TestRespondKeyRestoreDoesNotOverwriteLocalState(t *testing.T) {
+	f := newFakeCH(t)
+	x := newKeyExecutor(t)
+	e := keyEngine(t, f, x, 1)
+	ctx, t0 := context.Background(), time.Now().UTC().Truncate(time.Second)
+	e.autoRespond(ctx, []*incidents.Incident{capInc("INC-1", "203.0.113.7")}, t0) // failed в журнале
+	saveJournal(f)
+	r := keyEngine(t, f, x, 1)
+	key := keyOf("INC-1", "203.0.113.7")
+	r.storeKey(key, respKey{state: keyDone, at: t0.Add(time.Minute), incident: "INC-1", ip: "203.0.113.7", ruleID: "t-waf"})
+	ck := capKey(respond.ModeIPS, "t-waf", "203.0.113.7")
+	r.capRestore(ck, key, t0.Add(time.Minute))
+	if !r.restoreKeys(ctx, t0.Add(2*time.Minute)) {
+		t.Fatal("журнал читается")
+	}
+	r.respMu.Lock()
+	slotAt := r.respSlots[ck][key]
+	r.respMu.Unlock()
+	if keyState(r, "INC-1", "203.0.113.7") != keyDone || !slotAt.Equal(t0.Add(time.Minute)) {
+		t.Fatalf("журнал перезаписал свежее состояние: %q, место %s", keyState(r, "INC-1", "203.0.113.7"), slotAt)
+	}
+}
+
+// …и восстановление одно на движок: параллельные вызовы читают журнал один раз.
+func TestRespondKeyRestoreIsSingleFlight(t *testing.T) {
+	f := newFakeCH(t)
+	x := newKeyExecutor(t)
+	var reads atomic.Int32
+	release := make(chan struct{})
+	journal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("query") == "" {
+			reads.Add(1)
+			<-release
+		}
+		f.srv.Config.Handler.ServeHTTP(w, r)
+	}))
+	t.Cleanup(journal.Close)
+	e := keyEngine(t, f, x, 1)
+	e.ch = store.New(journal.URL, "argus", "default", "")
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); e.restoreKeys(context.Background(), time.Now()) }()
+	}
+	time.Sleep(100 * time.Millisecond)
+	close(release)
+	wg.Wait()
+	if got := reads.Load(); got != 1 {
+		t.Fatalf("журнал прочитан %d раз", got)
+	}
+}
+
+// Решение оператора (ручное снятие ожидающей автоблокировки) — в журнале с шагом
+// manual: после рестарта ключ конечный, автоповтор его не трогает.
+func TestRespondKeyOperatorOverrideSurvivesRestart(t *testing.T) {
+	f := newFakeCH(t)
+	x := newKeyExecutor(t)
+	e := keyEngine(t, f, x, 2)
+	ctx, t0 := context.Background(), time.Now().UTC().Truncate(time.Second)
+	e.autoRespond(ctx, []*incidents.Incident{capInc("INC-1", "203.0.113.7")}, t0)
+	code, body := do(t, e.handler(), "POST", "/respond/unblock", "s", `{"ip":"::ffff:203.0.113.7","user":"qa","reason":"ложное, отменить"}`)
+	if code != http.StatusOK || keyState(e, "INC-1", "203.0.113.7") != keyManual || countSteps(f, stepManual) != 1 {
+		t.Fatalf("отмена ожидающей автоблокировки: %d %s, состояние %q", code, body, keyState(e, "INC-1", "203.0.113.7"))
+	}
+	saveJournal(f)
+	x.available.Store(true)
+	r := keyEngine(t, f, x, 2)
+	r.expireBlocks(ctx, t0.Add(10*time.Minute))
+	if x.blocks.Load() != 0 || keyState(r, "INC-1", "203.0.113.7") != keyManual {
+		t.Fatalf("после рестарта автоматика вернулась к адресу: блоков %d, состояние %q", x.blocks.Load(), keyState(r, "INC-1", "203.0.113.7"))
+	}
+	e.respMu.Lock()
+	slots := len(e.respSlots[capKey(respond.ModeIPS, "t-waf", "203.0.113.7")])
+	e.respMu.Unlock()
+	if slots != 0 {
+		t.Fatal("решение оператора освобождает место")
 	}
 }
