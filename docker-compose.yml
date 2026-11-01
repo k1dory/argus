@@ -263,6 +263,7 @@ services:
       SINK_PENDING_ROWS: ${SINK_PENDING_ROWS:-200000}       # оперативный буфер перед дисковой очередью; при заполнении — обратное давление
       SINK_SPOOL_DIR: /state/spool
       SINK_SPOOL_BYTES: ${SINK_SPOOL_BYTES:-8589934592}    # 8 ГБ на collector-state; при заполнении приём блокируется
+      SINK_STALL_AFTER: ${SINK_STALL_AFTER:-10m}          # батч без прогресса дольше — событие collector.sink_stalled; 0 — выкл.
       LOG_LEVEL: ${COLLECTOR_LOG_LEVEL:-info}
       # WAF: файлы логов с хоста (каталог WAF_LOG_DIR монтируется в /logs/waf)
       WAF_AUDIT_LOG: ${WAF_AUDIT_LOG:-}

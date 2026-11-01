@@ -13,7 +13,7 @@ export const dynamic = "force-dynamic";
 export const metadata: Metadata = { title: "Согласие с агентом" };
 
 const pct = (x: number) => `${Math.round(x * 100)} %`;
-const lowData = (s: Share) => (s.low_data ? " · мало данных" : "");
+const lowData = (s: Share) => (s.low_data ? "мало данных" : undefined);
 
 /** Доля, интервал Уилсона и пометка «мало данных» при n < LOW_DATA_N. */
 function ShareCell({ s }: { s: Share }) {
@@ -62,11 +62,14 @@ export default async function AgreementPage({ searchParams }: PageProps<"/rules/
           <div className="grid grid-cols-2 gap-6 md:grid-cols-4">
             <StatTile label="Ответов людей" value={fmtNum(res.data.total.labeled)} />
             <StatTile label="Согласие · слепые" value={res.data.total.blind.agreement.n ? pct(res.data.total.blind.agreement.share ?? 0) : "—"}
-              hint={`${fmtNum(res.data.total.blind.agreement.k)} из ${fmtNum(res.data.total.blind.agreement.n)} сравнимых${lowData(res.data.total.blind.agreement)}`} />
+              hint={`${fmtNum(res.data.total.blind.agreement.k)} из ${fmtNum(res.data.total.blind.agreement.n)} сравнимых`}
+              note={lowData(res.data.total.blind.agreement)} />
             <StatTile label="Согласие · неслепые" value={res.data.total.sighted.agreement.n ? pct(res.data.total.sighted.agreement.share ?? 0) : "—"}
-              hint={`${fmtNum(res.data.total.sighted.agreement.k)} из ${fmtNum(res.data.total.sighted.agreement.n)} сравнимых${lowData(res.data.total.sighted.agreement)}`} />
+              hint={`${fmtNum(res.data.total.sighted.agreement.k)} из ${fmtNum(res.data.total.sighted.agreement.n)} сравнимых`}
+              note={lowData(res.data.total.sighted.agreement)} />
             <StatTile label="Ложных срабатываний" value={res.data.total.labeled ? pct(res.data.total.false_positive.share ?? 0) : "—"}
-              hint={`${fmtNum(res.data.total.false_positive.k)} из ${fmtNum(res.data.total.labeled)}${lowData(res.data.total.false_positive)}`} />
+              hint={`${fmtNum(res.data.total.false_positive.k)} из ${fmtNum(res.data.total.labeled)}`}
+              note={lowData(res.data.total.false_positive)} />
           </div>
 
           <Panel label="По правилам" meta={`сверху — кандидаты на тюнинг (доля ложных); при n < ${LOW_DATA_N} — «мало данных»`}>

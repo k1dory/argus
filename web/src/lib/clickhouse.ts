@@ -77,7 +77,8 @@ const DEFAULT_SETTINGS: Record<string, string | number> = { max_execution_time: 
 
 /** Настройки запроса; null — не передавать (и умолчание консоли тоже): значение
  *  задаёт профиль пользователя. Нужно для SQL, исполнимого и от argus_ro, у которого
- *  readonly = 1 отклоняет любую настройку, отличную от профиля. */
+ *  readonly = 1 отклоняет любую настройку, отличную от профиля. null убирает и параметр
+ *  из CLICKHOUSE_URL. */
 export type ChSettings = Record<string, string | number | null>;
 
 /**
@@ -171,7 +172,11 @@ function chFetch(sql: string, params: Record<string, string | number>, settings:
 
 async function chFetchWithSlot(sql: string, params: Record<string, string | number>, settings: ChSettings, format: string | null): Promise<string> {
   const url = new URL(CH_URL);
-  for (const [key, value] of Object.entries({ ...DEFAULT_SETTINGS, ...settings })) if (value !== null) url.searchParams.set(key, String(value));
+  // null убирает настройку совсем, в том числе заданную в самом CLICKHOUSE_URL.
+  for (const [key, value] of Object.entries({ ...DEFAULT_SETTINGS, ...settings })) {
+    if (value === null) url.searchParams.delete(key);
+    else url.searchParams.set(key, String(value));
+  }
   url.searchParams.set("database", CH_DB);
   if (format) url.searchParams.set("default_format", format);
   // Ответ буферизуется на сервере до конца запроса: ошибка посреди выдачи приходит HTTP-
