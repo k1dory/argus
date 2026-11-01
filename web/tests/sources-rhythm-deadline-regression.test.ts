@@ -28,7 +28,13 @@ type FixtureContext = {
 };
 type FixtureBody = (t: FixtureContext) => Promise<void>;
 
-async function runSetup(reportDelayMs: number) {
+type SetupOptions = {
+  reportDelaysMs?: readonly number[];
+  heartbeatAgeSec?: number;
+  stopAtInsert?: boolean;
+};
+
+async function runSetup(reportDelayMs: number, options: SetupOptions = {}) {
   let nowMs = START_MS;
   let reportCount = 0;
   let failure: unknown;
@@ -36,6 +42,7 @@ async function runSetup(reportDelayMs: number) {
   const commands: string[] = [];
   const waits: { atMs: number; delayMs: number }[] = [];
   const bodies: FixtureBody[] = [];
+  const stopAfterInsert = new Error("INSERT cap достигнут; конец проверки setup");
   // Источники выйдут из окна часа через 30, 61, 92, 123 и 154 секунды.
   // Во время setup ничего не вставляется и не удаляется.
   const events = [30, 61, 92, 123, 154].map((leavesSec, i) => ({
@@ -54,6 +61,7 @@ async function runSetup(reportDelayMs: number) {
     },
     chCommand: async (sql: string) => {
       commands.push(sql);
+      if (options.stopAtInsert && /^INSERT INTO events\b/.test(sql)) throw stopAfterInsert;
       assert.fail("неподходящее окно должно завершиться skip до первой записи cap");
     },
   };
@@ -82,13 +90,18 @@ async function runSetup(reportDelayMs: number) {
         // Как now() ClickHouse: снимок берётся в начале запроса, ответ приходит
         // позже. Все строки по-прежнему находятся внутри окна 30 суток.
         const snapshotMs = nowMs;
-        const sources = events.map(({ source, lastMs }) => ({
+        const sources = options.heartbeatAgeSec === undefined ? events.map(({ source, lastMs }) => ({
           source,
           events_1h: lastMs >= snapshotMs - 3_600_000 ? 1 : 0,
           last_ts: timestamp(lastMs),
           silent_for_sec: (snapshotMs - lastMs) / 1000,
-        }));
-        nowMs += reportDelayMs;
+        })) : [{
+          source: "heartbeat.only",
+          events_1h: 0,
+          last_ts: timestamp(START_MS - options.heartbeatAgeSec * 1000),
+          silent_for_sec: (snapshotMs - START_MS) / 1000 + options.heartbeatAgeSec,
+        }];
+        nowMs += options.reportDelaysMs?.[reportCount - 1] ?? reportDelayMs;
         return { sources, omitted: 0 };
       },
     },
@@ -123,7 +136,7 @@ async function runSetup(reportDelayMs: number) {
       test: async () => { assert.fail("после skip проверки cap не запускаются"); },
     });
   } catch (error) { failure = error; }
-  return { failure, skipped, commands, waits, reportCount, elapsedMs: nowMs - START_MS };
+  return { failure, skipped, commands, waits, reportCount, elapsedMs: nowMs - START_MS, stopAfterInsert };
 }
 
 for (const reportDelayMs of [0, 10_000]) {
@@ -139,3 +152,34 @@ for (const reportDelayMs of [0, 10_000]) {
       `${result.reportCount} отчётов и ${result.waits.reduce((sum, wait) => sum + wait.delayMs, 0) / 1000} с таймеров`);
   });
 }
+
+// Первый baseline занимает 1 с. Heartbeat возрастом 3543 с требует затем
+// ещё 87 с ожидания. Прогноз со старой длительностью разрешает новый отчёт:
+// 1 + 87 + 1 = 89 с. Если второй baseline длится 3 с, INSERT достигается
+// на 91-й секунде: wait <= 0 обходит проверку истёкшего бюджета.
+test("PR97: замедлившийся повторный baseline не разрешает INSERT после 90 с", { timeout: 5000 }, async () => {
+  const result = await runSetup(0, {
+    heartbeatAgeSec: 3600 - 57,
+    reportDelaysMs: [1000, 3000],
+    stopAtInsert: true,
+  });
+  assert.deepEqual(result.commands, [],
+    `исчерпанный бюджет должен завершить setup до INSERT; прошло ${result.elapsedMs} мс CH`);
+  assert.equal(result.failure, undefined, "истечение бюджета должно завершаться без исключения");
+  assert.equal(result.skipped.length, 1, "даже при wait <= 0 нужен явный skip по истёкшему бюджету");
+  assert.ok(result.skipped[0].length > 0);
+});
+
+// Контроль того же стенда: запросы занимают ненулевое время, но на самой
+// включённой границе бюджета cap уже допустим и должен доходить до INSERT.
+test("PR97: baseline, завершившийся ровно на 90-й секунде, допускает INSERT", { timeout: 5000 }, async () => {
+  const result = await runSetup(0, {
+    heartbeatAgeSec: 3600 - 57,
+    reportDelaysMs: [1000, 2000],
+    stopAtInsert: true,
+  });
+  assert.equal(result.failure, result.stopAfterInsert, "остановка только в перехваченном INSERT");
+  assert.equal(result.commands.length, 1);
+  assert.equal(result.skipped.length, 0);
+  assert.equal(result.elapsedMs, WAIT_BUDGET_MS);
+});

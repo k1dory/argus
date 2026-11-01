@@ -33,7 +33,14 @@ type Params = Record<string, string | number>;
 type Sample = { source: string; ageSec: number };
 type FixtureContext = { test: (name: string, body: () => Promise<void>) => Promise<void> };
 type FixtureBody = (t: FixtureContext) => Promise<void>;
-type Options = { events: Sample[]; heartbeats?: Sample[]; stopAtInsert?: boolean; overcountOmitted?: boolean };
+type Options = {
+  events: Sample[];
+  heartbeats?: Sample[];
+  stopAtInsert?: boolean;
+  overcountOmitted?: boolean;
+  // Только для mutation-теста самого харнесса; файл live-фикстуры не меняется.
+  compiledFixture?: string;
+};
 
 async function runFixture(t: TestContext, options: Options) {
   let now = START;
@@ -159,7 +166,7 @@ async function runFixture(t: TestContext, options: Options) {
     },
   });
   const evaluate = new Script(
-    `(function(require, module, exports, __dirname, __filename) {\n${compiled}\n})`,
+    `(function(require, module, exports, __dirname, __filename) {\n${options.compiledFixture ?? compiled}\n})`,
     { filename: fixtureFile },
   ).runInContext(context, { timeout: 1000 });
   const mod = { exports: {} };
@@ -279,15 +286,63 @@ test("PR89: ожидание ровно 90 с допустимо и выполн
   assert.deepEqual(result.waits, [90_000]);
 });
 
+// Вынесены без изменения из проверок PR97, чтобы mutation-тест ниже проверял
+// именно используемый ими критерий успеха, а не его отдельную копию.
+function assertFixtureSkipped(result: Awaited<ReturnType<typeof runFixture>>) {
+  assert.equal(result.failure, undefined,
+    `исчерпание бюджета должно моделировать node:test skip, а не проглатывать исключение: ${String(result.failure)}`);
+  assert.deepEqual(result.waits, [], "ожидание дольше 90 с отклоняется до таймера");
+  assert.equal(result.cap, undefined, "пропущенная фикстура не вставляется");
+  assert.equal(result.subtests.length, 0, "проверки cap после skip не выполняются");
+}
+
 for (const ageSec of [HOUR - 60, 60, -86400]) {
   test(`PR89: отказ от ожидания для heartbeat возрастом ${ageSec} с не маскирует исключение callback`, { timeout: 5000 }, async (t) => {
     const result = await runFixture(t, {
       events: [], heartbeats: [{ source: "heartbeat.only", ageSec }],
     });
-    assert.equal(result.failure, undefined,
-      `исчерпание бюджета должно моделировать node:test skip, а не проглатывать исключение: ${String(result.failure)}`);
-    assert.deepEqual(result.waits, [], "ожидание дольше 90 с отклоняется до таймера");
-    assert.equal(result.cap, undefined, "пропущенная фикстура не вставляется");
-    assert.equal(result.subtests.length, 0, "проверки cap после skip не выполняются");
+    assertFixtureSkipped(result);
   });
 }
+
+test("PR97: wait-харнесс отклоняет немедленный возврат без t.skip", { timeout: 5000 }, async (t) => {
+  // В памяти отключаем skip только при немедленном отказе (elapsed === 0),
+  // сохраняя return, бюджет и SQL. Два исходных deadline-теста пропускают после
+  // повторных baseline, поэтому их skip остаётся рабочим при этой мутации.
+  // Поддерживаются и прямой t.skip(...), и текущий optional call.
+  let changedCalls = 0;
+  const withoutSkip = ts.transpileModule(readFileSync(fixtureFile, "utf8"), {
+    compilerOptions: {
+      target: ts.ScriptTarget.ES2022,
+      module: ts.ModuleKind.CommonJS,
+      esModuleInterop: true,
+    },
+    transformers: {
+      before: [(context) => {
+        const visit: ts.Visitor = (node) => {
+          if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)
+            && node.expression.name.text === "skip") {
+            changedCalls++;
+            return context.factory.createBinaryExpression(
+              context.factory.createBinaryExpression(
+                context.factory.createIdentifier("chNow"), ts.SyntaxKind.ExclamationEqualsEqualsToken,
+                context.factory.createIdentifier("startCh"),
+              ),
+              ts.SyntaxKind.AmpersandAmpersandToken, node,
+            );
+          }
+          return ts.visitEachChild(node, visit, context);
+        };
+        return (source) => ts.visitNode(source, visit) as ts.SourceFile;
+      }],
+    },
+  }).outputText;
+  assert.equal(changedCalls, 1, "мутация меняет ровно один вызов skip в live-фикстуре");
+  const result = await runFixture(t, {
+    events: [],
+    heartbeats: [{ source: "heartbeat.only", ageSec: HOUR - 60 }],
+    compiledFixture: withoutSkip,
+  });
+  assert.throws(() => assertFixtureSkipped(result), { name: "AssertionError" },
+    "проверки отказа от ожидания должны обнаруживать пропавший skip, а не принимать пустой return за успех");
+});
