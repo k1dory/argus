@@ -27,9 +27,12 @@ type ClickHouse struct {
 	idStamps             stamps // метки updated_at паспорта (identity.go)
 }
 
-// JSONEachRow escapes newlines inside values, so an exception on its own
-// line cannot be confused with event text containing "DB::Exception".
-var responseException = regexp.MustCompile(`(?m)^Code:\s*\d+\.\s*DB::Exception:`)
+// Исключение после HTTP 200 (страховка: с wait_end_of_query=1 ClickHouse 24.8 отвечает
+// на ошибку HTTP-статусом и X-ClickHouse-Exception-Code). Формы сервера: отдельная
+// строка «Code: N. DB::Exception», «Poco::Exception. Code: N,», «std::exception. Code:
+// N,» и хвост JSONEachRow {"exception": "Code: …"}. JSONEachRow экранирует переводы
+// строк в значениях, а колонок с именем exception в запросах движка нет.
+var responseException = regexp.MustCompile(`(?m)^(?:\{"exception":\s*"|Poco::Exception\. |std::exception\. )?Code:\s*\d+[.,]`)
 
 func New(base, db, user, pass string) *ClickHouse {
 	return &ClickHouse{base: strings.TrimRight(base, "/"), db: db, user: user, pass: pass,
@@ -64,6 +67,10 @@ func (c *ClickHouse) do(ctx context.Context, query string, body io.Reader, param
 	q.Set("input_format_skip_unknown_fields", "1")
 	// UInt64 иначе приходит строкой в кавычках и ломает разбор JSON
 	q.Set("output_format_json_quote_64bit_integers", "0")
+	// Ответ буферизуется на сервере до конца запроса: ошибка посреди выдачи приходит
+	// HTTP-ошибкой, а не хвостом тела со статусом 200 (неполная страница EventsSince
+	// сдвинула бы курсор и потеряла события).
+	q.Set("wait_end_of_query", "1")
 	for k, v := range params {
 		q.Set("param_"+k, v)
 	}
@@ -557,7 +564,8 @@ func (c *ClickHouse) restoreGroupKeys(ctx context.Context, open []incidents.Inci
 				Exception  string `json:"exception"`
 			}
 			if err := json.Unmarshal(line, &row); err != nil || row.Exception != "" || row.IncidentID == "" {
-				return fmt.Errorf("restore group_key: %.200s", bytes.TrimSpace(line))
+				// Без текста строки: это может быть исключение с цитатой данных.
+				return errors.New("restore group_key: неожиданная строка ответа ClickHouse")
 			}
 			keys[row.IncidentID] = row.GroupKey
 		}
