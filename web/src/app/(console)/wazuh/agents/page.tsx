@@ -16,14 +16,21 @@ import { parseRange, safeQuery } from "@/lib/clickhouse";
 import { agentsSummary } from "@/lib/queries";
 import { fmtNum, formatAgo, formatTs } from "@/lib/shared/time";
 import { requirePageSession } from "@/lib/auth";
+import { RangeFilters } from "@/components/console/range-filters";
+import { describeChips } from "@/lib/shared/filters";
+import { AGENT_RANGE_FIELDS, agentRangeChips, parseAgentRanges } from "@/lib/shared/page-filters";
 
 export const dynamic = "force-dynamic";
 export const metadata: Metadata = { title: "Агенты Wazuh" };
 
 export default async function AgentsPage({ searchParams }: PageProps<"/wazuh/agents">) {
   await requirePageSession();
-  const range = parseRange((await searchParams).range as string | undefined);
-  const r = await safeQuery(() => agentsSummary(range));
+  const sp = await searchParams;
+  const range = parseRange(sp.range as string | undefined);
+  // Окно и уровень — какие алерты считаются; алертов/критичных — пороги итогов по агенту.
+  const ranges = parseAgentRanges(sp);
+  const filtersText = describeChips(agentRangeChips(ranges));
+  const r = await safeQuery(() => agentsSummary(ranges.time, { level: ranges.level, alerts: ranges.alerts, critical: ranges.critical }));
   const now = new Date();
 
   return (
@@ -36,8 +43,11 @@ export default async function AgentsPage({ searchParams }: PageProps<"/wazuh/age
         <StorageUnavailable reason={r.error} />
       ) : (
         <Panel label={`Активность агентов · ${fmtNum(r.data.length)} шт.`} meta="по алертам менеджера; регистрация и группы — в разделе «Управление Wazuh»">
+          <div className="mb-4"><RangeFilters time fields={AGENT_RANGE_FIELDS} idPrefix="agents" /></div>
           {r.data.length === 0 ? (
-            <Empty>Нет алертов за период — агенты либо молчат, либо не подключены к менеджеру.</Empty>
+            filtersText
+              ? <Empty>Нет агентов по фильтрам: {filtersText} — ослабьте пороги или расширьте интервал.</Empty>
+              : <Empty>Нет алертов за период — агенты либо молчат, либо не подключены к менеджеру.</Empty>
           ) : (
             <div className="c-well overflow-x-auto p-2">
               <Table>

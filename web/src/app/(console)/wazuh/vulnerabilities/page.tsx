@@ -18,6 +18,10 @@ import { vulnList, VULN_LIMIT } from "@/lib/queries";
 import { vulnSeverityLabel, vulnStatusLabel } from "@/lib/shared/labels";
 import { fmtNum, formatTs } from "@/lib/shared/time";
 import { requirePageSession } from "@/lib/auth";
+import { RangeFilters } from "@/components/console/range-filters";
+import { RangePicker } from "@/components/console/range-picker";
+import { describeChips } from "@/lib/shared/filters";
+import { parseVulnRanges, VULN_MAX_DAYS, VULN_RANGE_FIELDS, vulnRangeChips } from "@/lib/shared/page-filters";
 
 export const dynamic = "force-dynamic";
 export const metadata: Metadata = { title: "Уязвимости" };
@@ -26,21 +30,28 @@ function VulnSeverityBadge({ severity }: { severity: string }) {
   return <Badge variant="outline" className={cn("font-mono", TONE_CLASS[toneFor(VULN_TONE, severity)])}>{vulnSeverityLabel(severity)}</Badge>;
 }
 
-export default async function VulnerabilitiesPage() {
+export default async function VulnerabilitiesPage({ searchParams }: PageProps<"/wazuh/vulnerabilities">) {
   await requirePageSession();
-  const r = await safeQuery(() => vulnList());
+  // Окно обнаружения (по умолчанию 30 дней, не шире 30), серьёзность не ниже/не выше, CVSS от–до.
+  const ranges = parseVulnRanges(await searchParams);
+  const filtersText = describeChips(vulnRangeChips(ranges));
+  const r = await safeQuery(() => vulnList({ time: ranges.time, severity: ranges.severity, cvss: ranges.cvss }));
 
   return (
     <>
       <PageHeader title="Уязвимости">
-        <span className="c-label">vulnerability-detector · окно 30 дней</span>
+        <span className="flex flex-wrap items-center gap-3">
+          <span className="c-label">vulnerability-detector · окно до {VULN_MAX_DAYS} дней</span>
+          <RangePicker value={ranges.time.range} />
+        </span>
       </PageHeader>
-      {!r.ok ? <StorageUnavailable reason={r.error} /> : <VulnBody vulns={r.data} />}
+      <RangeFilters time timeLabel="Обнаружено, точный интервал UTC" fields={VULN_RANGE_FIELDS} idPrefix="vuln" />
+      {!r.ok ? <StorageUnavailable reason={r.error} /> : <VulnBody vulns={r.data} filtersText={filtersText} />}
     </>
   );
 }
 
-function VulnBody({ vulns }: { vulns: Awaited<ReturnType<typeof vulnList>> }) {
+function VulnBody({ vulns, filtersText }: { vulns: Awaited<ReturnType<typeof vulnList>>; filtersText: string }) {
   const active = vulns.filter((v) => v.status !== "Solved");
   const bySev = (sev: string) => active.filter((v) => v.severity === sev).length;
   return (
@@ -61,7 +72,9 @@ function VulnBody({ vulns }: { vulns: Awaited<ReturnType<typeof vulnList>> }) {
       </div>
 
       <Panel label={`CVE по агентам и пакетам · ${fmtNum(vulns.length)} записей`} meta={`не больше ${fmtNum(VULN_LIMIT)}`}>
-        {vulns.length === 0 ? (
+        {vulns.length === 0 && filtersText ? (
+          <Empty>Нет CVE по фильтрам: {filtersText} — ослабьте пороги или расширьте интервал.</Empty>
+        ) : vulns.length === 0 ? (
           <Empty>
             Алертов vulnerability-detector за 30 дней нет — включите модуль в ossec.conf
             менеджера или подождите первого скана.
