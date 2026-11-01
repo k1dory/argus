@@ -129,8 +129,9 @@ func TestPR49FollowupRestartRetriesFailedAddress(t *testing.T) {
 		t.Fatal("fixture must create one subnet incident")
 	}
 	e.autoRespond(context.Background(), snapshotIncidents(created), now)
-	if blocks.Load() != 0 || len(f.rows("response_log")) != 2 || len(e.respCap[created[0].IncidentID]) != 1 {
-		t.Fatal("fixture must log one failed executor attempt plus its queued-retry notice, retaining one slot")
+	// Запись вперёд: резерв, затем сбой исполнителя и уведомление о повторе.
+	if blocks.Load() != 0 || len(f.rows("response_log")) != 3 || len(e.respCap[created[0].IncidentID]) != 1 {
+		t.Fatal("fixture must log a reserve, one failed executor attempt and its queued-retry notice, retaining one slot")
 	}
 	old := pr49PersistedIncident(t, created[0])
 	pr49FollowupSaveResponses(f)
@@ -203,49 +204,6 @@ func TestPR49FollowupMissingRuleKeepsFailedRestoreClosed(t *testing.T) {
 	restarted.autoRespond(context.Background(), snapshotIncidents(updated), now.Add(2*time.Minute))
 	if got := blocks.Load(); got != 32 {
 		t.Fatalf("missing representative bypassed block_cap=32/1h during failed restore: blocks=%d, reservations=%d",
-			got, len(restarted.respCap[old.IncidentID]))
-	}
-}
-
-// Incidents are persisted before autoRespond runs. If its response_log INSERT
-// fails after successful firewall calls, a later successful empty SELECT is
-// not evidence of an unused budget. The original addresses remain blocked.
-func TestPR49FollowupLostResponseInsertDoesNotResetCap(t *testing.T) {
-	f := newFakeCH(t)
-	srv, blocks := pr49NGFW(t)
-	e := scanEngine(t, f, 32, ipsConfig(srv))
-	now := time.Date(2026, 11, 1, 10, 5, 0, 0, time.UTC)
-	var events []*model.Event
-	for i := 1; i <= 32; i++ {
-		events = append(events, portScan(fmt.Sprintf("203.0.113.%d", i), 3)...)
-	}
-	created, _ := e.applyEvents(events, now)
-	if len(created) != 1 {
-		t.Fatal("fixture must create one subnet incident")
-	}
-	// This is the incident row saved by cycle before it starts autoRespond.
-	old := pr49PersistedIncident(t, created[0])
-	f.mu.Lock()
-	f.fail["response_log"] = true
-	f.mu.Unlock()
-	e.autoRespond(context.Background(), snapshotIncidents(created), now)
-	if blocks.Load() != 32 || len(e.respCap[old.IncidentID]) != 32 || len(f.rows("response_log")) != 0 {
-		t.Fatal("fixture must exhaust the cap at the firewall while response_log persistence fails")
-	}
-	f.mu.Lock()
-	f.fail["response_log"] = false
-	f.mu.Unlock()
-	pr49FollowupSaveResponses(f)
-	restarted := scanEngine(t, f, 32, ipsConfig(srv))
-	restarted.reg = incidents.NewRegistry(100, []incidents.Incident{old})
-	restarted.restoreRespState([]incidents.Incident{old}, now.Add(time.Minute))
-	_, updated := restarted.applyEvents(portScan("203.0.113.33", 3), now.Add(time.Minute))
-	if len(updated) != 1 || updated[0].IncidentID != old.IncidentID {
-		t.Fatal("new address must join the restored incident")
-	}
-	restarted.autoRespond(context.Background(), snapshotIncidents(updated), now.Add(time.Minute))
-	if got := blocks.Load(); got != 32 {
-		t.Fatalf("lost journal INSERT reset block_cap=32/1h: %d successful blocks within one minute, reservations=%d",
 			got, len(restarted.respCap[old.IncidentID]))
 	}
 }

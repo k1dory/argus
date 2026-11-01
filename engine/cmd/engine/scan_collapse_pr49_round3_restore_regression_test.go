@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -44,8 +43,9 @@ func TestPR49Round3RestartRetriesAtFullCap(t *testing.T) {
 		t.Fatal("fixture must create one subnet incident")
 	}
 	e.autoRespond(context.Background(), snapshotIncidents(created), now)
-	if blocks.Load() != 0 || e.resp.Pending() != 32 || len(e.respCap[created[0].IncidentID]) != 32 || len(f.rows("response_log")) != 64 {
-		t.Fatal("fixture requires 32 failures, 32 retry notices, and 32 reserved slots")
+	// Запись вперёд: 32 резерва, 32 сбоя, 32 уведомления о повторе.
+	if blocks.Load() != 0 || e.resp.Pending() != 32 || len(e.respCap[created[0].IncidentID]) != 32 || len(f.rows("response_log")) != 96 {
+		t.Fatal("fixture requires 32 reserves, 32 failures, 32 retry notices, and 32 reserved slots")
 	}
 	old := pr49PersistedIncident(t, created[0])
 	pr49FollowupSaveResponses(f)
@@ -110,7 +110,8 @@ func TestPR49Round3EvictedMembersStillConsumeRestoredCap(t *testing.T) {
 		}
 	}
 	e.autoRespond(context.Background(), snapshotIncidents(updated), now.Add(time.Minute+time.Second))
-	if blocks.Load() != 32 || len(f.rows("response_log")) != 32 {
+	// 32 резерва и 32 итога блоков; адреса только с долбёжкой не дают ни строки.
+	if blocks.Load() != 32 || len(f.rows("response_log")) != 64 {
 		t.Fatal("hammer-only addresses must not produce blocks or response decisions")
 	}
 	old := pr49PersistedIncident(t, updated[0])
@@ -126,86 +127,5 @@ func TestPR49Round3EvictedMembersStillConsumeRestoredCap(t *testing.T) {
 	if got := blocks.Load(); got != 32 {
 		t.Fatalf("member eviction reset a fully journaled block_cap=32/1h: blocks=%d, restored reservations=%d",
 			got, len(restarted.respCap[old.IncidentID]))
-	}
-}
-
-// A successful SELECT need not contain the most recent successful blocks.
-// The missing-INSERT fallback must also work when an earlier waiting notice
-// exists, or when the rule responsible for an unjournaled block was removed.
-func TestPR49Round3LostInsertStillReservesCapacity(t *testing.T) {
-	for _, scenario := range []string{"earlier_waiting_notice", "removed_response_rule"} {
-		t.Run(scenario, func(t *testing.T) {
-			f := newFakeCH(t)
-			srv, blocks := pr49NGFW(t)
-			files := map[string]string{"scan.yml": fmt.Sprintf(scanPortsRule, 32)}
-			e := testEngine(t, f, rulesDirWith(t, files), ipsConfig(srv), "fixture", "fixture")
-			now := time.Date(2026, 11, 1, 10, 5, 0, 0, time.UTC)
-			var events []*model.Event
-			for i := 1; i <= 32; i++ {
-				events = append(events, pr49Round3Scan(fmt.Sprintf("203.0.113.%d", i), 3, now.Add(-time.Second))...)
-			}
-			if scenario == "earlier_waiting_notice" {
-				for _, ev := range events {
-					ev.Attrs["transport"], ev.Attrs["peer"] = "udp", "198.51.100.9"
-				}
-			}
-			created, _ := e.applyEvents(events, now)
-			if len(created) != 1 {
-				t.Fatal("fixture must create one subnet incident")
-			}
-			toRespond := created
-			if scenario == "earlier_waiting_notice" {
-				e.autoRespond(context.Background(), snapshotIncidents(created), now)
-				if blocks.Load() != 0 || len(f.rows("response_log")) != 32 {
-					t.Fatal("fixture must persist 32 waiting decisions without blocking")
-				}
-				events = nil
-				for i := 1; i <= 32; i++ {
-					events = append(events, pr49Round3Scan(fmt.Sprintf("203.0.113.%d", i), 4, now.Add(time.Minute))...)
-				}
-				_, toRespond = e.applyEvents(events, now.Add(time.Minute+time.Second))
-				if len(toRespond) != 1 {
-					t.Fatal("trusted scans must update the waiting incident")
-				}
-			}
-			old := pr49PersistedIncident(t, toRespond[0])
-			f.mu.Lock()
-			f.fail["response_log"] = true
-			f.mu.Unlock()
-			e.autoRespond(context.Background(), snapshotIncidents(toRespond), now.Add(time.Minute+time.Second))
-			if blocks.Load() != 32 || len(e.respCap[old.IncidentID]) != 32 {
-				t.Fatal("fixture must perform 32 blocks while their journal INSERT fails")
-			}
-			wantRows := 0
-			if scenario == "earlier_waiting_notice" {
-				wantRows = 32
-			}
-			if got := len(f.rows("response_log")); got != wantRows {
-				t.Fatalf("failed INSERT unexpectedly changed the journal: rows=%d want=%d", got, wantRows)
-			}
-			f.mu.Lock()
-			f.fail["response_log"] = false
-			f.mu.Unlock()
-			pr49FollowupSaveResponses(f)
-			if scenario == "removed_response_rule" {
-				// Same collapse group, threshold, and cap; only the rule ID changes.
-				files["scan.yml"] = strings.Replace(files["scan.yml"], "id: t-scan", "id: t-scan-replacement", 1)
-			}
-			restarted := testEngine(t, f, rulesDirWith(t, files), ipsConfig(srv), "fixture", "fixture")
-			if scenario == "removed_response_rule" && restarted.ruleFor(old.RuleID) != nil {
-				t.Fatal("historical response rule must be absent after restart")
-			}
-			restarted.reg = incidents.NewRegistry(100, []incidents.Incident{old})
-			restarted.restoreRespState([]incidents.Incident{old}, now.Add(2*time.Minute))
-			_, updated := restarted.applyEvents(pr49Round3Scan("203.0.113.33", 3, now.Add(2*time.Minute)), now.Add(2*time.Minute+time.Second))
-			if len(updated) != 1 || updated[0].IncidentID != old.IncidentID {
-				t.Fatal("new source must join the same restored subnet incident")
-			}
-			restarted.autoRespond(context.Background(), snapshotIncidents(updated), now.Add(2*time.Minute+time.Second))
-			if got := blocks.Load(); got != 32 {
-				t.Fatalf("%s: lost block INSERT reset block_cap=32/1h: blocks=%d, reservations=%d",
-					scenario, got, len(restarted.respCap[old.IncidentID]))
-			}
-		})
 	}
 }

@@ -30,6 +30,7 @@ type fakeCH struct {
 	inserts map[string][]string
 	selects map[string]string
 	fail    map[string]bool // таблица → INSERT отвечает 500
+	failIf  func(table, body string) bool
 	srv     *httptest.Server
 }
 
@@ -46,7 +47,7 @@ func newFakeCH(t *testing.T) *fakeCH {
 		defer f.mu.Unlock()
 		if strings.HasPrefix(q, "INSERT INTO ") {
 			table := strings.Fields(q)[2]
-			if f.fail[table] {
+			if f.fail[table] || (f.failIf != nil && f.failIf(table, string(body[:n]))) {
 				http.Error(w, "Code: 243. DB::Exception: fake insert failure", http.StatusInternalServerError)
 				return
 			}

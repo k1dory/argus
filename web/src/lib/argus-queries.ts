@@ -1001,9 +1001,14 @@ export async function incidentMembers(id: string): Promise<{ members: IncidentMe
   const dropped = Number(rows[0]?.members_dropped ?? 0) || 0;
   if (members.length === 0) return { members, dropped, blocks: {} };
   const last = await chQuery<MemberBlockRow>(
-    `SELECT ip, argMax(executor, ts) AS executor, argMax(mode, ts) AS mode, argMax(dry_run, ts) AS dry_run,
-            argMax(ok, ts) AS ok, argMax(detail, ts) AS detail
-     FROM response_log WHERE incident_id = {id:String} AND ip IN {ips:Array(String)} GROUP BY ip`,
+    // Резерв и итог пишутся в одну секунду: при равном ts итог важнее резерва.
+    // Признак итога — в подзапросе: в одном SELECT с argMax(detail, …) AS detail
+    // ссылка на detail внутри другого argMax указывала бы на агрегат (184).
+    `SELECT ip, argMax(executor, (ts, fin)) AS executor, argMax(mode, (ts, fin)) AS mode,
+            argMax(dry_run, (ts, fin)) AS dry_run, argMax(ok, (ts, fin)) AS ok, argMax(detail, (ts, fin)) AS detail
+     FROM (SELECT ts, ip, executor, mode, dry_run, ok, detail, NOT startsWith(detail, 'резерв:') AS fin
+           FROM response_log WHERE incident_id = {id:String} AND ip IN {ips:Array(String)})
+     GROUP BY ip`,
     // Array(String) параметром — литерал массива (как names в sourcesHealth).
     { id, ips: `[${members.map((m) => `'${m.ip.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`).join(",")}]` },
   );

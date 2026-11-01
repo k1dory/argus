@@ -31,4 +31,5 @@ test("memberBlockState: категории по последней записи 
   assert.equal(memberBlockState({ ...base, executor: "argus", mode: "ids", detail: "режим IDS: автоответ выключен" }), "ids");
   assert.equal(memberBlockState({ ...base, executor: "argus", detail: "ожидание: доверенных событий 0 из 1 (respond.min_events)" }), "waiting");
   assert.equal(memberBlockState({ ...base, executor: "argus", detail: "203.0.113.10 в allowlist" }), "refused");
+  assert.equal(memberBlockState({ ...base, executor: "argus", detail: "резерв: блок адреса перед вызовом исполнителей" }), "unconfirmed");
 });

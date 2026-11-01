@@ -57,6 +57,22 @@ func b2u(b bool) uint8 {
 	return 0
 }
 
+// reservePrefix — начало записи-резерва в response_log (запись вперёд перед
+// блоком адреса склеенного инцидента); reserveRetry — пауза перед новой
+// попыткой, если резерв не записался.
+const (
+	reservePrefix = "резерв:"
+	reserveRetry  = 30 * time.Second
+)
+
+// respEntry — решение и его время.
+func (e *engine) respEntry(id string) (string, time.Time) {
+	e.respMu.Lock()
+	defer e.respMu.Unlock()
+	v := e.respState[id]
+	return v.state, v.at
+}
+
 // respStatus — что автоответ уже решил по инциденту ("" — ещё ничего).
 func (e *engine) respStatus(id string) string {
 	e.respMu.Lock()
@@ -217,11 +233,10 @@ func (e *engine) capRestoreIP(id, ip string, at time.Time) {
 //   - потолок — capped; IDS, «уже заблокирован», отказ allowlist — done;
 //   - ожидание доверенных событий — без решения.
 //
-// Журнал мог не получить записи о блоках, уже сделанных на NGFW (INSERT после
-// исполнителей не дошёл). Поэтому записанный адрес инцидента без итоговой записи,
-// у которого сработало правило с respond (или, если правило убрано, у группы
-// склейки есть respond), считается заблокированным: done и место. Если журнал
-// недоступен — все записанные адреса решены, потолок окна исчерпан.
+// Перед каждым блоком в журнале есть резерв (запись вперёд). Резерв без итога —
+// итог после исполнителей не записался: адрес считается заблокированным (done,
+// место занято, повтора нет), в карточке — «итог не записан, проверьте NGFW».
+// Если журнал недоступен — все записанные адреса решены, потолок окна исчерпан.
 func (e *engine) restoreRespState(open []incidents.Incident, now time.Time) int {
 	n := 0
 	var collapsed []*incidents.Incident
@@ -257,69 +272,69 @@ func (e *engine) restoreRespState(open []incidents.Incident, now time.Time) int 
 		}
 		return n
 	}
-	final := map[string]bool{} // по адресу есть итоговая запись
+	type addr struct {
+		reserved, blocked, failed bool
+		decision                  string
+		slotAt                    time.Time
+	}
+	byKey := map[string]*addr{}
+	var order []string
 	for _, row := range rows {
 		key := row.IncidentID + "|" + row.IP
+		a := byKey[key]
+		if a == nil {
+			a = &addr{}
+			byKey[key] = a
+			order = append(order, key)
+		}
 		at, perr := time.ParseInLocation("2006-01-02 15:04:05", row.TS, time.UTC)
 		if perr != nil {
 			at = now
 		}
-		switch st := restoredState(row); st {
+		st := restoredState(row)
+		switch st {
+		case "reserved", "blocked", "failed":
+			if a.slotAt.IsZero() || at.Before(a.slotAt) {
+				a.slotAt = at
+			}
+		}
+		switch st {
+		case "reserved":
+			a.reserved = true
 		case "blocked":
-			final[key] = true
-			e.setRespStatus(key, "done", now)
-			e.capRestoreIP(row.IncidentID, row.IP, at)
+			a.blocked = true
 		case "failed":
-			final[key] = true
-			e.capRestoreIP(row.IncidentID, row.IP, at)
+			a.failed = true
 		case "":
 		default:
-			final[key] = true
-			if e.respStatus(key) != "done" {
-				e.setRespStatus(key, st, now)
-			}
+			a.decision = st
 		}
 	}
-	assumed := 0
-	for _, inc := range collapsed {
-		for _, m := range inc.Members {
-			key := inc.IncidentID + "|" + m.IP
-			if final[key] || !e.memberResponds(inc, m.Rules) {
-				continue
-			}
+	doubtful := 0
+	for _, key := range order {
+		a := byKey[key]
+		id, ip, _ := strings.Cut(key, "|")
+		switch {
+		case a.blocked:
 			e.setRespStatus(key, "done", now)
-			e.capRestoreIP(inc.IncidentID, m.IP, now)
-			assumed++
+		case a.failed:
+			// сбой исполнителей: место держится, новая сработка блокирует снова
+		case a.reserved:
+			// Резерв без итога: исполнитель мог заблокировать, а итог не записался.
+			// Место держится, повторной попытки нет — проверить NGFW.
+			e.setRespStatus(key, "done", now)
+			doubtful++
+		case a.decision != "":
+			e.setRespStatus(key, a.decision, now)
+		}
+		if a.reserved || a.blocked || a.failed {
+			e.capRestoreIP(id, ip, a.slotAt)
 		}
 	}
-	if assumed > 0 {
-		slog.Warn("ips: у адресов склеенных инцидентов нет итоговых записей в response_log — считаются заблокированными, место в потолке занято", "addresses", assumed)
+	if doubtful > 0 {
+		slog.Warn("ips: резерв блока без итога в response_log — адрес считается заблокированным, место занято; проверьте NGFW", "addresses", doubtful)
 	}
 	return n
-}
-
-// memberResponds — у адреса сработало действующее правило с respond; если ни
-// одного из его правил больше нет — есть ли respond у группы склейки инцидента.
-func (e *engine) memberResponds(inc *incidents.Incident, ids []string) bool {
-	known := false
-	for _, id := range ids {
-		if r := e.ruleFor(id); r != nil {
-			known = true
-			if respondsAt(r, r.Level) {
-				return true
-			}
-		}
-	}
-	if known {
-		return false
-	}
-	group := collapseGroupOf(inc)
-	for _, r := range e.current() {
-		if r.Collapsed() && r.CollapseGroup() == group && respondsAt(r, r.Level) {
-			return true
-		}
-	}
-	return false
 }
 
 // collapseGroupOf — группа из ключа «collapse:группа:подсеть» (в группе двоеточий
@@ -359,6 +374,8 @@ func restoredState(row store.ResponseRow) string {
 		return "failed"
 	case strings.HasPrefix(row.Detail, "все исполнители отказали"):
 		return "failed"
+	case strings.HasPrefix(row.Detail, reservePrefix):
+		return "reserved"
 	case strings.HasPrefix(row.Detail, "потолок блокировок"):
 		return "capped"
 	case strings.HasPrefix(row.Detail, "ожидание:"), strings.HasPrefix(row.Detail, "предупреждение:"), strings.HasPrefix(row.Detail, "адресов больше"),
@@ -465,8 +482,8 @@ func (e *engine) autoRespond(ctx context.Context, incs []*incidents.Incident, no
 	for _, inc := range incs {
 		for _, u := range e.respUnits(inc) {
 			r := u.rule
-			state := e.respStatus(u.key)
-			if state == "done" || state == "capped" {
+			state, at := e.respEntry(u.key)
+			if state == "done" || state == "capped" || (state == "reserve_failed" && now.Sub(at) < reserveRetry) {
 				continue
 			}
 			reason := r.Title + " (" + r.ID + ")"
@@ -498,6 +515,20 @@ func (e *engine) autoRespond(ctx context.Context, incs []*incidents.Incident, no
 					continue
 				}
 				fresh = f
+				// Запись вперёд: каждый блок на NGFW должен остаться в аудите. Резерв
+				// пишется в response_log до вызова исполнителя; не записался — блока
+				// нет, адрес ждёт следующей попытки (не раньше reserveRetry).
+				if mode != respond.ModeIDS {
+					if err := e.ch.InsertResponses(ctx, []store.ResponseRow{respRow(ts, mode, "argus-engine", respond.Result{Executor: "argus", OK: true, IP: u.ip, Incident: inc.IncidentID,
+						Detail: reservePrefix + " блок адреса перед вызовом исполнителей"}, r.ID, reason)}); err != nil {
+						if fresh {
+							e.capReleaseIP(inc.IncidentID, u.ip)
+						}
+						e.setRespStatus(u.key, "reserve_failed", now)
+						slog.Warn("ips: резерв в response_log не записан — адрес не блокируется до следующей попытки", "incident", inc.IncidentID, "ip", u.ip, "err", err)
+						continue
+					}
+				}
 			}
 			e.setRespStatus(u.key, "done", now)
 			if u.untrusted > 0 {
