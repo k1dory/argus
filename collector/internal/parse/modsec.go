@@ -131,7 +131,10 @@ func ParseWAFAudit(b []byte) (WAF, bool) {
 		}
 		w.UnixNano = n
 	}
-	if strings.Contains(strings.ToLower(t.Producer.Connector+t.Producer.Server+t.Producer.ModSecurity), "coraza") || t.Producer.RuleEngine != "" {
+	// producer пишется только с частью H аудита; без неё Coraza узнаётся по своим полям
+	// (timestamp/unix_timestamp вместо time_stamp ModSecurity) или по тексту сообщений.
+	if strings.Contains(strings.ToLower(t.Producer.Connector+t.Producer.Server+t.Producer.ModSecurity), "coraza") ||
+		t.Producer.RuleEngine != "" || (t.Time == "" && (t.Timestamp != "" || t.UnixTS != "")) || corazaMessages(a) {
 		w.Product = "coraza"
 	}
 	for k, v := range auditHeaders(t.Request.Headers) {
@@ -158,7 +161,7 @@ func ParseWAFAudit(b []byte) (WAF, bool) {
 					denied = denied || wafBlockAction(m.ErrorMessage[loc[4]:loc[5]])
 				}
 				var mw WAF
-				if r, ok := parseRuleMeta(m.ErrorMessage[loc[1]:], &mw); ok {
+				if r, ok := parseRuleMeta(m.ErrorMessage[loc[1]:], &mw, true); ok {
 					w.addRule(r)
 				}
 				continue
@@ -179,6 +182,18 @@ func ParseWAFAudit(b []byte) (WAF, bool) {
 	w.Blocked = !strings.EqualFold(w.EngineMode, "DetectionOnly") &&
 		(t.IsInterrupted || denied || ((w.Status == 403 || w.Status == 406) && w.hasFinalRule()))
 	return w, true
+}
+
+// corazaMessages — в сообщениях аудита есть строка error-лога Coraza.
+func corazaMessages(a modsecAudit) bool {
+	for _, ms := range [][]modsecMessage{a.Messages, a.Transaction.Messages} {
+		for _, m := range ms {
+			if strings.Contains(m.ErrorMessage, "Coraza: ") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // hasFinalRule — сработало правило оценки anomaly score (CRS 949110/980130) — признак решения WAF, а не приложения.
@@ -205,8 +220,21 @@ var (
 )
 
 // IsWAFErrorLine — строка error-лога ModSecurity/Coraza (в т.ч. внутри JSON-лога Caddy).
+// У JSON-лога Caddy проверяется декодированный msg: маркер в нём может прийти
+// экранированным («Coraza:\u0020»).
 func IsWAFErrorLine(line string) bool {
-	return strings.Contains(line, "ModSecurity: ") || strings.Contains(line, "Coraza: ")
+	if strings.Contains(line, "ModSecurity: ") || strings.Contains(line, "Coraza: ") {
+		return true
+	}
+	if t := strings.TrimSpace(line); strings.HasPrefix(t, "{") {
+		var j struct {
+			Msg string `json:"msg"`
+		}
+		if json.Unmarshal([]byte(t), &j) == nil {
+			return strings.Contains(j.Msg, "ModSecurity: ") || strings.Contains(j.Msg, "Coraza: ")
+		}
+	}
+	return false
 }
 
 // ParseWAFErrorLine разбирает строку error-лога. Если строка — JSON Caddy
@@ -236,13 +264,15 @@ func ParseWAFErrorLine(line string) (WAF, bool) {
 	if c := clientRe.FindStringSubmatch(text[:loc[0]]); c != nil {
 		w.ClientIP = c[1]
 	}
-	// denied/dropped/redirected — движок прервал запрос; allowed — явное разрешение правилом.
-	decision := m[2] != ""
+	// denied/dropped/redirected — движок прервал запрос. «Access allowed» итогом не считается
+	// даже у 949110 (SecRuleUpdateActionById … "allow:phase"): allow:phase и allow:request
+	// пропускают только часть фаз, дальше возможен deny.
 	denied := wafBlockAction(m[2])
+	allowed := m[2] == "allowed"
 	if m[3] != "" {
 		w.Status, _ = strconv.Atoi(m[3])
 	}
-	if r, ok := parseRuleMeta(text[loc[1]:], &w); ok {
+	if r, ok := parseRuleMeta(text[loc[1]:], &w, w.Product == "coraza"); ok {
 		w.addRule(r)
 	}
 	// «Access denied» = движок заблокировал; Warning — только детект (DetectionOnly или score ещё не набран).
@@ -251,7 +281,7 @@ func ParseWAFErrorLine(line string) (WAF, bool) {
 	if denied {
 		w.EngineMode, w.Blocked = "On", true
 	}
-	w.Final = decision || w.hasFinalRule()
+	w.Final = denied || (!allowed && w.hasFinalRule())
 	return w, true
 }
 
@@ -263,12 +293,31 @@ func wafBlockAction(a string) bool {
 // parseRuleMeta — метаданные правила из хвоста строки error-лога после маркера.
 // Разбор — от первого [file "…"]; до него — совпадение с данными запроса атакующего.
 // hostname/uri/unique_id пишутся в w.
-func parseRuleMeta(meta string, w *WAF) (WAFRule, bool) {
-	if fi := fileTagRe.FindStringIndex(meta); fi != nil {
-		meta = meta[fi[0]:]
-	} else {
-		meta = ""
+//
+// Coraza пишет перед метаданными текст msg без экранирования, а msg может включать
+// данные запроса (%{MATCHED_VAR}) — в т.ч. поддельный [file "…"] [tag "…"]. Сами
+// метаданные Coraza пишет через %q: кавычки внутри экранированы, и `[file "` в них
+// не встречается. Поэтому у Coraza (coraza=true) настоящий — последний [file "…"].
+// У ModSecurity данные атакующего (Value: `…') идут до метаданных — берётся первый.
+func parseRuleMeta(meta string, w *WAF, coraza bool) (WAFRule, bool) {
+	locs := fileTagRe.FindAllStringIndex(meta, -1)
+	if len(locs) == 0 {
+		return WAFRule{}, false
 	}
+	start := locs[0][0]
+	if coraza {
+		start = locs[len(locs)-1][0]
+	}
+	r := scanRuleMeta(meta[start:], w)
+	return r, r.ID != "" || r.Msg != ""
+}
+
+// scanRuleMeta — пары [key "value"] метаданных правила, начиная с [file "…"].
+// Для ModSecurity метаданные error-лога неоднозначны: msg и uri пишутся без экранирования,
+// и данные запроса могут дописать свои [id]/[tag]/[severity]. Строковыми эвристиками это не
+// решается (см. ревью #16), поэтому разбор прежний; надёжный источник для ModSecurity —
+// JSON-аудит. У Coraza метаданные экранированы (%q), и parseRuleMeta берёт последний [file].
+func scanRuleMeta(meta string, w *WAF) WAFRule {
 	r := WAFRule{Severity: -1}
 	for _, kv := range kvRe.FindAllStringSubmatch(meta, -1) {
 		v := strings.ReplaceAll(kv[2], `\"`, `"`)
@@ -295,7 +344,7 @@ func parseRuleMeta(meta string, w *WAF) (WAFRule, bool) {
 			w.UniqueID = v
 		}
 	}
-	return r, r.ID != "" || r.Msg != ""
+	return r
 }
 
 // auditHeaders — заголовки запроса из аудита: объект строк (ModSecurity) или массивов (Coraza 3.8).

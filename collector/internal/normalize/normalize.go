@@ -449,7 +449,8 @@ func (n *Normalizer) FromWAF(w parse.WAF, raw string) model.Event {
 		// attrs.server_addr. Узел окончательно выбирает коллектор (cmd/collector
 		// wafNode): отправитель → node: источника → server_id → адрес сервера →
 		// адрес отправителя.
-		Object: strings.TrimSpace(w.Method + " " + w.URI), Node: w.ServerID,
+		// Coraza-caddy кладёт в server_id заголовок Host клиента — узлом он не бывает.
+		Object: strings.TrimSpace(w.Method + " " + w.URI), Node: wafServerID(w),
 		SessionID: w.UniqueID, SrcIP: w.ClientIP, SrcPort: uint16(w.ClientPort), DstIP: w.HostIP, DstPort: uint16(w.HostPort),
 		Proto: "tcp", Raw: raw, Attrs: map[string]string{},
 	}
@@ -533,6 +534,37 @@ func (n *Normalizer) FromWAF(w parse.WAF, raw string) model.Event {
 	}
 	e.Ensure()
 	return e
+}
+
+// wafServerID — server_id как узел. У ModSecurity его задаёт оператор. Coraza-caddy
+// пишет в server_id заголовок Host клиента: такой server_id узлом не считается — если
+// он совпадает с Host запроса или Host в аудите нет (часть B не пишется) и проверить
+// нечем. Узел тогда выбирает коллектор по отправителю (cmd/collector wafNode).
+func wafServerID(w parse.WAF) string {
+	if w.Product != "coraza" {
+		return w.ServerID
+	}
+	if w.Host == "" || strings.EqualFold(hostOnly(w.Host), hostOnly(w.ServerID)) {
+		return ""
+	}
+	return w.ServerID
+}
+
+// hostOnly — имя без порта и скобок, в нижнем регистре: «[a.example:8443]:443» → «a.example».
+// Порт снимается до упора: Caddy снимает один уровень, и server_id может сохранить второй.
+func hostOnly(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	for i := 0; i < 4; i++ {
+		prev := s
+		if h, _, err := net.SplitHostPort(s); err == nil {
+			s = h
+		}
+		s = strings.Trim(s, "[]")
+		if s == prev {
+			break
+		}
+	}
+	return s
 }
 
 // wafServerAddr — адрес сервера WAF из доверенных данных: host_ip audit-лога или,

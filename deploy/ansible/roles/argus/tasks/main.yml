@@ -207,25 +207,102 @@
   changed_when: false
   no_log: true
 
-- name: Собрать и поднять стек (первый прогон собирает образы, это долго)
-  ansible.builtin.command:
-    cmd: make up
-    chdir: "{{ argus_dir }}"
-  async: "{{ argus_up_timeout_sec }}"
-  poll: 15
-  register: argus_up
-  changed_when: "'Started' in argus_up.stdout or 'Created' in argus_up.stdout or 'Recreated' in argus_up.stdout"
-  when: argus_images == 'build'
+# Миграции идут одноразовым сервисом migrator (scripts/migrate.sh) внутри make deploy /
+# make up: compose запускает его на каждом up, остальные сервисы ждут его успеха. Подъём
+# стека и проверка migrator — блоки с общим rescue: при отказе (compose падает раньше
+# проверки) rescue печатает код выхода и хвост лога migrator и роняет прогон. В логе clickhouse-
+# client печатает упавший запрос целиком — ALTER USER … BY '<хеш>' SALT '<соль>' из
+# migrate.sh, поэтому значения после BY и SALT маскируются до вывода. Пароль админа
+# ClickHouse берётся из окружения контейнера clickhouse, в argv и вывод не попадает.
+# timeout на пробах: retries/delay не прерывают зависший docker exec.
+- name: Поднять стек
+  block:
+    - name: Собрать и поднять стек (первый прогон собирает образы, это долго)
+      ansible.builtin.command:
+        cmd: make up
+        chdir: "{{ argus_dir }}"
+      async: "{{ argus_up_timeout_sec }}"
+      poll: 15
+      register: argus_up
+      changed_when: "'Started' in argus_up.stdout or 'Created' in argus_up.stdout or 'Recreated' in argus_up.stdout"
+      when: argus_images == 'build'
 
-- name: Проверить подписи, выкачать образы релиза и поднять стек без сборки
-  ansible.builtin.command:
-    cmd: make deploy
-    chdir: "{{ argus_dir }}"
-  async: "{{ argus_up_timeout_sec }}"
-  poll: 15
-  register: argus_deploy
-  changed_when: "'Started' in argus_deploy.stdout or 'Created' in argus_deploy.stdout or 'Recreated' in argus_deploy.stdout or 'Pulled' in argus_deploy.stdout"
-  when: argus_images == 'registry'
+    - name: Проверить подписи, выкачать образы релиза и поднять стек без сборки
+      ansible.builtin.command:
+        cmd: make deploy
+        chdir: "{{ argus_dir }}"
+      async: "{{ argus_up_timeout_sec }}"
+      poll: 15
+      register: argus_deploy
+      changed_when: "'Started' in argus_deploy.stdout or 'Created' in argus_deploy.stdout or 'Recreated' in argus_deploy.stdout or 'Pulled' in argus_deploy.stdout"
+      when: argus_images == 'registry'
+  rescue: &argus_migrator_rescue
+    # SQL из лога не выводится вовсе: clickhouse-client печатает упавший запрос целиком
+    # (ALTER USER … BY '<хеш>' SALT '<соль>', PASSWORD словаря), а надёжно замаскировать
+    # литералы SQL регулярками нельзя (табуляции, переносы, комментарии, heredoc,
+    # экранирование). Белый список строк: последняя «migrate: apply <файл>», отказы
+    # migrate.sh и «Code: N. DB::Exception: <текст>» — текст обрезается на первой
+    # кавычке, «$» или «(query:». Полный лог — на хосте, команда в сообщении.
+    - name: "Миграции: код выхода migrator и причина отказа (без SQL)"
+      ansible.builtin.shell:
+        cmd: |
+          set -uo pipefail
+          id="$(docker compose ps -aq migrator)"
+          [ -n "$id" ] && echo "migrator: код $(docker inspect -f '{{ '{{' }}.State.ExitCode{{ '}}' }}' "$id")"
+          docker compose logs --no-color --tail=400 migrator 2>&1 | awk -v sq="'" '
+            { sub(/^[^|]*\| ?/, "") }
+            /^migrate: apply / { apply = $0; next }
+            /^migrate: ОТКАЗ/ { print; next }
+            /^Code: [0-9]+\. DB::Exception:/ {
+              line = $0; cut = length(line) + 1
+              stop[1] = sq; stop[2] = "\""; stop[3] = "`"; stop[4] = "$"; stop[5] = "(query:"
+              for (i = 1; i <= 5; i++) { p = index(line, stop[i]); if (p > 0 && p < cut) cut = p }
+              line = substr(line, 1, cut - 1)
+              if (cut <= length($0)) line = line "…"
+              codes[++nc] = line
+            }
+            END {
+              if (apply != "") print apply
+              for (i = (nc > 5 ? nc - 4 : 1); i <= nc; i++) print codes[i]
+            }'
+        executable: /bin/bash
+        chdir: "{{ argus_dir }}"
+      register: argus_migrator_log
+      changed_when: false
+      failed_when: false
+      timeout: "{{ argus_probe_timeout_sec }}"
+
+    - name: "Выкатка не удалась"
+      ansible.builtin.fail:
+        msg: >-
+          Подъём стека или миграции не удались («{{ ansible_failed_task.name | default('?') }}»).
+          migrator: {{ argus_migrator_log.stdout_lines | default([]) | join(' / ') }}.
+          Полный лог (содержит SQL с хешами паролей, в тикеты и чаты не копировать):
+          cd {{ argus_dir }} && docker compose logs migrator
+
+- name: Проверить миграции
+  block:
+    - name: "Миграции: migrator завершился успешно"
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          id="$(docker compose ps -aq migrator)"
+          test -n "$id" || { echo "контейнер migrator не найден"; exit 1; }
+          code="$(docker inspect -f '{{ '{{' }}.State.ExitCode{{ '}}' }}' "$id")"
+          if [ "$code" != 0 ]; then echo "migrator: код $code"; exit 1; fi
+          docker compose exec -T clickhouse sh -c 'clickhouse-client --user "$CLICKHOUSE_USER"' <<'SQL'
+          SELECT max(name) FROM argus.schema_migrations
+          SQL
+        executable: /bin/bash
+        chdir: "{{ argus_dir }}"
+      register: argus_migrations
+      changed_when: false
+      timeout: "{{ argus_probe_timeout_sec }}"
+  rescue: *argus_migrator_rescue
+
+- name: "Миграции: последняя применённая"
+  ansible.builtin.debug:
+    msg: "{{ argus_migrations.stdout | default('') | trim }}"
 
 # По имени, а не по 127.0.0.1: клиент без SNI получает сертификат default_sni
 # (CONSOLE_HOST), а для имени localhost Caddy выпускает свой всегда.
@@ -242,6 +319,31 @@
     (argus_sync.stdout_lines | default([]) | select('search', '(identities|cmdb)\.yml') | list | length > 0)
     or (argus_git is defined and argus_git.changed | default(false))
   changed_when: true
+
+# Строка «незавершённых|частей к обработке|причина сбоя» (причина пуста — сбоя нет).
+- name: "Миграции: дождаться фоновых мутаций (MATERIALIZE)"
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      docker compose exec -T clickhouse sh -c 'clickhouse-client --user "$CLICKHOUSE_USER" --format TSVRaw' <<'SQL'
+      SELECT concat(toString(countIf(NOT is_done)), '|', toString(sumIf(parts_to_do, NOT is_done)), '|',
+                    anyIf(concat(table, ': ', latest_fail_reason), NOT is_done AND latest_fail_reason != ''))
+      FROM system.mutations WHERE database = 'argus'
+      SQL
+    executable: /bin/bash
+    chdir: "{{ argus_dir }}"
+  register: argus_mutations
+  changed_when: false
+  timeout: "{{ argus_probe_timeout_sec }}"
+  retries: "{{ argus_mutations_retries }}"
+  delay: "{{ argus_mutations_delay_sec }}"
+  until: >-
+    argus_mutations.rc == 0 and
+    ((argus_mutations.stdout.split('|', 2) + ['', '', ''])[0] | trim == '0'
+     or (argus_mutations.stdout.split('|', 2) + ['', '', ''])[2] | trim | length > 0)
+  failed_when: >-
+    argus_mutations.rc != 0
+    or (argus_mutations.stdout.split('|', 2) + ['', '', ''])[0] | trim != '0'
 
 - name: Дождаться консоли
   ansible.builtin.uri:

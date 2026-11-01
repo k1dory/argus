@@ -25,7 +25,7 @@ const props = (params: Record<string, string> = {}, sp: Record<string, string> =
 const isNotFound = (e: unknown): boolean => e instanceof Error && /NEXT_HTTP_ERROR_FALLBACK;404|NEXT_NOT_FOUND/.test(String((e as { digest?: string }).digest ?? e.message));
 
 /* ===== fetch: ClickHouse по подстроке SQL ===== */
-type Route = { when: (sql: string) => boolean; rows: () => Record<string, unknown>[]; fail?: boolean };
+type Route = { when: (sql: string) => boolean; rows: (params: URLSearchParams) => Record<string, unknown>[]; fail?: boolean };
 let routes: Route[] = [];
 let chDown = false;
 const fetched: string[] = [];
@@ -36,7 +36,8 @@ globalThis.fetch = (async (input: URL | string | Request, init?: RequestInit) =>
   for (const r of routes) {
     if (!r.when(sql)) continue;
     if (r.fail) return new Response("Code: 60. DB::Exception: Table argus.events does not exist", { status: 500 });
-    return new Response(r.rows().map((x) => JSON.stringify(x)).join("\n") + "\n");
+    const params = new URL(input instanceof Request ? input.url : String(input)).searchParams;
+    return new Response(r.rows(params).map((x) => JSON.stringify(x)).join("\n") + "\n");
   }
   return new Response("");
 }) as typeof fetch;
@@ -88,6 +89,15 @@ function fullRoutes(): Route[] {
       { id: "INC-7", level: "high", status: "new", rule_id: "ssh.bruteforce", rule_title: "Перебор SSH", created_s: "2026-10-29 09:30:00", actor_name: "ivan.petrov", first_s: "2026-10-29 09:00:00" },
       { id: "INC-8", level: "low", status: "weird", rule_id: "x", rule_title: "До алиаса", created_s: "2026-10-29 09:30:00", actor_name: "ivan.petrov", first_s: "2019-01-01 00:00:00" },
     ] },
+    // Разделы получают собственные строки по параметру section. Общая лента
+    // ниже сохраняет все семь событий и больше не служит ответом каждого раздела.
+    { when: (s) => s.includes("{section:String}"), rows: (params) => ({
+      login: [logRow("auth.login", "failure")],
+      host: [logRow("sudo", "success", { object: "/bin/ls" })],
+      network: [logRow("net.flow", "allow", { source: "netflow.core", source_class: "netflow", dst_ip: "8.8.8.8", node: "" })],
+      app: [logRow("app.authorize", "success", { src_ip: "" })],
+      change: [logRow("user.create", "success", { object: "guest7" }), logRow("identity.alias", "deny")],
+    } as Record<string, Record<string, unknown>[]>)[params.get("param_section") ?? ""] ?? [] },
     { when: (s) => s.includes("ORDER BY ts DESC LIMIT"), rows: () => [
       logRow("auth.login", "failure"),
       logRow("sudo", "success", { object: "/bin/ls" }),
@@ -216,6 +226,21 @@ test("паспорт: алиасы (действует / закрыт / на у�
   const tl = fetched.find((s) => s.includes("ORDER BY ts DESC LIMIT"))!;
   assert.ok(!tl.includes("ivan@corp.local"), "удержанный алиас в предикате отсутствует");
   assert.ok(!tl.includes("10.0.0.5"), "закрытый в 2021 алиас вне окна");
+});
+
+test("паспорт: длинный раздел показывает 50 строк и явно сообщает полный размер выборки", async () => {
+  await auth.createSession("analyst1", "analyst");
+  const section = routes.find((route) => route.when("SELECT * WHERE section = {section:String}"));
+  assert.ok(section);
+  const original = section.rows;
+  section.rows = (params) => params.get("param_section") === "login"
+    ? Array.from({ length: 60 }, (_, i) => logRow("auth.login", "success", { object: `section-entry-${String(i).padStart(3, "0")}` }))
+    : original(params);
+  const text = await pageText(await actorPage.default(props({ id: "i.petrov" })));
+  assert.match(text, /Входы · 60/);
+  assert.match(text, /50 из 60.*Markdown.*API/, "ограничение страницы не выдаётся за полный результат");
+  assert.match(text, /section-entry-049/, "последняя видимая строка присутствует");
+  assert.doesNotMatch(text, /section-entry-050|section-entry-059/, "остальные строки доступны через полный экспорт");
 });
 
 test("паспорт: администратор видит формы — добавить, закрыть действующий, подтвердить удержанный; закрытый алиас кнопок не имеет", async () => {

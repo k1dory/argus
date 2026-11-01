@@ -367,7 +367,12 @@ func (r *Registry) Reconcile(toWrite []*Incident, ops map[string]Operator, engin
 				// Оператор закрыл сам — движку нечего добавить; эскалация
 				// тишиной не перебивает статус, который оператор уже поставил.
 				inc.Status, inc.Owner, inc.Note = op.Status, op.Owner, op.Note
-				inc.groupPending = false // строка не пишется: повторять присвоение незачем
+				if isFinal(op.Status) {
+					// Финальный статус оператора: повторять присвоение незачем. У
+					// открытого (escalated, in_progress…) ключ ещё не записан — повтор
+					// остаётся, иначе после рестарта инцидент снова окажется без ключа.
+					inc.groupPending = false
+				}
 				continue
 			}
 			// Закрытие движком: заметка оператора остаётся, наша дописывается.
