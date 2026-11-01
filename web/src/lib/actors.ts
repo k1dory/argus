@@ -33,6 +33,14 @@ const ALIASES_LATEST = `
   FROM identity_aliases GROUP BY alias_kind, alias_value, valid_from, person_id
   HAVING argMax(deleted, updated_at) = 0`;
 
+/** ALIASES_LATEST с условием до GROUP BY: фильтр по (alias_kind, alias_value) идёт по
+ *  первичному ключу, а не после свёртки всего справочника. */
+const aliasesLatestWhere = (where: string): string => {
+  const sql = ALIASES_LATEST.replace("FROM identity_aliases GROUP BY", `FROM identity_aliases WHERE ${where} GROUP BY`);
+  if (sql === ALIASES_LATEST) throw new Error("aliasesLatestWhere: ALIASES_LATEST changed shape");
+  return sql;
+};
+
 type PersonRow = { person_id: string; display: string; kind: string; team: string; note: string };
 type AliasRow = { person_id: string; alias_kind: string; alias_value: string; valid_from: string; valid_to_raw: string | null; source: string; confidence: number | string; note: string };
 
@@ -188,8 +196,10 @@ export async function aliasHistory(value: string, limit = 500): Promise<AliasHis
   return out;
 }
 
-/** Субъектные виды, которые сравниваются с actor_name без учёта регистра (login/email): константы, не ввод. */
+/** Субъектные виды, которые сравниваются с actor_name без учёта регистра (login/email)
+ *  и точно (uid/sid/peer; phone — отдельно, в E.164): константы, не ввод. */
 const CASE_INSENSITIVE_ACTOR_SQL = ACTOR_KINDS.filter((k) => LOWERCASE_KINDS.includes(k)).map((k) => `'${k}'`).join(", ");
+const CASE_SENSITIVE_ACTOR_SQL = ACTOR_KINDS.filter((k) => k !== "phone" && !LOWERCASE_KINDS.includes(k)).map((k) => `'${k}'`).join(", ");
 
 export type Sighting = { source: string; action: string; who: string; where: string; ips: string[]; events: number; first_ts: string; last_ts: string };
 export type VpnConnection = { actor_name: string; peer_name: string; peer_ip: string; events: number; first_ts: string; last_ts: string };
@@ -228,21 +238,44 @@ export async function aliasSightings(value: string, range: ActorRange, now = Dat
   }
   // Те же правила значения, что у алиасов (aliasColumn/compareValue): uid/sid/peer —
   // actor_name точно, phone — в E.164, host — node без учёта регистра. Без учёта
-  // регистра actor_name сравнивается, только если значение — зарегистрированный
-  // login/email: иначе uid CaseKey одной персоны подтягивал бы события casekey
-  // другой (и любого незарегистрированного cAsEkEy). Подзапрос идёт по первичному
-  // ключу identity_aliases (alias_kind, alias_value) — одна гранула, не весь справочник.
+  // регистра actor_name сравнивается, только если значение — login/email, который
+  // действует на ts события и не на удержании, — с той же политикой, что в резолве.
+  // Из этой ветки исключаются подтверждённые uid/sid/peer других персон, действующие
+  // на ts события: login casekey персоны A не берёт события uid CaseKey персоны B.
+  // Оба справочных запроса идут по первичному ключу (alias_kind, alias_value);
+  // второй сравнивает lowerUTF8(alias_value) и читает только uid/sid/peer.
   const v = value.trim();
+  const lv = v.toLowerCase();
+  const [folding, exact] = await Promise.all([
+    chQuery<AliasRow>(`SELECT * FROM (${aliasesLatestWhere(`alias_kind IN (${CASE_INSENSITIVE_ACTOR_SQL}) AND alias_value = {lv:String}`)})`, { lv }),
+    chQuery<AliasRow>(`SELECT * FROM (${aliasesLatestWhere(`alias_kind IN (${CASE_SENSITIVE_ACTOR_SQL}) AND lowerUTF8(alias_value) = {lv:String}`)})`, { lv }),
+  ]);
+  const ci = aliasesOf(folding).filter((a) => !isHeld(a));
+  const owners = new Set(ci.map((a) => a.person_id));
+  const foreign = aliasesOf(exact).filter((a) => !isHeld(a) && !owners.has(a.person_id));
+  const params: Record<string, string> = { ...win, v, pv: canonicalPhone(v) ?? v, lv };
+  const at = (name: string) => `parseDateTime64BestEffort({${name}:String}, 3, 'UTC')`;
+  const interval = (a: Alias, p: string) => {
+    params[`${p}f`] = a.valid_from;
+    if (a.valid_to === null) return `ts >= ${at(`${p}f`)}`;
+    params[`${p}t`] = a.valid_to;
+    return `(ts >= ${at(`${p}f`)} AND ts < ${at(`${p}t`)})`;
+  };
+  let folded = "";
+  if (ci.length > 0) {
+    const active = ci.map((a, i) => interval(a, `ci${i}_`)).join(" OR ");
+    const excluded = foreign.map((a, i) => {
+      params[`fx${i}_v`] = a.value;
+      return `(actor_name = {fx${i}_v:String} AND ${interval(a, `fx${i}_`)})`;
+    });
+    folded = `OR (lowerUTF8(actor_name) = {lv:String} AND (${active})${excluded.length ? ` AND NOT (${excluded.join(" OR ")})` : ""})`;
+  }
   const rows = await chQuery<Row>(
     `SELECT source, action, actor_name AS who, node AS at_node, groupUniqArray(5)(src_ip) AS ips, count() AS events, toString(min(ts)) AS first_ts, toString(max(ts)) AS last_ts
      FROM events WHERE ${ts}
-       AND (actor_name IN ({v:String}, {pv:String})
-         OR (lowerUTF8(actor_name) = {lv:String} AND {lv:String} IN (
-               SELECT alias_value FROM identity_aliases WHERE alias_kind IN (${CASE_INSENSITIVE_ACTOR_SQL}) AND alias_value = {lv:String}
-               GROUP BY alias_kind, alias_value, valid_from, person_id HAVING argMax(deleted, updated_at) = 0))
-         OR lowerUTF8(node) = {lv:String})
+       AND (actor_name IN ({v:String}, {pv:String}) ${folded} OR lowerUTF8(node) = {lv:String})
      GROUP BY source, action, actor_name, node ORDER BY last_ts DESC LIMIT 100`,
-    { ...win, v, pv: canonicalPhone(v) ?? v, lv: v.toLowerCase() },
+    params,
   );
   return { kind: "actor", rows: rows.map(toSighting), vpn: [] };
 }
