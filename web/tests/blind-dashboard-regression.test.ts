@@ -1,41 +1,113 @@
-// PR #13: SQL-предпросмотр доступен тому же аналитику, который ставит blind-метку.
-// Авторизация, server action, валидация SQL и обработка результата — настоящие;
-// подменён только HTTP ClickHouse. Production argus_ro имеет SELECT ON argus.*.
-import { test } from "node:test";
+// PR #13: SQL-предпросмотр и панели дашбордов — любой SELECT от argus_ro. Слепой
+// разбор держат политики строк из scripts/migrate.sh (блок argus_ro_blind): тест
+// исполняет ровно этот блок для временного пользователя с профилем argus_ro и гоняет
+// настоящий previewPanelAction против живого ClickHouse — без подмены ответа.
+// (Первая версия codex подменяла fetch: защиту на стороне ClickHouse так не проверить.)
+import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { applyAllMigrations, ch, liveSkip as skip, root, serializeLiveFile } from "./_ch-live";
 import { formData, installNextMocks, loadAuth } from "./_next-mock";
-import { hideVerdicts } from "../src/lib/blind";
+import { hideVerdicts, isBlindIncident } from "../src/lib/blind";
 
-process.env.CLICKHOUSE_RO_USER = "argus_ro";
-process.env.CLICKHOUSE_RO_PASSWORD = "fixture-only-password";
-const mocks = installNextMocks();
+serializeLiveFile({ before, after });
+
+const suffix = randomBytes(6).toString("hex");
+const user = `blind_ro_test_${suffix}`;
+const policy = `blind_ro_test_${suffix}`;
+process.env.CLICKHOUSE_RO_USER = user;
+process.env.CLICKHOUSE_RO_PASSWORD = `fixture-${randomBytes(16).toString("hex")}`;
+installNextMocks();
+// _next-mock глушит сеть (CLICKHOUSE_URL → :9); этому тесту нужен живой сервер.
+if (process.env.ARGUS_TEST_CLICKHOUSE_URL) process.env.CLICKHOUSE_URL = process.env.ARGUS_TEST_CLICKHOUSE_URL;
 const auth = loadAuth();
-/* eslint-disable @typescript-eslint/no-require-imports -- конфигурация RO до загрузки настоящего action */
+/* eslint-disable @typescript-eslint/no-require-imports -- RO-учётка задана до загрузки настоящего action */
 const { previewPanelAction } = require("../src/lib/dashboard-actions") as typeof import("../src/lib/dashboard-actions");
 /* eslint-enable @typescript-eslint/no-require-imports */
 
-const id = "INC-4";
-const marker = "HiddenDecisionViaDashboardPreview";
+const script = readFileSync(path.join(root, "scripts/migrate.sh"), "utf8");
 
-for (const [table, column] of [["incident_verdicts", "summary_ru"], ["agent_verdicts", "markdown"]] as const) {
-  test(`blind: аналитик не получает ${table} открытого инцидента через previewPanelAction`, async (t) => {
-    const incident = { incident_id: id, status: "in_progress" };
-    assert.equal(hideVerdicts(incident), true);
-    mocks.queries.incidentGet = async () => incident;
-    await auth.createSession(`sso:blind-dashboard-${table}`, "analyst", true);
-    const sql = `SELECT ${column} FROM ${table} WHERE incident_id = '${id}'`;
-    t.mock.method(globalThis, "fetch", async (_input: unknown, init?: RequestInit) => {
-      const query = String(init?.body ?? "");
-      if (query === "SELECT 1 AS n") return new Response('{"n":1}\n');
-      assert.equal(query, sql, "фикстура отвечает только на конкретный запрос скрытого вердикта");
-      return new Response(JSON.stringify({ [column]: marker }) + "\n");
-    });
-
-    const control = await previewPanelAction({ data: null, error: null }, formData({ sql: "SELECT 1 AS n", range: "24h" }));
-    assert.equal(control.error, null, "аналитик авторизован, RO-пользователь настроен");
-    assert.deepEqual(control.data?.rows, [{ n: 1 }]);
-
-    const result = await previewPanelAction({ data: null, error: null }, formData({ sql, range: "24h" }));
-    assert.ok(!JSON.stringify(result).includes(marker), "SQL-предпросмотр не должен обходить запрет подсказок до закрытия");
-  });
+/** Профиль argus_ro: настройки и гранты вызова mkuser. */
+function roProfile(): { settings: string; grants: string[] } {
+  const call = script.match(/^mkuser argus_ro\b(?:.*\\\n)*.*$/m);
+  assert.ok(call, "production профиль argus_ro найден");
+  const quoted = [...call[0].matchAll(/"((?:\\.|[^"\\])*)"/g)].map((m) => m[1]);
+  const [, settings, ...grants] = quoted;
+  return { settings, grants };
 }
+
+/** SQL блока политик: bash исполняет блок с ch(), который только печатает запрос. */
+function policyStatements(): string[] {
+  const block = script.match(/^if \[ -n "\$\{CLICKHOUSE_RO_PASSWORD:-\}" \]; then\n[\s\S]*?\nfi$/m);
+  assert.ok(block && block[0].includes("ROW POLICY"), "блок политик argus_ro найден в migrate.sh");
+  const out = execFileSync("bash", ["-c", `ch() { printf '%s\\0' "$2"; }\n${block[0]}`], {
+    env: { ...process.env, CLICKHOUSE_RO_PASSWORD: "x" }, encoding: "utf8",
+  });
+  const stmts = out.split("\0").filter((s) => s.includes("ROW POLICY"));
+  assert.equal(stmts.length, 4);
+  return stmts.map((s) => s.replaceAll("argus_ro_blind", policy).replace(/\bTO argus_ro$/, `TO ${user}`));
+}
+
+const pick = (blind: boolean, from = 870_000_000): number => {
+  for (let i = from; ; i++) if (isBlindIncident(`INC-${i}`) === blind) return i;
+};
+const blindOpen = `INC-${pick(true)}`;
+const blindClosed = `INC-${pick(true, pick(true) + 1)}`;
+const plainOpen = `INC-${pick(false)}`;
+const marker = `BlindRo${suffix}`;
+
+test("blind: argus_ro не читает вердикт и его копии по слепому открытому инциденту", { skip }, async () => {
+  await applyAllMigrations();
+  const { settings, grants } = roProfile();
+  const policies = policyStatements();
+  const tables = ["incident_verdicts", "agent_verdicts", "incident_comments", "console_audit"];
+  let created = false;
+  try {
+    await ch().chCommand(`CREATE USER ${user} IDENTIFIED WITH plaintext_password BY '${process.env.CLICKHOUSE_RO_PASSWORD}'`);
+    created = true;
+    await ch().chCommand(`ALTER USER ${user} SETTINGS ${settings}`);
+    for (const grant of grants) await ch().chCommand(`GRANT ${grant} TO ${user}`);
+    for (const sql of policies) await ch().chCommand(sql);
+
+    const statuses: [string, string][] = [[blindOpen, "in_progress"], [blindClosed, "closed"], [plainOpen, "new"]];
+    for (const [id, status] of statuses) {
+      assert.equal(hideVerdicts({ incident_id: id, status }), id === blindOpen);
+      await ch().chCommand(`INSERT INTO incidents (incident_id, created_at, updated_at, rule_id, rule_title, level, tags, status, first_ts, last_ts)
+        VALUES ({id:String}, now(), now(), 'fixture-blind-ro', 'Blind RO fixture', 'high', [], {status:String}, now64(3), now64(3))`, { id, status });
+      const p = { id, m: `${marker}-${id}` };
+      await ch().chCommand("INSERT INTO incident_verdicts (incident_id, evaluated_at, summary_ru) VALUES ({id:String}, now(), {m:String})", p);
+      await ch().chCommand(`INSERT INTO agent_verdicts (incident_id, session_id, agent, created_at, verdict, markdown)
+        VALUES ({id:String}, 'fixture', 'fixture-bot', now(), 'true_positive', {m:String})`, p);
+      await ch().chCommand(`INSERT INTO incident_comments (comment_id, incident_id, created_at, author, body) VALUES
+        (generateUUIDv4(), {id:String}, now(), 'agent:fixture-bot', {m:String}),
+        (generateUUIDv4(), {id:String}, now(), 'analyst', concat('human-', {m:String}))`, p);
+      await ch().chCommand(`INSERT INTO console_audit (user, action, target, detail) VALUES
+        ('triage:fixture', 'triage.verdict', {id:String}, {m:String}),
+        ('analyst', 'incident.comment', {id:String}, concat('human-', {m:String}))`, p);
+    }
+
+    await auth.createSession(`sso:blind-ro-${suffix}`, "analyst", true);
+    const preview = async (sql: string) => {
+      const result = await previewPanelAction({ data: null, error: null }, formData({ sql, range: "24h" }));
+      assert.equal(result.error, null, `${sql}: ${result.error}`);
+      return JSON.stringify(result.data?.rows);
+    };
+    for (const [table, column] of [["incident_verdicts", "summary_ru"], ["agent_verdicts", "markdown"], ["incident_comments", "body"], ["console_audit", "detail"]]) {
+      const text = await preview(`SELECT ${column} FROM ${table} WHERE position(${column}, '${marker}') > 0`);
+      assert.ok(!text.includes(`"${marker}-${blindOpen}"`), `${table}: слепой открытый инцидент скрыт`);
+      assert.ok(text.includes(`${marker}-${blindClosed}`), `${table}: после завершения доступен`);
+      assert.ok(text.includes(`${marker}-${plainOpen}`), `${table}: не слепой инцидент доступен`);
+      if (table === "incident_comments" || table === "console_audit") {
+        assert.ok(text.includes(`human-${marker}-${blindOpen}`), `${table}: записи людей по слепому инциденту остаются`);
+      }
+    }
+    // Агрегаты встроенного дашборда argus-siem по-прежнему считаются.
+    assert.match(await preview(`SELECT count() AS n FROM incident_verdicts WHERE position(summary_ru, '${marker}') > 0`), /"n":2\b/);
+  } finally {
+    for (const table of tables) await ch().chCommand(`DROP ROW POLICY IF EXISTS ${policy} ON argus.${table}`);
+    if (created) await ch().chCommand(`DROP USER IF EXISTS ${user}`);
+  }
+});

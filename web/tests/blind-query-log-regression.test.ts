@@ -27,13 +27,14 @@ const comments = [
   { comment_id: "12345678-9abc-4def-8abc-123456789abc", incident_id: id, created_at: ts, author: "agent:fixture-bot", body: marker },
   { comment_id: "12345678-9abc-4def-8abc-123456789abd", incident_id: id, created_at: ts, author: "analyst", body: humanText },
 ];
+const incident = {
+  incident_id: id, status: "in_progress", rule_id: "fixture-rule", rule_title: "Fixture", level: "high",
+  owner: "analyst", created_at: ts, note: "",
+};
 let serial = 0;
 
 beforeEach(async () => {
-  mocks.queries.incidentGet = async () => ({
-    incident_id: id, status: "in_progress", rule_id: "fixture-rule", rule_title: "Fixture", level: "high",
-    owner: "analyst", created_at: ts, note: "",
-  });
+  mocks.queries.incidentGet = async () => incident;
   mocks.queries.incidentComments = realQueries.incidentComments;
   await auth.createSession(`sso:blind-query-log-${++serial}`, "analyst", true);
   assert.equal(hideVerdicts({ incident_id: id, status: "in_progress" }), true);
@@ -45,7 +46,11 @@ for (const [name, route] of routes) {
     const logs: string[] = [];
     t.mock.method(console, "error", (...args: unknown[]) => { logs.push(args.map(String).join(" ")); });
     t.mock.method(globalThis, "fetch", async (_input: unknown, init?: RequestInit) => {
-      assert.match(String(init?.body), /FROM incident_comments/);
+      const sql = String(init?.body);
+      // Маршрут импортирует argus-queries-export: в tsx он привязан к настоящему модулю,
+      // загруженному выше, поэтому прочие чтения карточки тоже приходят сюда.
+      if (/FROM incidents_current/.test(sql)) return new Response(JSON.stringify(incident) + "\n");
+      if (!/FROM incident_comments/.test(sql)) return new Response("");
       const body = failAfterRow
         ? JSON.stringify(comments[0]) + "\nCode: 241. DB::Exception: Memory limit exceeded\n"
         : comments.map((row) => JSON.stringify(row)).join("\n") + "\n";

@@ -1794,6 +1794,11 @@ components:
           oneOf:
             - $ref: "#/components/schemas/EngineVerdict"
             - type: "null"
+        verdict_hidden:
+          type: boolean
+          description: |
+            Инцидент разбирается вслепую и ещё не завершён: как в `/api/incidents/{id}`,
+            анализ модели скрыт (verdict = null), комментарии `agent:*` не выдаются.
         related:
           type: array
           items: { $ref: "#/components/schemas/RelatedSummary" }

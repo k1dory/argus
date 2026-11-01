@@ -27,3 +27,19 @@ export function blindComments<T extends { author: string }>(comments: T[]): T[] 
 export function blindActions<T extends { action?: unknown }>(actions: T[]): T[] {
   return actions.filter((a) => !String(a.action ?? "").startsWith("triage.verdict"));
 }
+
+/** Общий журнал (/settings): записи triage.verdict* по слепым незавершённым инцидентам
+ *  убираются. Статус спрашивается только у слепых целей — их четверть, а в хвосте
+ *  журнала единицы. Статус не прочитался — запись скрывается (безопасная сторона). */
+export async function blindAuditTail<T extends { action: string; target: string }>(
+  rows: T[], statusOf: (id: string) => Promise<{ incident_id: string; status: string } | null>,
+): Promise<T[]> {
+  const ids = [...new Set(rows.filter((r) => r.action.startsWith("triage.verdict") && isBlindIncident(r.target)).map((r) => r.target))];
+  if (!ids.length) return rows;
+  const hidden = new Set<string>();
+  await Promise.all(ids.map(async (id) => {
+    const inc = await statusOf(id).catch(() => null);
+    if (!inc || hideVerdicts(inc)) hidden.add(id);
+  }));
+  return rows.filter((r) => !(r.action.startsWith("triage.verdict") && hidden.has(r.target)));
+}

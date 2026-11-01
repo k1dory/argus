@@ -1,20 +1,15 @@
 import { apiGuard } from "@/lib/auth";
 import { incidentLabels } from "@/lib/argus-queries";
-import { decodeLabelCursor, encodeLabelCursor } from "@/lib/label-cursor";
+import { decodeLabelCursor, encodeLabelCursor, validUtc } from "@/lib/label-cursor";
 
 // Дата или дата-время ISO 8601 в UTC: секунды и доли (до наносекунд) необязательны,
 // суффикс Z — тоже (время и так UTC). Смещения не принимаются.
 const SINCE_RE = /^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,9})?)?Z?)?$/;
 const MAX_LIMIT = 50_000;
 
-/** Регулярка пропускает 2026-99-99 и 25:00 — проверяем, что такая дата существует. */
 function validSince(since: string): boolean {
   const m = SINCE_RE.exec(since);
-  if (!m) return false;
-  const [y, mo, d, h = "0", mi = "0", s = "0"] = m.slice(1).map((v) => v ?? undefined);
-  const t = new Date(Date.UTC(+y, +mo - 1, +d, +h, +mi, +s));
-  return t.getUTCFullYear() === +y && t.getUTCMonth() === +mo - 1 && t.getUTCDate() === +d
-    && t.getUTCHours() === +h && t.getUTCMinutes() === +mi && t.getUTCSeconds() === +s;
+  return !!m && validUtc(m[1], m[2], m[3], m[4], m[5], m[6]);
 }
 
 // GET /api/incidents/labels?since=2026-11-01&limit=10000 — ответы людей при
