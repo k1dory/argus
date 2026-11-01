@@ -274,6 +274,11 @@ func ParsePeerZones(spec string) (PeerZones, error) {
 		if err != nil {
 			return nil, fmt.Errorf("syslog tz: %q: %w", addr, err)
 		}
+		// Адрес отправителя сравнивается в виде IPv4 (Unmap), поэтому и
+		// ::ffff:a.b.c.d/N из настройки приводится к a.b.c.d/(N-96).
+		if pfx.Addr().Is4In6() && pfx.Bits() >= 96 {
+			pfx = netip.PrefixFrom(pfx.Addr().Unmap(), pfx.Bits()-96)
+		}
 		loc, err := time.LoadLocation(zone)
 		if err != nil {
 			return nil, fmt.Errorf("syslog tz: %q: %w", zone, err)
@@ -289,7 +294,8 @@ func (z PeerZones) Lookup(addr string) *time.Location {
 	if err != nil {
 		return nil
 	}
-	ip = ip.Unmap()
+	// fe80::59%eth0: зона интерфейса в Prefix.Contains не совпадает ни с чем.
+	ip = ip.WithZone("").Unmap()
 	var best *peerZone
 	for i := range z {
 		if z[i].pfx.Contains(ip) && (best == nil || z[i].pfx.Bits() > best.pfx.Bits()) {

@@ -5,7 +5,8 @@
 # Порог 200 действий за 5 минут: ручная уборка папки столько не даёт, а
 # шифровальщик проходит тысячи файлов в минуту. Плановые задания (бэкап с
 # зеркалированием, очистка корзины) заводятся отдельной учёткой — её стоит
-# занести в filter, а не поднимать порог.
+# занести в filter, а не поднимать порог. Учётки QNAP локальные: admin двух NAS —
+# разные люди, поэтому группировка по субъекту и узлу.
 title: "NAS: mass file delete/rename by one user"
 id: a41c-imp-090
 level: high
@@ -19,7 +20,7 @@ detection:
     kind: count
     count: 200
     window: 5m
-    group_by: actor.name
+    group_by: actor.name, node
   condition: selection and threshold
 
 analyst:

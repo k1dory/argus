@@ -503,36 +503,39 @@ func (c *ClickHouse) OperatorStates(ctx context.Context, ids []string) (map[stri
 
 // restoreGroupKeys — group_key открытых инцидентов (колонка incidents из
 // миграции 0034, в incidents_current её нет). Ошибка ClickHouse, в том числе
-// пришедшая внутри ответа 200, возвращается: с пустыми ключами разные группы
-// одного узла слились бы в реестре под «правило|субъект|узел», а старт движка
-// повторяет попытку.
+// пришедшая внутри ответа 200 (строкой {"exception":…} у JSONEachRow), возвращается:
+// с пустыми ключами разные группы одного узла слились бы в реестре под
+// «правило|субъект|узел», а старт движка повторяет попытку. ID уходят пачками:
+// параметры запроса идут в URL, а у ClickHouse он не длиннее 1 МиБ.
 func (c *ClickHouse) restoreGroupKeys(ctx context.Context, open []incidents.Incident) error {
-	if len(open) == 0 {
-		return nil
-	}
-	ids := make([]string, len(open))
-	for i := range open {
-		ids[i] = open[i].IncidentID
-	}
-	out, err := c.do(ctx, `SELECT incident_id, argMax(group_key, (updated_at, event_count, last_ts)) AS group_key
-	FROM incidents WHERE incident_id IN {ids:Array(String)} GROUP BY incident_id FORMAT JSONEachRow`, nil,
-		map[string]string{"ids": chArray(ids)})
-	if err != nil {
-		return fmt.Errorf("restore group_key: %w", err)
-	}
+	const batch = 5000
 	keys := map[string]string{}
-	for _, line := range bytes.Split(out, []byte("\n")) {
-		if len(bytes.TrimSpace(line)) == 0 {
-			continue
+	for lo := 0; lo < len(open); lo += batch {
+		hi := min(lo+batch, len(open))
+		ids := make([]string, 0, hi-lo)
+		for i := lo; i < hi; i++ {
+			ids = append(ids, open[i].IncidentID)
 		}
-		var row struct {
-			IncidentID string `json:"incident_id"`
-			GroupKey   string `json:"group_key"`
+		out, err := c.do(ctx, `SELECT incident_id, argMax(group_key, (updated_at, event_count, last_ts)) AS group_key
+		FROM incidents WHERE incident_id IN {ids:Array(String)} GROUP BY incident_id FORMAT JSONEachRow`, nil,
+			map[string]string{"ids": chArray(ids)})
+		if err != nil {
+			return fmt.Errorf("restore group_key: %w", err)
 		}
-		if err := json.Unmarshal(line, &row); err != nil {
-			return fmt.Errorf("restore group_key: %.200s", bytes.TrimSpace(line))
+		for _, line := range bytes.Split(out, []byte("\n")) {
+			if len(bytes.TrimSpace(line)) == 0 {
+				continue
+			}
+			var row struct {
+				IncidentID string `json:"incident_id"`
+				GroupKey   string `json:"group_key"`
+				Exception  string `json:"exception"`
+			}
+			if err := json.Unmarshal(line, &row); err != nil || row.Exception != "" || row.IncidentID == "" {
+				return fmt.Errorf("restore group_key: %.200s", bytes.TrimSpace(line))
+			}
+			keys[row.IncidentID] = row.GroupKey
 		}
-		keys[row.IncidentID] = row.GroupKey
 	}
 	for i := range open {
 		open[i].GroupKey = keys[open[i].IncidentID]

@@ -72,6 +72,9 @@ type Incident struct {
 	// иначе закрыл бы инцидент, пока настоящий секрет действует.
 	links     map[string]*secretLink
 	confirmed map[string]bool
+	// groupPending — group_key присвоен старому инциденту, но ещё не записан:
+	// Apply отдаёт инцидент на запись каждый цикл, пока движок не вызовет Persisted.
+	groupPending bool
 	// reviewNoted — ротация без подтверждения уже отмечена заметкой.
 	reviewNoted bool
 	// Review — причина пометки «закрыт автоматикой, нужна проверка» для
@@ -192,7 +195,6 @@ func (r *Registry) Apply(dets []eval.Detection, now time.Time) (created, updated
 	for _, d := range dets {
 		inc := build(d, now)
 		key := inc.regKey()
-		var adopted *Incident
 		if _, ok := r.open[key]; !ok && inc.GroupKey != "" {
 			// Инцидент, заведённый до group_key (или восстановленный без него), —
 			// под старым ключом: его забирает первая сработка группы, а не новый инцидент.
@@ -201,14 +203,14 @@ func (r *Registry) Apply(dets []eval.Detection, now time.Time) (created, updated
 				delete(r.open, legacy)
 				ex.GroupKey = inc.GroupKey
 				r.open[key] = ex
-				adopted = ex
+				ex.groupPending = true
 			}
 		}
 		if ex, ok := r.open[key]; ok && isFinal(ex.Status) && inc.LastTS <= ex.LastTS {
 			// Закрытый инцидент по той же сработке без новых событий: absence
 			// и склеенные окна иначе заводили бы новый инцидент каждый цикл.
-			if adopted != nil {
-				updated = append(updated, adopted.bumpUpdated(now))
+			if ex.groupPending {
+				updated = append(updated, ex.bumpUpdated(now))
 			}
 			continue
 		}
@@ -216,8 +218,8 @@ func (r *Registry) Apply(dets []eval.Detection, now time.Time) (created, updated
 			if inc.EventCount <= ex.EventCount && inc.LastTS <= ex.LastTS {
 				// Присвоенный group_key записывается отдельной версией строки и без
 				// новых событий: иначе после рестарта инцидент снова окажется без ключа.
-				if adopted != nil {
-					updated = append(updated, adopted.bumpUpdated(now))
+				if ex.groupPending {
+					updated = append(updated, ex.bumpUpdated(now))
 				}
 				continue // ничего нового
 			}
@@ -241,6 +243,22 @@ func (r *Registry) Apply(dets []eval.Detection, now time.Time) (created, updated
 		created = append(created, inc)
 	}
 	return created, updated, dropped
+}
+
+// Persisted отмечает инциденты записанными: присвоенный group_key больше не
+// нужно повторять. Вызывается после успешного INSERT.
+func (r *Registry) Persisted(incs []*Incident) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ids := make(map[string]bool, len(incs))
+	for _, inc := range incs {
+		ids[inc.IncidentID] = true
+	}
+	for _, inc := range r.open {
+		if inc.groupPending && ids[inc.IncidentID] {
+			inc.groupPending = false
+		}
+	}
 }
 
 // bumpUpdated продвигает updated_at к now, а если now не позже — на секунду
@@ -668,9 +686,14 @@ func explicitGroup(r *rules.Rule) bool {
 	if r.Detection.Threshold != nil && r.Detection.Threshold.GroupBy != "" {
 		gb = r.Detection.Threshold.GroupBy
 	}
-	switch gb {
-	case "", "actor.name", "node", "src.ip", "dst.ip":
-		return false
+	// Составной ключ только из субъекта, узла и адресов ничего не добавляет к
+	// ключу реестра «правило|субъект|узел» — как и одиночное поле.
+	for _, f := range strings.Split(gb, ",") {
+		switch strings.TrimSpace(f) {
+		case "", "actor.name", "node", "src.ip", "dst.ip":
+		default:
+			return true
+		}
 	}
-	return true
+	return false
 }
