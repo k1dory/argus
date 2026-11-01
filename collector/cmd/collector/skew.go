@@ -127,10 +127,11 @@ func (w *skewWatch) flush(now time.Time) []model.Event {
 		p := peers[name]
 		e := model.Event{
 			TS: model.FormatTS(now), Source: "argus.collector", SourceClass: "telemetry", Vendor: "ARGUS", Product: "collector",
-			// object — устройство с убежавшими часами: его видно в цепочке инцидента и
-			// уведомлении. node остаётся коллектором: сводка — его телеметрия, и по
+			// object — устройство с убежавшими часами и источник («172.16.0.10 (net.vrp)»):
+			// их видно в цепочке инцидента и уведомлении (за одним посредником — разные
+			// источники). node остаётся коллектором: сводка — его телеметрия, и по
 			// node с ним считается молчание узла (a41c-ops-061).
-			Action: "collector.clock_skew", Outcome: "failure", ActorName: "argus-collector", ActorKind: "system", Node: "argus-collector", Object: p.peer,
+			Action: "collector.clock_skew", Outcome: "failure", ActorName: "argus-collector", ActorKind: "system", Node: "argus-collector", Object: p.peer + " (" + p.source + ")",
 			Value: math.Round(p.maxSkew.Seconds()), Unit: "seconds", Severity: 4,
 			Attrs: map[string]string{
 				"peer": p.peer, "source": p.source, "count": strconv.FormatUint(p.count, 10),

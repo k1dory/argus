@@ -51,7 +51,7 @@ func TestSkewWatchReplacesFutureTimestamp(t *testing.T) {
 	byPeer := map[string]model.Event{}
 	for _, e := range events {
 		byPeer[e.Attrs["peer"]] = e
-		if e.Source != "argus.collector" || e.Action != "collector.clock_skew" || e.Attrs["transport"] != "internal" || e.Attrs["threshold_sec"] != "600" || e.Object != e.Attrs["peer"] || e.Node != "argus-collector" {
+		if e.Source != "argus.collector" || e.Action != "collector.clock_skew" || e.Attrs["transport"] != "internal" || e.Attrs["threshold_sec"] != "600" || e.Object != e.Attrs["peer"]+" ("+e.Attrs["source"]+")" || e.Node != "argus-collector" {
 			t.Fatalf("событие телеметрии: %+v", e)
 		}
 	}
