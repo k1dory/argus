@@ -168,6 +168,10 @@ export function encodeParam(value: string | number, type: string | undefined): s
 
 /** Параметров в URL не больше стольких байт — остальное телом (см. chFetchWithSlot). */
 export const PARAMS_IN_URL_MAX = 64 * 1024;
+/** Предел значения поля формы ClickHouse (http_max_field_value_size, 128 КиБ на 24.8) с запасом. */
+export const FORM_FIELD_MAX = 120 * 1024;
+/** Параметры в URL при длинном SQL — пока URI не ближе запаса к http_max_uri_size (1 MiB). */
+export const URI_PARAMS_MAX = 960 * 1024;
 
 /** Граница multipart, которой нет ни в одной части. */
 function multipartBoundary(parts: string[]): string {
@@ -198,11 +202,15 @@ async function chFetchWithSlot(sql: string, params: Record<string, string | numb
   // Параметры — в URL, пока он короткий; большие (массивы значений сотен персон) — телом
   // multipart/form-data вместе с запросом: URI ClickHouse не длиннее 1 MiB
   // (http_max_uri_size), и запрос с тысячей персон иначе получил бы HTTP 414. Только для
-  // чтения: у INSERT в теле — данные.
+  // чтения: у INSERT в теле — данные. В multipart запрос — тоже поле формы, а у поля (и у
+  // параметра URL — его разбирает тот же HTMLForm) предел FORM_FIELD_MAX байт: SQL длиннее
+  // уходит телом text/plain, параметры — в URL, если он помещается.
   let body: string = sql;
   let contentType = "text/plain";
   const urlBytes = encoded.reduce((n, [k, v]) => n + k.length + encodeURIComponent(v).length + 2, 0);
-  if (urlBytes > PARAMS_IN_URL_MAX && !/^\s*INSERT\b/i.test(sql)) {
+  const multipart = urlBytes > PARAMS_IN_URL_MAX && !/^\s*INSERT\b/i.test(sql)
+    && !(Buffer.byteLength(sql, "utf8") > FORM_FIELD_MAX && urlBytes <= URI_PARAMS_MAX);
+  if (multipart) {
     const boundary = multipartBoundary([sql, ...encoded.map(([, v]) => v)]);
     contentType = `multipart/form-data; boundary=${boundary}`;
     body = [["query", sql] as const, ...encoded].map(([name, value]) =>

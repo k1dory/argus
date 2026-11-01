@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import {
-  ACTOR_KEYS_EXPR, activityPlan, actorMarkdown, ARRAY_PARAM_CHUNK, arrayParam, aliasEventsQuery, aliasPrefilter, PREFILTER_INDEX_MAX, aliasInterval, canonicalIp, canonicalPhone, aliasPredicate, ambiguousAliases, bucketEvents, classifyEvent, clampWindow, holdPolicy, isHeld, isIp, isPhone, normalizeAliasValue, parseActorsParams, parseAliasInput, parseDateInput, parseIdentitiesDoc,
+  ACTOR_KEYS_EXPR, activityPlan, actorMarkdown, ARRAY_PARAM_CHUNK, arrayParam, utf8Bytes, aliasEventsQuery, aliasPrefilter, PREFILTER_INDEX_MAX, aliasInterval, canonicalIp, canonicalPhone, aliasPredicate, ambiguousAliases, bucketEvents, classifyEvent, clampWindow, holdPolicy, isHeld, isIp, isPhone, normalizeAliasValue, parseActorsParams, parseAliasInput, parseDateInput, parseIdentitiesDoc,
   primaryAlias, rangeWindow, resolveStatus, aliasKey, aliasMatches, activeAliases, ACTOR_KINDS, type ActorReport, type Alias,
 } from "../src/lib/shared/actors";
 import { toLogItem } from "../src/lib/shared/log-query";
@@ -293,12 +293,21 @@ test("activityPlan: классы по слоту, значению и интер
     { id: "old", aliases: [mk("old", "login", "o", "2026-09-01 00:00:00.000", "2026-10-01 00:00:00.000")] },
   ], w);
   assert.deepEqual(plan.persons, ["a", "b"], "без алиасов в окне — не в плане");
-  // Классы: 1 — login shared [окно] (a и b), 2 — ip 192.0.2.1 c 22.10 (a), 3 — uid shared (b).
-  assert.deepEqual(plan.owners, [[1, 2], [1], [2]], "одно значение и интервал у двух персон — один класс");
+  // Классы подряд по слотам и значениям: 1 — uid shared (actor_name, b), 2 — login shared
+  // [окно] (lowerUTF8(actor_name), a и b), 3 — ip 192.0.2.1 c 22.10 (src_ip, a).
+  assert.deepEqual(plan.owners, [[2], [1, 2], [1]], "одно значение и интервал у двух персон — один класс");
+  const sp = (start: number, n: number) => String(start * 4294967296 + n);
+  assert.equal(plan.params.ap_k0, "['shared']");
+  assert.equal(plan.params.ap_r0, `[${sp(1, 1)}]`, "значение → отрезок классов [1, 2)");
   assert.equal(plan.params.ap_k1, "['shared']");
-  assert.equal(plan.params.ap_ga, "[[],[3],[1],[2]]", "группы слотов: actor_name → 3, lowerUTF8(actor_name) → 1, src_ip → 2");
-  assert.equal(plan.params.ap_vf, `[${w.fromMs},${Date.UTC(2026, 9, 22)},${w.fromMs}]`, "интервал — внутри окна");
+  assert.equal(plan.params.ap_r1, `[${sp(2, 1)}]`);
+  assert.equal(plan.params.ap_r2, `[${sp(3, 1)}]`);
+  assert.equal(plan.params.ap_vf, `[${w.fromMs},${w.fromMs},${Date.UTC(2026, 9, 22)}]`, "интервал — внутри окна");
+  assert.equal(plan.params.ap_ow, "[2,1,2,1]", "владельцы классов — плоско");
+  assert.equal(plan.params.ap_os, `[${sp(1, 1)},${sp(2, 2)},${sp(4, 1)}]`, "класс → отрезок владельцев");
+  assert.ok(!/Array\(Array/.test(Object.keys(plan.params).join() + plan.hits + plan.who), "без вложенных массивов-параметров");
   assert.ok(!/ OR /.test(plan.hits) && plan.hits.startsWith("arraySort("));
+  assert.ok(plan.who.startsWith("arrayDistinct(") && plan.who.includes("hits"));
 });
 
 test("arrayParam: короткий массив — один параметр, длинный — частями и arrayConcat", () => {
@@ -311,4 +320,14 @@ test("arrayParam: короткий массив — один параметр, �
   assert.ok(parts.length > 1 && sql === `arrayConcat(${parts.map((k) => `{${k}:Array(String)}`).join(", ")})`, sql);
   assert.ok(parts.every((k) => String(params[k]).length <= ARRAY_PARAM_CHUNK + 2));
   assert.deepEqual(parts.flatMap((k) => String(params[k]).slice(1, -1).split(",")), long, "порядок и состав сохранены");
+});
+
+test("arrayParam: предел части — в байтах UTF-8, а не в символах", () => {
+  const params: Record<string, string | number> = {};
+  const wide = Array.from({ length: 300 }, (_, i) => `'${"漢".repeat(250)}${i}'`);
+  arrayParam(params, "u", "Array(String)", wide);
+  const parts = Object.keys(params).filter((k) => k.startsWith("u_"));
+  assert.ok(parts.length > 1);
+  assert.ok(parts.every((k) => utf8Bytes(String(params[k])) <= ARRAY_PARAM_CHUNK + 2), "каждая часть ≤ предела в байтах");
+  assert.equal(utf8Bytes("a漢é😀"), 1 + 3 + 2 + 4);
 });

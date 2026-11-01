@@ -30,3 +30,22 @@ test("chQuery: короткие параметры — в URL, длинные �
   assert.equal(seen[2].type, "text/plain");
   assert.equal(seen[2].url.searchParams.get("param_v")?.length, big.length);
 });
+
+test("chQuery: SQL длиннее поля формы — телом text/plain, параметры в URL, пока URI помещается", async (t) => {
+  const seen: { url: URL; body: string; type: string }[] = [];
+  t.mock.method(globalThis, "fetch", async (input: URL | string | Request, init?: RequestInit) => {
+    seen.push({ url: new URL(String(input)), body: String(init?.body ?? ""), type: String(new Headers(init?.headers).get("content-type")) });
+    return new Response("");
+  });
+  const ch = await import("../src/lib/clickhouse");
+  const sql = `SELECT length({v:String}) AS n /* ${"x".repeat(ch.FORM_FIELD_MAX)} */`;
+  const big = "y".repeat(ch.PARAMS_IN_URL_MAX + 1);
+  await ch.chQuery(sql, { v: big });
+  assert.equal(seen[0].type, "text/plain", "query полем формы не пройдёт: предел 128 КиБ");
+  assert.equal(seen[0].body, sql);
+  assert.equal(seen[0].url.searchParams.get("param_v"), big);
+  // Параметры не помещаются и в URI — остаётся multipart (ClickHouse ответит явной ошибкой).
+  const huge = "z".repeat(ch.URI_PARAMS_MAX + 1);
+  await ch.chQuery(sql, { v: huge });
+  assert.match(seen[1].type, /^multipart\/form-data/);
+});

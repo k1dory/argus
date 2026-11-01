@@ -74,8 +74,8 @@ function fullRoutes(): Route[] {
     { when: (s) => s.includes("LEFT JOIN"), rows: () => [] },
     { when: (s) => s.includes("FROM identity_aliases") && s.includes("WHERE person_id = {id:String}"), rows: () => aliases.filter((a) => a.person_id === "i.petrov") },
     { when: (s) => s.includes("FROM identity_aliases"), rows: () => aliases },
-    // Активность списка: класс 1 — первый алиас первой персоны с алиасами.
-    { when: (s) => s.includes("GROUP BY hits") && s.includes("FROM events"), rows: () => [{ hits: [1], n: 5, last_ts: "2026-10-29 09:00:00.000" }] },
+    // Активность списка: персона 1 плана — первая персона с алиасами.
+    { when: (s) => s.includes("GROUP BY hits") && s.includes("FROM events"), rows: () => [{ p: 1, n: 5, last_ts: "2026-10-29 09:00:00.000" }] },
     { when: (s) => s.includes("countIf(") && s.includes("FROM incidents_current"), rows: () => [{ i0: 0, i1: 2 }] },
     { when: (s) => s.includes("groupUniqArray"), rows: () => [
       { actor_name: "a.smirnova", count: 40, first_ts: TS, last_ts: TS, sources: ["idp"] },

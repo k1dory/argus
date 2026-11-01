@@ -64,9 +64,9 @@ globalThis.fetch = (async (url: URL | string, init?: RequestInit) => {
   calls.push({ sql, params: p });
   if (sql.startsWith("INSERT")) return fail.insert ? new Response("Code: 241. DB::Exception: Memory limit exceeded", { status: 500 }) : new Response("");
   if (sql.includes("GROUP BY hits") && sql.includes("FROM events")) {
-    // Активность списка персон: одна строка с набором всех классов плана (ap_vf).
-    const classes = (p.get("param_ap_vf") ?? "[]").slice(1, -1).split(",").filter(Boolean).map((_, i) => i + 1);
-    return rows([{ hits: classes, n: "2", last_ts: "2026-10-24 11:00:00.000" }]);
+    // Активность списка персон: строка на каждую персону плана (номера — в ap_ow).
+    const nos = [...new Set((p.get("param_ap_ow") ?? "[]").slice(1, -1).split(",").filter(Boolean))];
+    return rows(nos.map((no) => ({ p: no, n: "2", last_ts: "2026-10-24 11:00:00.000" })));
   }
   if (sql.includes("countIf(")) {
     // Список персон: на персону — e<j>/l<j> или i<j>; отвечаем по именам колонок из SQL.
