@@ -1019,7 +1019,7 @@ export async function requestReanalyze(id: string): Promise<string | null> {
 
 /* ===== Обратный канал: блокировка/разблокировка адреса через движок ===== */
 
-export type RespondResult = { error?: string; warning?: string; results?: { executor: string; ok: boolean; detail: string }[] };
+export type RespondResult = { error?: string; warning?: string; until?: string; results?: { executor: string; ok: boolean; detail: string }[] };
 
 async function engineRespond(url: string, body: unknown, scope: string): Promise<RespondResult> {
   try {
