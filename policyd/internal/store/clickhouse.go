@@ -6,10 +6,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -74,7 +77,7 @@ func (c *ClickHouse) HasStatusColumn(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return false, fmt.Errorf("clickhouse describe: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		return false, chError("describe", resp, body)
 	}
 	for _, line := range strings.Split(string(body), "\n") {
 		name, _, _ := strings.Cut(line, "\t")
@@ -113,7 +116,30 @@ func (c *ClickHouse) InsertVerdicts(ctx context.Context, rows []VerdictRow) erro
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
-		return fmt.Errorf("clickhouse insert: %s: %s", resp.Status, strings.TrimSpace(string(msg)))
+		return chError("insert", resp, msg)
 	}
 	return nil
+}
+
+var exceptionCode = regexp.MustCompile(`Code:\s*(\d+)`)
+
+// chError — ошибка ClickHouse без текста исключения: он цитирует данные (сущность
+// политики), а ошибка уходит в журнал и в открытый /healthz. Статус, код и query_id;
+// полный текст — в system.query_log.
+func chError(op string, resp *http.Response, body []byte) error {
+	code := strings.TrimSpace(resp.Header.Get("X-ClickHouse-Exception-Code"))
+	if _, err := strconv.Atoi(code); err != nil || code == "0" {
+		code = ""
+		if m := exceptionCode.FindSubmatch(body); m != nil {
+			code = string(m[1])
+		}
+	}
+	msg := fmt.Sprintf("clickhouse %s: HTTP %d", op, resp.StatusCode)
+	if code != "" {
+		msg += " code " + code
+	}
+	if id := resp.Header.Get("X-ClickHouse-Query-Id"); id != "" && len(id) <= 64 {
+		msg += " query_id " + id
+	}
+	return errors.New(msg)
 }

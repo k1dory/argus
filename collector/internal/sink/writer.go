@@ -446,7 +446,7 @@ func (w *Writer) deadLetter(rows []any, err error) bool {
 		slog.Debug("dead letter raw", "source", rej.Source, "raw", rej.Raw)
 		rejs = append(rejs, rej)
 	}
-	slog.Error("dead letter: строки отброшены", "rows", len(rejs), "source", rejs[0].Source, "reason", short(reason), "bytes", total)
+	slog.Error("dead letter: строки отброшены", "rows", len(rejs), "source", rejs[0].Source, "reason", short(err.Error()), "bytes", total)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if ierr := w.Ins.InsertRejects(ctx, rejs); ierr != nil {
@@ -477,9 +477,13 @@ func short(s string) string {
 	return s
 }
 
-// full — полный текст ошибки для таблицы отказов, с потолком.
+// full — полный текст ошибки для таблицы отказов, с потолком (с текстом ClickHouse).
 func full(err error) string {
 	s := err.Error()
+	var ce *Error
+	if errors.As(err, &ce) {
+		s = ce.Detail()
+	}
 	if len(s) > 4<<10 {
 		return s[:4<<10] + "…"
 	}
