@@ -158,7 +158,7 @@ func ParseWAFAudit(b []byte) (WAF, bool) {
 					denied = denied || wafBlockAction(m.ErrorMessage[loc[4]:loc[5]])
 				}
 				var mw WAF
-				if r, ok := parseRuleMeta(m.ErrorMessage[loc[1]:], &mw); ok {
+				if r, ok := parseRuleMeta(m.ErrorMessage[loc[1]:], &mw, true); ok {
 					w.addRule(r)
 				}
 				continue
@@ -236,13 +236,13 @@ func ParseWAFErrorLine(line string) (WAF, bool) {
 	if c := clientRe.FindStringSubmatch(text[:loc[0]]); c != nil {
 		w.ClientIP = c[1]
 	}
-	// denied/dropped/redirected — движок прервал запрос; allowed — явное разрешение правилом.
-	decision := m[2] != ""
+	// denied/dropped/redirected — движок прервал запрос. «Access allowed» итогом не считается:
+	// allow:phase и allow:request пропускают только часть фаз, дальше возможен deny.
 	denied := wafBlockAction(m[2])
 	if m[3] != "" {
 		w.Status, _ = strconv.Atoi(m[3])
 	}
-	if r, ok := parseRuleMeta(text[loc[1]:], &w); ok {
+	if r, ok := parseRuleMeta(text[loc[1]:], &w, w.Product == "coraza"); ok {
 		w.addRule(r)
 	}
 	// «Access denied» = движок заблокировал; Warning — только детект (DetectionOnly или score ещё не набран).
@@ -251,7 +251,7 @@ func ParseWAFErrorLine(line string) (WAF, bool) {
 	if denied {
 		w.EngineMode, w.Blocked = "On", true
 	}
-	w.Final = decision || w.hasFinalRule()
+	w.Final = denied || w.hasFinalRule()
 	return w, true
 }
 
@@ -263,12 +263,27 @@ func wafBlockAction(a string) bool {
 // parseRuleMeta — метаданные правила из хвоста строки error-лога после маркера.
 // Разбор — от первого [file "…"]; до него — совпадение с данными запроса атакующего.
 // hostname/uri/unique_id пишутся в w.
-func parseRuleMeta(meta string, w *WAF) (WAFRule, bool) {
-	if fi := fileTagRe.FindStringIndex(meta); fi != nil {
-		meta = meta[fi[0]:]
-	} else {
-		meta = ""
+//
+// Coraza пишет перед метаданными текст msg без экранирования, а msg может включать
+// данные запроса (%{MATCHED_VAR}) — в т.ч. поддельный [file "…"] [tag "…"]. Сами
+// метаданные Coraza пишет через %q: кавычки внутри экранированы, и `[file "` в них
+// не встречается. Поэтому у Coraza (coraza=true) настоящий — последний [file "…"].
+// У ModSecurity данные атакующего (Value: `…') идут до метаданных — берётся первый.
+func parseRuleMeta(meta string, w *WAF, coraza bool) (WAFRule, bool) {
+	locs := fileTagRe.FindAllStringIndex(meta, -1)
+	if len(locs) == 0 {
+		return WAFRule{}, false
 	}
+	start := locs[0][0]
+	if coraza {
+		start = locs[len(locs)-1][0]
+	}
+	r := scanRuleMeta(meta[start:], w)
+	return r, r.ID != "" || r.Msg != ""
+}
+
+// scanRuleMeta — пары [key "value"] метаданных правила, начиная с [file "…"].
+func scanRuleMeta(meta string, w *WAF) WAFRule {
 	r := WAFRule{Severity: -1}
 	for _, kv := range kvRe.FindAllStringSubmatch(meta, -1) {
 		v := strings.ReplaceAll(kv[2], `\"`, `"`)
@@ -295,7 +310,7 @@ func parseRuleMeta(meta string, w *WAF) (WAFRule, bool) {
 			w.UniqueID = v
 		}
 	}
-	return r, r.ID != "" || r.Msg != ""
+	return r
 }
 
 // auditHeaders — заголовки запроса из аудита: объект строк (ModSecurity) или массивов (Coraza 3.8).
