@@ -7,6 +7,20 @@ import { promises as fs } from "fs";
 import path from "path";
 import { chCommand, chQuery, createLimiter, headerChCode, LimiterWaitError, shortChError } from "./clickhouse";
 import { RANGES, type RangeKey } from "./shared/ranges";
+import { parseDtParam, toChParam, type TimeFilter } from "./shared/filters";
+
+/** Окно дашборда: пресет (как раньше) или точный интервал from/to (UTC). */
+export type PanelWindow = RangeKey | TimeFilter;
+
+/** Значения параметров окна для ClickHouse ({argus_from:String}, {argus_to:String}): даты не вклеиваются в SQL. */
+export function panelParams(w: PanelWindow): Record<string, string> {
+  if (typeof w === "string" || !w.from) return {};
+  const out: Record<string, string> = { argus_from: toChParam(parseDtParam(w.from)!) };
+  if (w.to) out.argus_to = toChParam(parseDtParam(w.to)!);
+  return out;
+}
+
+const windowKey = (w: PanelWindow): string => (typeof w === "string" ? w : w.from ? `${w.from}|${w.to ?? ""}` : w.range ?? "24h");
 import { normalizeSpec, refreshSeconds, SPEC_LIMITS, SpecError, type DashboardSpec, type Panel, type PanelType } from "./shared/dashboard-spec";
 import { wazuhEnabled } from "./integrations";
 
@@ -140,18 +154,29 @@ export function validateSql(sql: string): string | null {
  *  ошибкой (проверено на 24.8), поэтому текст запроса на них не разбирается; WITH,
  *  UNION ALL, ORDER BY/LIMIT и комментарий «--» в конце работают. Перевод строки перед
  *  «)» закрывает строчный комментарий. */
-export function panelQuery(sql: string, range: RangeKey): string {
+export function panelQuery(sql: string, range: PanelWindow): string {
   return `SELECT * FROM (\n${expandMacros(sql, range)}\n) FORMAT JSONEachRow`;
 }
 
-export function expandMacros(sql: string, range: RangeKey): string {
-  const { hours, bucketMinutes } = RANGES[range];
-  const from = `now() - INTERVAL ${hours} HOUR`;
+export function expandMacros(sql: string, range: PanelWindow): string {
+  const t: TimeFilter = typeof range === "string" ? { range } : range;
+  let from: string, to = "now()", bucketMinutes: number;
+  if (t.from) {
+    // Точный интервал: границы — параметры запроса (panelParams), шаг — 48 корзин на окно.
+    const a = parseDtParam(t.from)!, b = t.to ? parseDtParam(t.to)! : Date.now();
+    from = "toDateTime({argus_from:String}, 'UTC')";
+    if (t.to) to = "toDateTime({argus_to:String}, 'UTC')";
+    bucketMinutes = Math.max(1, Math.round((b - a) / 60_000 / 48));
+  } else {
+    const r = RANGES[t.range ?? "24h"];
+    from = `now() - INTERVAL ${r.hours} HOUR`;
+    bucketMinutes = r.bucketMinutes;
+  }
   return sql
-    .replace(/\$__timeFilter\(\s*([A-Za-z0-9_.]+)\s*\)/g, (_m, col) => `(${col} >= ${from} AND ${col} <= now())`)
+    .replace(/\$__timeFilter\(\s*([A-Za-z0-9_.]+)\s*\)/g, (_m, col) => `(${col} >= ${from} AND ${col} <= ${to})`)
     .replace(/\$__timeInterval\(\s*([A-Za-z0-9_.]+)\s*\)/g, (_m, col) => `toStartOfInterval(${col}, INTERVAL ${bucketMinutes} MINUTE)`)
     .replace(/\$__from\b/g, from)
-    .replace(/\$__to\b/g, "now()")
+    .replace(/\$__to\b/g, to)
     .replace(/\$__interval\b/g, `INTERVAL ${bucketMinutes} MINUTE`);
 }
 
@@ -211,7 +236,7 @@ export function stripPanelDetail(d: PanelData): PanelData {
   return rest;
 }
 
-async function executePanel(sql: string, range: RangeKey, signal?: AbortSignal): Promise<PanelData> {
+async function executePanel(sql: string, range: PanelWindow, signal?: AbortSignal): Promise<PanelData> {
   const err = validateSql(sql);
   if (err) return { columns: [], rows: [], error: err, ms: 0 };
   if (!RO_USER || !RO_PASSWORD) {
@@ -220,6 +245,7 @@ async function executePanel(sql: string, range: RangeKey, signal?: AbortSignal):
   const url = new URL(CH_URL);
   url.searchParams.set("database", CH_DB);
   url.searchParams.set("default_format", "JSONEachRow");
+  for (const [k, v] of Object.entries(panelParams(range))) url.searchParams.set(`param_${k}`, v);
   // Буферизация на сервере: ошибка посреди выдачи — HTTP-ошибка с кодом в заголовке, а не
   // строка в конце тела со статусом 200. Это параметр HTTP, не настройка — readonly=1 его
   // пропускает (проверено на 24.8).
@@ -275,8 +301,8 @@ async function executePanel(sql: string, range: RangeKey, signal?: AbortSignal):
  * ttlMs — на сколько кэшировать результат (обычно интервал refresh дашборда);
  * 0 — без кэша (предпросмотр в редакторе).
  */
-export async function runPanelQuery(sql: string, range: RangeKey, ttlMs = 0, signal?: AbortSignal): Promise<PanelData> {
-  const key = `${range} ${sql}`;
+export async function runPanelQuery(sql: string, range: PanelWindow, ttlMs = 0, signal?: AbortSignal): Promise<PanelData> {
+  const key = `${windowKey(range)} ${sql}`;
   if (ttlMs > 0) {
     const hit = panelCacheGet(key, ttlMs);
     if (hit) return { ...hit, cached: true };

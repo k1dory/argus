@@ -39,6 +39,7 @@ const raw = C<typeof import("../src/components/console/journal/raw-block")>("jou
 const feed = C<typeof import("../src/components/console/journal/event-feed")>("journal/event-feed");
 const filterBar = C<typeof import("../src/components/console/journal/filter-bar")>("journal/filter-bar");
 const alertsFilters = C<typeof import("../src/components/console/alerts-filters")>("alerts-filters");
+const rangeFilters = C<typeof import("../src/components/console/range-filters")>("range-filters");
 const actionForm = C<typeof import("../src/components/console/action-form")>("action-form");
 const statusForm = C<typeof import("../src/components/console/incident-status-form")>("incident-status-form");
 const usersForm = C<typeof import("../src/components/console/users-form")>("users-form");
@@ -276,6 +277,11 @@ test("range-picker, auto-refresh, download, refresh, copyable: SSR-размет�
   assert.match(rp, /aria-label="Диапазон времени"/);
   assert.match(rp, /aria-pressed="true"[^>]*>7 дней|7 дней/);
   assert.equal((rp.match(/aria-pressed="true"/g) ?? []).length, 1);
+  // Точный интервал в URL — ни один пресет не вдавлен; anyLabel — клавиша «без окна».
+  assert.equal((html(h(range.RangePicker, { value: "7d" }), "/x", "from=2026-10-01T00:00").match(/aria-pressed="true"/g) ?? []).length, 0);
+  const any = html(h(range.RangePicker, { keys: ["24h", "7d"], anyLabel: "Всё время" }), "/incidents");
+  assert.match(stripTags(any), /^Всё время 24 часа 7 дней$/);
+  assert.match(any, /aria-pressed="true"[^>]*>Всё время/);
   assert.equal(html(h(autoRefresh.AutoRefresh, { seconds: 2 })), "", "интервал меньше 5 с — компонент не рисуется");
   assert.match(text(h(autoRefresh.AutoRefresh, { seconds: 30, label: "обновление" })), /обновление 30 с · через 30 с/);
   assert.match(html(h(autoRefresh.AutoRefresh, { seconds: 30 })), /aria-label="Приостановить автообновление"/);
@@ -325,7 +331,7 @@ test("journal: гистограмма с подписями и ссылками 
   assert.match(stripTags(fb), /gone\.src/, "выбранный источник показан, даже если его нет в окне");
   assert.match(fb, /value="5763"/);
   assert.match(fb, /value="2026-10-29T00:00"/);
-  assert.match(stripTags(html(h(alertsFilters.AlertsFilters, { agents: ["web-01"] }), "/wazuh/alerts", "level=10&agent=web-01&q=ssh")), /Описание правила Уровень Агент Найти/);
+  assert.match(stripTags(html(h(alertsFilters.AlertsFilters, { agents: ["web-01"] }), "/wazuh/alerts", "level=10&agent=web-01&q=ssh")), /Описание правила Агент Найти/);
 });
 
 /* ===== Формы действий (SSR без обработчиков) ===== */
@@ -450,4 +456,23 @@ test("login-form: шаг пароля и скрытый next; SSR без оши�
   assert.match(out, /autocomplete="current-password"/i);
   assert.doesNotMatch(out, /role="alert"/);
   assert.match(stripTags(out), /Войти/);
+});
+
+test("range-filters: значения из URL, поля числа/шкалы/даты, «сбросить» только при активных диапазонах", () => {
+  const fields = [
+    { key: "level", label: "Уровень", kind: "ordinal", options: [{ value: "low", label: "низкий" }, { value: "high", label: "высокий" }] },
+    { key: "events", label: "Событий", kind: "number", min: 0, max: 100 },
+    { key: "seen", label: "Последний приём", kind: "datetime" },
+  ];
+  const out = html(h(rangeFilters.RangeFilters, { time: true, fields, legacy: ["level"] }), "/incidents", "from=2026-10-01T00:00&level_min=high&events_max=5&page=3");
+  const t = stripTags(out);
+  assert.match(out, /role="search"/);
+  assert.match(out, /type="datetime-local"[^>]*aria-label="Точный интервал, UTC: начало"[^>]*value="2026-10-01T00:00"/);
+  assert.match(t, /≥ высокий/, "нижняя граница шкалы из URL");
+  assert.match(out, /id="rf-events-max"[^>]*value="5"/);
+  assert.match(out, /aria-label="Последний приём, UTC: начало"/);
+  assert.match(t, /Применить сбросить диапазоны/);
+  // Без диапазонов в URL — кнопки сброса нет; устаревший точный level тоже считается активным.
+  assert.doesNotMatch(stripTags(html(h(rangeFilters.RangeFilters, { fields }), "/incidents", "q=x")), /сбросить диапазоны/);
+  assert.match(stripTags(html(h(rangeFilters.RangeFilters, { fields, legacy: ["level"] }), "/incidents", "level=high")), /сбросить диапазоны/);
 });

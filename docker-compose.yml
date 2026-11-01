@@ -325,7 +325,10 @@ services:
   engine:
     image: ${ARGUS_IMAGE_PREFIX:-argus}/engine:${APP_VERSION:-dev}
     build:
-      context: ./engine
+      # Корень репозитория: образ несёт rules/ и fixtures/events (реестр
+      # internal/registry); .dockerignore пропускает только нужное.
+      context: .
+      dockerfile: engine/Dockerfile
       args:
         REGISTRY: ${REGISTRY_MIRROR:-docker.io}
     environment:

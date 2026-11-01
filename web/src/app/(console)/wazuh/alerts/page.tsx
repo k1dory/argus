@@ -22,7 +22,10 @@ import {
 import { muteRuleAction } from "@/lib/actions";
 import { parseRange, safeQuery } from "@/lib/clickhouse";
 import { agentNames, alertsList, ALERTS_MAX_PAGE, ALERTS_PAGE_SIZE, mutedRuleIds, parseAlertDir, parseAlertSort } from "@/lib/queries";
-import { clampLevel, clampPage } from "@/lib/shared/limits";
+import { clampPage } from "@/lib/shared/limits";
+import { RangeFilters } from "@/components/console/range-filters";
+import { describeChips } from "@/lib/shared/filters";
+import { ALERT_LEVEL_FIELD, alertRangeChips, parseAlertRanges } from "@/lib/shared/page-filters";
 import { fmtNum, formatTs } from "@/lib/shared/time";
 import { requirePageSession, ROLE_RANK } from "@/lib/auth";
 
@@ -36,13 +39,17 @@ export default async function AlertsPage({ searchParams }: PageProps<"/wazuh/ale
   const canEdit = ROLE_RANK[session.role] >= ROLE_RANK.analyst;
   const params = await searchParams;
   const range = parseRange(str(params.range));
+  // Окно (пресет или точный from/to), уровень не ниже/не выше; прежний level=N — «не ниже N».
+  const ranges = parseAlertRanges(params);
   const showMuted = params.muted === "1";
   const sort = parseAlertSort(params.sort);
   const dir = parseAlertDir(params.dir);
   const page = Math.min(ALERTS_MAX_PAGE, clampPage(params.page));
   const filters = {
     range,
-    minLevel: clampLevel(params.level) || undefined,
+    time: ranges.time,
+    minLevel: ranges.level.min,
+    maxLevel: ranges.level.max,
     agent: str(params.agent)?.slice(0, 128),
     search: str(params.q)?.slice(0, 200),
     showMuted,
@@ -64,7 +71,7 @@ export default async function AlertsPage({ searchParams }: PageProps<"/wazuh/ale
     return s ? `/wazuh/alerts?${s}` : "/wazuh/alerts";
   };
 
-  const r = await safeQuery(() => Promise.all([alertsList(filters), agentNames(range), mutedRuleIds()]));
+  const r = await safeQuery(() => Promise.all([alertsList(filters), agentNames(ranges.time), mutedRuleIds()]));
 
   return (
     <>
@@ -85,6 +92,7 @@ export default async function AlertsPage({ searchParams }: PageProps<"/wazuh/ale
           dir={dir}
           href={href}
           filtersKey={qs.toString()}
+          filtersText={describeChips(alertRangeChips(ranges))}
         />
       )}
     </>
@@ -101,6 +109,7 @@ function AlertsTable({
   dir,
   href,
   filtersKey,
+  filtersText,
 }: {
   list: Awaited<ReturnType<typeof alertsList>>;
   agents: string[];
@@ -111,6 +120,7 @@ function AlertsTable({
   dir: "asc" | "desc";
   href: (patch: Record<string, string | undefined>) => string;
   filtersKey: string;
+  filtersText: string;
 }) {
   const mutedSet = new Set(muted);
   const sortHref = (s: string, d: "asc" | "desc") => href({ sort: s === "ts" && d === "desc" ? undefined : s, dir: s === "ts" && d === "desc" ? undefined : d, page: undefined });
@@ -121,6 +131,7 @@ function AlertsTable({
     >
       <div className="mb-5 flex flex-wrap items-end gap-3">
         <AlertsFilters key={filtersKey} agents={agents} />
+        <RangeFilters time fields={[ALERT_LEVEL_FIELD]} legacy={["level"]} idPrefix="alerts" />
         {muted.length > 0 && (
           <Button asChild variant="secondary" size="sm" className="mb-2">
             <Link href={href({ muted: showMuted ? undefined : "1", page: undefined })}>
@@ -149,7 +160,7 @@ function AlertsTable({
             {list.rows.length === 0 && (
               <TableRow>
                 <TableCell colSpan={canEdit ? 6 : 5} className="py-8 text-center font-mono text-muted-foreground">
-                  Ничего не найдено — измените фильтры или диапазон
+                  Ничего не найдено{filtersText ? ` (${filtersText})` : ""} — измените фильтры или диапазон
                 </TableCell>
               </TableRow>
             )}

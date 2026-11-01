@@ -2,4 +2,4 @@
   - Срабатывает на сводку коллектора `collector.clock_skew` (только `attrs.transport: internal`).
   - Склейка по `attrs.peer`, `dedupe: 24h` — один инцидент на устройство за сутки.
   - Подсказка оператору: RFC 3164 без пояса → `SYSLOG_PEER_TZ`, иначе NTP на устройстве.
-  - Тест на фикстуре `fixtures/events/collector-clock-skew.ndjson`; `shipped.json` перегенерирован.
+  - Тест на фикстуре `fixtures/events/collector-clock-skew.ndjson`.

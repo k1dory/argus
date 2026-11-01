@@ -29,13 +29,15 @@ const { WazuhApiError } = require("../src/lib/wazuh-api") as typeof import("../s
 const props = (params: Record<string, string> = {}, sp: Record<string, string> = {}): Props => ({ params: Promise.resolve(params), searchParams: Promise.resolve(sp) });
 const isNotFound = (e: unknown): boolean => e instanceof Error && /NEXT_HTTP_ERROR_FALLBACK;404|NEXT_NOT_FOUND/.test(String((e as { digest?: string }).digest ?? e.message));
 
-type Route = { when: (sql: string) => boolean; rows: () => Record<string, unknown>[] };
+// rows получает параметры запроса (param_*): фильтры диапазонов проверяются по тому, что дошло до ClickHouse.
+type Route = { when: (sql: string) => boolean; rows: (params: URLSearchParams) => Record<string, unknown>[] };
 let routes: Route[] = [];
 let chDown = false;
 globalThis.fetch = (async (input: URL | string | Request, init?: RequestInit) => {
   const sql = String(init?.body ?? "");
   if (chDown) throw Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:9"), { cause: { code: "ECONNREFUSED" } });
-  for (const r of routes) if (r.when(sql)) return new Response(r.rows().map((x) => JSON.stringify(x)).join("\n") + "\n");
+  const params = new URL(input instanceof Request ? input.url : String(input)).searchParams;
+  for (const r of routes) if (r.when(sql)) return new Response(r.rows(params).map((x) => JSON.stringify(x)).join("\n") + "\n");
   return new Response("");
 }) as typeof fetch;
 
@@ -180,6 +182,120 @@ test("уязвимости: активные и устранённые, бейд
   assert.match(text, /включите модуль в ossec\.conf/);
   chDown = true;
   assert.match(await pageText(await vulns.default(props())), /Хранилище недоступно/);
+});
+
+/* ===== Диапазоны витрин: фильтр сужает выдачу по тому, что дошло до ClickHouse ===== */
+
+/** Пороги из param_<name>_min/_max: так ClickHouse применил бы условие запроса. */
+const within = (p: URLSearchParams, name: string, v: number): boolean => {
+  const lo = p.get(`param_${name}_min`), hi = p.get(`param_${name}_max`);
+  return (lo === null || v >= Number(lo)) && (hi === null || v <= Number(hi));
+};
+
+test("алерты: level_min/level_max и точный интервал доходят до запроса и сужают журнал; прежний level=N — «не ниже»", async () => {
+  await auth.createSession("viewer1", "viewer");
+  const ALERTS = [
+    { timestamp: NOW, agent_name: "web-01", rule_id: 5763, rule_level: 10, rule_description: "sshd: brute force", srcip: "203.0.113.5", location: "" },
+    { timestamp: NOW, agent_name: "web-01", rule_id: 5710, rule_level: 5, rule_description: "sshd: attempt", srcip: "", location: "journald" },
+    { timestamp: NOW, agent_name: "db-01", rule_id: 100100, rule_level: 13, rule_description: "rootkit found", srcip: "", location: "rootcheck" },
+  ];
+  const seen: URLSearchParams[] = [];
+  const pick = (p: URLSearchParams) => ALERTS.filter((a) => within(p, "lvl", a.rule_level));
+  routes = [
+    { when: (s) => s.includes("SELECT timestamp, agent_name, rule_id"), rows: (p) => { seen.push(p); return pick(p); } },
+    { when: (s) => s.includes("count() AS total FROM wazuh_alerts"), rows: (p) => [{ total: String(pick(p).length) }] },
+  ];
+  let text = await pageText(await alerts.default(props({}, { level_min: "7", level_max: "12" })));
+  assert.match(text, /Журнал · 1 записей/);
+  assert.match(text, /sshd: brute force/);
+  assert.doesNotMatch(text, /rootkit found|sshd: attempt/);
+  assert.equal(seen.at(-1)?.get("param_t_hours"), "24", "окно по умолчанию — 24 часа");
+
+  text = await pageText(await alerts.default(props({}, { level: "12" })));
+  assert.match(text, /rootkit found/);
+  assert.doesNotMatch(text, /sshd/, "прежний level=12 — порог снизу");
+
+  text = await pageText(await alerts.default(props({}, { from: "2026-10-29T00:00", to: "2026-10-28T00:00", level_min: "14" })));
+  assert.equal(seen.at(-1)?.get("param_t_from"), "2026-10-28 00:00:00", "перепутанные границы — по порядку");
+  assert.equal(seen.at(-1)?.get("param_t_to"), "2026-10-29 00:00:00");
+  assert.equal(seen.at(-1)?.get("param_t_hours"), null, "точный интервал главнее пресета");
+  assert.match(text, /Ничего не найдено \(интервал 2026-10-28 00:00 — 2026-10-29 00:00 UTC, уровень ≥ 14\)/);
+
+  // Мусор в параметрах не роняет страницу и не доходит до запроса.
+  text = await pageText(await alerts.default(props({}, { level_min: "abc", from: "2026-02-31T00:00", range: "1y" })));
+  assert.match(text, /Журнал · 3 записей/);
+  assert.equal(seen.at(-1)?.get("param_lvl_min"), null);
+  assert.equal(seen.at(-1)?.get("param_t_from"), null);
+});
+
+test("агенты: пороги алертов/критичных (HAVING) и уровень правила сужают таблицу", async () => {
+  await auth.createSession("viewer1", "viewer");
+  const AGENTS_ROWS = [
+    { agent_name: "web-01", alerts: "40", critical: "3", rules: "7", last_alert: NOW },
+    { agent_name: "db-01", alerts: "2", critical: "0", rules: "1", last_alert: NOW },
+  ];
+  let seen: URLSearchParams | null = null;
+  routes = [{ when: (s) => s.includes("uniqExact(rule_id) AS rules"), rows: (p) => { seen = p; return AGENTS_ROWS.filter((a) => within(p, "al", Number(a.alerts)) && within(p, "cr", Number(a.critical))); } }];
+  let text = await pageText(await agents.default(props({}, { alerts_min: "10", level_min: "7", range: "7d" })));
+  assert.match(text, /Активность агентов · 1 шт\./);
+  assert.match(text, /web-01/);
+  assert.doesNotMatch(text, /db-01/);
+  assert.equal(seen!.get("param_lvl_min"), "7");
+  assert.equal(seen!.get("param_t_hours"), "168");
+  text = await pageText(await agents.default(props({}, { critical_min: "5" })));
+  assert.match(text, /Нет агентов по фильтрам: критичных ≥ 5/);
+});
+
+test("MITRE: уровень правила и интервал сужают техники", async () => {
+  await auth.createSession("viewer1", "viewer");
+  // Алерты с техниками и уровнями — фейк считает техники так, как посчитал бы ClickHouse по условиям.
+  const RAW = [{ id: "T1110", technique: "Brute Force", level: 10 }, { id: "T1110", technique: "Brute Force", level: 12 }, { id: "T1046", technique: "Network Service Discovery", level: 3 }];
+  routes = [
+    { when: (s) => s.includes("ARRAY JOIN mitre_tactics"), rows: () => [{ tactic: "Credential Access", cnt: "2" }] },
+    { when: (s) => s.includes("arrayZip(mitre_ids"), rows: (p) => {
+      const counts = new Map<string, { id: string; technique: string; cnt: number }>();
+      for (const r of RAW.filter((x) => within(p, "lvl", x.level))) {
+        const c = counts.get(r.id) ?? { id: r.id, technique: r.technique, cnt: 0 };
+        c.cnt++;
+        counts.set(r.id, c);
+      }
+      return [...counts.values()].map((c) => ({ ...c, cnt: String(c.cnt) }));
+    } },
+  ];
+  let text = await pageText(await mitre.default(props()));
+  assert.match(text, /Техники · топ 2/);
+  text = await pageText(await mitre.default(props({}, { level_min: "7" })));
+  assert.match(text, /Техники · топ 1/);
+  assert.doesNotMatch(text, /T1046/);
+  routes = [];
+  text = await pageText(await mitre.default(props({}, { level_min: "15" })));
+  assert.match(text, /Нет данных по фильтрам: уровень ≥ 15/);
+});
+
+test("уязвимости: серьёзность не ниже и CVSS от–до (HAVING), окно не шире 30 дней", async () => {
+  await auth.createSession("viewer1", "viewer");
+  const VULNS = [
+    { cve: "CVE-2026-0001", severity: "Critical", score: "9.8", pkg: "openssl", pkg_version: "3.0.1", agent_name: "web-01", status: "Active", last_seen: NOW },
+    { cve: "CVE-2026-0002", severity: "High", score: "7.5", pkg: "curl", pkg_version: "", agent_name: "", status: "Active", last_seen: NOW },
+    { cve: "CVE-2026-0003", severity: "Low", score: "2.1", pkg: "vim", pkg_version: "", agent_name: "db-01", status: "", last_seen: NOW },
+  ];
+  const rank = (p: URLSearchParams, sev: string) => [1, 2, 3, 4].find((i) => p.get(`param_sev_r${i}`) === sev.toLowerCase()) ?? 0;
+  let seen: URLSearchParams | null = null;
+  routes = [{ when: (s) => s.includes("vuln_cve AS cve"), rows: (p) => {
+    seen = p;
+    return VULNS.filter((v) => within(p, "cvss", Number(v.score)) && (p.get("param_sev_min") === null || within(p, "sev", rank(p, v.severity))));
+  } }];
+  let text = await pageText(await vulns.default(props({}, { level_min: "high" })));
+  assert.match(text, /CVE по агентам и пакетам · 2 записей/);
+  assert.doesNotMatch(text, /CVE-2026-0003/);
+  assert.equal(seen!.get("param_t_hours"), "720", "окно по умолчанию — 30 дней");
+  text = await pageText(await vulns.default(props({}, { cvss_min: "8", cvss_max: "10" })));
+  assert.match(text, /CVE-2026-0001/);
+  assert.doesNotMatch(text, /CVE-2026-0002/);
+  text = await pageText(await vulns.default(props({}, { from: "2026-01-01T00:00", to: "2026-10-29T00:00" })));
+  assert.equal(seen!.get("param_t_from"), "2026-09-29 00:00:00", "точное окно подтянуто до 30 дней");
+  text = await pageText(await vulns.default(props({}, { cvss_min: "9.9" })));
+  assert.match(text, /Нет CVE по фильтрам: CVSS ≥ 9\.9/);
 });
 
 /* ===== Управление менеджером ===== */

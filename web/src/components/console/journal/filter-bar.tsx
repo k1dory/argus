@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { journalHref, MAX_Q_LEN, SEV_OPTIONS, type JournalFilters } from "@/lib/shared/journal";
+import { journalHref, MAX_Q_LEN, SEV_MAX_OPTIONS, SEV_OPTIONS, type JournalFilters } from "@/lib/shared/journal";
 
 const ANY = "__any"; // Radix Select не принимает пустое значение пункта
 
@@ -21,6 +21,14 @@ export function JournalFilterBar({ filters, sources, hosts }: { filters: Journal
   const [source, setSource] = useState(filters.source ?? ANY);
   const [host, setHost] = useState(filters.host ?? ANY);
   const [sev, setSev] = useState(filters.sev ? String(filters.sev) : ANY);
+  const [sevMax, setSevMax] = useState(filters.sevMax !== undefined ? String(filters.sevMax) : ANY);
+  // Выбранный в URL порог, которого нет среди пресетов (level_max=6), показываем как есть.
+  const sevMaxOpts = filters.sevMax !== undefined && !SEV_MAX_OPTIONS.some((o) => o.value === String(filters.sevMax))
+    ? [...SEV_MAX_OPTIONS, { value: String(filters.sevMax), label: `≤ ${filters.sevMax}` }]
+    : SEV_MAX_OPTIONS;
+  const sevOpts = filters.sev !== undefined && !SEV_OPTIONS.some((o) => o.value === String(filters.sev))
+    ? [...SEV_OPTIONS, { value: String(filters.sev), label: `≥ ${filters.sev}` }]
+    : SEV_OPTIONS;
   const [rule, setRule] = useState(filters.rule ?? "");
   const [from, setFrom] = useState(filters.from ?? "");
   const [to, setTo] = useState(filters.to ?? "");
@@ -33,7 +41,7 @@ export function JournalFilterBar({ filters, sources, hosts }: { filters: Journal
     const v = (s: string) => (s === ANY || s.trim() === "" ? undefined : s.trim());
     start(() =>
       router.push(
-        journalHref(filters, { q: q.trim() || undefined, source: v(source), host: v(host), sev: v(sev), rule: v(rule), from: v(from), to: v(to) }),
+        journalHref(filters, { q: q.trim() || undefined, source: v(source), host: v(host), sev: v(sev), sevMax: v(sevMax), rule: v(rule), from: v(from), to: v(to) }),
       ),
     );
   };
@@ -61,7 +69,7 @@ export function JournalFilterBar({ filters, sources, hosts }: { filters: Journal
         </Button>
       </div>
 
-      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-[repeat(4,minmax(0,1fr))_auto]">
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-[repeat(5,minmax(0,1fr))_auto]">
         <Field label="Источник" id="journal-source">
           <Select value={source} onValueChange={setSource}>
             <SelectTrigger id="journal-source" className="h-9 w-full font-mono text-[13px]"><SelectValue>{source === ANY ? "Все источники" : source}</SelectValue></SelectTrigger>
@@ -84,12 +92,22 @@ export function JournalFilterBar({ filters, sources, hosts }: { filters: Journal
             </SelectContent>
           </Select>
         </Field>
-        <Field label="Серьёзность" id="journal-sev">
+        <Field label="Серьёзность от" id="journal-sev">
           <Select value={sev} onValueChange={setSev}>
-            <SelectTrigger id="journal-sev" className="h-9 w-full"><SelectValue>{SEV_OPTIONS.find((o) => (o.value || ANY) === sev)?.label ?? "Любая"}</SelectValue></SelectTrigger>
+            <SelectTrigger id="journal-sev" className="h-9 w-full"><SelectValue>{sevOpts.find((o) => (o.value || ANY) === sev)?.label ?? "Любая"}</SelectValue></SelectTrigger>
             <SelectContent>
               <SelectGroup>
-                {SEV_OPTIONS.map((o) => <SelectItem key={o.value || ANY} value={o.value || ANY}>{o.label}</SelectItem>)}
+                {sevOpts.map((o) => <SelectItem key={o.value || ANY} value={o.value || ANY}>{o.label}</SelectItem>)}
+              </SelectGroup>
+            </SelectContent>
+          </Select>
+        </Field>
+        <Field label="Серьёзность до" id="journal-sev-max">
+          <Select value={sevMax} onValueChange={setSevMax}>
+            <SelectTrigger id="journal-sev-max" className="h-9 w-full"><SelectValue>{sevMaxOpts.find((o) => (o.value || ANY) === sevMax)?.label ?? "Любая"}</SelectValue></SelectTrigger>
+            <SelectContent>
+              <SelectGroup>
+                {sevMaxOpts.map((o) => <SelectItem key={o.value || ANY} value={o.value || ANY}>{o.label}</SelectItem>)}
               </SelectGroup>
             </SelectContent>
           </Select>

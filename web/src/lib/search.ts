@@ -8,6 +8,7 @@ import { parseQuery, type Op, type Term } from "./shared/search-query";
 import type { SeriesPoint } from "./queries";
 import { SEVERITY, type SeverityThresholds } from "./shared/severity";
 import { clampInt } from "./shared/limits";
+import { numConditions } from "./shared/filters";
 import { wazuhEnabled } from "./integrations";
 
 export type IndexKey = "alerts" | "events";
@@ -128,6 +129,9 @@ export type SearchInput = {
   to?: string;
   page: number;
   showMuted?: boolean;
+  /** Порог уровня индекса (rule_level у alerts, severity у events): не ниже / не выше. */
+  levelMin?: number;
+  levelMax?: number;
   /** false — без фасетов (сессия разбора): запрос фасетов не выполняется. */
   facets?: boolean;
   /** Сессия разбора: строки только своего субъекта или своих узлов —
@@ -220,6 +224,8 @@ export function buildWhere(input: SearchInput): Built {
     conds.push(`${def.tsCol} >= now() - INTERVAL {hours:UInt32} HOUR`);
   }
   if (def.notMuted && !input.showMuted) conds.push(def.notMuted);
+  // Порог уровня — структурный фильтр поверх языка запроса (level_min/level_max в URL).
+  conds.push(...numConditions(def.severity.col, { min: input.levelMin, max: input.levelMax }, params, "lvl", "UInt8"));
 
   let n = 0;
   const p = (value: string | number, type: string): string => {
