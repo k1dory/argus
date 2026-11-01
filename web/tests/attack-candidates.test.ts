@@ -89,3 +89,46 @@ test("тактика по умолчанию — из тегов attack.<tactic>
   assert.equal(opts.candidates["credential-access"][0].id, "T1110");
   assert.equal(opts.version, dictionary.version);
 });
+
+// Общий golden-файл кандидатов: тот же подбор строит конвейер датасета на Go
+// (engine/internal/dataset), и он сверяется с этим же файлом. Перегенерация после правки
+// правил или справочника — UPDATE_GOLDEN=1 и этот тест.
+const GOLDEN = path.join(ROOT, "testdata/attack-candidates.json");
+
+function goldenCases(): string[][] {
+  const seen = new Set<string>();
+  const cases: string[][] = [];
+  const add = (tags: string[]) => {
+    const key = JSON.stringify(tags);
+    if (!seen.has(key)) {
+      seen.add(key);
+      cases.push(tags);
+    }
+  };
+  for (const r of [...rules].sort((a, b) => a.file.localeCompare(b.file))) add(r.tags ?? []);
+  add([]); // пустые теги
+  add(["attack.credential_access"]); // только тактика
+  add(["attack.t9999", "attack.t1110.999"]); // техники, которых нет в справочнике
+  add(["ATTACK.T1110.001", "Attack.Credential_Access"]); // прописные
+  add(["attack.t1046", "attack.t1071.004", "attack.t1486"]); // разные тактики
+  add(["attack.t1595.002"]); // подтехника без родителя в тегах
+  add(["attack.defense_evasion"]); // тактика, которой нет в v20
+  return cases;
+}
+
+test("golden: кандидаты и тактика по умолчанию совпадают с testdata/attack-candidates.json", () => {
+  const actual = {
+    version: dictionary.version,
+    max: ATTACK_MAX_CANDIDATES,
+    cases: goldenCases().map((tags) => {
+      const opts = attackFormOptions(tags);
+      return { tags, default_tactic: opts.defaultTactic, candidates: Object.fromEntries(Object.entries(opts.candidates).map(([k, v]) => [k, v.map((t) => t.id)])) };
+    }),
+  };
+  if (process.env.UPDATE_GOLDEN === "1") {
+    fs.mkdirSync(path.dirname(GOLDEN), { recursive: true });
+    fs.writeFileSync(GOLDEN, JSON.stringify(actual, null, 1) + "\n");
+  }
+  const golden = JSON.parse(fs.readFileSync(GOLDEN, "utf8"));
+  assert.deepEqual(actual, golden, "подбор кандидатов изменился — UPDATE_GOLDEN=1 npx tsx … --test tests/attack-candidates.test.ts");
+});
