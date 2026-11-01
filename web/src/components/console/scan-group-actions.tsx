@@ -1,9 +1,10 @@
 "use client";
 
-import { useActionState, useId } from "react";
+import { useActionState, useId, useState } from "react";
 import type { FormState } from "@/lib/actions";
 import { scanGroupAction } from "@/lib/incident-actions";
-import { DISPOSITIONS } from "@/lib/shared/closure-label";
+import type { AttackFormOptions } from "@/lib/shared/attack";
+import { ClosureLabelFields } from "./incident-status-form";
 import { Button } from "@/components/ui/button";
 import { FieldError } from "@/components/ui/field";
 
@@ -43,9 +44,10 @@ function Hidden({ op, subnet, ids, filter }: { op: string; subnet: string; ids: 
 }
 
 /** Групповые действия над открытыми инцидентами одной подсети сканов — по выбору аналитика. */
-export function ScanGroupActions({ subnet, ids, filter, isAdmin, users }: {
-  subnet: string; ids: string[]; filter: GroupFilter; isAdmin: boolean; users: { name: string; role: string }[];
+export function ScanGroupActions({ subnet, ids, filter, attack, isAdmin, users }: {
+  subnet: string; ids: string[]; filter: GroupFilter; attack: AttackFormOptions; isAdmin: boolean; users: { name: string; role: string }[];
 }) {
+  const [closeStatus, setCloseStatus] = useState("");
   const count = ids.length;
   const [takeState, takeAction, taking] = useActionState(scanGroupAction, initial);
   const [assignState, assignAction, assigning] = useActionState(scanGroupAction, initial);
@@ -73,25 +75,13 @@ export function ScanGroupActions({ subnet, ids, filter, isAdmin, users }: {
     <form action={closeAction} aria-busy={closing} className="space-y-2 border border-border p-3">
       <div className="c-label">Завершить все</div>
       <Hidden op="close" subnet={subnet} ids={ids} filter={filter} />
-      <select name="status" required defaultValue="" aria-label="Статус завершения" className={selectClass}>
+      <select name="status" required value={closeStatus} onChange={(e) => setCloseStatus(e.target.value)} aria-label="Статус завершения" className={selectClass}>
         <option value="" disabled>Статус</option>
         <option value="closed">закрыт</option>
         <option value="false_positive">ложное срабатывание</option>
       </select>
-      <select name="disposition" required defaultValue="" aria-label="Характер срабатывания" className={selectClass}>
-        <option value="" disabled>Характер срабатывания</option>
-        {Object.entries(DISPOSITIONS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
-      </select>
-      <select name="escalate" required defaultValue="" aria-label="Нужна ли эскалация" className={selectClass}>
-        <option value="" disabled>Эскалация</option>
-        <option value="no">не нужна</option>
-        <option value="yes">нужна</option>
-      </select>
-      <select name="severity_correct" required defaultValue="" aria-label="Верен ли уровень" className={selectClass}>
-        <option value="" disabled>Уровень</option>
-        <option value="yes">верен</option>
-        <option value="no">неверен</option>
-      </select>
+      {/* Та же метка ответа, что в карточке инцидента (вердикт, уровень, ATT&CK). */}
+      {closeStatus && <ClosureLabelFields ops={false} status={closeStatus} attack={attack} disabled={closing} />}
       <textarea name="reason" required minLength={10} maxLength={2000} rows={2} placeholder="Причина (от 10 символов)" aria-label="Причина" className="w-full border border-border bg-[var(--surface-deep)] p-2 text-sm" />
       <Confirm count={count} />
       <Button type="submit" size="sm" variant="secondary" disabled={closing}>{closing ? "Завершаю…" : "Завершить"}</Button>

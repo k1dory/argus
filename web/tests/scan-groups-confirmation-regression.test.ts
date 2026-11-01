@@ -94,7 +94,8 @@ async function confirmedClose(search: Record<string, string> = {}): Promise<Form
   }
   for (const [name, value] of Object.entries({
     confirm: "yes", status: "closed", reason: "Проверенные фоновые сканы, эскалация не нужна",
-    disposition: "benign_authorized", escalate: "no", severity_correct: "yes",
+    // формат метки после #66: уровень оценкой и ATT&CK (тактика и техника)
+    disposition: "benign_authorized", escalate: "no", severity_level: "2", attack_tactic: "reconnaissance", attack_technique: "other",
   })) fd.set(name, value);
   return fd;
 }

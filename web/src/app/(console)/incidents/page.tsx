@@ -18,6 +18,7 @@ import {
 } from "@/components/ui/table";
 import { listUsers, requirePageSession } from "@/lib/auth";
 import { ScanGroupActions } from "@/components/console/scan-group-actions";
+import { attackFormOptions } from "@/lib/shared/attack";
 import { BLOCK_LABEL, GROUP_ACTION_MAX, GROUP_ROWS_PAGE, GROUPS_PAGE, isSubnetKey, SCAN_GROUP_RULES } from "@/lib/shared/scan-groups";
 import { ROLE_RANK } from "@/lib/shared/incidents";
 import { safeQuery } from "@/lib/clickhouse";
@@ -200,6 +201,7 @@ export default async function IncidentsPage({ searchParams }: PageProps<"/incide
                 )}
                 {canEdit && spage === 1 && expanded.data.rows.length > 0 && expanded.data.rows.length <= GROUP_ACTION_MAX && <ScanGroupActions subnet={subnet}
                   ids={expanded.data.rows.map((x) => x.incident_id)} filter={{ status, level, q, queue }}
+                  attack={attackFormOptions([...new Set(expanded.data.rows.flatMap((x) => x.tags))])}
                   isAdmin={session.role === "admin"} users={expanded.data.users.map((u) => ({ name: u.name, role: u.role }))} />}
                 {canEdit && (spage > 1 || expanded.data.rows.length > GROUP_ACTION_MAX) && (
                   <p className="mt-2 text-xs text-muted-foreground">Групповые действия — для группы до {GROUP_ACTION_MAX} инцидентов: уточните фильтр (уровень, очередь) или работайте с инцидентами по одному.</p>
