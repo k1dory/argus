@@ -4,7 +4,7 @@
 title: "Firewall: inbound deny burst across ports"
 id: a41c-net-073
 level: low
-tags: [attack.reconnaissance, attack.t1046]
+tags: [attack.reconnaissance, attack.t1595]   # ATT&CK v20: скан снаружи — Active Scanning (T1046 — разведка изнутри, discovery)
 
 detection:
   selection:
