@@ -3,7 +3,10 @@
 package rules
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/netip"
 	"os"
@@ -68,6 +71,11 @@ type Rule struct {
 		// нового ключа, у событий которой старый ключ совпадает (то же правило,
 		// субъект и узел). Без поля смена group_by заводит новые инциденты.
 		GroupByPrevious string `yaml:"group_by_previous"`
+		// GroupByPreviousBefore — для инцидентов без записанного group_by (строки до
+		// миграции 0039): по прежнему group_by заведены только те, что созданы раньше
+		// этого момента (UTC, «2006-01-02 15:04:05» или RFC 3339) — например, слияния
+		// смены group_by. Без поля такие инциденты не подхватываются.
+		GroupByPreviousBefore string `yaml:"group_by_previous_before"`
 	} `yaml:"detection"`
 	Enrich    []any          `yaml:"enrich"` // edr.process_tree: 120s | ngfw.sessions: 120s | cmdb.owner
 	Analyst   Analyst        `yaml:"analyst"`
@@ -92,6 +100,8 @@ type Rule struct {
 	filter    []matcher
 	closeOn   []matcher
 	reset     []matcher // detection.reset
+
+	previousBefore time.Time // detection.group_by_previous_before
 }
 
 // Respond — что делать автоматически при создании инцидента этим правилом.
@@ -283,8 +293,18 @@ func (r *Rule) Window() time.Duration {
 	return 10 * time.Minute
 }
 
-// normGroupBy — group_by без пробелов вокруг полей, для сравнения.
-func normGroupBy(gb string) string {
+func parseBefore(s string) (time.Time, error) {
+	if t, err := time.ParseInLocation("2006-01-02 15:04:05", s, time.UTC); err == nil {
+		return t, nil
+	}
+	return time.Parse(time.RFC3339, s)
+}
+
+// GroupByPreviousBefore — граница group_by_previous_before (нулевое время — не задана).
+func (r *Rule) GroupByPreviousBefore() time.Time { return r.previousBefore }
+
+// NormGroupBy — group_by без пробелов вокруг полей, для сравнения и записи в инцидент.
+func NormGroupBy(gb string) string {
 	parts := strings.Split(gb, ",")
 	for i := range parts {
 		parts[i] = strings.TrimSpace(parts[i])
@@ -397,8 +417,14 @@ func LoadFile(path string) (*Rule, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Неизвестное поле — ошибка, а не молчаливый пропуск: движок старой версии,
+	// получивший правило с полем новее себя (group_by_previous до своего релиза),
+	// отвергнет набор и оставит прежний при перечитывании, а не применит его
+	// частично (новый group_by без миграции — второй открытый инцидент).
 	var r Rule
-	if err := yaml.Unmarshal(raw, &r); err != nil {
+	dec := yaml.NewDecoder(bytes.NewReader(raw))
+	dec.KnownFields(true)
+	if err := dec.Decode(&r); err != nil && !errors.Is(err, io.EOF) {
 		return nil, err
 	}
 	if r.Respond != nil {
@@ -494,9 +520,19 @@ func LoadFile(path string) (*Rule, error) {
 		if Getter(prev) == nil {
 			return nil, fmt.Errorf("group_by_previous: неизвестное поле %q", prev)
 		}
-		if normGroupBy(prev) == normGroupBy(r.GroupBy()) {
+		if NormGroupBy(prev) == NormGroupBy(r.GroupBy()) {
 			return nil, fmt.Errorf("group_by_previous совпадает с group_by %q — миграции ключа нет, поле лишнее", r.GroupBy())
 		}
+	}
+	if b := strings.TrimSpace(r.Detection.GroupByPreviousBefore); b != "" {
+		if strings.TrimSpace(r.Detection.GroupByPrevious) == "" {
+			return nil, fmt.Errorf("group_by_previous_before без group_by_previous")
+		}
+		t, err := parseBefore(b)
+		if err != nil {
+			return nil, fmt.Errorf("group_by_previous_before %q: ожидается «2006-01-02 15:04:05» (UTC) или RFC 3339", b)
+		}
+		r.previousBefore = t
 	}
 	for _, f := range r.CloseMatch {
 		if Getter(f) == nil {
