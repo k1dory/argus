@@ -56,6 +56,9 @@ type Incident struct {
 	// В incidents_current не выводится — движок и консоль читают его из incidents.
 	Members        MemberList `json:"members,omitempty"`
 	MembersDropped uint32     `json:"members_dropped,omitempty"`
+	// Candidates — снимок сработок участников для автоответа (snapshotIncidents);
+	// в реестре пуст, в таблицу не пишется.
+	Candidates []Candidate `json:"-"`
 
 	Events []*model.Event `json:"-"`
 

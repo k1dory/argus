@@ -81,6 +81,11 @@ func (m *MemberList) UnmarshalJSON(b []byte) error {
 // События части держатся, только пока укладываются в общий бюджет инцидента
 // (maxCollapsedEvents); у остальных частей остаются время и число событий —
 // этого хватает, чтобы понять, есть ли у сработки новое.
+//
+// Решение автоответа по сработке от событий инцидента не зависит: у части есть
+// origins — сколько событий сработки пришло каким транспортом и от какого
+// отправителя (по полной сработке, до любой обрезки). Этого хватает, чтобы
+// движок посчитал доверенные события и min_events, не держа сами события.
 type part struct {
 	rule, ip    string
 	level       string
@@ -88,12 +93,44 @@ type part struct {
 	tags        []string
 	first, last string
 	count       int
+	origins     map[string]int // «transport|peer» → событий
 	events      []*model.Event
 }
 
 func newPart(d eval.Detection) *part {
+	origins := map[string]int{}
+	for _, e := range d.Events {
+		origins[e.Attrs["transport"]+"|"+e.Attrs["peer"]]++
+	}
 	return &part{rule: d.Rule.ID, ip: d.Key, level: d.Rule.Level, title: d.Rule.Title, tags: d.Rule.Tags,
-		first: model.FormatTS(d.First), last: model.FormatTS(d.Last), count: len(d.Events), events: d.Events}
+		first: model.FormatTS(d.First), last: model.FormatTS(d.Last), count: len(d.Events), origins: origins, events: d.Events}
+}
+
+// Candidate — сработка правила по адресу склеенного инцидента для автоответа:
+// правило, адрес и происхождение всех её событий («transport|peer» → число).
+type Candidate struct {
+	Rule, IP string
+	Origins  map[string]int
+}
+
+// RespondCandidates — копии сработок участников (для снимка автоответа: Apply
+// следующего цикла перезаписывает части), по адресу и правилу в стабильном порядке.
+func (inc *Incident) RespondCandidates() []Candidate {
+	out := make([]Candidate, 0, len(inc.parts))
+	for _, p := range inc.parts {
+		o := make(map[string]int, len(p.origins))
+		for k, v := range p.origins {
+			o[k] = v
+		}
+		out = append(out, Candidate{Rule: p.rule, IP: p.ip, Origins: o})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].IP != out[j].IP {
+			return out[i].IP < out[j].IP
+		}
+		return out[i].Rule < out[j].Rule
+	})
+	return out
 }
 
 // maxDroppedIPs — сколько вытесненных из списка адресов помнить, чтобы не
@@ -287,7 +324,9 @@ func (inc *Incident) aggregate() {
 	}
 	for _, p := range parts {
 		if k := keep[p]; k < len(p.events) {
-			p.events = p.events[len(p.events)-k:]
+			// Копия, а не срез: срез держал бы весь исходный массив указателей, и
+			// отброшенные события не собирались бы сборщиком мусора.
+			p.events = append([]*model.Event(nil), p.events[len(p.events)-k:]...)
 		}
 	}
 	sort.SliceStable(evs, func(i, j int) bool { return evs[i].TS < evs[j].TS })
@@ -355,7 +394,7 @@ var levelOrder = map[string]int{"low": 0, "medium": 1, "high": 2, "critical": 3}
 
 func rankOf(l string) int { return levelOrder[strings.ToLower(l)] }
 
-// MemberRules — правила, сработавшие по адресу склеенного инцидента.
+// MemberRules — правила, записанные за адресом склеенного инцидента (история).
 func (inc *Incident) MemberRules(ip string) []string {
 	for _, m := range inc.Members {
 		if m.IP == ip {
