@@ -61,7 +61,7 @@ func TestBuildSecurityRecord(t *testing.T) {
 	}
 	if !strings.Contains(r.State, "a41c-auth-031") || !strings.Contains(r.State, "auth.ssh.failure") ||
 		!strings.Contains(r.State, "ip-private-") || !strings.Contains(r.State, ":22") || !strings.Contains(r.State, "user-") ||
-		!strings.Contains(r.State, "1 lines of unrecognized format omitted") {
+		!strings.Contains(r.State, "1 lines omitted") {
 		t.Fatalf("состояние без правила или сети:\n%s", r.State)
 	}
 }

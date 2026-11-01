@@ -46,8 +46,8 @@ type Sample struct {
 
 // Samples — наблюдения источника (laya, jev) по вопросу из записей, подходящих
 // под keep. version — ModelAnswers.Model: разные версии одной модели (до и
-// после переобучения) не смешиваются; "" — любая. Записи без метки, без
-// ответа или с ошибкой модели пропускаются.
+// после переобучения) не смешиваются; пустая версия — тоже версия, не «любая».
+// Записи без метки, без ответа или с ошибкой модели пропускаются.
 func Samples(recs []Record, model, version, question string, keep func(*Record) bool) []Sample {
 	var out []Sample
 	for i := range recs {
@@ -60,7 +60,7 @@ func Samples(recs []Record, model, version, question string, keep func(*Record) 
 			continue
 		}
 		ma, ok := r.Models[model]
-		if !ok || ma.Error != "" || (version != "" && ma.Model != version) {
+		if !ok || ma.Error != "" || ma.Model != version {
 			continue
 		}
 		a, ok := ma.Answers[question]

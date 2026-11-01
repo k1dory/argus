@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
-	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -17,19 +16,27 @@ import (
 
 // Состояние инцидента для моделей решений (System One: Laya, Jev) и записи
 // датасета. Записи уходят за пределы консоли (обучение, замеры, облачный Jev),
-// поэтому состояние собирается по БЕЛОМУ списку: в него попадают только
-// перечисленные ниже поля, а свободный текст — только из разобранных строк
-// известного формата (цепочка incidents.chain, события обогащения
-// enrich.events). Нераспознанное отбрасывается. Учётки, узлы и адреса
-// заменяются псевдонимами (HMAC с солью Pseudonyms).
+// поэтому состояние собирается по БЕЛОМУ списку полей:
 //
-// Не входят никогда: номер инцидента, статус, владелец, заметка, похожие
-// закрытые инциденты (в них ответы людей, в том числе по отложенной выборке),
-// владелец/команда/заметка CMDB, сырые события.
+//   - правило (id, название, уровень), теги, источники, число событий;
+//   - субъект и узел — псевдонимы;
+//   - строки цепочки (incidents.chain) и событий обогащения (enrich.events)
+//     известного формата: время, источник, узел (псевдоним), действие и деталь,
+//     от которой остаются только псевдоним адреса или учётки, измерение с
+//     единицей из постоянного списка или тип объекта ([path], [url], [text]) с
+//     расширением из постоянного списка;
+//   - из обогащения ещё — заголовки (сколько событий в окне) и критичность CMDB.
+//
+// Свободный текст (объект события, путь, URL, причина срабатывания, атрибуты,
+// заметки) не попадает никогда — ни целиком, ни «безопасными» кусками:
+// надёжно обезличить его нельзя. Всё нераспознанное отбрасывается, в
+// состоянии остаётся только счётчик. Не входят также номер инцидента, статус,
+// владелец, заметка и похожие закрытые инциденты (в них ответы людей, в том
+// числе по отложенной выборке).
 
-// Pseudonyms — псевдонимы учёток, узлов и адресов с солью. Одна соль на
-// выгрузку: внутри неё один и тот же узел — один псевдоним, между выгрузками
-// псевдонимы не сопоставляются.
+// Pseudonyms — псевдонимы учёток, узлов, адресов и ключей (group_id) с солью.
+// Одна соль на выгрузку; в JSONL она не пишется: внутри выгрузки один узел —
+// один псевдоним, между выгрузками псевдонимы не сопоставляются.
 type Pseudonyms struct{ salt []byte }
 
 // NewPseudonyms — псевдонимы с заданной солью (тесты) или со случайной (nil).
@@ -46,10 +53,16 @@ func NewPseudonyms(salt []byte) *Pseudonyms {
 // processPseudonyms — соль процесса: одна выгрузка = один запуск engine dataset export.
 var processPseudonyms = NewPseudonyms(nil)
 
+// Process — псевдонимы процесса (соль выгрузки).
+func Process() *Pseudonyms { return processPseudonyms }
+
+// Key — псевдоним произвольного ключа (group_id датасета) с той же солью.
+func (p *Pseudonyms) Key(kind, s string) string { return p.h(kind, s) }
+
 func (p *Pseudonyms) h(kind, s string) string {
 	m := hmac.New(sha256.New, p.salt)
 	m.Write([]byte(kind + "|" + strings.ToLower(s)))
-	return hex.EncodeToString(m.Sum(nil))[:8]
+	return hex.EncodeToString(m.Sum(nil))[:12]
 }
 
 // systemAccounts — служебные учётки: не ПДн и важны для решения (вход под root
@@ -87,7 +100,7 @@ func (p *Pseudonyms) Host(s string) string {
 	return "host-" + p.h("host", s)
 }
 
-// IP — область адреса (public / private / loopback / link-local) и псевдоним
+// IP — область адреса (public / private / loopback / link-local) и псевдонимы
 // сети (/24, /48) и узла: соседство адресов одного сканера сохраняется, сами
 // адреса — нет.
 func (p *Pseudonyms) IP(s string) string {
@@ -112,25 +125,36 @@ func (p *Pseudonyms) IP(s string) string {
 	} else {
 		netw = ip.Mask(net.CIDRMask(48, 128)).String() + "/48"
 	}
-	return "ip-" + scope + "-" + p.h("net", netw) + "." + p.h("ip", ip.String())[:4]
+	return "ip-" + scope + "-" + p.h("net", netw) + "." + p.h("ip", ip.String())
 }
 
 var (
-	safeTokenRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,63}$`) // источник, действие, тег
-	ipPortRe    = regexp.MustCompile(`^\[?([0-9A-Fa-f:.]+?)\]?:(\d{1,5})$`)
+	safeTokenRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,63}$`) // правило, тег, источник, действие
 	measureRe   = regexp.MustCompile(`^(.*?)\s*(-?[0-9][0-9.eE+-]*) ([a-z_]{1,16})$`)
-	urlRe       = regexp.MustCompile(`^([a-zA-Z][a-zA-Z0-9+.-]{1,15})://([^/?#\s]+)([^?#\s]*)`)
-	segmentRe   = regexp.MustCompile(`^[A-Za-z0-9._+-]{1,48}$`)
-	extRe       = regexp.MustCompile(`^\.[A-Za-z0-9]{1,8}$`)
+	urlRe       = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9+.-]{1,15}://([^/?#\s]+)`)
 	clockRe     = regexp.MustCompile(`^\d{2}:\d{2}:\d{2}$`)
 )
 
-// systemDirs — каталоги, пути в которых — система, а не данные сотрудника.
-var systemDirs = []string{"/etc/", "/usr/", "/bin/", "/sbin/", "/lib", "/opt/", "/var/", "/tmp/", "/proc/",
-	"/dev/", "/boot/", "/sys/", "/run/", "/srv/"}
+// knownExts — расширения, которые остаются у [path] и [url]. Только этот
+// список: «расширение» из имени (alice.smirnov) — часть имени.
+var knownExts = map[string]bool{
+	"exe": true, "dll": true, "sys": true, "msi": true, "bat": true, "cmd": true, "ps1": true, "vbs": true,
+	"sh": true, "py": true, "pl": true, "rb": true, "js": true, "php": true, "jar": true, "so": true, "elf": true,
+	"zip": true, "rar": true, "7z": true, "tar": true, "gz": true, "tgz": true,
+	"doc": true, "docx": true, "xls": true, "xlsx": true, "ppt": true, "pptx": true, "pdf": true, "csv": true,
+	"txt": true, "log": true, "conf": true, "cfg": true, "ini": true, "yml": true, "yaml": true, "json": true,
+	"xml": true, "html": true, "jpg": true, "png": true, "bak": true, "sql": true, "db": true,
+	"key": true, "pem": true, "crt": true, "p12": true, "pfx": true, "kdbx": true, "ovpn": true,
+}
 
-// homeDirs — домашние каталоги: имя учётки — псевдоним, остальное — только расширение.
-var homeDirs = []string{"/home/", "/Users/"}
+// knownUnits — единицы, которые движок дописывает в деталь из полей события
+// (model.Event.Value, Unit). Число перед другим словом — свободный текст.
+var knownUnits = map[string]bool{
+	"percent": true, "bytes": true, "celsius": true, "seconds": true, "ms": true, "count": true,
+	"bps": true, "pps": true, "rpm": true, "volts": true, "watts": true, "hz": true,
+}
+
+var criticality = map[string]bool{"low": true, "medium": true, "high": true, "critical": true}
 
 func token(s, fallback string) string {
 	s = strings.TrimSpace(strings.TrimSuffix(s, "…"))
@@ -140,47 +164,47 @@ func token(s, fallback string) string {
 	return fallback
 }
 
-func ext(p string) string {
-	if e := path.Ext(strings.TrimSuffix(p, "…")); extRe.MatchString(e) {
-		return e
+// knownExt — расширение последнего сегмента, если оно из knownExts.
+func knownExt(s string) string {
+	s = strings.TrimSuffix(s, "…")
+	if i := strings.IndexAny(s, "?#"); i >= 0 {
+		s = s[:i]
+	}
+	s = s[strings.LastIndexAny(s, `/\`)+1:]
+	i := strings.LastIndex(s, ".")
+	if i <= 0 {
+		return ""
+	}
+	if e := strings.ToLower(s[i+1:]); knownExts[e] {
+		return "." + e
 	}
 	return ""
 }
 
-// Path — системный путь по сегментам из безопасных символов; домашний каталог
-// — псевдоним учётки и расширение; прочее — «[path]» и расширение.
-func (p *Pseudonyms) Path(s string) string {
-	s = strings.TrimSuffix(s, "…")
-	if strings.HasPrefix(s, "/root/") {
-		return "/root/[path]" + ext(s)
+// ipPort — «адрес:порт» как его пишет движок (fmt "%s:%d", IPv6 без скобок):
+// порт — после последнего двоеточия, если до него — адрес.
+func ipPort(s string) (net.IP, string, bool) {
+	i := strings.LastIndex(s, ":")
+	if i <= 0 || i == len(s)-1 {
+		return nil, "", false
 	}
-	for _, home := range homeDirs {
-		if rest, ok := strings.CutPrefix(s, home); ok {
-			user, _, _ := strings.Cut(rest, "/")
-			return home + p.User(user) + "/[path]" + ext(s)
-		}
+	port := s[i+1:]
+	if n, err := strconv.Atoi(port); err != nil || n < 0 || n > 65535 {
+		return nil, "", false
 	}
-	for _, dir := range systemDirs {
-		if strings.HasPrefix(s, dir) {
-			segs := strings.Split(strings.TrimPrefix(s, "/"), "/")
-			for i, seg := range segs {
-				if seg != "" && (!segmentRe.MatchString(seg) || strings.Contains(seg, "@")) {
-					segs[i] = "[x]"
-				}
-			}
-			return "/" + strings.Join(segs, "/")
-		}
-	}
-	return "[path]" + ext(s)
+	ip := net.ParseIP(strings.Trim(s[:i], "[]"))
+	return ip, port, ip != nil
 }
 
-// Detail — деталь события (объект, адрес:порт, учётка, измерение) по виду.
+// Detail — деталь события по виду: адрес и адрес:порт — псевдонимы;
+// измерение — число и единица из knownUnits; одно слово — учётка
+// (псевдоним); прочее — только тип и известное расширение.
 func (p *Pseudonyms) Detail(s string) string {
 	s = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(s), "…"))
 	if s == "" {
 		return ""
 	}
-	if m := measureRe.FindStringSubmatch(s); m != nil {
+	if m := measureRe.FindStringSubmatch(s); m != nil && knownUnits[m[3]] {
 		if _, err := strconv.ParseFloat(m[2], 64); err == nil {
 			obj := ""
 			if m[1] != "" {
@@ -189,23 +213,32 @@ func (p *Pseudonyms) Detail(s string) string {
 			return obj + m[2] + " " + m[3]
 		}
 	}
+	// Сначала «адрес:порт»: движок пишет IPv6 с портом без скобок
+	// (fd12::1:443), а такая строка — ещё и корректный IPv6.
+	if ip, port, ok := ipPort(s); ok {
+		return p.IP(ip.String()) + ":" + port
+	}
 	if net.ParseIP(s) != nil {
 		return p.IP(s)
 	}
-	if m := ipPortRe.FindStringSubmatch(s); m != nil && net.ParseIP(m[1]) != nil {
-		return p.IP(m[1]) + ":" + m[2]
-	}
 	if m := urlRe.FindStringSubmatch(s); m != nil {
-		return strings.ToLower(m[1]) + "://" + p.Host(m[2]) + "/[path]" + ext(m[3])
+		host := m[1]
+		if i := strings.LastIndex(host, "@"); i >= 0 {
+			host = host[i+1:]
+		}
+		if ip, _, ok := ipPort(host); ok {
+			return "[url " + p.IP(ip.String()) + "]" + knownExt(s)
+		}
+		if ip := net.ParseIP(strings.Trim(host, "[]")); ip != nil {
+			return "[url " + p.IP(ip.String()) + "]" + knownExt(s)
+		}
+		return "[url]" + knownExt(s)
 	}
-	if strings.HasPrefix(s, "/") {
-		return p.Path(s)
+	if strings.ContainsAny(s, `/\`) || (len(s) > 1 && s[1] == ':') || strings.HasPrefix(s, "~") {
+		return "[path]" + knownExt(s)
 	}
-	if len(s) > 2 && s[1] == ':' && (s[2] == '\\' || s[2] == '/') {
-		return "[path]" + ext(strings.ReplaceAll(s, "\\", "/"))
-	}
-	if !strings.ContainsAny(s, " \t") {
-		return p.User(s) // одно слово без пути — учётка (в цепочке detail = actor_name)
+	if !strings.ContainsAny(s, " \t=@:,;\"'()[]{}<>|") {
+		return p.User(s) // одно слово — учётка (в цепочке detail = actor_name)
 	}
 	return "[text]"
 }
@@ -225,12 +258,9 @@ func columns(r []rune, widths ...int) ([]string, bool) {
 	return append(out, strings.TrimSpace(string(r[pos:]))), true
 }
 
-// chainLine — «ts  источник(16) узел(14) действие(24) деталь» (incidents.chain)
-// или «→ причина» движка.
+// chainLine — «ts  источник(16) узел(14) действие(24) деталь» (incidents.chain).
+// Строка «→ причина» движка — текст: отбрасывается (в счётчик).
 func (p *Pseudonyms) chainLine(line string) (string, bool) {
-	if reason, ok := strings.CutPrefix(line, "→ "); ok {
-		return "→ " + p.reason(reason), true
-	}
 	r := []rune(line)
 	if len(r) < 10 || !clockRe.MatchString(string(r[:8])) || string(r[8:10]) != "  " {
 		return "", false
@@ -245,17 +275,22 @@ func (p *Pseudonyms) chainLine(line string) (string, bool) {
 
 var (
 	enrichHeadRe = regexp.MustCompile(`^(edr\.process_tree|ngfw\.sessions): (\d+ событий за окно|событий в окне нет|ошибка запроса)`)
-	cmdbCritRe   = regexp.MustCompile(`^cmdb: .* — владелец .*, команда .*, критичность (\S+)`)
+	// Ленивые группы: критичность — первая после шаблона, а не слово из заметки.
+	cmdbCritRe = regexp.MustCompile(`^cmdb: .*? — владелец .*?, команда .*?, критичность (\S+)`)
 )
 
 // enrichLine — заголовки и события enrich.events («  ts  источник(14)
-// действие(22) деталь»), из CMDB — только критичность.
+// действие(22) деталь»), из CMDB — только критичность из шкалы.
 func (p *Pseudonyms) enrichLine(line string) (string, bool) {
 	if m := enrichHeadRe.FindStringSubmatch(line); m != nil {
 		return m[1] + ": " + m[2], true
 	}
 	if m := cmdbCritRe.FindStringSubmatch(line); m != nil {
-		return "cmdb: criticality " + token(m[1], "?"), true
+		crit := m[1]
+		if !criticality[crit] {
+			crit = "?"
+		}
+		return "cmdb: criticality " + crit, true
 	}
 	if strings.HasPrefix(line, "cmdb: узел ") && strings.HasSuffix(line, " в CMDB не найден") {
 		return "cmdb: node not in CMDB", true
@@ -269,24 +304,6 @@ func (p *Pseudonyms) enrichLine(line string) (string, bool) {
 		return "", false
 	}
 	return fmt.Sprintf("  %s  %s  %s  %s", string(r[2:10]), token(f[0], "[source]"), token(f[1], "[action]"), p.Detail(f[2])), true
-}
-
-// reason — причина срабатывания от движка (порог, тишина, периодичность):
-// числа и слова остаются; адреса — псевдонимы; всё похожее на имя узла,
-// путь или учётку — «[x]».
-func (p *Pseudonyms) reason(s string) string {
-	words := strings.Fields(s)
-	for i, w := range words {
-		core := strings.Trim(w, "(),;")
-		switch {
-		case core == "":
-		case net.ParseIP(core) != nil:
-			words[i] = strings.Replace(w, core, p.IP(core), 1)
-		case strings.ContainsAny(core, "@\\/_") || strings.Contains(core, ".") && strings.ContainsAny(strings.ToLower(core), "abcdefghijklmnopqrstuvwxyz"):
-			words[i] = strings.Replace(w, core, "[x]", 1)
-		}
-	}
-	return strings.Join(words, " ")
 }
 
 // redactPII — шаблоны ПДн (email, телефон, паспорт, ИНН, карта).
@@ -334,7 +351,7 @@ func DecisionStateWith(inc *incidents.Incident, p *Pseudonyms) string {
 		b.WriteString("\nEnrichment:\n" + strings.Join(enr, "\n") + "\n")
 	}
 	if dropped > 0 {
-		fmt.Fprintf(&b, "\n(%d lines of unrecognized format omitted)\n", dropped)
+		fmt.Fprintf(&b, "\n(%d lines omitted)\n", dropped)
 	}
 	return redactPII(b.String())
 }

@@ -37,17 +37,20 @@ func TestPseudonymsStablePerSalt(t *testing.T) {
 func TestDetailKinds(t *testing.T) {
 	p := NewPseudonyms([]byte("s"))
 	cases := map[string]string{
-		"/etc/shadow":                      "/etc/shadow",
-		"/var/lib/clickhouse 91.5 percent": "/var/lib/clickhouse 91.5 percent",
-		"/home/ivan.petrov/secret.docx":    "/home/" + p.User("ivan.petrov") + "/[path].docx",
-		"/root/.ssh/id_rsa":                "/root/[path]",
-		"/data/clients/acme/report.pdf":    "[path].pdf",
+		"/etc/shadow":                      "[path]",
+		"/var/lib/clickhouse 91.5 percent": "[path] 91.5 percent",
+		"/home/ivan.petrov/secret.docx":    "[path].docx",
+		"/home/alice.smirnov":              "[path]",
 		`C:\Users\ivan\Desktop\a.xlsx`:     "[path].xlsx",
 		"10.0.0.5:3389":                    p.IP("10.0.0.5") + ":3389",
-		"https://intranet.corp/x?token=1":  "https://" + p.Host("intranet.corp") + "/[path]",
+		"fd12::1:443":                      p.IP("fd12::1") + ":443",
+		"https://intranet.corp/x?token=1":  "[url]",
+		"https://10.1.2.3:8443/r.pdf":      "[url " + p.IP("10.1.2.3") + "].pdf",
 		"ivan.petrov":                      p.User("ivan.petrov"),
+		"root":                             "root",
+		"uid=1000 alice":                   "[text]",
+		"owner_id 42 smirnov":              "[text]",
 		"Тестов Тест Тестович":             "[text]",
-		"/etc/ivan@corp/x":                 "/etc/[x]/x",
 	}
 	for in, want := range cases {
 		if got := p.Detail(in); got != want {
@@ -77,13 +80,13 @@ func TestDecisionStateWhitelist(t *testing.T) {
 		Similar: []string{"INC-3 · 2026-10-30 · closed · SSH · ложное, это Анна"},
 	}
 	s := DecisionStateWith(inc, p)
-	for _, leak := range []string{"INC-", "anna", "Анна", "пентест", "alice", "db-prod-01", "203.0.113.7", "dba", "host.corp.local", "secret", "10.0.0.1", "closed"} {
+	for _, leak := range []string{"INC-", "anna", "Анна", "пентест", "alice", "db-prod-01", "203.0.113.7", "dba", "host.corp.local", "secret", "10.0.0.1", "closed", "попыток"} {
 		if strings.Contains(s, leak) {
 			t.Errorf("в состоянии %q:\n%s", leak, s)
 		}
 	}
 	for _, want := range []string{"a41c-auth-031", "attack.t1110.001", "auth.ssh.failure", "root", "cmdb: criticality high",
-		"edr.process_tree: 1 событий за окно", "process.start", ".sh", "25 попыток", "(порог 20)", "1 lines of unrecognized format omitted",
+		"edr.process_tree: 1 событий за окно", "process.start", "[path].sh", "(2 lines omitted)",
 		p.Host("db-prod-01"), p.IP("203.0.113.7")} {
 		if !strings.Contains(s, want) {
 			t.Errorf("в состоянии нет %q:\n%s", want, s)

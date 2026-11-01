@@ -120,11 +120,12 @@ func (c *Client) Decide(ctx context.Context, state string, qs map[string]Questio
 	}
 	body, err := json.Marshal(request{State: state, Model: c.Model, Questions: qs})
 	if err != nil {
-		return Response{}, err
+		return Response{}, c.fail(ClassRequest, 0)
 	}
+	// Ошибка разбора адреса цитирует его целиком — вместе с токеном в query.
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.Endpoint, bytes.NewReader(body))
 	if err != nil {
-		return Response{}, err
+		return Response{}, c.fail(ClassRequest, 0)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if c.APIKey != "" {
@@ -166,6 +167,7 @@ func (c *Client) Decide(ctx context.Context, state string, qs map[string]Questio
 // ошибки транспорта наружу не отдаются: в них бывает эхо запроса и ключа, а
 // ошибка пишется в лог и в запись датасета.
 const (
+	ClassRequest   = "bad request config"
 	ClassTransport = "transport"
 	ClassTimeout   = "timeout"
 	ClassCanceled  = "canceled"

@@ -161,7 +161,9 @@ func Build(l store.LabeledIncident, source string) *Record {
 	}
 	group := GroupID(inc)
 	split := "train"
-	if bucket(group) < HoldoutPercent {
+	// Разбиение — по ключу случая без соли: одна и та же группа по одну сторону
+	// во всех выгрузках. В JSONL пишется только group_id с солью выгрузки.
+	if bucket(groupKey(inc)) < HoldoutPercent {
 		split = "holdout"
 	}
 	return &Record{
@@ -181,7 +183,15 @@ func put(m map[string]string, k, v string) {
 // GroupID — исходный случай: правило и субъект. Адрес субъекта схлопывается
 // до сети (/24, /48): сканер, перебирающий соседние адреса, — один случай,
 // иначе варианты одного скана окажутся по обе стороны разбиения.
+//
+// В JSONL — HMAC с солью выгрузки (analyst.Process): по открытому хешу
+// правила и субъекта словарём восстанавливались бы учётки, узлы и подсети.
 func GroupID(inc *incidents.Incident) string {
+	return "g-" + analyst.Process().Key("group", groupKey(inc))
+}
+
+// groupKey — «правило|субъект» до хеширования; наружу не выдаётся.
+func groupKey(inc *incidents.Incident) string {
 	subject := inc.ActorName
 	if subject == "" {
 		subject = inc.Node
@@ -195,17 +205,7 @@ func GroupID(inc *incidents.Incident) string {
 	} else {
 		subject = strings.ToLower(subject)
 	}
-	sum := sha256.Sum256([]byte(inc.RuleID + "|" + subject))
-	return "g-" + hexPrefix(sum[:6])
-}
-
-func hexPrefix(b []byte) string {
-	const digits = "0123456789abcdef"
-	out := make([]byte, 0, len(b)*2)
-	for _, c := range b {
-		out = append(out, digits[c>>4], digits[c&0xf])
-	}
-	return string(out)
+	return inc.RuleID + "|" + subject
 }
 
 func bucket(s string) int {
