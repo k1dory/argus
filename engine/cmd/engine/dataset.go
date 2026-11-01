@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"maps"
 	"os"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -158,9 +159,16 @@ func askModel(ctx context.Context, c *systemone.Client, r *dataset.Record) (data
 // laya-serve для ARGUS должен отдавать в model версию или хеш чекпойнта.
 var backendNames = map[string]bool{"laya-rl-agent": true}
 
-// reportedRevision — модель сообщила ревизию, а не пустоту и не имя бэкенда.
+// revisionRe — белый формат ревизии: только ASCII без пробелов. Невидимые
+// символы (U+200B, BOM), омоглифы (кириллическая «а»), полноширинные буквы и
+// внутренние пробелы в него не входят — сравнивать с backendNames после
+// нормализации не нужно: такая строка отклоняется целиком.
+var revisionRe = regexp.MustCompile(`^[A-Za-z0-9._:@+/-]{1,128}$`)
+
+// reportedRevision — модель сообщила ревизию (после strings.TrimSpace, он
+// снимает и Unicode-пробелы): строка белого формата и не имя бэкенда.
 func reportedRevision(rev string) bool {
-	return rev != "" && !backendNames[strings.ToLower(rev)]
+	return revisionRe.MatchString(rev) && !backendNames[strings.ToLower(rev)]
 }
 
 // choiceOf — выбранный вариант: choice, а без него — наибольшая вероятность.
