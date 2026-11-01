@@ -21,16 +21,42 @@ root="$(cd -P "$(dirname "$0")/.." && pwd)"
 cd "$root"
 log=CHANGELOG.md
 fail() { echo "$*" >&2; exit 1; }
-rollback="git checkout HEAD -- CHANGELOG.md changes && git reset -q -- CHANGELOG.md changes"
 
 # --- чистое дерево -----------------------------------------------------------------
 git rev-parse --verify -q HEAD >/dev/null || fail "нет коммита HEAD"
+# Откат — с абсолютным корнем (вызывающий может стоять в другом каталоге); changes —
+# только если путь есть в HEAD (иначе checkout ругается на неизвестный путь).
+paths="CHANGELOG.md"
+git cat-file -e HEAD:changes 2>/dev/null && paths="CHANGELOG.md changes"
+q_root="$(printf '%q' "$root")"
+rollback="git -C $q_root checkout HEAD -- $paths && git -C $q_root reset -q -- $paths"
+
+# CHANGELOG.md (и VERSION, если он есть) — отслеживаемые обычные файлы: симлинк
+# увёл бы запись за пределы checkout, неотслеживаемый файл — мимо проверок чистоты.
+for f in CHANGELOG.md VERSION; do
+    entry="$(git ls-files -s -- "$f")"
+    if [ "$f" = VERSION ] && [ -z "$entry" ] && [ ! -e VERSION ] && [ ! -L VERSION ]; then continue; fi
+    case "${entry%% *}" in 100644|100755) ;; *) fail "$f — не отслеживаемый обычный файл в Git" ;; esac
+    [ ! -L "$f" ] && [ -f "$f" ] || fail "$f в дереве — не обычный файл"
+done
+# Флаги индекса assume-unchanged (строчная буква) и skip-worktree (S) прячут локальные
+# правки от git diff: прочитался бы старый blob, а файл удалился бы.
+if git ls-files -v -- CHANGELOG.md VERSION changes | grep -q '^[a-zS]'; then
+    fail "на CHANGELOG.md, VERSION или changes/ стоят флаги assume-unchanged/skip-worktree — снимите их"
+fi
 git diff --quiet -- CHANGELOG.md VERSION changes ||
     fail "незакоммиченные изменения в CHANGELOG.md, VERSION или changes/ — закоммитьте их"
 git diff --cached --quiet -- CHANGELOG.md VERSION changes ||
     fail "staged-изменения в CHANGELOG.md, VERSION или changes/ — закоммитьте их"
 [ -z "$(git ls-files -o -- changes)" ] ||
     fail "в changes/ есть неотслеживаемые файлы — закоммитьте фрагменты или удалите лишнее"
+# ls-files -o не заходит в нечитаемые каталоги и молчит о FIFO: полный обход find с
+# проверкой ошибки; всё, кроме файлов и каталогов, — отказ.
+if [ -e changes ] || [ -L changes ]; then
+    odd="$(find changes -mindepth 1 ! -type f ! -type d -print 2>/dev/null)" ||
+        fail "не удалось обойти changes/ (нечитаемый каталог?)"
+    [ -z "$odd" ] || fail "в changes/ есть не файлы и не каталоги (FIFO, сокет, симлинк)"
+fi
 
 # --- проверки содержимого ------------------------------------------------------------
 # Строки передаются в awk через ENVIRON: -v раскрывает «\t» и прочие escape-последовательности.
@@ -95,6 +121,10 @@ on_exit() {
 trap on_exit EXIT
 if [ ${#frags[@]} -gt 0 ]; then
     git --literal-pathspecs rm -q -- "${frags[@]}"
+    # git rm лишь предупреждает, если файл не удалось удалить (каталог без записи).
+    for f in "${frags[@]}"; do
+        [ ! -e "$f" ] && [ ! -L "$f" ] || fail "фрагмент не удалён из дерева: $f"
+    done
 fi
 cat -- "$work/new" > "$log"
 echo "CHANGELOG.md: раздел $ver — $date, фрагментов: ${#frags[@]}"
