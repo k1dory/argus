@@ -10,10 +10,11 @@ detection:
   selection:
     action: net.firewall
     outcome: deny
-  # Источник из частных и служебных диапазонов — разведка изнутри (T1046, Discovery),
-  # а не Active Scanning снаружи: такой поток этим правилом не размечается.
+  # Источник из своих сетей (INTERNAL_NETS, по умолчанию RFC 1918, 100.64/10, loopback,
+  # link-local, ULA) — разведка изнутри (T1046, Discovery), а не Active Scanning снаружи:
+  # такой поток этим правилом не размечается. Событие без attrs.scope тоже проверяется.
   filter:
-    src.ip|regex: '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|127\.|169\.254\.|::1$|f[cd][0-9a-f]{2}:|fe[89ab][0-9a-f]:)'
+    src.ip|internal: true
   threshold:
     kind: distinct
     field: dst.port
