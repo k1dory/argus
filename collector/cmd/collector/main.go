@@ -16,11 +16,13 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"testing"
 	"time"
 	_ "time/tzdata" // пояса SYSLOG_PEER_TZ и в образе без /usr/share/zoneinfo
 
@@ -405,8 +407,67 @@ func main() {
 	norm := &normalize.Normalizer{Rules: cfg.Sources, PIIFields: cfg.PIIFields}
 	st := &stats{perMin: map[string]uint32{}, listener: map[string]string{}, bySource: map[string]uint64{}}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	sigCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	// Отмена изнутри (приёмник не открыл порт) — отдельно от сигналов: обработчики
+	// SIGINT/SIGTERM снимаются только при выходе из main, после дренажа. Иначе SIGTERM
+	// от compose stop посреди дозаписи батча убивал бы процесс и терял батч.
+	ctx, cancel := context.WithCancel(sigCtx)
+	defer cancel()
+	// Дренаж ограничен: источник, который не слушает отмену (зависшее чтение файла
+	// курсора, сетевой вызов без контекста), иначе держал бы wg.Wait вечно — процесс
+	// без приёма, но живой, и compose его не перезапускает. После ARGUS_SHUTDOWN_TIMEOUT
+	// или по второму SIGINT/SIGTERM — лог с незавершёнными задачами и выход с кодом 1;
+	// принятое уже лежит в spool на диске и дошлётся после перезапуска.
+	shutdownTimeout := 30 * time.Second
+	if raw := os.Getenv("ARGUS_SHUTDOWN_TIMEOUT"); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d <= 0 {
+			slog.Error("ARGUS_SHUTDOWN_TIMEOUT: нужна положительная длительность, например 30s", "value", raw)
+			os.Exit(1)
+		}
+		shutdownTimeout = d
+	}
+	var activeMu sync.Mutex
+	active := map[string]int{}
+	activeNames := func() []string {
+		activeMu.Lock()
+		defer activeMu.Unlock()
+		names := make([]string, 0, len(active))
+		for name, n := range active {
+			if n > 0 {
+				names = append(names, name)
+			}
+		}
+		sort.Strings(names)
+		return names
+	}
+	sigs := make(chan os.Signal, 4)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigs)
+	drained := make(chan struct{})
+	defer close(drained)
+	go func() {
+		var deadline <-chan time.Time
+		done := ctx.Done()
+		received := 0
+		for {
+			select {
+			case <-drained:
+				return
+			case <-done:
+				done = nil
+				deadline = time.After(shutdownTimeout)
+			case sig := <-sigs:
+				// Первый сигнал запускает (или не прерывает) штатный дренаж, второй — выход.
+				if received++; received >= 2 {
+					forceExit("повторный сигнал — выход без дренажа", "signal", sig.String(), "unfinished", activeNames())
+				}
+			case <-deadline:
+				forceExit("дренаж не уложился в ARGUS_SHUTDOWN_TIMEOUT — выход", "timeout", shutdownTimeout.String(), "unfinished", activeNames())
+			}
+		}
+	}()
 
 	queue := make(chan queuedEvent, cfg.Batch.PendingRows)
 	// emit всегда сам проставляет attrs.transport: значение из тела события
@@ -621,28 +682,50 @@ func main() {
 	}
 
 	var wg sync.WaitGroup
+	// Приёмник, который не смог открыть порт (занят, нет прав), останавливает весь
+	// коллектор: процесс без HTTP- или syslog-приёма выглядел бы живым и молча терял
+	// события. Остановка штатная — принятое дописывается, затем код выхода 1.
+	var listenerFailed atomic.Bool
 	run := func(name string, f func() error) {
 		wg.Add(1)
+		activeMu.Lock()
+		active[name]++
+		activeMu.Unlock()
 		go func() {
 			defer wg.Done()
+			defer func() {
+				activeMu.Lock()
+				active[name]--
+				activeMu.Unlock()
+			}()
 			if err := f(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				slog.Error(name, "err", err)
 			}
 		}()
 	}
+	runListener := func(name string, f func() error) {
+		run(name, func() error {
+			err := f()
+			if err != nil && !errors.Is(err, http.ErrServerClosed) && ctx.Err() == nil {
+				listenerFailed.Store(true)
+				cancel()
+			}
+			return err
+		})
+	}
 	tcpOpts := listen.TCPOptions{MaxConns: cfg.Listeners.Syslog.MaxConns, MaxConnsPerIP: cfg.Listeners.Syslog.MaxConnsPerIP}
 	if a := cfg.Listeners.Syslog.UDP; a != "" {
-		run("syslog udp", func() error { return listen.SyslogUDP(ctx, a, lines) })
+		runListener("syslog udp", func() error { return listen.SyslogUDP(ctx, a, lines) })
 	}
 	if a := cfg.Listeners.Syslog.TCP; a != "" {
-		run("syslog tcp", func() error { return listen.SyslogTCP(ctx, a, tcpOpts, lines) })
+		runListener("syslog tcp", func() error { return listen.SyslogTCP(ctx, a, tcpOpts, lines) })
 	}
 	if a := tlsCfg.Addr; a != "" {
 		to := listen.TLSOptions{Cert: tlsCfg.Cert, Key: tlsCfg.Key, ClientCA: tlsCfg.ClientCA, Dev: dev}
-		run("syslog tls", func() error { return listen.SyslogTLS(ctx, a, to, tcpOpts, lines) })
+		runListener("syslog tls", func() error { return listen.SyslogTLS(ctx, a, to, tcpOpts, lines) })
 	}
 	if a := cfg.Listeners.NetFlow.UDP; a != "" {
-		run("netflow udp", func() error { return listen.NetFlowUDP(ctx, a, packets) })
+		runListener("netflow udp", func() error { return listen.NetFlowUDP(ctx, a, packets) })
 	}
 	// Опрашиваемые источники: CrowdStrike Falcon, S3-бакеты (Yandex/VK Cloud).
 	if cfg.Falcon.ClientID != "" {
@@ -654,7 +737,7 @@ func main() {
 		run("s3 "+sc.Name, func() error { listen.Guard("s3 "+sc.Name, func() { src.Run(ctx) }); return nil })
 	}
 	srv := &http.Server{Addr: cfg.Listeners.HTTP.Addr, Handler: handlers.Mux(), ReadHeaderTimeout: 5 * time.Second}
-	run("http", func() error {
+	runListener("http", func() error {
 		slog.Info("http listening", "addr", cfg.Listeners.HTTP.Addr)
 		return srv.ListenAndServe()
 	})
@@ -698,7 +781,32 @@ func main() {
 	slog.Info("collector started", "batch", strconv.Itoa(cfg.Batch.Size), "sources", len(cfg.Sources),
 		"max_conns", tcpOpts.MaxConns, "pending_rows", cfg.Batch.PendingRows, "netflow_exporters", len(dec.Allow))
 	wg.Wait()
+	if listenerFailed.Load() {
+		slog.Error("приёмник не запустился — коллектор остановлен")
+		// Тесты вызывают main() в своём процессе и ждут его возврата.
+		if !testing.Testing() {
+			os.Exit(1)
+		}
+	}
 }
+
+// forceExit — принудительный выход при зависшем дренаже. Запись в журнал может
+// заблокироваться сама (stderr — pipe, читатель встал), поэтому сообщение пишется
+// в отдельной горутине и ждётся не дольше forceExitLogWait: выход — в любом случае.
+func forceExit(msg string, args ...any) {
+	logged := make(chan struct{})
+	go func() {
+		slog.Error(msg, args...)
+		close(logged)
+	}()
+	select {
+	case <-logged:
+	case <-time.After(forceExitLogWait):
+	}
+	os.Exit(1)
+}
+
+const forceExitLogWait = time.Second
 
 // drainIdle — тишина в queue, после которой при остановке считаем остаток вычитанным.
 const drainIdle = 100 * time.Millisecond
@@ -836,6 +944,10 @@ func logLevel() slog.Level {
 	return slog.LevelInfo
 }
 
+// hasCEF/hasLEEF — поиск маркера по строке, как прежде. Выбор разборщика по содержимому
+// строки подделывается данными запроса (URI, User-Agent в JSON Caddy), а каждая строковая
+// эвристика ломала настоящие CEF/LEEF (ревью #16, круги 2–5). Решение — отдельной задачей:
+// формат по источнику/транспорту (collector.yml), тесты в review/codex-waf-dispatch.
 func hasCEF(s string) bool  { return strings.Contains(s, "CEF:") }
 func hasLEEF(s string) bool { return strings.Contains(s, "LEEF:") }
 

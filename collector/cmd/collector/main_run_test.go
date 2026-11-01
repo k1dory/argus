@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -28,31 +29,54 @@ func freePort(t *testing.T) int {
 
 // waitHealthy ждёт 200 от /healthz с экспоненциальной паузой 50 мс → 1 с. Под -race на
 // общем раннере CI старт коллектора (spool, приёмники, первый запрос к «ClickHouse»)
-// занимал больше прежних 10 с — тест падал ложно. Если main() завершился раньше
-// (порт из freePort успели занять, ошибка конфига), ждать нечего: падаем сразу.
+// занимал больше прежних 10 с — тест падал ложно. Если main() завершился (занятый порт
+// останавливает коллектор, ошибка конфига), ждать нечего: падаем сразу — и до запроса,
+// и после него, даже если ответ успел прийти. Каждый запрос ограничен общим дедлайном,
+// а не только своими 2 с: зависший ответ не продлевает ожидание.
 func waitHealthy(t *testing.T, url string, exited <-chan struct{}, timeout time.Duration) {
 	t.Helper()
+	deadline := time.Now().Add(timeout)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
 	client := &http.Client{Timeout: 2 * time.Second}
-	start, pause := time.Now(), 50*time.Millisecond
+	pause := 50 * time.Millisecond
 	var last string
+	exitedNow := func() bool {
+		select {
+		case <-exited:
+			return true
+		default:
+			return false
+		}
+	}
 	for {
-		r, err := client.Get(url)
+		if exitedNow() {
+			t.Fatalf("коллектор завершился до готовности /healthz: %s", last)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r, err := client.Do(req)
 		if err == nil {
 			r.Body.Close()
-			if r.StatusCode == http.StatusOK {
-				return
-			}
 			last = r.Status
 		} else {
 			last = err.Error()
 		}
-		if time.Since(start) > timeout {
+		if exitedNow() {
+			t.Fatalf("коллектор завершился до готовности /healthz: %s", last)
+		}
+		if err == nil && r.StatusCode == http.StatusOK {
+			return
+		}
+		if !time.Now().Before(deadline) {
 			t.Fatalf("коллектор не поднялся за %s: %s", timeout, last)
 		}
 		select {
 		case <-exited:
 			t.Fatalf("коллектор завершился до готовности /healthz: %s", last)
-		case <-time.After(pause):
+		case <-time.After(min(pause, time.Until(deadline))):
 		}
 		pause = min(2*pause, time.Second)
 	}
@@ -126,6 +150,22 @@ batch:
 
 	done := make(chan struct{})
 	go func() { defer close(done); main() }()
+	// Fatal где угодно ниже не должен оставлять main с занятыми портами следующему
+	// тесту: останавливаем его тем же SIGTERM и ждём. Если main уже вышел, сигнал не
+	// посылаем — без NotifyContext он убил бы весь тестовый процесс.
+	t.Cleanup(func() {
+		select {
+		case <-done:
+			return
+		default:
+		}
+		_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			t.Error("main не остановился при очистке теста")
+		}
+	})
 
 	base := fmt.Sprintf("http://127.0.0.1:%d", httpPort)
 	waitHealthy(t, base+"/healthz", done, 60*time.Second)

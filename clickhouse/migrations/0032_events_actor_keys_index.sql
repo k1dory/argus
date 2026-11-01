@@ -8,7 +8,9 @@
 -- hasAny(<то же выражение>, массив значений) отсекает гранулы для любой смеси видов,
 -- точный предикат с интервалами алиасов идёт уже по оставшимся строкам. Выражение
 -- должно совпадать дословно с ACTOR_KEYS_EXPR в web/src/lib/shared/actors.ts.
--- MATERIALIZE — фоновая мутация только индексных файлов по существующим партам;
--- новые парты индексируются при вставке. Идемпотентно.
+-- Индекс получают новые парты при вставке. Старые — отдельным шагом оператора
+-- (README, «Паспорт сотрудника»), не здесь: MATERIALIZE — мутация по всей events, и
+-- повтор миграции после сбоя записи schema_migrations поставил бы её второй раз
+-- (IF NOT EXISTS защищает только ADD INDEX):
+--   ALTER TABLE argus.events MATERIALIZE INDEX idx_actor_keys;
 ALTER TABLE argus.events ADD INDEX IF NOT EXISTS idx_actor_keys [actor_name, lowerUTF8(actor_name), src_ip, lowerUTF8(node)] TYPE bloom_filter(0.01) GRANULARITY 4;
-ALTER TABLE argus.events MATERIALIZE INDEX idx_actor_keys;

@@ -31,7 +31,22 @@ jobs:
         run: |
           tag="${GITHUB_REF_NAME#v}"; ver="$(cat VERSION)"
           [ "$tag" = "$ver" ] || { echo "тег v$tag, а VERSION=$ver"; exit 1; }
-          grep -q "^## $ver " CHANGELOG.md || { echo "в CHANGELOG.md нет раздела $ver"; exit 1; }
+          # Заголовок сравнивается строкой: версия — не регулярное выражение.
+          awk -v h="## $ver — " 'index($0, h) == 1 { found = 1 } END { exit !found }' CHANGELOG.md \
+            || { echo "в CHANGELOG.md нет раздела $ver"; exit 1; }
+          # Любой файл в changes/unreleased, кроме README.md (скрытый, вложенный), — несобранный
+          # фрагмент. Имена не печатаются: строка из имени файла стала бы командой раннера.
+          # Корень-симлинк спрятал бы фрагменты от find, ошибка обхода — тоже: оба — отказ.
+          set -o pipefail
+          for d in changes changes/unreleased; do
+            [ ! -L "$d" ] || { echo "$d — симлинк; changelog-фрагменты не проверены"; exit 1; }
+          done
+          left=0
+          if [ -e changes/unreleased ]; then
+            left="$(find changes/unreleased -mindepth 1 ! -type d ! -path changes/unreleased/README.md -print0 | tr -cd '\0' | wc -c)" \
+              || { echo "не удалось обойти changes/unreleased"; exit 1; }
+          fi
+          [ "$left" -eq 0 ] || { echo "несобранных фрагментов changelog: $left — запустите scripts/changelog-release.sh $ver"; exit 1; }
           echo "version=$ver" >> "$GITHUB_OUTPUT"
 
   images:
