@@ -89,7 +89,7 @@ type Incident struct {
 	// droppedIPs — адреса, вытесненные из Members (счёт MembersDropped без повторов).
 	parts      map[string]*part
 	droppedIPs map[string]bool
-	fresh      map[string]Candidate // сработки этого цикла до снимка автоответа
+	fresh      map[string]*part // сработки этого цикла до снимка автоответа
 	// reviewNoted — ротация без подтверждения уже отмечена заметкой.
 	reviewNoted bool
 	// Review — причина пометки «закрыт автоматикой, нужна проверка» для

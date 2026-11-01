@@ -3,8 +3,10 @@ package incidents
 import (
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"net/netip"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -115,17 +117,84 @@ type part struct {
 	tags        []string
 	first, last string
 	count       int
-	origins     map[string]int // «transport|peer» → событий
+	origins     map[string]*idSet // «transport|peer» → уникальные события
 	events      []*model.Event
 }
 
-func newPart(d eval.Detection, ip string) *part {
-	origins := map[string]int{}
-	for _, e := range d.Events {
-		origins[e.Attrs["transport"]+"|"+e.Attrs["peer"]]++
+// maxOriginIDs — сколько уникальных событий помнить на источник части; сверх —
+// только признак «не меньше потолка» (min_events правил куда меньше).
+const maxOriginIDs = 256
+
+// idSet — уникальные события одного источника (по хешу содержимого). Окна
+// eval перекрываются, и одно событие в двух окнах — одно событие, а не два.
+type idSet struct {
+	ids  map[uint64]struct{}
+	full bool
+}
+
+func (s *idSet) add(id uint64) bool {
+	if _, ok := s.ids[id]; ok {
+		return false
 	}
-	return &part{rule: d.Rule.ID, ip: ip, level: d.Rule.Level, title: d.Rule.Title, tags: d.Rule.Tags,
-		first: model.FormatTS(d.First), last: model.FormatTS(d.Last), count: len(d.Events), origins: origins, events: d.Events}
+	if len(s.ids) >= maxOriginIDs {
+		s.full = true
+		return false
+	}
+	s.ids[id] = struct{}{}
+	return true
+}
+
+func (s *idSet) count() int { return len(s.ids) }
+
+// eventID — отпечаток события для счёта уникальных: в модели движка нет
+// event_id, а указатели держали бы сами события в памяти реестра.
+func eventID(e *model.Event) uint64 {
+	h := fnv.New64a()
+	for _, v := range []string{e.TS, e.Source, e.Node, e.Action, e.Object, e.SrcIP, strconv.Itoa(int(e.SrcPort)),
+		e.DstIP, strconv.Itoa(int(e.DstPort)), e.Proto, e.ActorName, e.SessionID, e.Attrs["transport"], e.Attrs["peer"]} {
+		h.Write([]byte(v))
+		h.Write([]byte{0})
+	}
+	return h.Sum64()
+}
+
+// merge добавляет события сработки в части; true — появилось новое событие.
+func (p *part) merge(d eval.Detection) bool {
+	added := false
+	if p.origins == nil {
+		p.origins = map[string]*idSet{}
+	}
+	for _, e := range d.Events {
+		o := e.Attrs["transport"] + "|" + e.Attrs["peer"]
+		set := p.origins[o]
+		if set == nil {
+			set = &idSet{ids: map[uint64]struct{}{}}
+			p.origins[o] = set
+		}
+		if set.add(eventID(e)) {
+			added = true
+		}
+	}
+	if f := model.FormatTS(d.First); p.first == "" || f < p.first {
+		p.first = f
+	}
+	if l := model.FormatTS(d.Last); l > p.last {
+		p.last = l
+	}
+	if len(d.Events) > p.count {
+		p.count = len(d.Events)
+	}
+	if added {
+		p.events = d.Events // свежее окно — для карточки и цепочки
+	}
+	return added
+}
+
+func newPart(d eval.Detection, ip string) *part {
+	p := &part{rule: d.Rule.ID, ip: ip, level: d.Rule.Level, title: d.Rule.Title, tags: d.Rule.Tags}
+	p.merge(d)
+	p.events = d.Events
+	return p
 }
 
 // Candidate — сработка правила по адресу склеенного инцидента для автоответа:
@@ -139,21 +208,21 @@ type Candidate struct {
 // автоответа: Apply следующего цикла перезаписывает части), по адресу и правилу в
 // стабильном порядке. Сработки цикла после снимка сбрасываются.
 func (inc *Incident) RespondCandidates() []Candidate {
-	byKey := map[string]Candidate{}
+	byKey := map[string]*part{}
 	for k, p := range inc.parts {
-		byKey[k] = Candidate{Rule: p.rule, IP: p.ip, Origins: p.origins}
+		byKey[k] = p
 	}
-	for k, c := range inc.fresh {
-		byKey[k] = c
+	for k, p := range inc.fresh {
+		byKey[k] = p
 	}
 	inc.fresh = nil
 	out := make([]Candidate, 0, len(byKey))
-	for _, c := range byKey {
-		o := make(map[string]int, len(c.Origins))
-		for k, v := range c.Origins {
-			o[k] = v
+	for _, p := range byKey {
+		o := make(map[string]int, len(p.origins))
+		for k, set := range p.origins {
+			o[k] = set.count()
 		}
-		out = append(out, Candidate{Rule: c.Rule, IP: c.IP, Origins: o})
+		out = append(out, Candidate{Rule: p.rule, IP: p.ip, Origins: o})
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].IP != out[j].IP {
@@ -177,8 +246,22 @@ func (r *Registry) applyCollapsed(d eval.Detection, ip, net string, now time.Tim
 	pk := d.Rule.ID + "|" + ip
 	last := model.FormatTS(d.Last)
 	if ex, ok := r.open[key]; ok {
-		if p := ex.parts[pk]; p != nil && len(d.Events) <= p.count && last <= p.last {
-			return // ничего нового
+		if p := ex.parts[pk]; p != nil {
+			// Новое — только новые события (окна перекрываются; другая запись того же
+			// адреса — те же или новые события, но не повод их отбросить).
+			if !p.merge(d) {
+				return
+			}
+			if !isFinal(ex.Status) {
+				ex.markFresh(p)
+				ex.aggregate()
+				ex.UpdatedAt = model.FormatTS(now)[:19]
+				if !inUpdated[ex] {
+					inUpdated[ex] = true
+					*updated = append(*updated, ex)
+				}
+				return
+			}
 		}
 		if ex.parts[pk] == nil && ex.memberCovers(d.Rule.ID, ip, last, len(d.Events)) {
 			// Восстановленный после рестарта инцидент: адрес уже записан с этими
@@ -218,23 +301,18 @@ func (inc *Incident) setPart(p *part) {
 		inc.parts = map[string]*part{}
 	}
 	inc.parts[p.rule+"|"+p.ip] = p
-	// Сработка этого цикла идёт в автоответ, даже если лимит участников вытеснит
-	// её из parts раньше снимка (256 свежих соседей без respond не должны
-	// спрятать доверенный скан).
-	// Несколько окон одного правила по одному адресу за цикл (догоняющий буфер)
-	// складываются: позднее недоверенное окно не стирает доверенное.
+	inc.markFresh(p)
+}
+
+// markFresh — сработка этого цикла идёт в автоответ, даже если лимит участников
+// вытеснит её из parts раньше снимка (256 свежих соседей без respond не должны
+// спрятать доверенный скан). Часть общая: несколько окон одного правила по
+// одному адресу за цикл дают одно множество событий.
+func (inc *Incident) markFresh(p *part) {
 	if inc.fresh == nil {
-		inc.fresh = map[string]Candidate{}
+		inc.fresh = map[string]*part{}
 	}
-	k := p.rule + "|" + p.ip
-	c, ok := inc.fresh[k]
-	if !ok {
-		c = Candidate{Rule: p.rule, IP: p.ip, Origins: map[string]int{}}
-	}
-	for o, n := range p.origins {
-		c.Origins[o] += n
-	}
-	inc.fresh[k] = c
+	inc.fresh[p.rule+"|"+p.ip] = p
 }
 
 // memberCovers — сработка правила rule по адресу уже записана в списке участников
