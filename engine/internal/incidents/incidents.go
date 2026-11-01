@@ -215,12 +215,12 @@ func (r *Registry) Apply(dets []eval.Detection, now time.Time) (created, updated
 	for _, d := range dets {
 		inc := build(d, now)
 		key := inc.regKey()
-		if d.Rule.Collapsed() && collapseSource(d) {
+		if ip, ok := collapseSource(d); ok && d.Rule.Collapsed() {
 			// Открытый инцидент адреса, заведённый до склейки, дописывается как
 			// раньше: живые инциденты задним числом не склеиваются.
 			if ex, ok := r.open[key]; !ok || isFinal(ex.Status) {
-				if net, ok := rules.NetKey(d.Key); ok {
-					r.applyCollapsed(d, net, now, &created, &updated, inUpdated, dropped)
+				if net, ok := rules.NetKey(ip); ok {
+					r.applyCollapsed(d, ip, net, now, &created, &updated, inUpdated, dropped)
 					continue
 				}
 			}

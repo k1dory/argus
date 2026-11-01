@@ -3,6 +3,7 @@ package incidents
 import (
 	"encoding/json"
 	"fmt"
+	"net/netip"
 	"sort"
 	"strings"
 	"time"
@@ -29,19 +30,28 @@ const (
 	minPartEvents = 4
 )
 
-// collapseSource — ключ сработки действительно адрес источника: у всех её
-// событий src.ip равен ключу. Без src.ip eval группирует по node (экспортёр
-// NetFlow) — такая сработка не склеивается, и цели для блока у неё нет.
-func collapseSource(d eval.Detection) bool {
-	if d.Key == "" || len(d.Events) == 0 {
-		return false
+// collapseSource — канонический адрес источника сработки: ключ разбирается как IP
+// (пробелы по краям не в счёт, IPv4 в записи IPv6 — IPv4), и у всех событий src.ip
+// — тот же адрес. Дальше склейка знает только этот вид адреса: ключ подсети,
+// участники, «инцидент|адрес», цель блока и сверка с журналом (респондер пишет
+// адреса так же). Без src.ip eval группирует по node (экспортёр NetFlow), а
+// неразбираемый адрес — не адрес: такая сработка не склеивается.
+func collapseSource(d eval.Detection) (string, bool) {
+	if len(d.Events) == 0 {
+		return "", false
 	}
+	key, err := netip.ParseAddr(strings.TrimSpace(d.Key))
+	if err != nil {
+		return "", false
+	}
+	key = key.Unmap().WithZone("")
 	for _, e := range d.Events {
-		if e.SrcIP != d.Key {
-			return false
+		a, err := netip.ParseAddr(strings.TrimSpace(e.SrcIP))
+		if err != nil || a.Unmap().WithZone("") != key {
+			return "", false
 		}
 	}
-	return true
+	return key.String(), true
 }
 
 // CollapsedKey — ключ группы склеенного инцидента.
@@ -109,12 +119,12 @@ type part struct {
 	events      []*model.Event
 }
 
-func newPart(d eval.Detection) *part {
+func newPart(d eval.Detection, ip string) *part {
 	origins := map[string]int{}
 	for _, e := range d.Events {
 		origins[e.Attrs["transport"]+"|"+e.Attrs["peer"]]++
 	}
-	return &part{rule: d.Rule.ID, ip: d.Key, level: d.Rule.Level, title: d.Rule.Title, tags: d.Rule.Tags,
+	return &part{rule: d.Rule.ID, ip: ip, level: d.Rule.Level, title: d.Rule.Title, tags: d.Rule.Tags,
 		first: model.FormatTS(d.First), last: model.FormatTS(d.Last), count: len(d.Events), origins: origins, events: d.Events}
 }
 
@@ -162,22 +172,22 @@ const maxDroppedIPs = 4096
 // applyCollapsed — сработка правила со склейкой: дописать участника в открытый
 // инцидент подсети или завести новый. done=false — склеивать нечего (ключ не
 // адрес), сработка идёт обычным путём.
-func (r *Registry) applyCollapsed(d eval.Detection, net string, now time.Time, created, updated *[]*Incident, inUpdated map[*Incident]bool, dropped map[string]int) {
+func (r *Registry) applyCollapsed(d eval.Detection, ip, net string, now time.Time, created, updated *[]*Incident, inUpdated map[*Incident]bool, dropped map[string]int) {
 	key := CollapsedKey(d.Rule.CollapseGroup(), net)
-	pk := d.Rule.ID + "|" + d.Key
+	pk := d.Rule.ID + "|" + ip
 	last := model.FormatTS(d.Last)
 	if ex, ok := r.open[key]; ok {
 		if p := ex.parts[pk]; p != nil && len(d.Events) <= p.count && last <= p.last {
 			return // ничего нового
 		}
-		if ex.parts[pk] == nil && ex.memberCovers(d.Rule.ID, d.Key, last, len(d.Events)) {
+		if ex.parts[pk] == nil && ex.memberCovers(d.Rule.ID, ip, last, len(d.Events)) {
 			// Восстановленный после рестарта инцидент: адрес уже записан с этими
 			// событиями — запомнить сработку, но не переписывать инцидент.
-			ex.setPart(newPart(d))
+			ex.setPart(newPart(d, ip))
 			return
 		}
 		if !isFinal(ex.Status) {
-			ex.setPart(newPart(d))
+			ex.setPart(newPart(d, ip))
 			ex.aggregate()
 			ex.UpdatedAt = model.FormatTS(now)[:19]
 			if !inUpdated[ex] {
@@ -194,7 +204,7 @@ func (r *Registry) applyCollapsed(d eval.Detection, net string, now time.Time, c
 	}
 	inc := build(d, now)
 	inc.ActorName, inc.GroupKey, inc.Collapsed = net, key, 1
-	inc.setPart(newPart(d))
+	inc.setPart(newPart(d, ip))
 	inc.aggregate()
 	inc.noteSecrets(d)
 	inc.IncidentID = fmt.Sprintf("INC-%d", r.next)
@@ -211,10 +221,20 @@ func (inc *Incident) setPart(p *part) {
 	// Сработка этого цикла идёт в автоответ, даже если лимит участников вытеснит
 	// её из parts раньше снимка (256 свежих соседей без respond не должны
 	// спрятать доверенный скан).
+	// Несколько окон одного правила по одному адресу за цикл (догоняющий буфер)
+	// складываются: позднее недоверенное окно не стирает доверенное.
 	if inc.fresh == nil {
 		inc.fresh = map[string]Candidate{}
 	}
-	inc.fresh[p.rule+"|"+p.ip] = Candidate{Rule: p.rule, IP: p.ip, Origins: p.origins}
+	k := p.rule + "|" + p.ip
+	c, ok := inc.fresh[k]
+	if !ok {
+		c = Candidate{Rule: p.rule, IP: p.ip, Origins: map[string]int{}}
+	}
+	for o, n := range p.origins {
+		c.Origins[o] += n
+	}
+	inc.fresh[k] = c
 }
 
 // memberCovers — сработка правила rule по адресу уже записана в списке участников
