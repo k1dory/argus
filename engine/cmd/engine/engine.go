@@ -80,8 +80,9 @@ type engine struct {
 	storms map[string]*incidents.Incident // rule_id → открытый инцидент «шторм»
 
 	respMu     sync.Mutex
-	respState  map[string]respEntry // incident_id → что автоответ уже решил
-	respCycles int                  // циклов с последней чистки respState по возрасту
+	respState  map[string]respEntry   // incident_id (у склеенного — incident_id|адрес) → что автоответ уже решил
+	respCap    map[string][]time.Time // incident_id → время новых блокировок склеенного инцидента (collapse.block_cap)
+	respCycles int                    // циклов с последней чистки respState по возрасту
 
 	// absence — последние события групп правил «молчание», вне буфера кандидатов:
 	// потолок буфера (ENGINE_BUFFER_MAX) их не выбрасывает. Пишет и читает только
@@ -108,7 +109,7 @@ type engine struct {
 const identRetryMax = 10000
 
 type respEntry struct {
-	state string // waiting | done
+	state string // waiting | done | capped
 	at    time.Time
 }
 
@@ -233,6 +234,7 @@ func newEngine(ctx context.Context, rulesDir string, rs []*rules.Rule, acfg anal
 		resp:      respond.New(acfg.Respond),
 		storms:    map[string]*incidents.Incident{},
 		respState: map[string]respEntry{},
+		respCap:   map[string][]time.Time{},
 		excWarned: map[string]bool{},
 		identFile: env("IDENTITIES_FILE", ""),
 		absence:   eval.NewAbsenceState(0),

@@ -52,6 +52,10 @@ type Incident struct {
 	Chain      []string `json:"chain"`
 	Enrichment []string `json:"enrichment"` // строки обогащения (EDR, NGFW, CMDB)
 	Similar    []string `json:"similar"`    // похожие закрытые инциденты: «INC-12 · closed · заметка»
+	// Members — адреса склеенного по подсети инцидента (collapse.go); у обычного пусто.
+	// В incidents_current не выводится — движок и консоль читают его из incidents.
+	Members        MemberList `json:"members,omitempty"`
+	MembersDropped uint32     `json:"members_dropped,omitempty"`
 
 	Events []*model.Event `json:"-"`
 
@@ -75,6 +79,8 @@ type Incident struct {
 	// groupPending — group_key присвоен старому инциденту, но ещё не записан:
 	// Apply отдаёт инцидент на запись каждый цикл, пока движок не вызовет Persisted.
 	groupPending bool
+	// parts — сработки участников склеенного инцидента «правило|адрес» (collapse.go).
+	parts map[string]*part
 	// reviewNoted — ротация без подтверждения уже отмечена заметкой.
 	reviewNoted bool
 	// Review — причина пометки «закрыт автоматикой, нужна проверка» для
@@ -178,7 +184,11 @@ func NewRegistry(startFrom int, open []Incident) *Registry {
 }
 
 // regKey — ключ реестра: правило, субъект, узел и, у явного group_by, его значение.
+// У склеенного по подсети — ключ группы: в нём несколько правил и адресов.
 func (inc *Incident) regKey() string {
+	if IsCollapsedKey(inc.GroupKey) {
+		return inc.GroupKey
+	}
 	k := inc.RuleID + "|" + inc.ActorName + "|" + inc.Node
 	if inc.GroupKey != "" {
 		k += "|" + inc.GroupKey
@@ -192,9 +202,20 @@ func (r *Registry) Apply(dets []eval.Detection, now time.Time) (created, updated
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	dropped = map[string]int{}
+	inUpdated := map[*Incident]bool{}
 	for _, d := range dets {
 		inc := build(d, now)
 		key := inc.regKey()
+		if d.Rule.Collapsed() {
+			// Открытый инцидент адреса, заведённый до склейки, дописывается как
+			// раньше: живые инциденты задним числом не склеиваются.
+			if ex, ok := r.open[key]; !ok || isFinal(ex.Status) {
+				if net, ok := rules.NetKey(d.Key); ok {
+					r.applyCollapsed(d, net, now, &created, &updated, inUpdated, dropped)
+					continue
+				}
+			}
+		}
 		if _, ok := r.open[key]; !ok && inc.GroupKey != "" {
 			// Инцидент, заведённый до group_key (или восстановленный без него), —
 			// под старым ключом: его забирает первая сработка группы, а не новый инцидент.
@@ -221,7 +242,10 @@ func (r *Registry) Apply(dets []eval.Detection, now time.Time) (created, updated
 				ex.PII = 1
 			}
 			ex.UpdatedAt = model.FormatTS(now)[:19]
-			updated = append(updated, ex)
+			if !inUpdated[ex] {
+				inUpdated[ex] = true
+				updated = append(updated, ex)
+			}
 			continue
 		}
 		if r.maxNew > 0 && len(created) >= r.maxNew {
@@ -238,10 +262,6 @@ func (r *Registry) Apply(dets []eval.Detection, now time.Time) (created, updated
 	// отдельной версией строки каждый цикл — без новых событий и даже когда
 	// исходная сработка уже ушла из буфера: иначе после рестарта инцидент
 	// снова окажется без ключа.
-	inUpdated := make(map[*Incident]bool, len(updated))
-	for _, inc := range updated {
-		inUpdated[inc] = true
-	}
 	var pending []*Incident
 	for _, inc := range r.open {
 		if inc.groupPending && !inUpdated[inc] {

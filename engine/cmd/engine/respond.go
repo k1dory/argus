@@ -35,7 +35,13 @@ import (
 
    Решение по инциденту (respState) живёт в памяти: после рестарта открытые
    инциденты с правилом respond считаются решёнными, чтобы их дописывание не
-   вызывало исполнителей повторно (список активных блокировок тоже в памяти). */
+   вызывало исполнителей повторно (список активных блокировок тоже в памяти).
+
+   Склеенный по подсети инцидент (rules.Collapse) решается по каждому адресу
+   отдельно: ключ «incident_id|адрес», события и min_events — этого адреса.
+   Новый адрес подсети блокируется, даже когда первый уже done. Общий потолок —
+   collapse.block_cap новых блокировок на инцидент за окно: сверх него адрес
+   не блокируется (capped), в журнал — «потолок блокировок, решение за аналитиком». */
 
 func respRow(ts, mode, actor string, res respond.Result, ruleID, reason string) store.ResponseRow {
 	return store.ResponseRow{TS: ts, IncidentID: res.Incident, RuleID: ruleID, IP: res.IP, Mode: mode, Executor: res.Executor,
@@ -87,7 +93,46 @@ func (e *engine) pruneRespStateLocked(now time.Time, ttl time.Duration) int {
 			n++
 		}
 	}
+	for k, ts := range e.respCap {
+		if len(ts) == 0 || now.Sub(ts[len(ts)-1]) > ttl {
+			delete(e.respCap, k)
+		}
+	}
 	return n
+}
+
+// capReserve — занять место под блокировку нового адреса склеенного
+// инцидента: false — за окно уже limit блокировок. Проверка и запись под
+// одной блокировкой: автоответы соседних циклов идут параллельно.
+func (e *engine) capReserve(id string, now time.Time, window time.Duration, limit int) bool {
+	e.respMu.Lock()
+	defer e.respMu.Unlock()
+	kept := e.respCap[id][:0]
+	for _, t := range e.respCap[id] {
+		if now.Sub(t) < window {
+			kept = append(kept, t)
+		}
+	}
+	if len(kept) >= limit {
+		e.respCap[id] = kept
+		return false
+	}
+	e.respCap[id] = append(kept, now)
+	return true
+}
+
+// capRelease — блокировки не было (отказ по allowlist, IDS, адрес уже
+// заблокирован, сбой исполнителя): место возвращается.
+func (e *engine) capRelease(id string, at time.Time) {
+	e.respMu.Lock()
+	defer e.respMu.Unlock()
+	ts := e.respCap[id]
+	for i := len(ts) - 1; i >= 0; i-- {
+		if ts[i].Equal(at) {
+			e.respCap[id] = append(ts[:i], ts[i+1:]...)
+			return
+		}
+	}
 }
 
 // restoreRespState — после рестарта: открытые инциденты с правилом respond
@@ -98,16 +143,55 @@ func (e *engine) restoreRespState(open []incidents.Incident, now time.Time) int 
 	for i := range open {
 		if r := e.ruleFor(open[i].RuleID); r != nil && r.Respond != nil {
 			e.setRespStatus(open[i].IncidentID, "done", now)
+			// У склеенного — каждый записанный адрес: новый адрес подсети после
+			// рестарта блокируется, уже бывшие — нет.
+			if incidents.IsCollapsedKey(open[i].GroupKey) {
+				for _, ip := range open[i].MemberIPs() {
+					e.setRespStatus(open[i].IncidentID+"|"+ip, "done", now)
+				}
+			}
 			n++
 		}
 	}
 	return n
 }
 
+// respUnit — что решается автоответом отдельно: инцидент целиком или, у
+// склеенного по подсети, один его адрес со своими событиями.
+type respUnit struct {
+	key    string // ключ respState
+	ip     string // адрес участника склеенного инцидента; "" — инцидент целиком
+	events []*model.Event
+}
+
+func respUnits(inc *incidents.Incident) []respUnit {
+	if !incidents.IsCollapsedKey(inc.GroupKey) {
+		return []respUnit{{key: inc.IncidentID, events: inc.Events}}
+	}
+	get := rules.Getter("src.ip")
+	by := map[string][]*model.Event{}
+	var order []string
+	for _, ev := range inc.Events {
+		ip := strings.TrimSpace(get(ev))
+		if ip == "" {
+			continue
+		}
+		if _, ok := by[ip]; !ok {
+			order = append(order, ip)
+		}
+		by[ip] = append(by[ip], ev)
+	}
+	units := make([]respUnit, 0, len(order))
+	for _, ip := range order {
+		units = append(units, respUnit{key: inc.IncidentID + "|" + ip, ip: ip, events: by[ip]})
+	}
+	return units
+}
+
 // splitTrusted — доверенное подмножество событий цепочки и причины, по
 // которым остальные не учитываются (не больше трёх, чтобы не раздувать журнал).
-func (e *engine) splitTrusted(inc *incidents.Incident) (trusted []*model.Event, untrusted int, why []string) {
-	for _, ev := range inc.Events {
+func (e *engine) splitTrusted(events []*model.Event) (trusted []*model.Event, untrusted int, why []string) {
+	for _, ev := range events {
 		transport, peer := ev.Attrs["transport"], ev.Attrs["peer"]
 		if e.resp.TrustedEvent(transport, peer) {
 			trusted = append(trusted, ev)
@@ -141,81 +225,112 @@ func (e *engine) autoRespond(ctx context.Context, incs []*incidents.Incident, no
 	ts := model.FormatTS(now)[:19]
 	mode, _ := e.resp.Mode()
 	for _, inc := range incs {
-		r := e.ruleFor(inc.RuleID)
-		if r == nil || r.Respond == nil {
+		collapsed := incidents.IsCollapsedKey(inc.GroupKey)
+		if r := e.ruleFor(inc.RuleID); !collapsed && !respondsAt(r, inc.Level) {
 			continue
 		}
-		minLevel := r.Respond.MinLevel
-		if minLevel == "" {
-			minLevel = "high"
-		}
-		if rules.LevelRank(inc.Level) < rules.LevelRank(minLevel) {
-			continue
-		}
-		state := e.respStatus(inc.IncidentID)
-		if state == "done" {
-			continue
-		}
-		reason := inc.RuleTitle + " (" + inc.RuleID + ")"
-		trusted, untrusted, why := e.splitTrusted(inc)
-		if need := r.RespondMinEvents(); len(trusted) < need {
-			if state != "waiting" {
-				e.setRespStatus(inc.IncidentID, "waiting", now)
-				detail := fmt.Sprintf("ожидание: доверенных событий %d из %d (respond.min_events) — блокировка после следующего доверенного события в окне", len(trusted), need)
-				if untrusted > 0 {
-					// событий хватило бы, но часть — с недоверенного транспорта: это и есть «не заблокирован по недоверию»
-					e.m.untrustedSkips.Add(1)
-					detail += fmt.Sprintf("; не учтено недоверенных: %d — %s", untrusted, strings.Join(why, "; "))
-					slog.Warn("ips: не заблокирован — недоверенный источник", "incident", inc.IncidentID, "rule", inc.RuleID, "trusted", len(trusted), "untrusted", untrusted, "why", why[0])
-				} else if len(inc.Events) == 0 {
-					detail += "; в инциденте нет событий с транспортом (восстановлен из базы?)"
+		for _, u := range respUnits(inc) {
+			// У склеенного инцидента правило решения — сработавшее по этому адресу:
+			// адрес, по которому была только долбёжка без respond, не блокируется
+			// оттого, что соседний адрес подсети сканировал.
+			r := e.ruleFor(inc.RuleID)
+			if collapsed {
+				r = nil
+				for _, id := range inc.MemberRules(u.ip) {
+					if rr := e.ruleFor(id); respondsAt(rr, rr.Level) {
+						r = rr
+						break
+					}
 				}
-				rows = append(rows, respRow(ts, mode, "argus-engine", respond.Result{Executor: "argus", OK: untrusted == 0, Incident: inc.IncidentID, Detail: detail}, inc.RuleID, reason))
+				if r == nil {
+					continue
+				}
 			}
-			continue
-		}
-		e.setRespStatus(inc.IncidentID, "done", now)
-		if untrusted > 0 {
-			rows = append(rows, respRow(ts, mode, "argus-engine", respond.Result{Executor: "argus", OK: true, Incident: inc.IncidentID,
-				Detail: fmt.Sprintf("предупреждение: %d недоверенных событий не учтены (адреса и порог — только по %d доверенным) — %s", untrusted, len(trusted), strings.Join(why, "; "))}, inc.RuleID, reason))
-		}
-		ttl, _ := time.ParseDuration(r.Respond.TTL)
-		targets, truncated := r.RespondTargets(trusted)
-		if len(targets) == 0 {
-			rows = append(rows, respRow(ts, mode, "argus-engine", respond.Result{Executor: "argus", OK: true, Incident: inc.IncidentID,
-				Detail: "адрес не найден в поле " + orDefault(r.Respond.Target, "src.ip") + " — блокировать нечего"}, inc.RuleID, reason))
-			continue
-		}
-		if truncated > 0 {
-			rows = append(rows, respRow(ts, mode, "argus-engine", respond.Result{Executor: "argus", OK: true, Incident: inc.IncidentID,
-				Detail: fmt.Sprintf("адресов больше max_targets: %d отброшено", truncated)}, inc.RuleID, reason))
-		}
-		for _, ip := range targets {
-			results, applied, err := e.resp.Auto(ctx, ip, inc.IncidentID, reason, ttl)
-			if err != nil {
-				// отказ по allowlist/адресу — не ошибка исполнителя, а решение движка
-				rows = append(rows, respRow(ts, mode, "argus-engine", respond.Result{Executor: "argus", OK: true, IP: ip, Incident: inc.IncidentID, Detail: err.Error()}, inc.RuleID, reason))
+			state := e.respStatus(u.key)
+			if state == "done" || state == "capped" {
 				continue
 			}
-			if mode == respond.ModeIDS {
-				rows = append(rows, respRow(ts, mode, "argus-engine", respond.Result{Executor: "argus", OK: true, IP: ip, Incident: inc.IncidentID, Detail: "режим IDS: автоответ выключен"}, inc.RuleID, reason))
+			reason := r.Title + " (" + r.ID + ")"
+			trusted, untrusted, why := e.splitTrusted(u.events)
+			if need := r.RespondMinEvents(); len(trusted) < need {
+				if state != "waiting" {
+					e.setRespStatus(u.key, "waiting", now)
+					detail := fmt.Sprintf("ожидание: доверенных событий %d из %d (respond.min_events) — блокировка после следующего доверенного события в окне", len(trusted), need)
+					if untrusted > 0 {
+						// событий хватило бы, но часть — с недоверенного транспорта: это и есть «не заблокирован по недоверию»
+						e.m.untrustedSkips.Add(1)
+						detail += fmt.Sprintf("; не учтено недоверенных: %d — %s", untrusted, strings.Join(why, "; "))
+						slog.Warn("ips: не заблокирован — недоверенный источник", "incident", inc.IncidentID, "rule", r.ID, "trusted", len(trusted), "untrusted", untrusted, "why", why[0])
+					} else if len(u.events) == 0 {
+						detail += "; в инциденте нет событий с транспортом (восстановлен из базы?)"
+					}
+					rows = append(rows, respRow(ts, mode, "argus-engine", respond.Result{Executor: "argus", OK: untrusted == 0, IP: u.ip, Incident: inc.IncidentID, Detail: detail}, r.ID, reason))
+				}
 				continue
 			}
-			for _, res := range results {
-				rows = append(rows, respRow(ts, mode, "argus-engine", res, inc.RuleID, reason))
+			reserved := false
+			if u.ip != "" && mode != respond.ModeIDS {
+				if limit, window := r.IncidentCap(); !e.capReserve(inc.IncidentID, now, window, limit) {
+					e.setRespStatus(u.key, "capped", now)
+					rows = append(rows, respRow(ts, mode, "argus-engine", respond.Result{Executor: "argus", OK: true, IP: u.ip, Incident: inc.IncidentID,
+						Detail: fmt.Sprintf("потолок блокировок инцидента: %d новых адресов за %s (collapse.block_cap) — адрес не заблокирован, решение за аналитиком", limit, window)}, r.ID, reason))
+					slog.Warn("ips: потолок блокировок склеенного инцидента", "incident", inc.IncidentID, "rule", r.ID, "ip", u.ip, "limit", limit)
+					continue
+				}
+				reserved = true
 			}
-			switch {
-			case applied:
-				e.m.autoBlocks.Add(1)
-				slog.Warn("ips: заблокирован", "ip", ip, "incident", inc.IncidentID, "rule", inc.RuleID)
-			case mode == respond.ModeSimulate:
-				e.m.simulatedBlocks.Add(1)
-			case respond.Noop(results):
-				// уже заблокирован (другим инцидентом или оператором) — делать нечего, не отказ
-				slog.Info("ips: уже заблокирован", "ip", ip, "incident", inc.IncidentID, "rule", inc.RuleID, "detail", results[0].Detail)
-			default:
-				e.m.blockFailures.Add(1)
-				slog.Error("ips: блокировка не выполнена", "ip", ip, "incident", inc.IncidentID, "rule", inc.RuleID)
+			e.setRespStatus(u.key, "done", now)
+			if untrusted > 0 {
+				rows = append(rows, respRow(ts, mode, "argus-engine", respond.Result{Executor: "argus", OK: true, Incident: inc.IncidentID,
+					Detail: fmt.Sprintf("предупреждение: %d недоверенных событий не учтены (адреса и порог — только по %d доверенным) — %s", untrusted, len(trusted), strings.Join(why, "; "))}, r.ID, reason))
+			}
+			ttl, _ := time.ParseDuration(r.Respond.TTL)
+			targets, truncated := r.RespondTargets(trusted)
+			if len(targets) == 0 {
+				rows = append(rows, respRow(ts, mode, "argus-engine", respond.Result{Executor: "argus", OK: true, Incident: inc.IncidentID,
+					Detail: "адрес не найден в поле " + orDefault(r.Respond.Target, "src.ip") + " — блокировать нечего"}, r.ID, reason))
+				if reserved {
+					e.capRelease(inc.IncidentID, now)
+				}
+				continue
+			}
+			if truncated > 0 {
+				rows = append(rows, respRow(ts, mode, "argus-engine", respond.Result{Executor: "argus", OK: true, Incident: inc.IncidentID,
+					Detail: fmt.Sprintf("адресов больше max_targets: %d отброшено", truncated)}, r.ID, reason))
+			}
+			for _, ip := range targets {
+				results, applied, err := e.resp.Auto(ctx, ip, inc.IncidentID, reason, ttl)
+				if err != nil {
+					// отказ по allowlist/адресу — не ошибка исполнителя, а решение движка
+					rows = append(rows, respRow(ts, mode, "argus-engine", respond.Result{Executor: "argus", OK: true, IP: ip, Incident: inc.IncidentID, Detail: err.Error()}, r.ID, reason))
+					continue
+				}
+				if mode == respond.ModeIDS {
+					rows = append(rows, respRow(ts, mode, "argus-engine", respond.Result{Executor: "argus", OK: true, IP: ip, Incident: inc.IncidentID, Detail: "режим IDS: автоответ выключен"}, r.ID, reason))
+					continue
+				}
+				for _, res := range results {
+					rows = append(rows, respRow(ts, mode, "argus-engine", res, r.ID, reason))
+				}
+				if applied || mode == respond.ModeSimulate {
+					reserved = false // место потрачено
+				}
+				switch {
+				case applied:
+					e.m.autoBlocks.Add(1)
+					slog.Warn("ips: заблокирован", "ip", ip, "incident", inc.IncidentID, "rule", r.ID)
+				case mode == respond.ModeSimulate:
+					e.m.simulatedBlocks.Add(1)
+				case respond.Noop(results):
+					// уже заблокирован (другим инцидентом или оператором) — делать нечего, не отказ
+					slog.Info("ips: уже заблокирован", "ip", ip, "incident", inc.IncidentID, "rule", r.ID, "detail", results[0].Detail)
+				default:
+					e.m.blockFailures.Add(1)
+					slog.Error("ips: блокировка не выполнена", "ip", ip, "incident", inc.IncidentID, "rule", r.ID)
+				}
+			}
+			if reserved {
+				e.capRelease(inc.IncidentID, now)
 			}
 		}
 	}
@@ -245,4 +360,16 @@ func (e *engine) expireBlocks(ctx context.Context, now time.Time) {
 	if err := e.ch.InsertResponses(ctx, rows); err != nil {
 		slog.Warn("response_log insert", "err", err)
 	}
+}
+
+// respondsAt — у правила есть respond и уровень не ниже его min_level.
+func respondsAt(r *rules.Rule, level string) bool {
+	if r == nil || r.Respond == nil {
+		return false
+	}
+	minLevel := r.Respond.MinLevel
+	if minLevel == "" {
+		minLevel = "high"
+	}
+	return rules.LevelRank(level) >= rules.LevelRank(minLevel)
 }

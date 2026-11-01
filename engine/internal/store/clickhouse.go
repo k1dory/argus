@@ -533,7 +533,7 @@ func (c *ClickHouse) OperatorStates(ctx context.Context, ids []string) (map[stri
 	return res, nil
 }
 
-// restoreGroupKeys — group_key открытых инцидентов (колонка incidents из
+// restoreGroupKeys — group_key и участники (members, 0035) открытых инцидентов (колонки incidents из
 // миграции 0034, в incidents_current её нет). Ошибка ClickHouse, в том числе
 // пришедшая внутри ответа 200 (строкой {"exception":…} у JSONEachRow), возвращается:
 // с пустыми ключами разные группы одного узла слились бы в реестре под
@@ -541,14 +541,21 @@ func (c *ClickHouse) OperatorStates(ctx context.Context, ids []string) (map[stri
 // параметры запроса идут в URL, а у ClickHouse он не длиннее 1 МиБ.
 func (c *ClickHouse) restoreGroupKeys(ctx context.Context, open []incidents.Incident) error {
 	const batch = 5000
-	keys := map[string]string{}
+	type restored struct {
+		groupKey string
+		members  incidents.MemberList
+		dropped  uint32
+	}
+	keys := map[string]restored{}
 	for lo := 0; lo < len(open); lo += batch {
 		hi := min(lo+batch, len(open))
 		ids := make([]string, 0, hi-lo)
 		for i := lo; i < hi; i++ {
 			ids = append(ids, open[i].IncidentID)
 		}
-		out, err := c.do(ctx, `SELECT incident_id, argMax(group_key, (updated_at, event_count, last_ts)) AS group_key
+		out, err := c.do(ctx, `SELECT incident_id, argMax(group_key, (updated_at, event_count, last_ts)) AS group_key,
+		argMax(members, (updated_at, event_count, last_ts)) AS members,
+		argMax(members_dropped, (updated_at, event_count, last_ts)) AS members_dropped
 		FROM incidents WHERE incident_id IN {ids:Array(String)} GROUP BY incident_id FORMAT JSONEachRow`, nil,
 			map[string]string{"ids": chArray(ids)})
 		if err != nil {
@@ -559,19 +566,22 @@ func (c *ClickHouse) restoreGroupKeys(ctx context.Context, open []incidents.Inci
 				continue
 			}
 			var row struct {
-				IncidentID string `json:"incident_id"`
-				GroupKey   string `json:"group_key"`
-				Exception  string `json:"exception"`
+				IncidentID     string               `json:"incident_id"`
+				GroupKey       string               `json:"group_key"`
+				Members        incidents.MemberList `json:"members"`
+				MembersDropped uint32               `json:"members_dropped"`
+				Exception      string               `json:"exception"`
 			}
 			if err := json.Unmarshal(line, &row); err != nil || row.Exception != "" || row.IncidentID == "" {
 				// Без текста строки: это может быть исключение с цитатой данных.
 				return errors.New("restore group_key: неожиданная строка ответа ClickHouse")
 			}
-			keys[row.IncidentID] = row.GroupKey
+			keys[row.IncidentID] = restored{row.GroupKey, row.Members, row.MembersDropped}
 		}
 	}
 	for i := range open {
-		open[i].GroupKey = keys[open[i].IncidentID]
+		k := keys[open[i].IncidentID]
+		open[i].GroupKey, open[i].Members, open[i].MembersDropped = k.groupKey, k.members, k.dropped
 	}
 	return nil
 }

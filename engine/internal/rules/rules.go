@@ -78,9 +78,10 @@ type Rule struct {
 	// AutoCloseAction — что делать по истечении auto_close: close (по
 	// умолчанию) или escalate — тишина не доказывает устранение (утечка
 	// секрета остаётся открытой и уходит дежурному).
-	AutoCloseAction string   `yaml:"auto_close_action"`
-	Respond         *Respond `yaml:"respond"` // автоответ: block_ip по адресу из событий (режим — у движка)
-	File            string   `yaml:"-"`
+	AutoCloseAction string    `yaml:"auto_close_action"`
+	Respond         *Respond  `yaml:"respond"`  // автоответ: block_ip по адресу из событий (режим — у движка)
+	Collapse        *Collapse `yaml:"collapse"` // склейка сработок по подсети источника (collapse.go)
+	File            string    `yaml:"-"`
 
 	selection []matcher
 	filter    []matcher
@@ -323,6 +324,9 @@ func Load(dir string) ([]*Rule, error) {
 		r.File = rel
 		out = append(out, r)
 	}
+	if err := checkCollapseGroups(out); err != nil {
+		return nil, err
+	}
 	return out, nil
 }
 
@@ -423,6 +427,9 @@ func LoadFile(path string) (*Rule, error) {
 	}
 	if len(r.CloseMatch) > 0 && len(r.CloseOn) == 0 {
 		return nil, fmt.Errorf("close_match без close_on")
+	}
+	if err := r.validateCollapse(); err != nil {
+		return nil, err
 	}
 	if r.selection, err = compile(r.Detection.Selection); err != nil {
 		return nil, err
