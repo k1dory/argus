@@ -74,7 +74,8 @@ function fullRoutes(): Route[] {
     { when: (s) => s.includes("LEFT JOIN"), rows: () => [] },
     { when: (s) => s.includes("FROM identity_aliases") && s.includes("WHERE person_id = {id:String}"), rows: () => aliases.filter((a) => a.person_id === "i.petrov") },
     { when: (s) => s.includes("FROM identity_aliases"), rows: () => aliases },
-    { when: (s) => s.includes("countIf(") && s.includes("FROM events"), rows: () => [{ e0: 5, l0: "2026-10-29 09:00:00.000", e1: 0, l1: "1970-01-01 00:00:00.000" }] },
+    // Активность списка: номер персоны в плане (1 — первая персона с алиасами), события, последнее.
+    { when: (s) => s.includes("ARRAY JOIN ps AS p") && s.includes("FROM events"), rows: () => [{ p: 1, events: 5, last_ts: "2026-10-29 09:00:00.000" }] },
     { when: (s) => s.includes("countIf(") && s.includes("FROM incidents_current"), rows: () => [{ i0: 0, i1: 2 }] },
     { when: (s) => s.includes("groupUniqArray"), rows: () => [
       { actor_name: "a.smirnova", count: 40, first_ts: TS, last_ts: TS, sources: ["idp"] },
@@ -139,10 +140,10 @@ test("список: сводка по персонам — события и и�
   assert.match(text, /служебная/);
   assert.match(text, /platform/);
   assert.match(text, /2026-10-29 09:00:00/, "последняя активность i.petrov");
-  const ev = fetched.find((s) => s.includes("countIf(") && s.includes("FROM events"))!;
-  assert.ok(ev.includes("e0") && ev.includes("e1") && !ev.includes("e2"), "svc.backup без алиасов в запрос не попадает");
-  assert.match(ev, /lowerUTF8\(actor_name\) = \{p0_a0:String\}/, "login сравнивается без регистра");
-  assert.ok(!ev.includes("ivan@corp.local"), "удержанный алиас события не сшивает");
+  const evs = fetched.filter((s) => s.includes("FROM events") && s.includes("ARRAY JOIN ps AS p"));
+  assert.equal(evs.length, 1, "события всех персон — одним проходом");
+  assert.match(evs[0], /transform\(lowerUTF8\(actor_name\), \{ap_k1:Array\(String\)\}/, "login сравнивается без регистра");
+  assert.ok(!evs[0].includes("ivan@corp.local"), "значения — параметрами, не в тексте SQL");
   assert.ok(fetched.some((s) => s.includes("FROM events") && s.includes("parseDateTime64BestEffort({from:String}")), "окно периода параметрами");
 });
 

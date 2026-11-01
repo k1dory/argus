@@ -270,6 +270,77 @@ export function aliasPredicate(aliases: Alias[], window: Window, prefix = "", ts
   return { sql: parts.length ? `(${parts.join(" OR ")})` : "0", params };
 }
 
+/** Слоты ключей строки события — по порядку ACTOR_KEYS_EXPR. */
+const KEY_SLOTS = ["actor_name", "lowerUTF8(actor_name)", "src_ip", "lowerUTF8(node)"] as const;
+
+export type ActivityPlan = {
+  /** Персоны с хотя бы одним алиасом в окне — по номеру (1-based) в результате запроса. */
+  persons: string[];
+  /** Выражение: массив номеров персон, которым принадлежит строка (без повторов). */
+  sql: string;
+  params: Record<string, string | number>;
+};
+
+const chIntArray = (values: number[]): string => `[${values.join(",")}]`;
+
+/**
+ * Активность многих персон за один проход по окну — без OR по алиасам. Каждый из
+ * четырёх ключей строки (ACTOR_KEYS_EXPR) ищется хеш-поиском transform в таблице
+ * «значение → группа алиасов»; из найденных алиасов остаются действующие в момент
+ * ts (их интервал внутри окна — как у aliasPredicate), от них — номера персон без
+ * повторов. Строка, совпавшая с двумя алиасами одной персоны, засчитывается ей один
+ * раз; два события в одну мс — два события (как count() паспорта, без хеша).
+ * Сотни веток OR × сотня персон считались на каждой строке и на живом потоке
+ * упирались в таймаут; поиск по ключу от числа алиасов почти не зависит.
+ */
+export function activityPlan(byPerson: { id: string; aliases: Alias[] }[], window: Window, prefix = "ap_"): ActivityPlan {
+  const w = clampWindow(window);
+  const persons: string[] = [];
+  const keyGroups = KEY_SLOTS.map(() => new Map<string, number>());
+  const groups: number[][] = [[]]; // группа 0 — «нет алиасов» (transform по умолчанию)
+  const from: number[] = [], to: number[] = [], owner: number[] = [];
+  for (const { id, aliases } of byPerson) {
+    let personNo = 0;
+    for (const a of aliases) {
+      if (isHeld(a)) continue;
+      const iv = aliasInterval(a, w);
+      if (!iv) continue;
+      if (!personNo) {
+        persons.push(id);
+        personNo = persons.length;
+      }
+      const slot = KEY_SLOTS.indexOf(aliasColumnExpr(a.kind) as (typeof KEY_SLOTS)[number]);
+      if (slot < 0) continue;
+      from.push(iv.fromMs);
+      to.push(iv.toMs);
+      owner.push(personNo);
+      const aliasNo = owner.length;
+      let g = keyGroups[slot].get(a.value);
+      if (g === undefined) {
+        g = groups.length;
+        groups.push([]);
+        keyGroups[slot].set(a.value, g);
+      }
+      groups[g].push(aliasNo);
+    }
+  }
+  const params: Record<string, string | number> = {
+    [`${prefix}ga`]: `[${groups.map(chIntArray).join(",")}]`,
+    [`${prefix}vf`]: chIntArray(from), [`${prefix}vt`]: chIntArray(to), [`${prefix}pi`]: chIntArray(owner),
+  };
+  const lookups = KEY_SLOTS.map((expr, s) => {
+    // Пустое значение — всегда группа 0: transform не принимает пустые массивы.
+    const keys = ["", ...keyGroups[s].keys()];
+    const ids = [0, ...keyGroups[s].values()];
+    params[`${prefix}k${s}`] = chStringArray(keys);
+    params[`${prefix}g${s}`] = chIntArray(ids);
+    return `{${prefix}ga:Array(Array(UInt32))}[transform(${expr}, {${prefix}k${s}:Array(String)}, {${prefix}g${s}:Array(UInt32)}, toUInt32(0)) + 1]`;
+  });
+  const ms = "toUnixTimestamp64Milli(ts)";
+  const sql = `arrayDistinct(arrayMap(i -> {${prefix}pi:Array(UInt32)}[i], arrayFilter(i -> ${ms} >= {${prefix}vf:Array(Int64)}[i] AND ${ms} < {${prefix}vt:Array(Int64)}[i], arrayConcat(${lookups.join(", ")}))))`;
+  return { persons, sql, params };
+}
+
 /** Строка ClickHouse Array(String) для параметра запроса. */
 export const chStringArray = (values: string[]): string =>
   `[${values.map((v) => `'${v.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`).join(",")}]`;
@@ -279,24 +350,45 @@ export const chStringArray = (values: string[]): string =>
  *  совпадать с индексом дословно — иначе ClickHouse индекс не применит. */
 export const ACTOR_KEYS_EXPR = "[actor_name, lowerUTF8(actor_name), src_ip, lowerUTF8(node)]";
 
+/** Больше стольких значений — предфильтр не hasAny, а IN по колонкам (см. aliasPrefilter). */
+export const PREFILTER_INDEX_MAX = 32;
+
 /**
- * Грубый фильтр строк по значениям алиасов без интервалов: hasAny(ключи строки,
- * массив значений). Ставится в WHERE рядом с точным aliasPredicate: bloom-индекс
- * idx_actor_keys отсекает гранулы для любой смеси видов алиасов (login OR ip …),
- * чего OR по отдельным индексам не умеет, и точный предикат с интервалами идёт по
- * тысячам совпавших строк, а не по всему окну (на живом потоке 7 суток — 100+ млн
- * строк). Значения — как их сравнивает aliasPredicate (compareValue), поэтому
- * фильтр не уже точного предиката. Удержанные алиасы не участвуют.
+ * Грубый фильтр строк по значениям алиасов без интервалов. Ставится в WHERE рядом с
+ * точным aliasPredicate, значения — те же, что сравнивает предикат, поэтому фильтр
+ * не уже точного предиката. Удержанные алиасы не участвуют.
+ *
+ * До PREFILTER_INDEX_MAX значений — hasAny(ключи строки, массив значений): bloom-индекс
+ * idx_actor_keys отсекает гранулы для любой смеси видов алиасов (login OR ip …), чего
+ * OR по отдельным индексам не умеет; паспорт одного человека идёт по тысячам строк, а
+ * не по всему окну (100+ млн строк за 7 суток).
+ *
+ * Больше — IN по колонке каждого вида (actor_name, lowerUTF8(actor_name), src_ip,
+ * lowerUTF8(node)): множество из констант — хеш-поиск. hasAny сравнивает каждую строку
+ * с каждым значением, а отсечения у bloom_filter(0.01) при n значениях почти нет
+ * (группа гранул «может содержать» с вероятностью 1 − 0,99ⁿ): на argus1 список
+ * «Субъекты» с 374 значениями шёл по hasAny 60+ с, по IN — 2 с на 180 млн строк.
  */
 export function aliasPrefilter(aliases: Alias[], prefix = "pf_"): Predicate {
-  const values = new Set<string>();
-  for (const a of aliases) {
-    if (isHeld(a)) continue;
-    values.add(compareValue(a));
-  }
+  const live = aliases.filter((a) => !isHeld(a));
+  const values = new Set(live.map(compareValue));
   if (!values.size) return { sql: "0", params: {} };
-  const name = `${prefix}keys`;
-  return { sql: `hasAny(${ACTOR_KEYS_EXPR}, {${name}:Array(String)})`, params: { [name]: chStringArray([...values].sort()) } };
+  if (values.size <= PREFILTER_INDEX_MAX) {
+    const name = `${prefix}keys`;
+    return { sql: `hasAny(${ACTOR_KEYS_EXPR}, {${name}:Array(String)})`, params: { [name]: chStringArray([...values].sort()) } };
+  }
+  const bySlot = new Map<string, Set<string>>();
+  for (const a of live) {
+    const expr = aliasColumnExpr(a.kind);
+    bySlot.set(expr, (bySlot.get(expr) ?? new Set()).add(a.value));
+  }
+  const params: Record<string, string> = {};
+  const parts = [...bySlot].sort(([x], [y]) => x.localeCompare(y)).map(([expr, vals], i) => {
+    const name = `${prefix}in${i}`;
+    params[name] = chStringArray([...vals].sort());
+    return `${expr} IN {${name}:Array(String)}`;
+  });
+  return { sql: `(${parts.join(" OR ")})`, params };
 }
 
 /** Действует ли алиас в момент at. */
