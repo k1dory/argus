@@ -48,7 +48,10 @@ test("actorReport: редкий login/email с IP-алиасом сохраня�
     url.searchParams.set("database", database);
     return nativeFetch(url, init);
   });
-  const window = { fromMs: Date.now() - 48 * 3600_000, toMs: 0 };
+  // Середина прошлого месяца: окно и INSERT целиком в одной партиции toYYYYMM(ts),
+  // в какой бы момент ни запускался тест (now − 48h на границе месяца давало две).
+  const today = new Date(Date.now());
+  const window = { fromMs: Date.UTC(today.getUTCFullYear(), today.getUTCMonth() - 1, 15, 12), toMs: 0 };
   window.toMs = window.fromMs + 66_000;
   const params = { source, login, email, ip, from: chTs(window.fromMs), to: chTs(window.toMs) };
   const person: Person = { person_id: "cost-fixture", display: "Cost fixture", kind: "person", team: "test", note: "" };
@@ -65,12 +68,17 @@ test("actorReport: редкий login/email с IP-алиасом сохраня�
   // фильтр раздела не может выдать отсечение за поиск редкого алиаса.
   // Окно охватывает весь INSERT, так что первичный ключ по ts тоже не помогает.
   try {
-    // Все миграции по порядку, как migrate.sh, но в отдельной базе.
-    await ch().chCommand(`CREATE DATABASE ${db}`);
+    // Все миграции по порядку, как migrate.sh, но в отдельной базе. Флаг — до
+    // CREATE: ответ может потеряться после того, как сервер базу уже создал.
     created = true;
+    await ch().chCommand(`CREATE DATABASE ${db}`);
     database = db;
     for (const file of readdirSync(MIGRATIONS_DIR).filter((f) => f.endsWith(".sql")).sort()) {
-      for (const sql of migrationStatements(file)) await ch().chCommand(sql.replaceAll("argus.", `${db}.`));
+      for (const sql of migrationStatements(file)) {
+        // CREATE DATABASE argus из 0001 создал бы на чистом сервере общую базу.
+        if (/^CREATE DATABASE\b/i.test(sql)) continue;
+        await ch().chCommand(sql.replaceAll("argus.", `${db}.`));
+      }
     }
     await ch().chCommand(`INSERT INTO events (ts, source, source_class, actor_name, actor_kind, src_ip, node, action, outcome, attrs)
     SELECT parseDateTime64BestEffort({from:String}, 3, 'UTC') + toIntervalMillisecond(number),
@@ -173,6 +181,6 @@ test("actorReport: редкий login/email с IP-алиасом сохраня�
     });
   } finally {
     database = "default";
-    if (created) await ch().chCommand(`DROP DATABASE ${db} SYNC`);
+    if (created) await ch().chCommand(`DROP DATABASE IF EXISTS ${db} SYNC`);
   }
 });
