@@ -1050,7 +1050,7 @@ export async function requestUnblockIp(ip: string, user: string, reason: string)
 }
 
 export { blockCandidates, publicIpsFromChain } from "./shared/respond";
-import { blockCandidates as blockCandidatesRaw, isOpsIncident } from "./shared/respond";
+import { blockCandidatesForIncident } from "./shared/respond";
 
 /** Свои сети из INTERNAL_NETS (те же, что у коллектора для attrs.scope и у движка в allowlist). */
 export function ownNets(): string[] {
@@ -1060,8 +1060,7 @@ export function ownNets(): string[] {
 /** Кандидаты на блокировку с учётом собственных сетей инсталляции. */
 export function blockCandidatesFor(inc: { actor_name: string; chain: string[]; tags?: string[] }): string[] {
   // Инцидент эксплуатации — не повод блокировать: кнопок нет, и blockIpAction их не примет.
-  if (isOpsIncident(inc.tags)) return [];
-  return blockCandidatesRaw(inc.actor_name, inc.chain, ownNets());
+  return blockCandidatesForIncident(inc, ownNets());
 }
 
 /* ===== Реагирование: режим IPS/IDS и журнал ответов ===== */

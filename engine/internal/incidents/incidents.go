@@ -186,6 +186,21 @@ func (inc *Incident) regKey() string {
 	return k
 }
 
+// widenedGroup — открытый инцидент того же правила, субъекта и узла, чей group_key —
+// начало составного key по границе «|» (ключ до того, как в group_by добавили поля
+// в конец). Длинные префиксы — первыми. base — «правило|субъект|узел».
+func (r *Registry) widenedGroup(base, key string) (*Incident, string) {
+	parts := strings.Split(key, "|")
+	for k := len(parts) - 1; k >= 1; k-- {
+		old := strings.Join(parts[:k], "|")
+		lk := base + "|" + old
+		if ex, ok := r.open[lk]; ok && ex.GroupKey == old && !isFinal(ex.Status) {
+			return ex, lk
+		}
+	}
+	return nil, ""
+}
+
 // Apply возвращает инциденты, которые надо записать (новые или обновлённые),
 // и сколько новых не завёл сверх предела SetMaxNew — по правилам.
 func (r *Registry) Apply(dets []eval.Detection, now time.Time) (created, updated []*Incident, dropped map[string]int) {
@@ -201,6 +216,14 @@ func (r *Registry) Apply(dets []eval.Detection, now time.Time) (created, updated
 			legacy := d.Rule.ID + "|" + inc.ActorName + "|" + inc.Node
 			if ex, ok := r.open[legacy]; ok && ex.GroupKey == "" {
 				delete(r.open, legacy)
+				ex.GroupKey = inc.GroupKey
+				r.open[key] = ex
+				ex.groupPending = true
+			} else if ex, lk := r.widenedGroup(legacy, inc.GroupKey); ex != nil {
+				// group_by правила дополнили полями (attrs.peer → attrs.peer, attrs.source):
+				// открытый инцидент со старым ключом-префиксом забирает первая группа
+				// нового ключа — без второго инцидента и с решениями оператора.
+				delete(r.open, lk)
 				ex.GroupKey = inc.GroupKey
 				r.open[key] = ex
 				ex.groupPending = true

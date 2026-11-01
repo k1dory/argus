@@ -89,7 +89,9 @@ function stripNodeColumn(line: string): string {
  *  блокировать их нечего (устройство с убежавшими часами блокировать нельзя). */
 export function isOpsIncident(tags: readonly string[] | undefined): boolean {
   if (!tags?.length) return false;
-  return tags.some((t) => t.startsWith("ops.")) && !tags.some((t) => t.startsWith("attack."));
+  // Теги — как их читают ruleTactics/ruleTechniques: без учёта регистра и пробелов по краям.
+  const norm = tags.map((t) => t.trim().toLowerCase());
+  return norm.some((t) => t.startsWith("ops.")) && !norm.some((t) => t.startsWith("attack."));
 }
 
 /** Кандидаты на блокировку из карточки инцидента.
@@ -104,4 +106,12 @@ export function blockCandidates(actor: string, chain: string[], ownNets: readonl
   const a = actor.trim();
   if (IPV4_EXACT_RE.test(a) && !own(a)) return [a];
   return publicIpsFromChain(chain.map(stripNodeColumn)).filter((ip) => !own(ip));
+}
+
+/** Кандидаты на блокировку для инцидента: у инцидентов эксплуатации их нет, иначе —
+ *  blockCandidates по субъекту и цепочке. Карточка и серверная проверка blockIpAction —
+ *  через blockCandidatesFor (argus-queries), он подставляет ownNets из INTERNAL_NETS. */
+export function blockCandidatesForIncident(inc: { actor_name: string; chain: string[]; tags?: string[] }, ownNets: readonly string[] = []): string[] {
+  if (isOpsIncident(inc.tags)) return [];
+  return blockCandidates(inc.actor_name, inc.chain, ownNets);
 }

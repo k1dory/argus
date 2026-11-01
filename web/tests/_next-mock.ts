@@ -7,7 +7,7 @@ import Module from "node:module";
 import path from "node:path";
 import os from "node:os";
 import fs from "node:fs";
-import { blockCandidates, RESPOND_MODES } from "../src/lib/shared/respond";
+import { blockCandidatesForIncident, RESPOND_MODES } from "../src/lib/shared/respond";
 import { ResponseCookies } from "next/dist/compiled/@edge-runtime/cookies";
 
 export type AuditEntry = { user: string; action: string; target: string; detail: string };
@@ -132,7 +132,7 @@ export function installNextMocks(): Mocks {
     },
     incidentGet: async () => null,
     requestBlockIp: async () => ({ error: "движок недоступен" }),
-    blockCandidatesFor: (inc) => blockCandidates(inc.actor_name, inc.chain),
+    blockCandidatesFor: (inc) => blockCandidatesForIncident(inc),
     requestUnblockIp: async () => ({ error: "движок недоступен" }),
     requestReanalyze: async () => "движок недоступен",
     addException: async () => undefined,

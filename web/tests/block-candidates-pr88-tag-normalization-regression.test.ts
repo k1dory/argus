@@ -5,11 +5,15 @@ import fs from "node:fs";
 import path from "node:path";
 import { formData, installNextMocks, loadAuth } from "./_next-mock";
 import { ruleTactics, ruleTechniques } from "../src/lib/shared/attack";
+import { blockCandidatesForIncident } from "../src/lib/shared/respond";
 
 // _next-mock's default blockCandidatesFor delegates directly to the old raw
-// IP extractor. Keep the production helper so the new ops gate is exercised
-// both as the card uses it and through the real server action.
-const { blockCandidatesFor } = require("../src/lib/argus-queries") as typeof import("../src/lib/argus-queries");
+// IP extractor. Use the production helper (shared/respond: the same function
+// argus-queries.blockCandidatesFor calls, INTERNAL_NETS is empty here) so the
+// ops gate is exercised both as the card uses it and through the real server
+// action. Loading the real argus-queries here would leave it in tsx's ESM cache
+// and hand incident-actions the real incidentGet instead of the mock.
+const blockCandidatesFor = (inc: { actor_name: string; chain: string[]; tags?: string[] }) => blockCandidatesForIncident(inc, []);
 const mocks = installNextMocks();
 mocks.queries.blockCandidatesFor = blockCandidatesFor;
 const auth = loadAuth();
