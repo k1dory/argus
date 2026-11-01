@@ -109,17 +109,20 @@ func TestPoisonManyAndNoRejectsTable(t *testing.T) {
 		}
 	}
 	w.Write(context.Background(), batch)
-	// ядовитые строки в обеих половинах — потолок бисекции: батч целиком в rejects
-	if m.rows() != 0 || st.DeadLetter.Load() != 100 {
+	// бисекция до строк: 15 ядовитых (каждая 7-я) отвергнуты, 85 корректных вставлены;
+	// таблицы отказов нет — ядовитые строки (в очереди в памяти) отбрасываются.
+	if m.rows() != 85 || st.DeadLetter.Load() != 15 {
 		t.Fatalf("rows=%d dead=%d", m.rows(), st.DeadLetter.Load())
 	}
-	if st.RejectsFailed.Load() != 100 || m.rejectCalls != 1 {
+	// отказы копятся и пишутся одним INSERT на батч
+	if st.RejectsFailed.Load() != 15 || m.rejectCalls != 1 {
 		t.Errorf("RejectsFailed=%d rejectCalls=%d", st.RejectsFailed.Load(), m.rejectCalls)
 	}
 }
 
-// Потолок бисекции: 8 ядовитых строк — полный батч, две половины, и всё; в
-// ingest_rejects один batched INSERT на 8 строк, а не 8 отдельных.
+// Бисекция до строк и при ядовитых данных во всех строках: 8 строк — батч, 2, 4, 8
+// частей (15 вставок), отказы — одним INSERT на 8 строк. Это цена того, что ядовитая
+// строка не уносит корректных соседей (ревью codex #43).
 func TestBisectCapBothHalvesRejected(t *testing.T) {
 	m := &mockCH{}
 	w, st := newTestWriter(m)
@@ -128,8 +131,8 @@ func TestBisectCapBothHalvesRejected(t *testing.T) {
 		batch = append(batch, ev("poison"))
 	}
 	w.Write(context.Background(), batch)
-	if m.calls != 3 {
-		t.Errorf("InsertEvents вызван %d раз, want 3 (батч + две половины)", m.calls)
+	if m.calls != 15 {
+		t.Errorf("InsertEvents вызван %d раз, want 15 (1+2+4+8)", m.calls)
 	}
 	if m.rejectCalls != 1 || len(m.rejects) != 8 || st.DeadLetter.Load() != 8 {
 		t.Errorf("rejectCalls=%d rejects=%d dead=%d", m.rejectCalls, len(m.rejects), st.DeadLetter.Load())
@@ -347,5 +350,38 @@ func TestParseErrorAndIsPermanent(t *testing.T) {
 	}
 	if !IsUnknownTable(parseError("ingest_rejects", 404, "60", "")) {
 		t.Error("code 60 — unknown table")
+	}
+}
+
+// Шторм ядовитых строк: бисекция ограничена bisectBudget вставками событий, отказы —
+// одним INSERT; ни одна строка не теряется молча.
+func TestBisectBudgetBoundsPoisonStorm(t *testing.T) {
+	m := &mockCH{}
+	w, st := newTestWriter(m)
+	batch := make([]any, 0, 500)
+	for i := 0; i < 500; i++ {
+		batch = append(batch, ev("poison"))
+	}
+	// Один WriteBatch: не больше Attempts целых вставок плюс общий бюджет бисекции;
+	// в отказы — только строки, отвергнутые поодиночке, одним INSERT; непроверенный
+	// остаток возвращён в очередь, а не в ingest_rejects.
+	w.Write(context.Background(), batch)
+	if limit := w.Attempts + bisectBudget; m.calls > limit {
+		t.Errorf("InsertEvents вызван %d раз, потолок %d", m.calls, limit)
+	}
+	first := len(m.rejects)
+	if m.rejectCalls != 1 || first == 0 || first >= 500 || st.DeadLetter.Load() != uint64(first) {
+		t.Errorf("rejectCalls=%d rejects=%d dead=%d", m.rejectCalls, first, st.DeadLetter.Load())
+	}
+	if got := w.Queue.Rows(); got != 500-first {
+		t.Errorf("в очереди %d строк, ждали %d", got, 500-first)
+	}
+	// Следующие проходы дорешивают остаток: в итоге все 500 — отказы, ни одна не потеряна.
+	w.Queue.Close()
+	for b, ok := w.Queue.Pop(); ok; b, ok = w.Queue.Pop() {
+		w.WriteBatch(context.Background(), b)
+	}
+	if len(m.rejects) != 500 || st.Inserted.Load() != 0 {
+		t.Errorf("rejects=%d inserted=%d", len(m.rejects), st.Inserted.Load())
 	}
 }
