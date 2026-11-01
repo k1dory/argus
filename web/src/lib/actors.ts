@@ -146,6 +146,9 @@ export async function listPersons(range: ActorRange | Window, now = Date.now()):
       chunk = []; cols = []; incParams = {}; sqlBytes = 0;
       pi = aliasPredicate(own, w, "p0_", "first_ts");
     }
+    // aliasPredicate для многих алиасов компактен (массивы параметрами), так что одна
+    // персона длиннее партии — ошибка построения, а не повод отправить слишком большое поле.
+    if (pi.sql.length > INCIDENT_SQL_MAX) throw new Error(`listPersons: SQL инцидентов персоны ${p.person_id} — ${pi.sql.length} байт, больше ${INCIDENT_SQL_MAX}`);
     if (!chunk.length) Object.assign(incParams, { from: chTs(w.fromMs), to: chTs(w.toMs) });
     Object.assign(incParams, pi.params);
     cols.push(`countIf(${pi.sql}) AS i${chunk.length}`);

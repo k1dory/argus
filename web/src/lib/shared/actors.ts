@@ -251,15 +251,39 @@ export function aliasInterval(a: Pick<Alias, "valid_from" | "valid_to">, w: Wind
  * prefix — чтобы два предиката в одном запросе не делили имена параметров;
  * tsColumn — колонка времени (first_ts для инцидентов).
  */
-export function aliasPredicate(aliases: Alias[], window: Window, prefix = "", tsColumn = "ts"): Predicate {
+/** Алиасов в предикате больше стольких — компактная форма (aliasPredicate). */
+export const PREDICATE_OR_MAX = 64;
+
+export function aliasPredicate(aliases: Alias[], window: Window, prefix = "", tsColumn = "ts", form: "auto" | "or" | "arrays" = "auto"): Predicate {
   const w = clampWindow(window);
   const params: Record<string, string | number> = {};
+  const live = aliases.flatMap((a) => {
+    if (isHeld(a)) return []; // удержанный алиас не сшивает события
+    const iv = aliasInterval(a, w);
+    return iv ? [{ a, iv }] : [];
+  });
+  if (form === "arrays" || (form === "auto" && live.length > PREDICATE_OR_MAX)) {
+    // Компактная форма: по колонке сравнения — массивы значений и интервалов параметрами
+    // (arrayParam делит их на части), текст SQL не растёт с числом алиасов. Ветки OR
+    // позволяют индексу отсекать гранулы, но строки и так отбирает aliasPrefilter, а
+    // тысяча веток делала SQL одной персоны длиннее поля формы ClickHouse (128 КиБ).
+    const byColumn = new Map<string, { v: string[]; f: string[]; t: string[] }>();
+    for (const { a, iv } of live) {
+      const col = aliasColumnExpr(a.kind);
+      const g = byColumn.get(col) ?? { v: [], f: [], t: [] };
+      byColumn.set(col, g);
+      g.v.push(chStringLiteral(a.value));
+      g.f.push(String(iv.fromMs));
+      g.t.push(String(iv.toMs));
+    }
+    const ms = `toUnixTimestamp64Milli(${tsColumn})`;
+    const parts = [...byColumn].map(([col, g], j) =>
+      `arrayExists((v, f, t) -> ${col} = v AND ${ms} >= f AND ${ms} < t, ${arrayParam(params, `${prefix}cv${j}`, "Array(String)", g.v)}, ${arrayParam(params, `${prefix}cf${j}`, "Array(Int64)", g.f)}, ${arrayParam(params, `${prefix}ct${j}`, "Array(Int64)", g.t)})`);
+    return { sql: parts.length ? `(${parts.join(" OR ")})` : "0", params };
+  }
   const parts: string[] = [];
   let i = 0;
-  for (const a of aliases) {
-    if (isHeld(a)) continue; // удержанный алиас не сшивает события
-    const iv = aliasInterval(a, w);
-    if (!iv) continue;
+  for (const { a, iv } of live) {
     const an = `${prefix}a${i}`, fn = `${prefix}f${i}`, tn = `${prefix}t${i}`;
     params[an] = a.value;
     params[fn] = chTs(iv.fromMs);
@@ -285,9 +309,11 @@ export type ActivityPlan = {
   params: Record<string, string | number>;
 };
 
-/** Часть массива-параметра не больше стольких байт UTF-8: длинный параметр уходит телом
- *  multipart (clickhouse.ts), а у поля формы есть предел значения (Poco HTMLForm,
- *  http_max_field_value_size — 128 КиБ на 24.8, в байтах; из URL не поднимается). */
+/** Часть массива-параметра не больше стольких байт в виде, в каком она уходит в URL
+ *  (application/x-www-form-urlencoded, как сериализует URLSearchParams), — значит, и в
+ *  сыром UTF-8 не больше. У поля формы ClickHouse предел значения (Poco HTMLForm,
+ *  http_max_field_value_size — 128 КиБ на 24.8; из URL не поднимается), и в URL он
+ *  меряется до percent-decoding: часть годится и для URL, и для multipart (clickhouse.ts). */
 export const ARRAY_PARAM_CHUNK = 60_000;
 
 /** Длина строки в байтах UTF-8 (без Buffer: модуль общий с клиентом). */
@@ -303,9 +329,24 @@ export function utf8Bytes(s: string): number {
   return n;
 }
 
+/** Длина строки после сериализации URLSearchParams: буквы, цифры и «*-._» как есть,
+ *  пробел — «+», остальное — %XX на каждый байт UTF-8 (в том числе «~», «'», «,»). */
+export function formEncodedBytes(s: string): number {
+  let n = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if ((c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || c === 0x2a || c === 0x2d || c === 0x2e || c === 0x5f || c === 0x20) n += 1;
+    else if (c < 0x80) n += 3;
+    else if (c < 0x800) n += 6;
+    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length) { n += 12; i++; }
+    else n += 9;
+  }
+  return n;
+}
+
 /**
  * Массив-параметр из готовых литералов элементов: одним параметром {name:Type}, а если
- * длиннее ARRAY_PARAM_CHUNK байт — частями name_0, name_1… и arrayConcat в SQL. Делится
+ * в URL он длиннее ARRAY_PARAM_CHUNK байт (formEncodedBytes) — частями name_0, name_1… и arrayConcat в SQL. Делится
  * только между элементами, поэтому элементы — скаляры (вложенные массивы не годятся:
  * один элемент мог бы сам превысить предел поля). Склейка констант — константа: её
  * принимают transform и IN.
@@ -314,7 +355,7 @@ export function arrayParam(params: Record<string, string | number>, name: string
   const chunks: string[][] = [[]];
   let len = 0;
   for (const el of elements) {
-    const bytes = utf8Bytes(el) + 1;
+    const bytes = formEncodedBytes(el) + 3; // «,» — %2C
     if (len + bytes > ARRAY_PARAM_CHUNK && chunks[chunks.length - 1].length) {
       chunks.push([]);
       len = 0;
