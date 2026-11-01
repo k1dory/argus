@@ -176,3 +176,20 @@ func TestFromEnvOffByDefault(t *testing.T) {
 		t.Fatalf("Laya: %+v", laya)
 	}
 }
+
+// Вопрос, прочитанный обратно из JSON (датасет), даёт те же варианты.
+func TestOptionsAfterJSONRoundTrip(t *testing.T) {
+	for _, q := range []Question{
+		{Type: Choice, Criteria: map[string]string{"a": "A", "b": "B"}},
+		{Type: Score, Criteria: []string{"low", "mid", "high"}},
+	} {
+		raw, _ := json.Marshal(q)
+		var back Question
+		if err := json.Unmarshal(raw, &back); err != nil {
+			t.Fatal(err)
+		}
+		if len(back.Options()) != len(q.Options()) || len(q.Options()) == 0 {
+			t.Fatalf("%s: %v против %v", q.Type, back.Options(), q.Options())
+		}
+	}
+}

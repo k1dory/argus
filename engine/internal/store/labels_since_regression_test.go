@@ -33,6 +33,7 @@ func TestPR64LabeledIncidentsSinceKeepsSubmillisecondBoundary(t *testing.T) {
 		{"0014_incident_state_events.sql", []string{"CREATE TABLE IF NOT EXISTS argus.incident_state_events", "CREATE VIEW IF NOT EXISTS argus.incidents_current"}},
 		{"0016_incident_closure_reason.sql", []string{"ALTER TABLE argus.incident_state_events "}},
 		{"0033_incident_labels.sql", []string{"ALTER TABLE argus.incident_state_events\n"}},
+		{"0036_incident_label_plan.sql", []string{"ALTER TABLE argus.incident_state_events\n"}},
 	} {
 		path := filepath.Join("..", "..", "..", "clickhouse", "migrations", migration.file)
 		matched := 0

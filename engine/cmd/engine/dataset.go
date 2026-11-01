@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -80,13 +82,13 @@ func exportDataset(ctx context.Context, src labeledSource, w io.Writer, o datase
 			}
 			cctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 			defer cancel()
-			resp, err := c.Decide(cctx, r.State, r.Questions)
+			ma, err := askModel(cctx, c, r)
 			if err != nil {
 				st.ModelErrors++
 				r.Models[c.Name] = dataset.ModelAnswers{Model: c.Model, Error: err.Error()}
 				return
 			}
-			r.Models[c.Name] = dataset.ModelAnswers{Model: orDefault(resp.Model, c.Model), Answers: resp.Answers}
+			r.Models[c.Name] = ma
 		}
 		ask(laya)
 		ask(jev)
@@ -96,6 +98,49 @@ func exportDataset(ctx context.Context, src labeledSource, w io.Writer, o datase
 		st.Written++
 	}
 	return st, bw.Flush()
+}
+
+// askModel задаёт модели вопросы записи. Техника ATT&CK — вторым шагом
+// (DECISIONS §8): кандидаты строятся по тактике, которую ответила модель, а не
+// человек — иначе ответ человека попал бы в вопрос.
+func askModel(ctx context.Context, c *systemone.Client, r *dataset.Record) (dataset.ModelAnswers, error) {
+	first := r.Questions
+	_, twoStep := first["attack_technique"]
+	if twoStep {
+		first = maps.Clone(first)
+		delete(first, "attack_technique")
+	}
+	resp, err := c.Decide(ctx, r.State, first)
+	if err != nil {
+		return dataset.ModelAnswers{}, err
+	}
+	ma := dataset.ModelAnswers{Model: orDefault(resp.Model, c.Model), Answers: resp.Answers}
+	if !twoStep {
+		return ma, nil
+	}
+	tq := dataset.TechniqueQuestion(r.Tags, choiceOf(resp.Answers["attack_tactic"]))
+	resp2, err := c.Decide(ctx, r.State, map[string]systemone.Question{"attack_technique": tq})
+	if err != nil {
+		return dataset.ModelAnswers{}, fmt.Errorf("attack_technique: %w", err)
+	}
+	ma.Answers = maps.Clone(ma.Answers)
+	ma.Answers["attack_technique"] = resp2.Answers["attack_technique"]
+	ma.Questions = map[string]systemone.Question{"attack_technique": tq}
+	return ma, nil
+}
+
+// choiceOf — выбранный вариант: choice, а без него — наибольшая вероятность.
+func choiceOf(a systemone.Answer) string {
+	if a.Choice != "" {
+		return a.Choice
+	}
+	best, bp := "", -1.0
+	for _, k := range slices.Sorted(maps.Keys(a.Probabilities)) {
+		if a.Probabilities[k] > bp {
+			best, bp = k, a.Probabilities[k]
+		}
+	}
+	return best
 }
 
 const datasetUsage = `engine dataset export [--since 2026-11-01] [--limit 50000] [--max-per-rule 100] [--source prod] [--models laya,jev] [--out file.jsonl]

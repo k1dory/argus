@@ -39,10 +39,12 @@ func (c *ClickHouse) LabeledIncidents(ctx context.Context, since string, limit i
 	// since сравнивается с точностью до наносекунд: при точности 3 граница
 	// .1231 округлялась бы до .123 и выдавала метку раньше неё.
 	out, err := c.do(ctx, `SELECT incident_id, toString(ts) AS changed_at, disposition, escalate,
-	       severity_correct, ops_cause, ops_action, blind, labeled_by_human
+	       severity_level, severity_correct, attack_tactic, attack_technique, attack_version,
+	       ops_cause, ops_act_now, ops_urgency, ops_action, blind, labeled_by_human
 	FROM (
-		SELECT incident_id, changed_at AS ts, disposition, escalate, severity_correct,
-		       ops_cause, ops_action, blind, labeled_by_human
+		SELECT incident_id, changed_at AS ts, disposition, escalate, severity_level, severity_correct,
+		       attack_tactic, attack_technique, attack_version, ops_cause, ops_act_now, ops_urgency,
+		       ops_action, blind, labeled_by_human
 		FROM (
 			SELECT * FROM incident_state_events
 			WHERE status IN ('closed', 'false_positive')

@@ -2,9 +2,11 @@ package dataset
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
+	"github.com/devitex-soft/argus/engine/internal/attack"
 	"github.com/devitex-soft/argus/engine/internal/incidents"
 	"github.com/devitex-soft/argus/engine/internal/store"
 	"github.com/devitex-soft/argus/engine/internal/systemone"
@@ -31,9 +33,12 @@ func human(inc incidents.Incident, l store.ClosureLabel) store.LabeledIncident {
 	return store.LabeledIncident{Incident: inc, Label: l, ChangedAt: "2026-11-01 10:00:00.000"}
 }
 
+func u8(v uint8) *uint8 { return &v }
+
 func TestBuildSecurityRecord(t *testing.T) {
 	r := Build(human(secIncident("INC-1", "ivan.petrov"), store.ClosureLabel{
-		Disposition: "benign_authorized", Escalate: bp(false), SeverityCorrect: bp(true), Blind: true,
+		Disposition: "benign_authorized", Escalate: bp(false), SeverityLevel: u8(2), SeverityCorrect: bp(false),
+		AttackTactic: "credential-access", AttackTechnique: "T1110.001", AttackVersion: "20.0", Blind: true,
 	}), "prod")
 	if r == nil {
 		t.Fatal("запись не построена")
@@ -41,17 +46,26 @@ func TestBuildSecurityRecord(t *testing.T) {
 	if r.Schema != Schema || r.Scenario != Security || !r.Blind || r.Source != "prod" {
 		t.Fatalf("поля: %+v", r)
 	}
-	want := map[string]string{"disposition": "benign_authorized", "escalate": "false", "severity_correct": "true"}
+	want := map[string]string{"disposition": "benign_authorized", "escalate": "false", "severity_level": "1",
+		"attack_tactic": "credential-access", "attack_technique": "T1110.001"}
+	if len(r.Labels) != len(want) {
+		t.Fatalf("метки: %+v", r.Labels)
+	}
 	for k, v := range want {
 		if r.Labels[k] != v {
 			t.Fatalf("метка %s = %q, ждали %q", k, r.Labels[k], v)
 		}
 	}
-	if _, ok := r.Labels["tactic"]; ok {
-		t.Fatal("у тактики метки человека нет")
-	}
-	if len(r.Questions) != 4 || r.Questions["disposition"].Type != systemone.Choice || r.Questions["escalate"].Type != systemone.Noul {
+	if len(r.Questions) != 5 || r.Questions["disposition"].Type != systemone.Choice || r.Questions["escalate"].Type != systemone.Noul ||
+		r.Questions["severity_level"].Type != systemone.Score || len(r.Questions["severity_level"].Options()) != 4 {
 		t.Fatalf("вопросы: %+v", r.Questions)
+	}
+	tech := r.Questions["attack_technique"].Criteria.(map[string]string)
+	if _, ok := tech["T1110.001"]; !ok || len(tech) > 21 {
+		t.Fatalf("кандидаты техники: %v", tech)
+	}
+	if _, ok := tech[AttackOther]; !ok {
+		t.Fatal("в кандидатах нет «другого»")
 	}
 	// Состояние: ни ответа человека, ни ПДн.
 	for _, leak := range []string{"INC-1", "пентест", "ivan", "db-prod-01", "192.168.0.44", "912 345", "closed", "corp.local"} {
@@ -64,6 +78,38 @@ func TestBuildSecurityRecord(t *testing.T) {
 		!strings.Contains(r.State, "1 lines omitted") {
 		t.Fatalf("состояние без правила или сети:\n%s", r.State)
 	}
+}
+
+// Кандидаты в записи — по тактике человека (как в форме); без неё — по
+// тактике из тегов правила. Метка другой версии справочника не берётся.
+func TestBuildTechniqueCandidatesFollowTactic(t *testing.T) {
+	inc := secIncident("INC-8", "1.2.3.4")
+	byHuman := Build(human(inc, store.ClosureLabel{Disposition: "malicious", Escalate: bp(true), SeverityLevel: u8(4),
+		AttackTactic: "initial-access", AttackTechnique: "T1078"}), "prod")
+	byTags := Build(human(inc, store.ClosureLabel{Disposition: "false_positive", Escalate: bp(false), SeverityLevel: u8(1)}), "prod")
+	if !slices.Equal(sorted(byHuman.Questions["attack_technique"].Options()), optionsOf(attack.Candidates(inc.Tags, "initial-access"))) {
+		t.Fatalf("по тактике человека: %v", byHuman.Questions["attack_technique"].Options())
+	}
+	if !slices.Equal(sorted(byTags.Questions["attack_technique"].Options()), optionsOf(attack.Candidates(inc.Tags, "credential-access"))) {
+		t.Fatalf("по тактике тегов: %v", byTags.Questions["attack_technique"].Options())
+	}
+	if _, ok := byTags.Labels["attack_tactic"]; ok {
+		t.Fatal("у ложного срабатывания без тактики нет метки тактики")
+	}
+	old := Build(human(inc, store.ClosureLabel{Disposition: "malicious", Escalate: bp(true), SeverityLevel: u8(3),
+		AttackTactic: "defense-evasion", AttackTechnique: "T1070", AttackVersion: "19.0"}), "prod")
+	if _, ok := old.Labels["attack_tactic"]; ok || old.Labels["disposition"] != "malicious" {
+		t.Fatalf("метка ATT&CK другой версии справочника: %+v", old.Labels)
+	}
+}
+
+func sorted(v []string) []string { slices.Sort(v); return v }
+
+// optionsOf — варианты choice в отсортированном виде (порядок map не задан).
+func optionsOf(ids []string) []string {
+	out := append(slices.Clone(ids), AttackOther)
+	slices.Sort(out)
+	return out
 }
 
 func TestBuildSkipsAutomationAndEmpty(t *testing.T) {
@@ -80,11 +126,17 @@ func TestBuildSkipsAutomationAndEmpty(t *testing.T) {
 func TestBuildOpsRecord(t *testing.T) {
 	inc := secIncident("INC-4", "")
 	inc.RuleID, inc.Tags = "ops-disk-high", []string{"ops.disk"}
-	r := Build(human(inc, store.ClosureLabel{OpsCause: "planned_work", OpsAction: "no_action"}), "prod")
-	if r == nil || r.Scenario != Ops || r.Labels["ops_cause"] != "planned_work" || r.Labels["ops_action"] != "no_action" || len(r.Labels) != 2 {
+	r := Build(human(inc, store.ClosureLabel{OpsCause: "disk", OpsActNow: bp(true), OpsUrgency: u8(3), OpsAction: "fixed"}), "prod")
+	want := map[string]string{"ops_cause": "disk", "ops_act_now": "true", "ops_urgency": "2"}
+	if r == nil || r.Scenario != Ops || len(r.Labels) != len(want) {
 		t.Fatalf("ops: %+v", r)
 	}
-	if _, ok := r.Questions["disposition"]; ok || len(r.Questions) != 2 {
+	for k, v := range want {
+		if r.Labels[k] != v {
+			t.Fatalf("метка %s = %q, ждали %q", k, r.Labels[k], v)
+		}
+	}
+	if _, ok := r.Questions["disposition"]; ok || len(r.Questions) != 3 || r.Questions["ops_urgency"].Type != systemone.Score {
 		t.Fatalf("вопросы ops: %+v", r.Questions)
 	}
 }
@@ -94,20 +146,32 @@ func TestQuestionOptionsMatchClosureForm(t *testing.T) {
 	check := func(q systemone.Question, want []string) {
 		t.Helper()
 		got := q.Options()
-		if len(got) != len(want) {
+		slices.Sort(got)
+		want = slices.Clone(want)
+		slices.Sort(want)
+		if !slices.Equal(got, want) {
 			t.Fatalf("%s: %v против %v", q.Instructions, got, want)
 		}
-		for _, w := range want {
-			if _, ok := q.Criteria.(map[string]string)[w]; !ok {
-				t.Fatalf("%s: нет %q", q.Instructions, w)
-			}
+	}
+	check(Questions(Security, nil, "")["disposition"], []string{"malicious", "benign_authorized", "false_positive"})
+	check(Questions(Ops, nil, "")["ops_cause"], []string{"disk", "memory", "network", "process_crash", "config", "deploy", "external_dependency", "false_positive"})
+	tactics := []string{AttackOther}
+	for _, tc := range attack.Tactics() {
+		tactics = append(tactics, tc.Shortname)
+	}
+	check(TacticQuestion(), tactics)
+	if len(tactics) != 16 {
+		t.Fatalf("15 тактик ATT&CK v20 + other: %d", len(tactics))
+	}
+	for _, id := range TacticQuestion().Options() {
+		if !attack.Tactic(id) {
+			t.Fatalf("тактика %q не принимается формой", id)
 		}
 	}
-	check(Questions(Security)["disposition"], []string{"malicious", "benign_authorized", "false_positive"})
-	check(Questions(Ops)["ops_cause"], []string{"real_failure", "planned_work", "monitoring_noise", "wrong_threshold"})
-	check(Questions(Ops)["ops_action"], []string{"fixed", "no_action", "rule_tuned", "handed_over"})
-	if len(Tactics) != 15 {
-		t.Fatalf("14 тактик ATT&CK + other: %d", len(Tactics))
+	for _, id := range TechniqueQuestion([]string{"attack.t1110.001"}, "").Options() {
+		if !attack.Technique(id) {
+			t.Fatalf("техника %q не принимается формой", id)
+		}
 	}
 }
 
@@ -125,8 +189,8 @@ func TestGroupIDCollapsesSubnetAndSplitIsStable(t *testing.T) {
 	if GroupID(&c) == GroupID(&d) {
 		t.Fatal("другое правило — другой случай")
 	}
-	ra := Build(human(a, store.ClosureLabel{Disposition: "malicious", Escalate: bp(true), SeverityCorrect: bp(true)}), "prod")
-	rb := Build(human(b, store.ClosureLabel{Disposition: "malicious", Escalate: bp(true), SeverityCorrect: bp(true)}), "prod")
+	ra := Build(human(a, store.ClosureLabel{Disposition: "malicious", Escalate: bp(true), SeverityLevel: u8(3)}), "prod")
+	rb := Build(human(b, store.ClosureLabel{Disposition: "malicious", Escalate: bp(true), SeverityLevel: u8(3)}), "prod")
 	if ra.Split != rb.Split {
 		t.Fatal("один случай — по одну сторону разбиения")
 	}

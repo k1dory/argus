@@ -131,7 +131,7 @@ func TestEvaluateRecordsSplitsAndBlind(t *testing.T) {
 			"disposition": {Type: systemone.Choice, Choice: choice, Probabilities: probs},
 		}}}
 	}
-	qs := Questions(Security)
+	qs := Questions(Security, nil, "")
 	rec := func(split string, blind bool, label, pred string) Record {
 		return Record{Split: split, Blind: blind, Questions: qs, Labels: map[string]string{"disposition": label}, Models: ans(pred, 0.9)}
 	}

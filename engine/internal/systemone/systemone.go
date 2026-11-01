@@ -54,17 +54,32 @@ func (q Question) Options() []string {
 			out = append(out, k)
 		}
 		return out
-	case []string:
-		if q.Type != Score {
+	case map[string]any: // вопрос, прочитанный из JSON (датасет)
+		if q.Type != Choice {
 			return nil
 		}
-		out := make([]string, len(c))
-		for i := range c {
-			out[i] = strconv.Itoa(i)
+		out := make([]string, 0, len(c))
+		for k := range c {
+			out = append(out, k)
 		}
 		return out
+	case []string:
+		return scoreOptions(q.Type, len(c))
+	case []any:
+		return scoreOptions(q.Type, len(c))
 	}
 	return nil
+}
+
+func scoreOptions(typ string, n int) []string {
+	if typ != Score {
+		return nil
+	}
+	out := make([]string, n)
+	for i := range out {
+		out[i] = strconv.Itoa(i)
+	}
+	return out
 }
 
 // Answer — ответ на один вопрос.

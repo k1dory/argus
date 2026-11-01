@@ -30,7 +30,7 @@ func TestPR64DatasetEvalReportsOutputFailure(t *testing.T) {
 	for _, split := range []string{"train", "holdout"} {
 		if err := enc.Encode(dataset.Record{
 			Schema: dataset.Schema, IncidentID: "fixture-" + split, GroupID: "fixture-" + split,
-			Split: split, Blind: true, Questions: dataset.Questions(dataset.Security),
+			Split: split, Blind: true, Questions: dataset.Questions(dataset.Security, nil, ""),
 			Labels: map[string]string{"disposition": "malicious"},
 			Models: map[string]dataset.ModelAnswers{"laya": {Model: "fixture-model", Answers: map[string]systemone.Answer{
 				"disposition": {Type: systemone.Choice, Choice: "malicious",

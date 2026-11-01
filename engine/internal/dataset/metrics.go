@@ -67,7 +67,7 @@ func Samples(recs []Record, model, version, question string, keep func(*Record) 
 		if !ok {
 			continue
 		}
-		if p := Dist(r.Questions[question], a); p != nil {
+		if p := Dist(r.Question(model, question), a); p != nil {
 			out = append(out, Sample{P: p, Label: label})
 		}
 	}

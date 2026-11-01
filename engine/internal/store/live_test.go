@@ -658,7 +658,10 @@ func TestLiveLabeledIncidents(t *testing.T) {
 		t.Fatal(err)
 	}
 	yes, no := true, false
-	human := ClosureLabel{Disposition: "malicious", Escalate: &yes, SeverityCorrect: &no, Blind: true, LabeledByHuman: true}
+	sev, urg := uint8(4), uint8(2)
+	human := ClosureLabel{Disposition: "malicious", Escalate: &yes, SeverityLevel: &sev, SeverityCorrect: &no,
+		AttackTactic: "credential-access", AttackTechnique: "T1110.001", AttackVersion: "20.0",
+		OpsActNow: &no, OpsUrgency: &urg, Blind: true, LabeledByHuman: true}
 	step := func(id, kind, status string, l ClosureLabel) {
 		t.Helper()
 		if _, err := c.AppendIncidentState(ctx, id, "ivan", kind, status, "ivan", "причина завершения", l); err != nil {
@@ -691,6 +694,11 @@ func TestLiveLabeledIncidents(t *testing.T) {
 	if l.Label.Disposition != "malicious" || l.Label.Escalate == nil || !*l.Label.Escalate || l.Label.SeverityCorrect == nil || *l.Label.SeverityCorrect ||
 		!l.Label.Blind || !l.Label.LabeledByHuman || l.ChangedAt == "" || l.Incident.Status != incidents.StatusClosed || len(l.Incident.Chain) != 1 {
 		t.Fatalf("метка и инцидент: %+v", l)
+	}
+	if l.Label.SeverityLevel == nil || *l.Label.SeverityLevel != 4 || l.Label.AttackTactic != "credential-access" ||
+		l.Label.AttackTechnique != "T1110.001" || l.Label.AttackVersion != "20.0" ||
+		l.Label.OpsActNow == nil || *l.Label.OpsActNow || l.Label.OpsUrgency == nil || *l.Label.OpsUrgency != 2 {
+		t.Fatalf("поля плана разметки (0036): %+v", l.Label)
 	}
 	if r := mine[relabeledID]; r.Label.Disposition != "false_positive" || r.Incident.Status != incidents.StatusFalsePositive {
 		t.Fatalf("берётся последняя метка: %+v", r)

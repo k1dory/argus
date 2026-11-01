@@ -18,7 +18,7 @@ func TestPR64RereviewEmptyModelVersionIsNotAWildcardInReports(t *testing.T) {
 				choice, p = "false_positive", 0.1
 			}
 			records = append(records, Record{
-				Schema: Schema, Split: split, Blind: true, Questions: Questions(Security),
+				Schema: Schema, Split: split, Blind: true, Questions: Questions(Security, nil, ""),
 				Labels: map[string]string{"disposition": "malicious"},
 				Models: map[string]ModelAnswers{"laya": {
 					Model: version,

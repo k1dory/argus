@@ -1,6 +1,6 @@
 // Package dataset — записи датасета для обучения и замеров моделей решений
 // (Laya, Jev): состояние инцидента → фиксированные вопросы → ответы моделей →
-// ответ человека при завершении (метка из incident_state_events, миграция 0033).
+// ответ человека при завершении (метка из incident_state_events, миграции 0033, 0036).
 //
 // Правила записи (вики argus-laya-данные-и-разметка, решение-argus-laya-классификатор-2026-10):
 //   - истина — только ответ человека (labeled_by_human), автозакрытия не попадают;
@@ -21,14 +21,17 @@ import (
 	"strings"
 
 	"github.com/devitex-soft/argus/engine/internal/analyst"
+	"github.com/devitex-soft/argus/engine/internal/attack"
 	"github.com/devitex-soft/argus/engine/internal/incidents"
 	"github.com/devitex-soft/argus/engine/internal/store"
 	"github.com/devitex-soft/argus/engine/internal/systemone"
 )
 
 // Schema — версия формата записи. Меняется при изменении вопросов или полей:
-// записи разных версий не смешиваются в одном обучении.
-const Schema = "argus-dataset/v1"
+// записи разных версий не смешиваются в одном обучении. v2 — форма закрытия по
+// плану разметки (миграция 0036): severity_level, attack_tactic,
+// attack_technique, ops_cause из 8 причин, ops_act_now, ops_urgency.
+const Schema = "argus-dataset/v2"
 
 // Сценарии.
 const (
@@ -37,63 +40,87 @@ const (
 )
 
 // Варианты ответов — те же, что в форме завершения (engine/cmd/engine/labels.go,
-// web/src/lib/shared/closure-label.ts).
+// web/src/lib/shared/closure-label.ts). Тексты фиксированы: правка — новая Schema.
 var (
 	Dispositions = map[string]string{
 		"malicious":         "Real malicious or unauthorized activity that required a response",
 		"benign_authorized": "The activity really happened but was legitimate and authorized (admin work, tests, known service)",
 		"false_positive":    "The rule fired on events that do not match what it is meant to detect",
 	}
+	// SeverityLevels — шкала severity_level 1–4; в ответе Score — индекс 0–3.
+	SeverityLevels = []string{
+		"low: no impact, informational",
+		"medium: needs a look during working hours",
+		"high: needs a response today",
+		"critical: needs an immediate response",
+	}
 	OpsCauses = map[string]string{
-		"real_failure":     "A real failure: disk, memory, network, crashed process, bad config or deploy, external dependency",
-		"planned_work":     "Planned maintenance or deploy that was expected",
-		"monitoring_noise": "Monitoring noise: a transient blip with no impact",
-		"wrong_threshold":  "The rule threshold does not fit this host or service",
+		"disk":                "Disk full, failing or slow",
+		"memory":              "Out of memory or memory pressure",
+		"network":             "Network problem: link, routing, DNS, firewall",
+		"process_crash":       "A process or service crashed or stopped",
+		"config":              "Wrong or changed configuration",
+		"deploy":              "A deploy or update caused it",
+		"external_dependency": "An external dependency failed: upstream service, provider, certificate",
+		"false_positive":      "The rule fired but nothing is actually wrong",
 	}
-	OpsActions = map[string]string{
-		"fixed":       "Someone fixed the cause",
-		"no_action":   "No action was needed",
-		"rule_tuned":  "The rule or its threshold was changed",
-		"handed_over": "Handed over to the owner of the system",
-	}
-	// Tactics — тактики MITRE ATT&CK Enterprise и «другое». Метки человека у
-	// тактики пока нет (форма завершения её не спрашивает): ответы моделей
-	// пишутся для сравнения с тегом правила attack.<тактика>.
-	Tactics = map[string]string{
-		"reconnaissance":       "Reconnaissance (TA0043)",
-		"resource_development": "Resource Development (TA0042)",
-		"initial_access":       "Initial Access (TA0001)",
-		"execution":            "Execution (TA0002)",
-		"persistence":          "Persistence (TA0003)",
-		"privilege_escalation": "Privilege Escalation (TA0004)",
-		"defense_evasion":      "Defense Evasion (TA0005)",
-		"credential_access":    "Credential Access (TA0006)",
-		"discovery":            "Discovery (TA0007)",
-		"lateral_movement":     "Lateral Movement (TA0008)",
-		"collection":           "Collection (TA0009)",
-		"command_and_control":  "Command and Control (TA0011)",
-		"exfiltration":         "Exfiltration (TA0010)",
-		"impact":               "Impact (TA0040)",
-		"other":                "None of the above or not an attack",
+	// OpsUrgency — шкала ops_urgency 1–4; в ответе Score — индекс 0–3.
+	OpsUrgency = []string{
+		"low: can wait for planned work",
+		"medium: fix within days",
+		"high: fix today",
+		"critical: fix now, users are affected",
 	}
 )
 
-// Questions — набор вопросов сценария. Тексты фиксированы: правка текста —
-// новая Schema.
-func Questions(scenario string) map[string]systemone.Question {
+// Ключ «другое» для тактики и техники ATT&CK.
+const AttackOther = attack.Other
+
+// TacticQuestion — тактика ATT&CK: 15 тактик справочника и «другое».
+func TacticQuestion() systemone.Question {
+	crit := map[string]string{AttackOther: "None of the above or not an attack"}
+	for _, t := range attack.Tactics() {
+		crit[t.Shortname] = t.Name
+	}
+	return systemone.Question{Type: systemone.Choice, Instructions: "Which MITRE ATT&CK tactic best describes the activity", Criteria: crit}
+}
+
+// TechniqueQuestion — техника ATT&CK среди кандидатов для тактики (теги правила,
+// соседние техники тактики — attack.Candidates, как в форме закрытия) и «другое».
+// Пустая или «другое» тактика — область по тактикам техник из тегов.
+func TechniqueQuestion(tags []string, tactic string) systemone.Question {
+	crit := map[string]string{AttackOther: "None of the listed techniques fits"}
+	for _, id := range attack.Candidates(tags, tactic) {
+		t, _ := attack.TechniqueByID(id)
+		crit[id] = id + " " + t.Name
+	}
+	return systemone.Question{Type: systemone.Choice, Instructions: "Which MITRE ATT&CK technique best describes the activity", Criteria: crit}
+}
+
+// Questions — набор вопросов сценария. Кандидаты техники зависят от тактики:
+// в записи — тактика человека (кандидаты, которые видел аналитик), а без неё —
+// тактика по умолчанию из тегов. Моделям техника задаётся вторым шагом по их
+// собственной тактике (cmd/engine: askModel), чтобы ответ человека не попадал
+// в вопрос.
+func Questions(scenario string, tags []string, tactic string) map[string]systemone.Question {
 	if scenario == Ops {
 		return map[string]systemone.Question{
-			"ops_cause":  {Type: systemone.Choice, Instructions: "What caused this operations alert", Criteria: OpsCauses},
-			"ops_action": {Type: systemone.Choice, Instructions: "What should be done about this alert", Criteria: OpsActions},
+			"ops_cause": {Type: systemone.Choice, Instructions: "What caused this operations alert", Criteria: OpsCauses},
+			"ops_act_now": {Type: systemone.Noul, Instructions: "Someone has to act on this alert right now",
+				Criteria: map[string]string{"true": "Act now", "false": "Can wait or needs no action"}},
+			"ops_urgency": {Type: systemone.Score, Instructions: "How urgent is this operations alert", Criteria: OpsUrgency},
 		}
+	}
+	if tactic == "" {
+		tactic = attack.DefaultTactic(tags)
 	}
 	return map[string]systemone.Question{
 		"disposition": {Type: systemone.Choice, Instructions: "What is the nature of this security incident", Criteria: Dispositions},
 		"escalate": {Type: systemone.Noul, Instructions: "This incident needs escalation to a senior analyst or the system owner",
 			Criteria: map[string]string{"true": "Needs escalation", "false": "The on-call analyst can close it alone"}},
-		"severity_correct": {Type: systemone.Noul, Instructions: "The severity level assigned by the rule is right for this incident",
-			Criteria: map[string]string{"true": "The level fits", "false": "The level is too high or too low"}},
-		"tactic": {Type: systemone.Choice, Instructions: "Which MITRE ATT&CK tactic best describes the activity", Criteria: Tactics},
+		"severity_level":   {Type: systemone.Score, Instructions: "Which severity level is right for this incident", Criteria: SeverityLevels},
+		"attack_tactic":    TacticQuestion(),
+		"attack_technique": TechniqueQuestion(tags, tactic),
 	}
 }
 
@@ -109,7 +136,18 @@ func Scenario(inc *incidents.Incident) string {
 type ModelAnswers struct {
 	Model   string                      `json:"model"`
 	Answers map[string]systemone.Answer `json:"answers,omitempty"`
-	Error   string                      `json:"error,omitempty"`
+	// Questions — вопросы, заданные этой модели иначе, чем в записи:
+	// attack_technique с кандидатами по тактике, которую ответила модель.
+	Questions map[string]systemone.Question `json:"questions,omitempty"`
+	Error     string                        `json:"error,omitempty"`
+}
+
+// Question — вопрос, на который ответила модель: свой, если был, иначе из записи.
+func (r *Record) Question(model, id string) systemone.Question {
+	if q, ok := r.Models[model].Questions[id]; ok {
+		return q
+	}
+	return r.Questions[id]
 }
 
 // Record — строка JSONL.
@@ -144,16 +182,20 @@ func Build(l store.LabeledIncident, source string) *Record {
 	}
 	scenario := Scenario(inc)
 	labels := map[string]string{}
+	tactic := ""
 	if scenario == Ops {
 		put(labels, "ops_cause", l.Label.OpsCause)
-		put(labels, "ops_action", l.Label.OpsAction)
+		putBool(labels, "ops_act_now", l.Label.OpsActNow)
+		putScore(labels, "ops_urgency", l.Label.OpsUrgency)
 	} else {
 		put(labels, "disposition", l.Label.Disposition)
-		if l.Label.Escalate != nil {
-			labels["escalate"] = strconv.FormatBool(*l.Label.Escalate)
-		}
-		if l.Label.SeverityCorrect != nil {
-			labels["severity_correct"] = strconv.FormatBool(*l.Label.SeverityCorrect)
+		putBool(labels, "escalate", l.Label.Escalate)
+		putScore(labels, "severity_level", l.Label.SeverityLevel)
+		// Метка ATT&CK — только той же версии справочника, что у вопросов.
+		if l.Label.AttackVersion == "" || l.Label.AttackVersion == attack.Version() {
+			tactic = l.Label.AttackTactic
+			put(labels, "attack_tactic", l.Label.AttackTactic)
+			put(labels, "attack_technique", l.Label.AttackTechnique)
 		}
 	}
 	if len(labels) == 0 {
@@ -171,13 +213,26 @@ func Build(l store.LabeledIncident, source string) *Record {
 		Schema: Schema, IncidentID: inc.IncidentID, GroupID: group, Split: split,
 		Scenario: scenario, Source: source, RuleID: recordRuleID(inc), Level: inc.Level, Tags: ruleTags(inc),
 		PII: inc.PII != 0, Blind: l.Label.Blind, LabeledAt: l.ChangedAt,
-		State: analyst.DecisionState(inc), Questions: Questions(scenario), Labels: labels,
+		State: analyst.DecisionState(inc), Questions: Questions(scenario, inc.Tags, tactic), Labels: labels,
 	}
 }
 
 func put(m map[string]string, k, v string) {
 	if v != "" {
 		m[k] = v
+	}
+}
+
+func putBool(m map[string]string, k string, v *bool) {
+	if v != nil {
+		m[k] = strconv.FormatBool(*v)
+	}
+}
+
+// putScore — шкала 1–4 в индекс варианта Score ("0".."3"), как в probabilities.
+func putScore(m map[string]string, k string, v *uint8) {
+	if v != nil && *v >= 1 && *v <= 4 {
+		m[k] = strconv.Itoa(int(*v) - 1)
 	}
 }
 

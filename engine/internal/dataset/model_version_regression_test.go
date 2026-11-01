@@ -19,7 +19,7 @@ func TestPR64EvaluateKeepsModelVersionsSeparate(t *testing.T) {
 			}
 			recs = append(recs, Record{
 				Schema: Schema, IncidentID: version + "-" + split, GroupID: version + "-" + split,
-				Split: split, Blind: true, Questions: Questions(Security),
+				Split: split, Blind: true, Questions: Questions(Security, nil, ""),
 				Labels: map[string]string{"disposition": "malicious"},
 				Models: map[string]ModelAnswers{"laya": {
 					Model: version, Answers: map[string]systemone.Answer{"disposition": {

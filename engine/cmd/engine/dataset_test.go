@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -29,12 +30,15 @@ func (f fakeLabeled) LabeledIncidents(context.Context, string, int) ([]store.Lab
 
 func boolp(v bool) *bool { return &v }
 
+func u8p(v uint8) *uint8 { return &v }
+
 func labeled(id string, pii uint8, human bool) store.LabeledIncident {
 	return store.LabeledIncident{
 		Incident: incidents.Incident{IncidentID: id, RuleID: "a41c-auth-031", RuleTitle: "SSH brute force", Level: "high",
 			Tags: []string{"attack.credential_access"}, Status: incidents.StatusClosed, ActorName: "203.0.113." + id[len(id)-1:],
 			Node: "web-1", PII: pii, Chain: []string{"auth.ssh failure"}},
-		Label: store.ClosureLabel{Disposition: "malicious", Escalate: boolp(true), SeverityCorrect: boolp(true), LabeledByHuman: human},
+		Label: store.ClosureLabel{Disposition: "malicious", Escalate: boolp(true), SeverityLevel: u8p(4), AttackTactic: "credential-access",
+			AttackTechnique: "T1110", AttackVersion: "20.0", LabeledByHuman: human},
 	}
 }
 
@@ -58,6 +62,13 @@ func decisionServer(t *testing.T, calls *atomic.Int32, states *[]string) *httpte
 			switch q.Type {
 			case systemone.Noul:
 				answers[id] = map[string]any{"type": "noul", "noul": 0.5}
+			case systemone.Score:
+				n := len(q.Criteria.([]any))
+				probs := map[string]float64{}
+				for i := 0; i < n; i++ {
+					probs[strconv.Itoa(i)] = 1 / float64(n)
+				}
+				answers[id] = map[string]any{"type": "score", "score": 0, "confidence": 0.1, "probabilities": probs}
 			case systemone.Choice:
 				crit, _ := q.Criteria.(map[string]any)
 				probs := map[string]float64{}
@@ -124,18 +135,28 @@ func TestExportDatasetAsksModelsJevNeverGetsPII(t *testing.T) {
 		t.Fatal(err)
 	}
 	recs := readRecords(t, &out)
-	if len(recs) != 2 || layaCalls.Load() != 2 || jevCalls.Load() != 1 || st.PIISkippedJev != 1 || st.ModelErrors != 0 {
+	// Два запроса на запись: вопросы без техники, затем техника по тактике модели.
+	if len(recs) != 2 || layaCalls.Load() != 4 || jevCalls.Load() != 2 || st.PIISkippedJev != 1 || st.ModelErrors != 0 {
 		t.Fatalf("laya=%d jev=%d stats=%+v", layaCalls.Load(), jevCalls.Load(), st)
 	}
 	for _, r := range recs {
-		if r.Models["laya"].Model != "m-1" || len(r.Models["laya"].Answers) != 4 {
-			t.Fatalf("%s: ответ Laya: %+v", r.IncidentID, r.Models["laya"])
+		la := r.Models["laya"]
+		if la.Model != "m-1" || len(la.Answers) != 5 {
+			t.Fatalf("%s: ответ Laya: %+v", r.IncidentID, la)
+		}
+		tactic := la.Answers["attack_tactic"].Choice
+		want := dataset.TechniqueQuestion(r.Tags, tactic)
+		got := la.Questions["attack_technique"]
+		gj, _ := json.Marshal(got.Criteria)
+		wj, _ := json.Marshal(want.Criteria)
+		if tactic == "" || len(got.Options()) != len(want.Options()) || string(gj) != string(wj) {
+			t.Fatalf("%s: кандидаты техники не по тактике модели %q: %v", r.IncidentID, tactic, got.Options())
 		}
 		jevAns := r.Models["jev"]
 		if r.PII && (jevAns.Error == "" || jevAns.Answers != nil) {
 			t.Fatalf("%s с ПДн: Jev не спрашивается, в записи — причина: %+v", r.IncidentID, jevAns)
 		}
-		if !r.PII && len(jevAns.Answers) != 4 {
+		if !r.PII && len(jevAns.Answers) != 5 {
 			t.Fatalf("%s без ПДн: ответ Jev: %+v", r.IncidentID, jevAns)
 		}
 	}
@@ -190,7 +211,7 @@ func TestDatasetEvalCmdOnExport(t *testing.T) {
 	if code := datasetEvalCmd([]string{"--in", path}, &out); code != 0 {
 		t.Fatalf("код %d", code)
 	}
-	for _, want := range []string{"laya", "disposition", "escalate", "severity_correct"} {
+	for _, want := range []string{"laya", "disposition", "escalate", "severity_level", "attack_tactic", "attack_technique"} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("нет %q в выводе:\n%s", want, out.String())
 		}
@@ -200,7 +221,7 @@ func TestDatasetEvalCmdOnExport(t *testing.T) {
 		t.Fatal("json")
 	}
 	var reps []dataset.Report
-	if err := json.Unmarshal(out.Bytes(), &reps); err != nil || len(reps) != 3 {
+	if err := json.Unmarshal(out.Bytes(), &reps); err != nil || len(reps) != 5 {
 		t.Fatalf("json: %v %d", err, len(reps))
 	}
 	for _, r := range reps {
