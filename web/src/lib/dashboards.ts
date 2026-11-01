@@ -121,22 +121,6 @@ export function scanSql(sql: string): SqlScan {
   return { ok: true, code, noComments };
 }
 
-const SQL_KEYWORDS = new Set(["FROM", "WHERE", "GROUP", "ORDER", "LIMIT", "HAVING", "UNION", "EXCEPT", "INTERSECT",
-  "SETTINGS", "AS", "AND", "OR", "NOT", "IN", "IS", "LIKE", "ILIKE", "BETWEEN", "JOIN", "INNER", "LEFT", "RIGHT", "FULL",
-  "CROSS", "ARRAY", "ON", "USING", "PREWHERE", "SAMPLE", "FINAL", "WITH", "WINDOW", "QUALIFY", "OFFSET", "INTO", "ASC", "DESC"]);
-
-/** Есть ли выходная секция «FORMAT <имя>» в тексте без литералов и комментариев. */
-function hasOutputFormat(code: string): boolean {
-  for (const m of code.matchAll(/\bFORMAT\b\s*([A-Za-z_][A-Za-z0-9_]*)?\s*(\()?/gi)) {
-    const name = m[1];
-    if (!name || m[2]) continue; // format(…) или format без имени после него
-    if (SQL_KEYWORDS.has(name.toUpperCase())) continue; // колонка format перед FROM/…
-    if (/\bAS\s*$/i.test(code.slice(0, m.index))) continue; // алиас «AS format»
-    return true;
-  }
-  return false;
-}
-
 export function validateSql(sql: string): string | null {
   const s = sql.trim();
   if (!s) return "Пустой запрос";
@@ -146,16 +130,20 @@ export function validateSql(sql: string): string | null {
   if (scan.code.includes(";")) return "Один запрос без «;»";
   if (!/^(select|with)\b/i.test(s)) return "Разрешены только SELECT / WITH";
   // По исходному тексту и по тексту без комментариев: `url/**/(` ловится вторым.
-  // Формат ответа ставит консоль (JSONEachRow): выходная секция FORMAT <имя> (JSONCompact…,
-  // TabSeparated) ломает разбор строк. Функция format(…), алиас «AS format» и колонка
-  // format перед ключевым словом — не выходная секция. Дополнительно executePanel
-  // проверяет форму ответа: каждая строка — объект.
-  if (hasOutputFormat(scan.code)) return "FORMAT задаёт консоль — уберите его из запроса";
   if (FORBIDDEN.test(s) || FORBIDDEN.test(scan.noComments)) return "Запрос содержит запрещённое ключевое слово";
   return null;
 }
 
 /** Макросы как в Grafana: $__timeFilter(col), $__timeInterval(col), $__from, $__to, $__interval. */
+/** SQL, который уходит в ClickHouse: запрос панели — подзапросом, выходной формат ставит
+ *  консоль. FORMAT, INTO OUTFILE внутри подзапроса ClickHouse отклоняет синтаксической
+ *  ошибкой (проверено на 24.8), поэтому текст запроса на них не разбирается; WITH,
+ *  UNION ALL, ORDER BY/LIMIT и комментарий «--» в конце работают. Перевод строки перед
+ *  «)» закрывает строчный комментарий. */
+export function panelQuery(sql: string, range: RangeKey): string {
+  return `SELECT * FROM (\n${expandMacros(sql, range)}\n) FORMAT JSONEachRow`;
+}
+
 export function expandMacros(sql: string, range: RangeKey): string {
   const { hours, bucketMinutes } = RANGES[range];
   const from = `now() - INTERVAL ${hours} HOUR`;
@@ -245,7 +233,7 @@ async function executePanel(sql: string, range: RangeKey, signal?: AbortSignal):
     const resp = await fetch(url, {
       method: "POST",
       headers: { Authorization: "Basic " + Buffer.from(`${RO_USER}:${RO_PASSWORD}`).toString("base64"), "Content-Type": "text/plain" },
-      body: expandMacros(sql, range),
+      body: panelQuery(sql, range),
       cache: "no-store",
       signal: signal ? AbortSignal.any([timeout, signal]) : timeout,
     });

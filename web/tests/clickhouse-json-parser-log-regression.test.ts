@@ -11,15 +11,15 @@ process.env.CLICKHOUSE_RO_PASSWORD = "fixture-password";
 const marker = "CHSecret7"; // короткий маркер целиком помещается в snippet V8
 
 test("панель: FORMAT TabSeparated не переносит значение колонки в журнал через SyntaxError", async (t) => {
-  const { runPanelQuery, validateSql } = await import("../src/lib/dashboards");
+  const { panelQuery, runPanelQuery, validateSql } = await import("../src/lib/dashboards");
   const sql = "SELECT body FROM incident_comments FORMAT TabSeparated";
   const logs: string[] = [];
   t.mock.method(console, "error", (...args: unknown[]) => { logs.push(format(...args)); });
   t.mock.method(globalThis, "fetch", async (_input: unknown, init?: RequestInit) => {
-    assert.equal(init?.body, sql);
+    assert.equal(init?.body, panelQuery(sql, "24h"));
     return new Response(marker + "\n", { headers: { "Content-Type": "text/tab-separated-values" } });
   });
-  assert.ok(validateSql(sql), "явный FORMAT в SQL панели запрещён: формат ставит консоль");
+  assert.equal(validateSql(sql), null, "FORMAT отклоняет сам ClickHouse (подзапрос); здесь — ответ не JSON");
   const result = await runPanelQuery(sql, "24h");
   assert.ok(result.error);
   assert.deepEqual(result.rows, []);
