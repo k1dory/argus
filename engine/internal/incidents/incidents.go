@@ -40,6 +40,10 @@ type Incident struct {
 	Note       string   `json:"note"`
 	ActorName  string   `json:"actor_name"`
 	Node       string   `json:"node"`
+	// GroupKey — значение явного group_by правила, если он не сводится к
+	// субъекту или узлу (node, object): иначе второй диск того же NAS склеивался
+	// с первым под ключом «правило|субъект|узел» и уведомления не было.
+	GroupKey   string   `json:"group_key"`
 	Sources    []string `json:"sources"`
 	EventCount uint32   `json:"event_count"`
 	FirstTS    string   `json:"first_ts"`
@@ -68,6 +72,9 @@ type Incident struct {
 	// иначе закрыл бы инцидент, пока настоящий секрет действует.
 	links     map[string]*secretLink
 	confirmed map[string]bool
+	// groupPending — group_key присвоен старому инциденту, но ещё не записан:
+	// Apply отдаёт инцидент на запись каждый цикл, пока движок не вызовет Persisted.
+	groupPending bool
 	// reviewNoted — ротация без подтверждения уже отмечена заметкой.
 	reviewNoted bool
 	// Review — причина пометки «закрыт автоматикой, нужна проверка» для
@@ -165,9 +172,18 @@ func NewRegistry(startFrom int, open []Incident) *Registry {
 		// Какие секреты утекли до рестарта, неизвестно (события не в памяти):
 		// close_match такой инцидент не закроет — только оператор.
 		inc.unmatchable = true
-		r.open[inc.RuleID+"|"+inc.ActorName+"|"+inc.Node] = &inc
+		r.open[inc.regKey()] = &inc
 	}
 	return r
+}
+
+// regKey — ключ реестра: правило, субъект, узел и, у явного group_by, его значение.
+func (inc *Incident) regKey() string {
+	k := inc.RuleID + "|" + inc.ActorName + "|" + inc.Node
+	if inc.GroupKey != "" {
+		k += "|" + inc.GroupKey
+	}
+	return k
 }
 
 // Apply возвращает инциденты, которые надо записать (новые или обновлённые),
@@ -178,14 +194,33 @@ func (r *Registry) Apply(dets []eval.Detection, now time.Time) (created, updated
 	dropped = map[string]int{}
 	for _, d := range dets {
 		inc := build(d, now)
-		key := d.Rule.ID + "|" + inc.ActorName + "|" + inc.Node
+		key := inc.regKey()
+		if _, ok := r.open[key]; !ok && inc.GroupKey != "" {
+			// Инцидент, заведённый до group_key (или восстановленный без него), —
+			// под старым ключом: его забирает первая сработка группы, а не новый инцидент.
+			legacy := d.Rule.ID + "|" + inc.ActorName + "|" + inc.Node
+			if ex, ok := r.open[legacy]; ok && ex.GroupKey == "" {
+				delete(r.open, legacy)
+				ex.GroupKey = inc.GroupKey
+				r.open[key] = ex
+				ex.groupPending = true
+			}
+		}
 		if ex, ok := r.open[key]; ok && isFinal(ex.Status) && inc.LastTS <= ex.LastTS {
 			// Закрытый инцидент по той же сработке без новых событий: absence
 			// и склеенные окна иначе заводили бы новый инцидент каждый цикл.
+			if ex.groupPending {
+				updated = append(updated, ex.bumpUpdated(now))
+			}
 			continue
 		}
 		if ex, ok := r.open[key]; ok && !isFinal(ex.Status) {
 			if inc.EventCount <= ex.EventCount && inc.LastTS <= ex.LastTS {
+				// Присвоенный group_key записывается отдельной версией строки и без
+				// новых событий: иначе после рестарта инцидент снова окажется без ключа.
+				if ex.groupPending {
+					updated = append(updated, ex.bumpUpdated(now))
+				}
 				continue // ничего нового
 			}
 			ex.EventCount, ex.LastTS, ex.Chain, ex.Sources, ex.Events = inc.EventCount, inc.LastTS, inc.Chain, inc.Sources, inc.Events
@@ -208,6 +243,35 @@ func (r *Registry) Apply(dets []eval.Detection, now time.Time) (created, updated
 		created = append(created, inc)
 	}
 	return created, updated, dropped
+}
+
+// Persisted отмечает инциденты записанными: присвоенный group_key больше не
+// нужно повторять. Вызывается после успешного INSERT.
+func (r *Registry) Persisted(incs []*Incident) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ids := make(map[string]bool, len(incs))
+	for _, inc := range incs {
+		ids[inc.IncidentID] = true
+	}
+	for _, inc := range r.open {
+		if inc.groupPending && ids[inc.IncidentID] {
+			inc.groupPending = false
+		}
+	}
+}
+
+// bumpUpdated продвигает updated_at к now, а если now не позже — на секунду
+// вперёд: новая версия строки должна победить в argMax по updated_at.
+func (inc *Incident) bumpUpdated(now time.Time) *Incident {
+	ts := model.FormatTS(now)[:19]
+	if ts <= inc.UpdatedAt {
+		if t, err := time.Parse("2006-01-02 15:04:05", inc.UpdatedAt); err == nil {
+			ts = model.FormatTS(t.Add(time.Second))[:19]
+		}
+	}
+	inc.UpdatedAt = ts
+	return inc
 }
 
 // Prune убирает из реестра финальные инциденты старше ttl после закрытия:
@@ -236,7 +300,7 @@ func (r *Registry) Prune(now time.Time, ttl time.Duration, keep func(ruleID stri
 func (r *Registry) AddSystem(inc *Incident) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.open[inc.RuleID+"|"+inc.ActorName+"|"+inc.Node] = inc
+	r.open[inc.regKey()] = inc
 }
 
 // Shadowed — оператор поменял инцидент между чтением seen и нашей вставкой:
@@ -373,7 +437,7 @@ func (r *Registry) Close(ruleID, key, note string, evTS, now time.Time) *Inciden
 		if last := (&model.Event{TS: inc.LastTS}).Time(); !evTS.IsZero() && !last.IsZero() && !evTS.After(last) {
 			continue
 		}
-		if inc.ActorName == key || inc.Node == key || strings.HasPrefix(k, ruleID+"|"+key+"|") {
+		if inc.ActorName == key || inc.Node == key || (inc.GroupKey != "" && inc.GroupKey == key) || strings.HasPrefix(k, ruleID+"|"+key+"|") {
 			inc.Status = StatusClosed
 			inc.Note = strings.TrimSpace(inc.Note + "\n" + note)
 			inc.UpdatedAt = model.FormatTS(now)[:19]
@@ -561,6 +625,9 @@ func build(d eval.Detection, now time.Time) *Incident {
 	if inc.ActorName == "" {
 		inc.ActorName = d.Key
 	}
+	if explicitGroup(d.Rule) && d.Key != "" && d.Key != "-" {
+		inc.GroupKey = d.Key
+	}
 	inc.Chain = chain(d.Events, 12)
 	if d.Reason != "" {
 		inc.Chain = append(inc.Chain, "→ "+d.Reason)
@@ -610,4 +677,23 @@ func cut(s string, n int) string {
 // Summary — короткое описание для уведомления/лога.
 func (i *Incident) Summary() string {
 	return fmt.Sprintf("%s · %s · %s · %s · %d событий", i.IncidentID, strings.ToUpper(i.Level), i.RuleTitle, i.ActorName, i.EventCount)
+}
+
+// explicitGroup — group_by правила задан явно и не совпадает с тем, что уже
+// в ключе реестра (субъект, узел; адрес становится субъектом в build).
+func explicitGroup(r *rules.Rule) bool {
+	gb := r.Detection.GroupBy
+	if r.Detection.Threshold != nil && r.Detection.Threshold.GroupBy != "" {
+		gb = r.Detection.Threshold.GroupBy
+	}
+	// Составной ключ только из субъекта, узла и адресов ничего не добавляет к
+	// ключу реестра «правило|субъект|узел» — как и одиночное поле.
+	for _, f := range strings.Split(gb, ",") {
+		switch strings.TrimSpace(f) {
+		case "", "actor.name", "node", "src.ip", "dst.ip":
+		default:
+			return true
+		}
+	}
+	return false
 }

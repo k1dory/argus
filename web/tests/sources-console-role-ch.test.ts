@@ -66,7 +66,7 @@ test("sourcesHealthReport работает с точными production прав
     inserted = true;
     await ch().chCommand("ALTER TABLE events MATERIALIZE PROJECTION p_source_last SETTINGS mutations_sync = 2");
     const [ready] = await ch().chQuery<{ missing: string | number }>(
-      "SELECT count() AS missing FROM system.parts WHERE database = currentDatabase() AND table = 'events' AND active AND NOT has(projections, 'p_source_last')");
+      "SELECT count() AS missing FROM system.parts WHERE database = currentDatabase() AND table = 'events' AND active AND rows > 0 AND NOT has(projections, 'p_source_last')");
     assert.equal(Number(ready.missing), 0, "проекция готова: проверяем права, не миграционный fallback");
 
     asConsole = true;
