@@ -89,8 +89,18 @@ export class ClickHouseError extends Error {
   }
 }
 
+/** Диагностика ClickHouse цитирует входные данные: «Cannot parse input: '…'», «Cannot
+ *  parse string '…' as UInt8», «parsed text: "…"» — строку INSERT или подставленный
+ *  параметр (вердикт, комментарий, detail аудита). Перед логом и сообщением ошибки
+ *  содержимое кавычек заменяется на «…»; имена таблиц и колонок ClickHouse пишет без
+ *  кавычек или в обратных — они остаются. */
+export function redactChText(text: string): string {
+  return text.replace(/'(?:\\.|''|[^'\\])*'/g, "'…'").replace(/"(?:\\.|[^"\\])*"/g, '"…"');
+}
+
 /** «Code: 60. DB::Exception: Table argus.x does not exist … while processing …» → короткая причина. */
 export function shortChError(text: string, status: number | null): { message: string; code: number | null } {
+  text = redactChText(text);
   const code = Number(/Code:\s*(\d+)/.exec(text)?.[1] ?? NaN);
   const m = /DB::Exception:\s*([^\n]*?)(?:\s*:? ?while processing|\s*\(version|\s*\([A-Z_]+\)\s*$|$)/m.exec(text);
   const reason = (m?.[1] ?? "").trim().slice(0, 160);
@@ -177,7 +187,7 @@ async function chFetchWithSlot(sql: string, params: Record<string, string | numb
   if (!resp.ok || exception || headerCode > 0) {
     // В лог — только текст исключения. При HTTP 200 до него идут уже отданные строки
     // результата (комментарии, вердикты): им не место в журнале контейнера.
-    const detail = exception ? text.slice(exception.index, exception.index + 2000) : resp.ok ? "(тело ответа не логируется)" : text.slice(0, 2000);
+    const detail = redactChText(exception ? text.slice(exception.index, exception.index + 2000) : resp.ok ? "(тело ответа не логируется)" : text.slice(0, 2000));
     console.error(`clickhouse ${resp.status}:`, detail, "\nSQL:", sqlForLog(sql));
     const { message, code } = shortChError(exception ? text.slice(exception.index) : text, resp.status);
     throw new ClickHouseError(headerCode > 0 && code == null ? `код ${headerCode}: запрос не выполнен` : message, resp.status, code ?? (headerCode > 0 ? headerCode : null));
@@ -185,11 +195,14 @@ async function chFetchWithSlot(sql: string, params: Record<string, string | numb
   return text;
 }
 
-/** SQL для журнала: INSERT … FORMAT JSONEachRow несёт строки в теле запроса (вердикт
- *  агента, комментарий) — в лог идёт только заголовок до имени формата. */
+/** SQL для журнала. INSERT несёт данные в теле (FORMAT JSONEachRow, VALUES, SELECT с
+ *  литералами) — в лог идёт только заголовок «INSERT INTO таблица (колонки)». В прочих
+ *  запросах строковые литералы заменяются на «…»; значения параметров идут в URL и сюда
+ *  не попадают. */
 export function sqlForLog(sql: string): string {
-  const format = /\bFORMAT\s+\w+/i.exec(sql);
-  return (format ? `${sql.slice(0, format.index + format[0].length)} <данные не логируются>` : sql).slice(0, 500);
+  const insert = /^\s*INSERT\b/i.test(sql) ? /\b(FORMAT|VALUES|SELECT|WITH)\b|\/\*|--/i.exec(sql) : null;
+  const head = insert ? `${sql.slice(0, insert.index).trimEnd()} <данные не логируются>` : redactChText(sql);
+  return head.slice(0, 500);
 }
 
 /** settings — серверные настройки ClickHouse на запрос (max_execution_time и т.п.). */

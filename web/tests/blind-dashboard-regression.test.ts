@@ -168,7 +168,8 @@ test("blind: argus_ro не читает вердикт и его копии по
       `SELECT markdown FROM merge('argus', '^agent_verdicts$') WHERE position(markdown, '${marker}') > 0`,
     ]) {
       const denied = await directRo(sql);
-      assert.match(denied.text, /^Code:\s*497\.\s*DB::Exception:/m, `${sql}: нужен именно серверный ACCESS_DENIED`);
+      // При default_format=JSONEachRow ClickHouse 24.8 оборачивает исключение в {"exception": …}.
+      assert.match(denied.text, /(^|"exception": ")Code:\s*497\.\s*DB::Exception:/m, `${sql}: нужен именно серверный ACCESS_DENIED`);
       assert.ok(!denied.text.includes(`${marker}-${blindOpen}`), "исключение не содержит скрытую строку");
     }
 
