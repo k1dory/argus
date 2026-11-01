@@ -27,12 +27,20 @@ trap cleanup EXIT
 up_failed() {
   echo "error: стенд e2e не поднялся — диагностика:" >&2
   dc --profile mcp ps -a >&2 || true
-  cid="$(dc ps -aq clickhouse 2>/dev/null | head -1)"
+  # Сбой поиска контейнера (временная ошибка Docker API) не обрывает диагностику.
+  cid="$(dc ps -aq clickhouse 2>/dev/null | head -1)" || cid=""
   if [ -n "$cid" ]; then
     docker inspect --format '{{json .State}}' "$cid" >&2 || true
   fi
   dc logs --no-color --tail 200 clickhouse >&2 || true
-  dc logs --no-color --tail 50 migrator >&2 || true
+  # Сырой журнал migrator не печатается: при ошибке clickhouse-client цитирует
+  # запрос, а в ALTER USER — хеш пароля и соль. Только проверенные поля статуса
+  # (scripts/migrate.sh пишет их при выходе): код выхода, этап, файл, код ошибки.
+  if [ -f run/migrator/migrate.json ] && command -v jq >/dev/null 2>&1; then
+    jq -c '{exit, stage, file, last_applied, code, name}' run/migrator/migrate.json >&2 || echo "migrator: статус не разобран" >&2
+  else
+    echo "migrator: статуса нет (run/migrator/migrate.json или jq)" >&2
+  fi
   exit 1
 }
 MCP_URL=""
