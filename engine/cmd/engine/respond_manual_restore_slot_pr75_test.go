@@ -50,7 +50,7 @@ func TestPR75RestoreManualDecisionDoesNotResurrectLaterFlightSlot(t *testing.T) 
 					http.Error(w, "fixture: invalid row", http.StatusBadRequest)
 					return
 				}
-				if row.Step != stepManual || row.IncidentID != "" {
+				if row.Step != stepManual || row.IncidentID != "INC-1" {
 					continue
 				}
 				at, err := time.ParseInLocation("2006-01-02 15:04:05", row.TS, time.UTC)

@@ -58,7 +58,7 @@ func TestPR75ManualCancelFirstFlightReleasesCapSlot(t *testing.T) {
 			tick := time.NewTicker(time.Millisecond)
 			defer tick.Stop()
 			for {
-				if _, manual := e.manualAt("203.0.113.7"); manual {
+				if e.keyManual(keyOf("INC-1", "203.0.113.7")) {
 					break
 				}
 				select {

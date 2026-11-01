@@ -103,6 +103,9 @@ func TestPR67ManualCancelBeforeRestoreDoesNotRearmRetry(t *testing.T) {
 	if keyState(beforeRestart, "INC-1", "203.0.113.7") != keyFailed {
 		t.Fatal("fixture: a failed automatic attempt must be in the journal")
 	}
+	// The journal already holds the failed attempt; the handlers read it before
+	// deciding (restore-first), so the fake must serve it.
+	saveJournal(f)
 
 	e := keyEngine(t, f, x, 4)
 	x.available.Store(true)

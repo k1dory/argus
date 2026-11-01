@@ -34,10 +34,14 @@ export function BlockIpButton({ incidentId, ip }: { incidentId: string; ip: stri
 
   // Тост — внешняя система; диалог при успехе исчезает сам (ниже рендерится строка вместо него).
   useEffect(() => {
-    if (state.ok) toast.success(`Адрес ${ip} заблокирован`, { description: "детали — в журнале реагирования" });
+    if (state.ok && state.warning) toast.warning(`Адрес ${ip} заблокирован с оговоркой`, { description: state.warning, duration: Infinity });
+    else if (state.ok) toast.success(`Адрес ${ip} заблокирован`, { description: "детали — в журнале реагирования" });
     else if (state.error) toast.error("Блокировка не выполнена", { description: state.error });
   }, [state, ip]);
 
+  if (state.ok && state.warning) {
+    return <span role="alert" className="font-mono text-xs text-[var(--status-warn)]">{ip} заблокирован, но: {state.warning}</span>;
+  }
   if (state.ok) {
     return <span className="font-mono text-xs text-[var(--status-ok)]">{ip} заблокирован — детали в журнале реагирования</span>;
   }

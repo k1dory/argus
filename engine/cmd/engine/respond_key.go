@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"time"
 
@@ -29,6 +30,13 @@ import (
    принадлежит ключу; повтор того же ключа своё место не перезанимает, пока оно в
    окне; освобождает место только владелец, при переходе в «блока нет».
 
+   Решение оператора (ручной блок, снятие) действует на ключи адреса, которые
+   есть в момент решения, — на свой инцидент, не на адрес вообще: новый инцидент
+   по тому же адресу блокируется как обычно. Не трогать адрес вообще — отдельное
+   явное действие: исключение из автоблокировки со сроком (respExcluded), его можно
+   отозвать. Ключ, отложенный исключением (excluded), не конечный: после срока или
+   отзыва свежие события того же инцидента доходят до исполнителей.
+
    Таблица переходов — README «Автоответ: потолок и запись вперёд». */
 
 // Состояния ключа.
@@ -41,6 +49,7 @@ const (
 	keyRefused       = "refused"        // allowlist / never_block / служебный адрес
 	keyIDS           = "ids"            // режим IDS
 	keyManual        = "manual"         // оператор заблокировал или снял адрес вручную
+	keyExcluded      = "excluded"       // адрес исключён из автоблокировки; после срока — свежими событиями заново
 )
 
 // Шаги в response_log.step (миграция 0037).
@@ -55,7 +64,21 @@ const (
 	stepRefused   = "refused"
 	stepIDS       = "ids"
 	stepManual    = "manual"
+	stepExcluded  = "excluded" // попытка отложена исключением адреса
+	stepExclude   = "exclude"  // решение оператора: исключить адрес до until (incident_id пустой); until <= ts — отзыв
 )
+
+// excludeMaxTTL — самое долгое исключение адреса из автоблокировки; столько же
+// журнал читается назад за строками exclude при старте.
+const excludeMaxTTL = 30 * 24 * time.Hour
+
+// exclusion — адрес исключён из автоблокировки оператором до until.
+type exclusion struct {
+	at     time.Time
+	until  time.Time
+	actor  string
+	reason string
+}
 
 // reserveRetry — пауза перед новой попыткой после незаписанного резерва.
 const reserveRetry = time.Minute
@@ -117,9 +140,6 @@ func (e *engine) storeKey(key string, k respKey) {
 	defer e.respMu.Unlock()
 	if cur := e.respKeys[key]; cur != nil && cur.state == keyManual {
 		return // оператор решил, пока шла попытка
-	}
-	if at, manual := e.respManual[k.ip]; manual {
-		k.state, k.at = keyManual, at // решение по адресу принято, пока шла первая попытка
 	}
 	e.respKeys[key] = &k
 }
@@ -204,8 +224,9 @@ func (e *engine) attemptKey(ctx context.Context, base respKey, now time.Time) (r
 	}
 	defer e.endFlight(key)
 	k := base
+	until, excluded := e.excludedUntil(k.ip, now)
 	if cur := e.keySnapshot(key); cur != nil {
-		if terminal(cur.state) {
+		if terminal(cur.state) || (cur.state == keyExcluded && excluded) {
 			return nil
 		}
 		if cur.state == keyReserveFailed && now.Sub(cur.at) < reserveRetry {
@@ -216,12 +237,13 @@ func (e *engine) attemptKey(ctx context.Context, base respKey, now time.Time) (r
 		}
 		k.attempts, k.slotSpace = cur.attempts, cur.slotSpace
 	}
-	if at, manual := e.manualAt(k.ip); manual {
-		k.state, k.at = keyManual, at
-		e.storeKey(key, k)
-		return nil // оператор заблокировал или снял адрес вручную
-	}
 	ts := model.FormatTS(now)[:19]
+	if excluded {
+		k.state, k.at = keyExcluded, now
+		e.storeKey(key, k)
+		return append(rows, keyRow(ts, "manual", k, stepExcluded, respond.Result{Executor: "argus", OK: true,
+			Detail: "адрес исключён оператором из автоблокировки до " + model.FormatTS(until)[:19] + " — после срока свежие события инцидента блокируют заново"}))
+	}
 	mode, _ := e.resp.Mode() // снимок режима — один на всю попытку
 	set := func(state string) {
 		k.state, k.at = state, now
@@ -257,8 +279,11 @@ func (e *engine) attemptKey(ctx context.Context, base respKey, now time.Time) (r
 	k.slotSpace = mode
 	release := func() { e.capRelease(ck, key) }
 	reserve := func() error {
-		if _, manual := e.manualAt(k.ip); manual {
+		if e.keyManual(key) {
 			return errManualDecision // решение оператора принято, пока попытка ждала замка адреса
+		}
+		if _, excl := e.excludedUntil(k.ip, time.Now()); excl {
+			return errManualDecision // адрес исключён, пока попытка ждала замка адреса
 		}
 		row := keyRow(ts, mode, k, stepReserve, respond.Result{Executor: "argus", OK: true, Detail: "резерв: блок адреса перед вызовом исполнителей"})
 		return e.ch.InsertResponses(ctx, []store.ResponseRow{row})
@@ -275,7 +300,9 @@ func (e *engine) attemptKey(ctx context.Context, base respKey, now time.Time) (r
 	case respond.OutcomeReserveFailed:
 		release()
 		if errors.Is(err, errManualDecision) {
-			set(keyManual)
+			if !e.keyManual(key) {
+				set(keyExcluded) // исключение: свежие события после срока — заново
+			}
 			return nil
 		}
 		set(keyReserveFailed)
@@ -315,6 +342,9 @@ func (e *engine) attemptKey(ctx context.Context, base respKey, now time.Time) (r
 		}
 		slog.Error("ips: блокировка не выполнена", "ip", k.ip, "incident", k.incident, "rule", k.ruleID, "attempt", k.attempts)
 	}
+	if e.keyManual(key) {
+		release() // оператор отменил ключ, пока шла попытка: место не держится
+	}
 	for _, res := range results {
 		rows = append(rows, keyRow(ts, mode, k, step, res))
 	}
@@ -343,7 +373,7 @@ func (e *engine) retryKeys(ctx context.Context, now time.Time) []store.ResponseR
 
 // stepPriority — какая строка последней секунды определяет состояние: итог
 // главнее резерва, блок главнее отказа, решение оператора главнее всего.
-var stepPriority = []string{stepManual, stepBlocked, stepExhausted, stepFailed, stepNoop, stepSimulated, stepCapped, stepRefused, stepIDS, stepReserve}
+var stepPriority = []string{stepManual, stepExcluded, stepBlocked, stepExhausted, stepFailed, stepNoop, stepSimulated, stepCapped, stepRefused, stepIDS, stepReserve}
 
 // respRetention — сколько хранить и читать решения: не меньше respStateTTL и не
 // меньше самого длинного окна потолка среди правил (block_cap_window может быть
@@ -382,7 +412,7 @@ func (e *engine) restoreKeysLocked(ctx context.Context, now time.Time) bool {
 	if done {
 		return true
 	}
-	rows, err := e.ch.ResponsesSince(ctx, now.Add(-e.respRetention()))
+	rows, err := e.ch.ResponsesSince(ctx, now.Add(-e.respRetention()), now.Add(-excludeMaxTTL))
 	if err != nil {
 		slog.Warn("ips: решения автоответа не восстановлены из response_log — новые блокировки отложены до чтения журнала", "err", err)
 		return false
@@ -399,7 +429,7 @@ func (e *engine) restoreKeysLocked(ctx context.Context, now time.Time) bool {
 			continue
 		}
 		if row.IncidentID == "" {
-			continue // решение оператора по адресу — ниже, не ключ
+			continue // исключение адреса — ниже, не ключ
 		}
 		key := keyOf(row.IncidentID, ip)
 		at, perr := time.ParseInLocation("2006-01-02 15:04:05", row.TS, time.UTC)
@@ -424,14 +454,26 @@ func (e *engine) restoreKeysLocked(ctx context.Context, now time.Time) bool {
 	}
 	doubtful := 0
 	e.respMu.Lock()
+	// Исключения адресов: действует последняя строка exclude по адресу (отзыв —
+	// until не позже ts); локальное решение, принятое до чтения журнала, главнее.
+	lastExcl := map[string]exclusion{}
 	for _, row := range rows {
-		if row.Step != stepManual || row.IncidentID != "" {
+		if row.Step != stepExclude || row.IncidentID != "" {
 			continue
 		}
 		ip, ok := respond.CanonicalIP(row.IP)
 		at, perr := time.ParseInLocation("2006-01-02 15:04:05", row.TS, time.UTC)
-		if ok && perr == nil && at.After(e.respManual[ip]) {
-			e.respManual[ip] = at
+		until, uerr := time.ParseInLocation("2006-01-02 15:04:05", row.Until, time.UTC)
+		if !ok || perr != nil || uerr != nil {
+			continue
+		}
+		if cur, seen := lastExcl[ip]; !seen || !at.Before(cur.at) {
+			lastExcl[ip] = exclusion{at: at, until: until, actor: row.Actor, reason: row.Reason}
+		}
+	}
+	for ip, x := range lastExcl {
+		if _, local := e.respExcluded[ip]; !local && x.until.After(now) {
+			e.respExcluded[ip] = x
 		}
 	}
 	for key, l := range byKey {
@@ -484,12 +526,10 @@ func (e *engine) restoreKeysLocked(ctx context.Context, now time.Time) bool {
 			k.state = keyIDS
 		case stepManual:
 			k.state = keyManual
+		case stepExcluded:
+			k.state = keyExcluded
 		default:
 			continue
-		}
-		if at, manual := e.respManual[row.IP]; manual && !l.at.After(at) {
-			// Решение оператора по адресу позже последней строки ключа.
-			k.state, k.at, holdsSlot = keyManual, at, false
 		}
 		e.respKeys[key] = k
 		if holdsSlot {
@@ -566,60 +606,82 @@ func (e *engine) takeDeferred() []*incidents.Incident {
 	return out
 }
 
-// errManualDecision — решение оператора по адресу принято до резерва попытки.
+// errManualDecision — решение оператора по ключу или исключение адреса приняты до
+// резерва попытки.
 var errManualDecision = errors.New("решение оператора по адресу")
 
-// manualAt — время решения оператора по адресу (ручной блок или снятие); ok=false —
-// решения нет. Решение — по адресу, а не по ключам: оно действует и на попытку,
-// которая ещё в полёте без записи в respKeys, и на ключи, ещё не прочитанные из
-// журнала при старте.
-func (e *engine) manualAt(ip string) (time.Time, bool) {
+// keyManual — оператор отменил ключ (ручной блок или снятие).
+func (e *engine) keyManual(key string) bool {
 	e.respMu.Lock()
 	defer e.respMu.Unlock()
-	at, ok := e.respManual[ip]
-	return at, ok
+	k := e.respKeys[key]
+	return k != nil && k.state == keyManual
 }
 
-// operatorOverride — строка журнала решения оператора по адресу (incident_id пустой,
-// step=manual): по ней восстановление делает manual все ключи адреса, последняя
-// строка которых не позже решения. pending — сколько автоблокировок адреса ещё ждало
-// (ключи с неконечным состоянием и попытки в полёте). Решение не применяется:
-// вызывающий сначала пишет строку в журнал, и только при успехе — applyOverride.
-func (e *engine) operatorOverride(ip, actor, reason string, now time.Time) (rows []store.ResponseRow, pending int) {
-	ip, ok := respond.CanonicalIP(ip)
-	if !ok {
-		return nil, 0
-	}
-	row := respRow(model.FormatTS(now)[:19], "manual", actor, respond.Result{Executor: "argus", OK: true, IP: ip,
-		Detail: "решение оператора: автоблокировка адреса больше не выполняется"}, "", reason)
-	row.Step = stepManual
+// excludedUntil — адрес исключён оператором из автоблокировки (до until).
+func (e *engine) excludedUntil(ip string, now time.Time) (time.Time, bool) {
 	e.respMu.Lock()
 	defer e.respMu.Unlock()
-	for _, k := range e.respKeys {
-		if k.ip == ip && !terminal(k.state) {
+	x, ok := e.respExcluded[ip]
+	if !ok || !x.until.After(now) {
+		return time.Time{}, false
+	}
+	return x.until, true
+}
+
+// operatorKeys — решение оператора по ключам адреса, которые есть сейчас: в
+// respKeys (кроме уже отменённых) и в полёте без записи в respKeys. Новый
+// инцидент по адресу решением не покрыт. Строки журнала — по строке на ключ
+// (step=manual, incident_id ключа), ts не раньше последней строки ключа: при
+// восстановлении решение главнее его итога. pending — сколько из них ещё ждало
+// автоблокировки. Решение не применяется: вызывающий сначала пишет строки, и
+// только при успехе — applyKeys.
+func (e *engine) operatorKeys(ip, actor, reason string, now time.Time) (rows []store.ResponseRow, keys []string, pending int) {
+	ip, ok := respond.CanonicalIP(ip)
+	if !ok {
+		return nil, nil, 0
+	}
+	e.respMu.Lock()
+	defer e.respMu.Unlock()
+	add := func(key, incident, ruleID string, at time.Time) {
+		if at.Before(now) {
+			at = now
+		}
+		row := respRow(model.FormatTS(at)[:19], "manual", actor, respond.Result{Executor: "argus", OK: true, IP: ip, Incident: incident,
+			Detail: "решение оператора: автоблокировка по этому инциденту больше не выполняется"}, ruleID, reason)
+		row.Step = stepManual
+		rows, keys = append(rows, row), append(keys, key)
+	}
+	for key, k := range e.respKeys {
+		if k.ip != ip || k.state == keyManual {
+			continue
+		}
+		if !terminal(k.state) {
 			pending++
 		}
+		add(key, k.incident, k.ruleID, k.at)
 	}
 	for key := range e.respFlight {
-		if _, kip, _ := strings.Cut(key, "|"); kip == ip && e.respKeys[key] == nil {
+		incident, kip, _ := strings.Cut(key, "|")
+		if kip == ip && e.respKeys[key] == nil {
 			pending++ // первая попытка в полёте, ключа в respKeys ещё нет
+			add(key, incident, "", now)
 		}
 	}
-	return []store.ResponseRow{row}, pending
+	return rows, keys, pending
 }
 
-// applyOverride — решение оператора записано: адрес и все его ключи — manual,
-// места отданы. Итог попытки, которая сейчас в полёте, тоже станет manual (storeKey).
-func (e *engine) applyOverride(ip string, now time.Time) {
-	ip, ok := respond.CanonicalIP(ip)
-	if !ok {
-		return
-	}
+// applyKeys — решение оператора записано: ключи manual, места отданы. Итог
+// попытки, которая сейчас в полёте, тоже останется manual (storeKey), а её место
+// отдаст сама попытка (attemptKey).
+func (e *engine) applyKeys(keys []string, now time.Time) {
 	e.respMu.Lock()
 	defer e.respMu.Unlock()
-	e.respManual[ip] = now
-	for key, k := range e.respKeys {
-		if k.ip != ip {
+	for _, key := range keys {
+		k := e.respKeys[key]
+		if k == nil {
+			incident, ip, _ := strings.Cut(key, "|")
+			e.respKeys[key] = &respKey{state: keyManual, at: now, incident: incident, ip: ip}
 			continue
 		}
 		if k.slotSpace != "" {
@@ -627,8 +689,71 @@ func (e *engine) applyOverride(ip string, now time.Time) {
 				delete(slots, key)
 			}
 		}
-		k.state, k.at = keyManual, now
+		k.state = keyManual
+		if now.After(k.at) {
+			k.at = now
+		}
 	}
+}
+
+// excludeRow — строка журнала исключения адреса до until (until не позже now — отзыв).
+func excludeRow(ip, actor, reason string, now, until time.Time) store.ResponseRow {
+	detail := "решение оператора: адрес исключён из автоблокировки до " + model.FormatTS(until)[:19]
+	if !until.After(now) {
+		detail = "решение оператора: исключение адреса из автоблокировки отозвано"
+	}
+	row := respRow(model.FormatTS(now)[:19], "manual", actor, respond.Result{Executor: "argus", OK: true, IP: ip, Detail: detail}, "", reason)
+	row.Step, row.Until = stepExclude, model.FormatTS(until)[:19]
+	return row
+}
+
+// setExclusion — исключение записано: применить (until не позже at — снять).
+func (e *engine) setExclusion(ip string, x exclusion) {
+	e.respMu.Lock()
+	defer e.respMu.Unlock()
+	if !x.until.After(x.at) {
+		delete(e.respExcluded, ip)
+		return
+	}
+	e.respExcluded[ip] = x
+}
+
+// Exclusion — исключённый адрес для /respond/status.
+type Exclusion struct {
+	IP     string `json:"ip"`
+	Since  string `json:"since"`
+	Until  string `json:"until"`
+	Actor  string `json:"actor"`
+	Reason string `json:"reason"`
+}
+
+func (e *engine) exclusions(now time.Time) []Exclusion {
+	e.respMu.Lock()
+	defer e.respMu.Unlock()
+	out := []Exclusion{}
+	for ip, x := range e.respExcluded {
+		if x.until.After(now) {
+			out = append(out, Exclusion{IP: ip, Since: model.FormatTS(x.at)[:19], Until: model.FormatTS(x.until)[:19], Actor: x.actor, Reason: x.reason})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].IP < out[j].IP })
+	return out
+}
+
+// hasExcludedKeys — у инцидента есть ключи, отложенные исключением, которое уже
+// не действует: свежие события инцидента решаются заново.
+func (e *engine) hasExcludedKeys(incident string, now time.Time) bool {
+	e.respMu.Lock()
+	defer e.respMu.Unlock()
+	for _, k := range e.respKeys {
+		if k.incident != incident || k.state != keyExcluded {
+			continue
+		}
+		if x, ok := e.respExcluded[k.ip]; !ok || !x.until.After(now) {
+			return true
+		}
+	}
+	return false
 }
 
 // pruneKeysLocked — конечные ключи старше ttl и места старше окна хранения.
@@ -637,13 +762,13 @@ func (e *engine) pruneKeysLocked(now time.Time, ttl time.Duration) {
 	// иначе ключ «manual» или занятое место исчезли бы раньше, чем их запись в журнале.
 	keep := max(ttl, e.respRetention())
 	for key, k := range e.respKeys {
-		if terminal(k.state) && now.Sub(k.at) > keep {
+		if (terminal(k.state) || k.state == keyExcluded) && now.Sub(k.at) > keep {
 			delete(e.respKeys, key)
 		}
 	}
-	for ip, at := range e.respManual {
-		if now.Sub(at) > keep {
-			delete(e.respManual, ip)
+	for ip, x := range e.respExcluded {
+		if !x.until.After(now) {
+			delete(e.respExcluded, ip)
 		}
 	}
 	for ck, slots := range e.respSlots {

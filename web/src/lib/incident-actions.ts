@@ -223,7 +223,8 @@ export async function blockIpAction(_prev: FormState, formData: FormData): Promi
   if (res.error) return { error: res.error };
   const failed = (res.results ?? []).filter((r) => !r.ok);
   if (failed.length > 0) return { error: failed.map((r) => `${r.executor}: ${r.detail}`).join("; ") };
-  return { error: null, ok: true };
+  // 200 с оговоркой движка (журнал реагирования недоступен) — оператор должен её увидеть.
+  return res.warning ? { error: null, ok: true, warning: res.warning } : { error: null, ok: true };
 }
 
 /** Снятие блокировки: POST ${ENGINE_URL}/respond/unblock {ip, user, reason}.
@@ -251,7 +252,8 @@ export async function unblockIpAction(_prev: FormState, formData: FormData): Pro
   if (res.error) return { error: res.error };
   const failed = (res.results ?? []).filter((r) => !r.ok);
   if (failed.length > 0) return { error: failed.map((r) => `${r.executor}: ${r.detail}`).join("; ") };
-  return { error: null, ok: true };
+  // 200 с оговоркой движка (журнал реагирования недоступен) — оператор должен её увидеть.
+  return res.warning ? { error: null, ok: true, warning: res.warning } : { error: null, ok: true };
 }
 
 /** Та же разблокировка для форм без useActionState (ConfirmForm). */

@@ -34,10 +34,12 @@ export function UnblockIpButton({ ip, incidentId, action }: { ip: string; incide
 
   // Тост — внешняя система; при успехе вместо диалога рендерится «снята».
   useEffect(() => {
-    if (state.ok) toast.success(`Блокировка ${ip} снята`);
+    if (state.ok && state.warning) toast.warning(`Блокировка ${ip} снята с оговоркой`, { description: state.warning, duration: Infinity });
+    else if (state.ok) toast.success(`Блокировка ${ip} снята`);
     else if (state.error) toast.error("Не удалось снять блокировку", { description: state.error });
   }, [state, ip]);
 
+  if (state.ok && state.warning) return <span role="alert" className="font-mono text-xs text-[var(--status-warn)]">снята, но: {state.warning}</span>;
   if (state.ok) return <span className="font-mono text-xs text-[var(--status-ok)]">снята</span>;
 
   return (

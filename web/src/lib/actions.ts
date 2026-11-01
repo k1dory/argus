@@ -28,7 +28,9 @@ import { otpauthUri } from "./totp";
 import { setRuleMuted } from "./queries";
 import { audit } from "./argus-queries";
 
-export type FormState = { error: string | null; ok?: boolean; requiresTotp?: boolean; totpUser?: string; message?: string };
+export type FormState = { error: string | null; ok?: boolean; requiresTotp?: boolean; totpUser?: string; message?: string;
+  /** Действие выполнено, но с оговоркой (например, решение не сохранится после рестарта движка). */
+  warning?: string };
 
 export async function loginAction(_prev: FormState, formData: FormData): Promise<FormState> {
   if (formData.get("step") === "totp") {

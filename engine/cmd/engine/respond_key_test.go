@@ -617,7 +617,7 @@ func TestRespondKeyUnblockJournalFailureIs503(t *testing.T) {
 	if code != http.StatusServiceUnavailable || len(e.resp.Active()) != 1 {
 		t.Fatalf("журнал недоступен: HTTP %d %s, активных %d", code, body, len(e.resp.Active()))
 	}
-	if _, manual := e.manualAt("203.0.113.7"); manual {
+	if keyState(e, "INC-1", "203.0.113.7") == keyManual {
 		t.Fatal("незаписанное решение оператора применено")
 	}
 	code, body = do(t, e.handler(), "POST", "/respond/unblock", "s", `{"ip":"203.0.113.7","user":"qa","reason":"ложное"}`)

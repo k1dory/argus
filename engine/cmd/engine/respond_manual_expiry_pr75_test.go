@@ -11,52 +11,68 @@ import (
 	"github.com/devitex-soft/argus/engine/internal/model"
 )
 
-// A new incident first seen just before an IP-wide override expires must not
-// retain that exemption for another respStateTTL. After the override expires,
-// fresh trusted evidence for the same open incident must reach the responder.
+// An incident first seen while the address is excluded must not keep that
+// exemption after the exclusion ends. After expiry (or revocation), fresh
+// trusted evidence for the same open incident must reach the responder — in
+// this process and after a restart.
 func TestPR75ManualExpiryReconsidersSuppressedIncident(t *testing.T) {
-	for _, window := range []string{"1h", "72h"} {
-		t.Run(window, func(t *testing.T) {
+	for _, end := range []string{"expiry", "revoke", "expiry_after_restart"} {
+		t.Run(end, func(t *testing.T) {
 			f := newFakeCH(t)
 			x := newKeyExecutor(t)
 			x.available.Store(true)
-			rule := strings.Replace(capRule(4), "block_cap_window: 1h", "block_cap_window: "+window, 1)
-			e := testEngine(t, f, rulesDirWith(t, map[string]string{"r.yml": rule}), ipsConfig(x.srv), "s", "s")
+			rule := strings.Replace(capRule(4), "block_cap_window: 1h", "block_cap_window: 72h", 1)
+			dir := rulesDirWith(t, map[string]string{"r.yml": rule})
+			e := testEngine(t, f, dir, ipsConfig(x.srv), "s", "s")
 			ctx := context.Background()
-			e.autoRespond(ctx, []*incidents.Incident{capInc("INC-1", "203.0.113.7")}, time.Now())
-			if x.blocks.Load() != 1 {
-				t.Fatal("fixture: the original incident must block")
+			code, body := do(t, e.handler(), http.MethodPost, "/respond/exclude", "s",
+				`{"ip":"203.0.113.7","ttl":"24h","user":"qa","reason":"partner scanner, agreed window"}`)
+			if code != http.StatusOK {
+				t.Fatalf("fixture: exclude: HTTP %d %s", code, body)
 			}
-			code, body := do(t, e.handler(), http.MethodPost, "/respond/unblock", "s",
-				`{"ip":"203.0.113.7","user":"qa","reason":"INC-1 was a false positive"}`)
-			if code != http.StatusOK || len(e.resp.Active()) != 0 {
-				t.Fatalf("fixture: manual unblock: HTTP %d %s", code, body)
+			until, excluded := e.excludedUntil("203.0.113.7", time.Now())
+			if !excluded {
+				t.Fatal("fixture: expected the exclusion")
 			}
-			at, manual := e.manualAt("203.0.113.7")
-			if !manual {
-				t.Fatal("fixture: expected the address-wide decision")
-			}
-			beforeExpiry := at.Add(e.respRetention() - time.Minute)
-			e.pruneRespState(beforeExpiry, respStateTTL)
+			during := until.Add(-time.Minute)
 			inc := capInc("INC-2", "203.0.113.7")
-			inc.Events[0] = wafEvent(model.FormatTS(beforeExpiry), "203.0.113.7", "file", "")
-			e.autoRespond(ctx, []*incidents.Incident{inc}, beforeExpiry)
-			if x.blocks.Load() != 1 || keyState(e, "INC-2", "203.0.113.7") != keyManual {
-				t.Fatal("fixture: the new incident must be suppressed while the decision is still valid")
+			inc.Events[0] = wafEvent(model.FormatTS(during), "203.0.113.7", "file", "")
+			e.autoRespond(ctx, []*incidents.Incident{inc}, during)
+			if x.blocks.Load() != 0 || keyState(e, "INC-2", "203.0.113.7") != keyExcluded {
+				t.Fatalf("the incident must be suppressed while the exclusion is valid: state=%q", keyState(e, "INC-2", "203.0.113.7"))
 			}
-
-			afterExpiry := at.Add(e.respRetention() + time.Minute)
-			e.pruneRespState(afterExpiry, respStateTTL)
-			if _, manual := e.manualAt("203.0.113.7"); manual {
-				t.Fatal("fixture: the IP-wide override must have expired")
+			after := until.Add(time.Minute)
+			switch end {
+			case "revoke":
+				code, body = do(t, e.handler(), http.MethodPost, "/respond/exclude/revoke", "s", `{"ip":"203.0.113.7","user":"qa","reason":"window over"}`)
+				if code != http.StatusOK {
+					t.Fatalf("revoke: HTTP %d %s", code, body)
+				}
+				after = during.Add(time.Second)
+				if _, excluded := e.excludedUntil("203.0.113.7", time.Now()); excluded {
+					t.Fatal("revoked exclusion still applies")
+				}
+			case "expiry_after_restart":
+				saveJournal(f)
+				e = testEngine(t, f, dir, ipsConfig(x.srv), "s", "s")
+				e.restoreRespState([]incidents.Incident{*inc}, during)
+				if !e.restoreKeys(ctx, during) {
+					t.Fatal("journal not read after restart")
+				}
+				if _, excluded := e.excludedUntil("203.0.113.7", during); !excluded {
+					t.Fatal("exclusion lost after restart")
+				}
+				if keyState(e, "INC-2", "203.0.113.7") != keyExcluded {
+					t.Fatalf("excluded key not restored: %q", keyState(e, "INC-2", "203.0.113.7"))
+				}
 			}
-			// This is an update within the rule's 30m dedupe window, not a new
-			// incident ID: the ordinary engine cycle passes it to autoRespond.
-			inc.Events = append(inc.Events, wafEvent(model.FormatTS(afterExpiry), "203.0.113.7", "file", ""))
+			e.pruneRespState(after, respStateTTL)
+			// An update within the rule's dedupe window, not a new incident ID.
+			inc.Events = append(inc.Events, wafEvent(model.FormatTS(after), "203.0.113.7", "file", ""))
 			inc.EventCount = uint32(len(inc.Events))
-			e.autoRespond(ctx, []*incidents.Incident{inc}, afterExpiry)
-			if x.blocks.Load() != 2 || len(e.resp.Active()) != 1 {
-				t.Fatalf("expired manual decision still suppresses fresh evidence for the same incident: incident state=%q, key=%q, blocks=%d",
+			e.autoRespond(ctx, []*incidents.Incident{inc}, after)
+			if x.blocks.Load() != 1 || len(e.resp.Active()) != 1 {
+				t.Fatalf("ended exclusion still suppresses fresh evidence for the same incident: incident state=%q, key=%q, blocks=%d",
 					e.respStatus("INC-2"), keyState(e, "INC-2", "203.0.113.7"), x.blocks.Load())
 			}
 		})
