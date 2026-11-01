@@ -63,6 +63,8 @@ argus_ready_delay_sec: 10
 # parts_to_do (стек при этом уже поднят и работает); latest_fail_reason — падение сразу.
 argus_mutations_retries: 120
 argus_mutations_delay_sec: 30
+# Потолок одной попытки проверок migrator и мутаций (docker exec может зависнуть).
+argus_probe_timeout_sec: 60
 
 # Что исключить при rsync рабочей копии (argus_source: local).
 argus_rsync_excludes:
