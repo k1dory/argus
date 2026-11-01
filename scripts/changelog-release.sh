@@ -87,7 +87,12 @@ CL_BODY="$work/body" awk '
 # --- изменения: git rm фрагментов, затем CHANGELOG.md --------------------------------
 # Сбой (index.lock, нет прав) — сообщение с командой отката; повтор после неё —
 # обычная первая сборка.
-trap 'rc=$?; rm -rf -- "$work"; [ $rc -eq 0 ] || echo "релиз не завершён; откатить: $rollback" >&2' EXIT
+on_exit() {
+    local rc=$?
+    rm -rf -- "$work"
+    [ "$rc" -eq 0 ] || echo "релиз не завершён; откатить: $rollback" >&2
+}
+trap on_exit EXIT
 if [ ${#frags[@]} -gt 0 ]; then
     git --literal-pathspecs rm -q -- "${frags[@]}"
 fi
