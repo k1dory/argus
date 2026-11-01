@@ -347,3 +347,29 @@ test("по алиасу: неоднозначно — кандидаты с ин
   assert.match(text, /недоступн/i);
   assert.ok(!/Привязать к персоне/.test(text), "без хранилища форма не показывается");
 });
+
+/* ===== Диапазоны списка ===== */
+
+test("список: пороги событий/инцидентов сужают персон; точное окно уходит в запрос параметрами", async () => {
+  await auth.createSession("analyst1", "analyst");
+  // events_min=1 — только i.petrov (5 событий).
+  let text = await pageText(await actorsPage.default(props({}, { range: "24h", events_min: "1" })));
+  assert.match(text, /Иван Петров/);
+  assert.doesNotMatch(text, /Анна Смирнова/, "у a.smirnova нет событий за окно");
+  assert.doesNotMatch(text, /служебная/, "svc.backup без событий");
+  // incidents_min=1 — только a.smirnova (два инцидента).
+  text = await pageText(await actorsPage.default(props({}, { incidents_min: "1" })));
+  assert.match(text, /Анна Смирнова/);
+  assert.doesNotMatch(text, /Иван Петров/);
+  // Пороги, под которые никто не подходит, — пустое состояние с перечнем фильтров.
+  text = await pageText(await actorsPage.default(props({}, { events_min: "100", incidents_max: "0" })));
+  assert.match(text, /Нет персон по фильтрам: событий ≥ 100, инцидентов ≤ 0/);
+  assert.match(text, /Персон 3/, "сводные плитки — по всем персонам");
+  // Точное окно: границы — параметрами from/to запроса событий, подпись — интервал.
+  const seen: URLSearchParams[] = [];
+  routes = routes.map((r) => (r.when("ARRAY JOIN ps AS p FROM events") ? { ...r, rows: (p: URLSearchParams) => { seen.push(p); return r.rows(p); } } : r));
+  text = await pageText(await actorsPage.default(props({}, { from: "2026-10-28T00:00", to: "2026-10-29T00:00" })));
+  assert.match(text, /активность интервал 2026-10-28 00:00 — 2026-10-29 00:00 UTC/);
+  assert.equal(seen[0]?.get("param_from"), "2026-10-28 00:00:00.000");
+  assert.equal(seen[0]?.get("param_to"), "2026-10-29 00:00:00.000");
+});

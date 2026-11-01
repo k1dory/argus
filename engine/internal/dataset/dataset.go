@@ -212,7 +212,10 @@ func Build(l store.LabeledIncident, source string) *Record {
 	if splitBucket(groupKey(inc)) < HoldoutPercent {
 		split = "holdout"
 	}
-	qs := Questions(scenario, inc.Tags, tactic)
+	// Кандидаты техники — по тем же обезличенным тегам, что в записи (r.Tags):
+	// по ним же строится запрос модели (askModel), варианты совпадают.
+	tags := ruleTags(inc)
+	qs := Questions(scenario, tags, tactic)
 	// Групповое закрытие (#65) предлагает технику по объединению тегов группы,
 	// а она может не попасть в кандидаты этого инцидента. Добавить её в
 	// варианты нельзя: в работе движок строит кандидатов по тегам самого
@@ -225,7 +228,7 @@ func Build(l store.LabeledIncident, source string) *Record {
 	}
 	return &Record{
 		Schema: Schema, IncidentID: inc.IncidentID, GroupID: group, Split: split,
-		Scenario: scenario, Source: source, RuleID: recordRuleID(inc), Level: inc.Level, Tags: ruleTags(inc),
+		Scenario: scenario, Source: source, RuleID: recordRuleID(inc), Level: inc.Level, Tags: tags,
 		PII: inc.PII != 0, Blind: l.Label.Blind, LabeledAt: l.ChangedAt,
 		State: analyst.DecisionState(inc), Questions: qs, Labels: labels, OmittedLabels: omitted,
 	}

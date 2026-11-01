@@ -3,10 +3,10 @@
 import { RANGES, parseRange, type RangeKey } from "./ranges";
 import { appendTerm, parseQuery, termToString } from "./search-query";
 import { SEVERITY } from "./severity";
+import { getParam as getFilterParam, parseTimeFilter, rangeLabel } from "./filters";
 
 export const JOURNAL_PATH = "/events";
 export const MAX_Q_LEN = 2000;
-const DT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/;
 const VALUE_MAX = 256;
 
 /** Порог серьёзности события 0..10: пороги — из lib/shared/severity. */
@@ -17,6 +17,14 @@ export const SEV_OPTIONS = [
   { value: String(SEVERITY.events.critical), label: `≥ ${SEVERITY.events.critical} · критичная` },
 ] as const;
 
+/** Верхний порог серьёзности: «не выше» — отсечь шумные критичные или смотреть только фон. */
+export const SEV_MAX_OPTIONS = [
+  { value: "", label: "Любая" },
+  { value: String(SEVERITY.events.medium - 1), label: `≤ ${SEVERITY.events.medium - 1} · низкая` },
+  { value: String(SEVERITY.events.high - 1), label: `≤ ${SEVERITY.events.high - 1} · до средней` },
+  { value: String(SEVERITY.events.critical - 1), label: `≤ ${SEVERITY.events.critical - 1} · до высокой` },
+] as const;
+
 export type JournalFilters = {
   q: string;
   range: RangeKey;
@@ -24,7 +32,10 @@ export type JournalFilters = {
   to?: string;
   source?: string;
   host?: string;
+  /** Серьёзность не ниже (URL level_min, прежде sev). */
   sev?: number;
+  /** Серьёзность не выше (URL level_max). */
+  sevMax?: number;
   rule?: string;
   page?: number;
 };
@@ -43,18 +54,28 @@ const clean = (v: string | undefined): string | undefined => {
 
 export function parseJournalParams(sp: Params): JournalFilters {
   const g = (k: string) => getParam(sp, k);
-  const dt = (v: string | undefined) => (v && DT_RE.test(v) ? v : undefined);
-  const sevRaw = Number(g("sev"));
-  const sev = Number.isInteger(sevRaw) && sevRaw > 0 && sevRaw <= 10 ? sevRaw : undefined;
+  // Порог серьёзности: level_min/level_max (как на остальных страницах), sev — прежнее имя нижнего.
+  const sevOf = (v: string | undefined, lo: number) => {
+    const n = Number(v);
+    return v !== undefined && /^\d+$/.test(v.trim()) && Number.isInteger(n) && n >= lo && n <= 10 ? n : undefined;
+  };
+  let sev = sevOf(getFilterParam(sp, "level_min") ?? g("sev"), 1);
+  let sevMax = sevOf(getFilterParam(sp, "level_max"), 0);
+  // Перепутанные границы — местами; нижняя 0 значит «без нижней границы» (severity=0 остаётся в окне).
+  if (sev !== undefined && sevMax !== undefined && sev > sevMax) [sev, sevMax] = [sevMax > 0 ? sevMax : undefined, sev];
+  if (sevMax === 10) sevMax = undefined;
+  // Точный интервал: невалидные даты отбрасываются, перепутанные границы меняются местами.
+  const time = parseTimeFilter(sp, { defaultRange: "24h" });
   const pageRaw = Number(g("page"));
   return {
     q: (g("q") ?? "").slice(0, MAX_Q_LEN),
-    range: parseRange(g("range")),
-    from: dt(g("from")),
-    to: dt(g("to")),
+    range: parseRange(g("range") ?? g("period")),
+    from: time.from,
+    to: time.to,
     source: clean(g("source")),
     host: clean(g("host")),
     sev,
+    sevMax,
     rule: clean(g("rule")),
     page: Number.isInteger(pageRaw) && pageRaw > 1 ? pageRaw : undefined,
   };
@@ -67,6 +88,7 @@ export function journalQuery(f: JournalFilters): string {
   if (f.host) q = appendTerm(q, "node", f.host);
   if (f.rule) q = appendTerm(q, "rule", f.rule);
   if (f.sev) q = `${q} severity>=${f.sev}`.trim();
+  if (f.sevMax !== undefined) q = `${q} severity<=${f.sevMax}`.trim();
   return q;
 }
 
@@ -74,15 +96,17 @@ export type JournalPatch = Partial<Record<keyof JournalFilters, string | number 
 
 /** Параметры URL журнала; patch со значением undefined убирает ключ. Страница сбрасывается, если не задана явно. */
 export function journalParams(f: JournalFilters, patch: JournalPatch = {}): URLSearchParams {
-  const merged: JournalPatch = { q: f.q, range: f.range, from: f.from, to: f.to, source: f.source, host: f.host, sev: f.sev, rule: f.rule, ...patch };
+  const merged: JournalPatch = { q: f.q, range: f.range, from: f.from, to: f.to, source: f.source, host: f.host, sev: f.sev, sevMax: f.sevMax, rule: f.rule, ...patch };
   if (!("page" in patch)) merged.page = undefined;
   const p = new URLSearchParams();
-  for (const k of ["q", "source", "host", "sev", "rule", "range", "from", "to", "page"] as const) {
+  // Имена в URL — общие для консоли: порог серьёзности — level_min/level_max.
+  const URL_KEY: Partial<Record<keyof JournalFilters, string>> = { sev: "level_min", sevMax: "level_max" };
+  for (const k of ["q", "source", "host", "sev", "sevMax", "rule", "range", "from", "to", "page"] as const) {
     const v = merged[k];
     if (v === undefined || v === "") continue;
     if (k === "range" && v === "24h") continue; // диапазон по умолчанию — без шума в URL
     if (k === "page" && Number(v) <= 1) continue;
-    p.set(k, String(v));
+    p.set(URL_KEY[k] ?? k, String(v));
   }
   return p;
 }
@@ -104,7 +128,7 @@ export function activeChips(f: JournalFilters): { key: string; label: string; va
   const chips: { key: string; label: string; value: string; href: string }[] = [];
   if (f.source) chips.push({ key: "source", label: "источник", value: f.source, href: journalHref(f, { source: undefined }) });
   if (f.host) chips.push({ key: "host", label: "хост", value: f.host, href: journalHref(f, { host: undefined }) });
-  if (f.sev) chips.push({ key: "sev", label: "серьёзность", value: `≥ ${f.sev}`, href: journalHref(f, { sev: undefined }) });
+  if (f.sev || f.sevMax !== undefined) chips.push({ key: "sev", label: "серьёзность", value: rangeLabel(f.sev ? String(f.sev) : undefined, f.sevMax !== undefined ? String(f.sevMax) : undefined) ?? "", href: journalHref(f, { sev: undefined, sevMax: undefined }) });
   if (f.rule) chips.push({ key: "rule", label: "правило", value: f.rule, href: journalHref(f, { rule: undefined }) });
   if (f.from || f.to) chips.push({ key: "time", label: "интервал UTC", value: `${(f.from ?? "…").replace("T", " ")} — ${(f.to ?? "сейчас").replace("T", " ")}`, href: journalHref(f, { from: undefined, to: undefined }) });
   return chips;

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -202,6 +203,9 @@ batch:
 		t.Fatal(err)
 	}
 	fmt.Fprint(tc, "<86>Jan  1 00:00:02 host2 sudo: root : COMMAND=/bin/ls\n")
+	// Часы источника на 3 ч вперёд (RFC 5424 с поясом): ts — время приёма, исходное — в attrs.ts_original.
+	future := time.Now().UTC().Add(3 * time.Hour)
+	fmt.Fprintf(tc, "<86>1 %s skewhost skewapp - - - clock ahead\n", future.Format(time.RFC3339))
 	tc.Close()
 
 	// HTTP: CEF и LEEF через /ingest/syslog, готовое событие через /ingest/events.
@@ -223,7 +227,8 @@ batch:
 		t.Errorf("/ingest/syslog: %d", code)
 	}
 	if code := post("/ingest/events", `{"ts":"2026-01-01 00:00:03.000","source":"vector.test","action":"login","outcome":"success","src_ip":"10.1.2.3","dst_ip":"203.0.113.1","attrs":{"transport":"tls","src_asn":"666","dst_asn":"666","dst_as_org":"spoofed"}}`+"\n"+
-		`{"ts":"2026-01-01 00:00:03.500","source":"vector.asn","action":"scan","outcome":"failure","src_ip":"45.33.32.156","dst_ip":"10.0.0.7","attrs":{"src_asn":"13335","src_as_org":"spoofed"}}`+"\n"+
+		`{"ts":"2026-01-01 00:00:03.500","source":"vector.asn","action":"scan","outcome":"failure","src_ip":"45.33.32.156","dst_ip":"10.0.0.7","attrs":{"src_asn":"13335","src_as_org":"spoofed","ts_original":"spoofed"}}`+"\n"+
+		`{"ts":"`+future.Format("2006-01-02 15:04:05.000")+`","source":"vector.skew","action":"login","outcome":"success"}`+"\n"+
 		// Поддельный стоп-сигнал коллектора: внутренний признак из тела тоже не переживает приём.
 		`{"ts":"2026-01-01 00:00:03.500","source":"argus.collector","action":"collector.sink_recovered","node":"argus-collector","attrs":{"transport":"internal"}}`+"\n", "tok-e2e"); code/100 != 2 {
 		t.Errorf("/ingest/events: %d", code)
@@ -249,7 +254,7 @@ batch:
 
 	// Ждём не число строк, а каждый транспорт: udp, tcp, http (CEF, LEEF,
 	// событие), файл. UDP пересылается раз в полсекунды, пока не дошёл.
-	markers := []string{`"transport":"udp"`, `"transport":"tcp"`, `"transport":"http"`, `"transport":"file"`, `"source":"vector.test"`, `"source":"argus.collector"`, `"scope":"outbound"`, `"src_asn":"63949"`, `"src_as_org":"AKAMAI-LINODE-AP Akamai Connected Cloud"`}
+	markers := []string{`"transport":"udp"`, `"transport":"tcp"`, `"transport":"http"`, `"transport":"file"`, `"source":"vector.test"`, `"source":"argus.collector"`, `"scope":"outbound"`, `"src_asn":"63949"`, `"src_as_org":"AKAMAI-LINODE-AP Akamai Connected Cloud"`, `"source":"vector.skew"`, `"node":"skewhost"`}
 	// Ожидание до готовности, а не пауза: 60 с стоят времени только при сбое (под -race на раннере).
 	deadline := time.Now().Add(60 * time.Second)
 	var all string
@@ -281,6 +286,24 @@ batch:
 	}
 	if strings.Contains(all, `"transport":"tls"`) || strings.Contains(all, `"transport":"internal"`) {
 		t.Error("transport из тела события не должен переживать приём")
+	}
+	// Будущее время syslog и NDJSON — заменено временем приёма, исходное сохранено.
+	for _, line := range strings.Split(all, "\n") {
+		if !strings.Contains(line, `"source":"vector.skew"`) && !strings.Contains(line, `"node":"skewhost"`) {
+			continue
+		}
+		var row struct {
+			TS    string            `json:"ts"`
+			Attrs map[string]string `json:"attrs"`
+		}
+		if err := json.Unmarshal([]byte(line), &row); err != nil {
+			t.Fatal(err)
+		}
+		ts, _ := time.Parse("2006-01-02 15:04:05.000", row.TS)
+		orig, _ := time.Parse("2006-01-02 15:04:05.000", row.Attrs["ts_original"])
+		if d := time.Since(ts); d < -time.Minute || d > 5*time.Minute || orig.Sub(ts) < 2*time.Hour {
+			t.Errorf("часы впереди: ts=%s ts_original=%q", row.TS, row.Attrs["ts_original"])
+		}
 	}
 	for _, spoof := range []string{`"666"`, `"spoofed"`, `"src_asn":"13335"`, `"dst_asn"`} {
 		if strings.Contains(all, spoof) {

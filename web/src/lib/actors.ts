@@ -88,8 +88,9 @@ const INCIDENT_SQL_MAX = 64 * 1024;
  * Инциденты — по субъектным алиасам, действовавшим на first_ts инцидента,
  * партиями по PERSONS_PER_QUERY персон (incidents_current невелик).
  */
-export async function listPersons(range: ActorRange, now = Date.now()): Promise<PersonSummary[]> {
-  const w = clampWindow(rangeWindow(range, now));
+/** Сводка персон за период: ключ пресета или точное окно (не шире 30 дней — clampWindow). */
+export async function listPersons(range: ActorRange | Window, now = Date.now()): Promise<PersonSummary[]> {
+  const w = clampWindow(typeof range === "string" ? rangeWindow(range, now) : range);
   const [persons, aliases] = await Promise.all([
     chQuery<PersonRow>(`${PERSONS_LATEST} ORDER BY display, person_id LIMIT 5000`),
     allAliases(),

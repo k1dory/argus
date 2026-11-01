@@ -25,6 +25,8 @@ import { isIncidentStatus, type IncidentStatus } from "./shared/incidents";
 import type { ClosureLabel } from "./shared/closure-label";
 import { addrSQL, blockState, GROUP_ROWS_PAGE, GROUPS_PAGE, isSubnetKey, levelOfRank, SCAN_GROUP_RULES, subnetSQL, type BlockRow, type BlockState } from "./shared/scan-groups";
 import { AGENT_VERDICT_SESSION_ORDER } from "./shared/triage-verdict";
+import { INCIDENT_LEVELS, numConditions, ordinalConditions, timeCondition, type NumRange, type TimeFilter } from "./shared/filters";
+import type { IncidentRanges } from "./shared/page-filters";
 
 
 export type IncidentRow = {
@@ -53,7 +55,11 @@ export type IncidentRow = {
 
 const LATEST = `SELECT * FROM incidents_current`;
 
-type IncidentFilter = { status?: string; level?: string; q?: string; page?: number; pageSize?: number; queue?: "open" | "mine" | "unassigned" | "overdue"; user?: string; groupScans?: boolean };
+export type IncidentFilter = {
+  status?: string; level?: string; q?: string; page?: number; pageSize?: number; queue?: "open" | "mine" | "unassigned" | "overdue"; user?: string; groupScans?: boolean;
+  /** Диапазоны (lib/shared/page-filters): окно по first_ts, уровень не ниже/не выше, число событий. */
+  ranges?: Partial<IncidentRanges>;
+};
 
 /** Условия очереди (поиск, статус, уровень, очередь) — общие для списка и групп сканов. */
 function incidentConditions(filter: IncidentFilter, params: Record<string, string | number>): string[] {
@@ -70,6 +76,12 @@ function incidentConditions(filter: IncidentFilter, params: Record<string, strin
     having.push("level = {level:String}");
     params.level = filter.level;
   }
+  // incidents_current — представление над ReplacingMergeTree с ключом incident_id:
+  // ни партиций, ни ключа по времени у него нет, условие окна — по агрегированной строке.
+  const r = filter.ranges;
+  if (r?.time) having.push(...timeCondition("first_ts", r.time, params, "inc_t"));
+  if (r?.level) having.push(...ordinalConditions("level", r.level, INCIDENT_LEVELS, params, "inc_lvl"));
+  if (r?.events) having.push(...numConditions("event_count", r.events, params, "inc_ev", "UInt64"));
   if (filter.queue === "open") {
     having.push("status NOT IN ('closed', 'false_positive')");
   } else if (filter.queue === "mine") {
@@ -659,13 +671,18 @@ export type EventRow = {
   pii: number;
 };
 
-export async function eventsRecent(source?: string, limit = 60): Promise<EventRow[]> {
+/** Лента «Источников»: окно по received_at (minmax-индекс idx_received_at, 0028) и порог серьёзности. */
+export type RecentFilters = { time?: TimeFilter; severity?: NumRange };
+
+export async function eventsRecent(source?: string, limit = 60, f: RecentFilters = {}): Promise<EventRow[]> {
   const params: Record<string, string | number> = { limit };
-  let where = "received_at >= now() - INTERVAL 24 HOUR";
+  const conds = timeCondition("received_at", f.time ?? { range: "24h" }, params, "rcv");
   if (source) {
-    where += " AND source = {source:String}";
+    conds.push("source = {source:String}");
     params.source = source;
   }
+  if (f.severity) conds.push(...numConditions("severity", f.severity, params, "sev", "UInt8"));
+  const where = conds.join(" AND ");
   return chQuery<EventRow>(
     `SELECT ts, received_at, source, action, outcome, severity, actor_name, object, node, src_ip, dst_ip, dst_port, pii
      FROM events WHERE ${where} ORDER BY received_at DESC, ts DESC LIMIT {limit:UInt32}`,

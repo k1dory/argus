@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/devitex-soft/argus/engine/internal/analyst"
 	"github.com/devitex-soft/argus/engine/internal/dataset"
+	"github.com/devitex-soft/argus/engine/internal/registry"
 	"github.com/devitex-soft/argus/engine/internal/store"
 	"github.com/devitex-soft/argus/engine/internal/systemone"
 )
@@ -132,6 +134,11 @@ func askModel(ctx context.Context, c *systemone.Client, r *dataset.Record) (data
 	if err != nil {
 		return dataset.ModelAnswers{}, fmt.Errorf("attack_technique: %w", err)
 	}
+	// У записи одна версия модели на все ответы: если за псевдонимом модели
+	// между запросами выкатили другую ревизию, пару не смешиваем.
+	if resp2.Model != resp.Model {
+		return dataset.ModelAnswers{}, errors.New("systemone " + c.Name + ": model revision changed between requests")
+	}
 	ma.Answers = maps.Clone(ma.Answers)
 	ma.Answers["attack_technique"] = resp2.Answers["attack_technique"]
 	ma.Questions = map[string]systemone.Question{"attack_technique": tq}
@@ -181,6 +188,13 @@ func datasetCmd(args []string) int {
 		return 2
 	}
 	analyst.SetDatasetSecret([]byte(secret))
+	// Реестр поставляемого набора — из копии в образе (ARGUS_SHIPPED_DIR,
+	// по умолчанию /usr/share/argus/shipped). Без него каждое правило было бы
+	// «[rule]», а каждое действие — «[action]»: выгрузка бесполезна, поэтому отказ.
+	if err := registry.LoadEnv(); err != nil {
+		fmt.Fprintln(os.Stderr, "реестр поставляемого набора:", err)
+		return 2
+	}
 	laya, jev := systemone.FromEnv(os.Getenv)
 	var list []string
 	if *models != "" {
