@@ -134,11 +134,40 @@ jobs:
       - env:
           BASE: ${{ github.event.pull_request.base.sha }}
         run: |
-          changed="$(git diff --name-only "$BASE"...HEAD)"
-          if grep -qx CHANGELOG.md <<<"$changed" && ! grep -qx VERSION <<<"$changed"; then
-            echo "::error file=CHANGELOG.md::CHANGELOG.md правится только в релизе (с VERSION). Запись PR — файл changes/unreleased/${GITHUB_HEAD_REF//\//-}.md, см. changes/unreleased/README.md"
-            exit 1
+          # Пути — через -z и сравнение строк (имена файлов не регулярки и не команды);
+          # переименование и удаление CHANGELOG.md тоже правка (--no-renames). Релиз —
+          # это новая версия по содержимому VERSION, а не любое касание файла.
+          git cat-file -e "$BASE^{commit}" || { echo "база PR $BASE недоступна"; exit 1; }
+          mb="$(git merge-base "$BASE" HEAD)"
+          paths="$(mktemp)"
+          git diff --no-renames --name-only -z "$mb" HEAD > "$paths"
+          touched=0
+          while IFS= read -r -d '' path; do
+            if [ "$path" = CHANGELOG.md ]; then touched=1; fi
+          done < "$paths"
+          if [ "$touched" = 1 ]; then
+            old="$(git show "$mb:VERSION" 2>/dev/null | tr -d '[:space:]' || true)"
+            new="$(git show HEAD:VERSION 2>/dev/null | tr -d '[:space:]' || true)"
+            if [ -z "$new" ] || [ "$new" = "$old" ]; then
+              echo "::error file=CHANGELOG.md::CHANGELOG.md правится только в релизе вместе с новой версией в VERSION. Запись PR — отдельный файл в changes/unreleased/ (формат в changes/unreleased/README.md)."
+              exit 1
+            fi
           fi
+
+  scripts:
+    # Регрессии скриптов репозитория и run-блоков workflow (Go вне модулей, только std):
+    # scripts/changelog-release.sh и проверки changelog в ci.yml / release.yml исполняются
+    # на временных git-репозиториях.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - run: |
+          go test -count=1 ./scripts/changelog_release_test.go
+          go test -count=1 ./.github/workflows/changelog_test.go
 
   compose:
     # Конфигурация compose валидна (со стендовыми секретами .env.dev) с профилями
