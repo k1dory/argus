@@ -158,7 +158,7 @@
   "a41c-ops-040": {
    "title": "Wazuh agent went silent",
    "tags": [
-    "attack.defense_evasion",
+    "attack.defense_impairment",
     "attack.t1489"
    ]
   },
