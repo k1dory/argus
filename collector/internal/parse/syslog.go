@@ -268,6 +268,11 @@ func ParsePeerZones(spec string) (PeerZones, error) {
 			if err != nil {
 				return nil, fmt.Errorf("syslog tz: %q: %w", addr, err)
 			}
+			// Отправитель сравнивается без зоны интерфейса, поэтому fe80::59%eth0
+			// молча действовал бы на всех интерфейсах — такая настройка отклоняется.
+			if ip.Zone() != "" {
+				return nil, fmt.Errorf("syslog tz: %q — зона интерфейса не поддерживается, укажите адрес без %%%s", addr, ip.Zone())
+			}
 			addr = netip.PrefixFrom(ip, ip.BitLen()).String()
 		}
 		pfx, err := netip.ParsePrefix(addr)
