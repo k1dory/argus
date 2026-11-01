@@ -19,10 +19,10 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync/atomic"
 
+	"github.com/devitex-soft/argus/engine/internal/attack"
 	"github.com/devitex-soft/argus/engine/internal/rules"
 )
 
@@ -175,11 +175,30 @@ func LookupRule(id string) (Rule, bool) {
 func Source(s string) bool { return get().sources[s] }
 func Action(s string) bool { return get().actions[s] }
 
-// attackTagRe — теги ATT&CK по форме (тактика snake_case или техника).
-var attackTagRe = regexp.MustCompile(`^attack\.(t\d{4}(\.\d{3})?|[a-z]+(_[a-z]+){0,3})$`)
+// Tag — тег поставляемых правил или тег ATT&CK из справочника.
+func Tag(t string) bool { return CleanTag(t, true) != "" }
 
-// Tag — тег поставляемых правил или тег ATT&CK.
-func Tag(t string) bool { return get().tags[t] || attackTagRe.MatchString(t) }
+// CleanTag — тег для состояния и записи: тег поставляемых правил как есть
+// (shipped), канонический тег ATT&CK из справочника, иначе "".
+func CleanTag(t string, shipped bool) string {
+	if shipped && get().tags[t] {
+		return t
+	}
+	return NormalizeAttackTag(t)
+}
 
-// AttackTag — тег ATT&CK (для пользовательских правил остаются только они).
-func AttackTag(t string) bool { return attackTagRe.MatchString(t) }
+// AttackTag — тег тактики или техники, которая есть в справочнике ATT&CK
+// (engine/internal/attack): «attack.alice_smirnov» по форме похож на тактику,
+// но в справочнике его нет — это не тег ATT&CK, а свободный текст.
+func AttackTag(t string) bool { return NormalizeAttackTag(t) != "" }
+
+// NormalizeAttackTag — канонический вид тега ATT&CK (trim, нижний регистр:
+// attack.credential_access, attack.t1558.003) или "", если тактики или
+// техники нет в справочнике. Так же теги понимает attack.Candidates.
+func NormalizeAttackTag(t string) string {
+	t = strings.ToLower(strings.TrimSpace(t))
+	if len(attack.RuleTactics([]string{t})) == 1 || len(attack.RuleTechniques([]string{t})) == 1 {
+		return t
+	}
+	return ""
+}
