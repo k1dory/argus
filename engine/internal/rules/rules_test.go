@@ -244,3 +244,32 @@ func TestRepoRulesLayout(t *testing.T) {
 		}
 	}
 }
+
+func TestRespondBlockCapAndSubnet(t *testing.T) {
+	r := load(t, "title: x\nid: y\nlevel: critical\ndetection:\n  selection: {node: a}\nrespond: {action: block_ip}\n")
+	if n, w := r.RespondCap(); n != DefaultBlockCap || w != DefaultBlockCapWindow {
+		t.Fatalf("умолчание: %d %s", n, w)
+	}
+	r = load(t, "title: x\nid: y\nlevel: critical\ndetection:\n  selection: {node: a}\nrespond: {action: block_ip, block_cap: 5, block_cap_window: 10m}\n")
+	if n, w := r.RespondCap(); n != 5 || w.String() != "10m0s" {
+		t.Fatalf("задано: %d %s", n, w)
+	}
+	for _, bad := range []string{"block_cap: -1", "block_cap_window: 0s", "block_cap_window: soon"} {
+		p := filepath.Join(t.TempDir(), "r.yml")
+		_ = os.WriteFile(p, []byte("title: x\nid: y\nlevel: critical\ndetection:\n  selection: {node: a}\nrespond: {action: block_ip, "+bad+"}\n"), 0o600)
+		if _, err := LoadFile(p); err == nil {
+			t.Errorf("%s принято", bad)
+		}
+	}
+	for ip, want := range map[string]string{"203.0.113.7": "203.0.113.0/24", "::ffff:203.0.113.7": "203.0.113.0/24", "2001:db8:1:2::7": "2001:db8:1::/48"} {
+		if got, ok := CapSubnet(ip); !ok || got != want {
+			t.Errorf("%s: %s", ip, got)
+		}
+	}
+	// адреса целей — в канонической записи и без дублей по ней
+	r = load(t, "title: x\nid: y\nlevel: critical\ndetection:\n  selection: {node: a}\nrespond: {action: block_ip, max_targets: 5}\n")
+	targets, _ := r.RespondTargets([]*model.Event{{SrcIP: "::ffff:203.0.113.7"}, {SrcIP: "203.0.113.7"}, {SrcIP: "2001:0DB8::1"}})
+	if len(targets) != 2 || targets[0] != "203.0.113.7" || targets[1] != "2001:db8::1" {
+		t.Fatalf("цели: %v", targets)
+	}
+}

@@ -431,6 +431,40 @@ type ResponseRow struct {
 	Detail     string `json:"detail"`
 	Reason     string `json:"reason"`
 	Actor      string `json:"actor"` // argus-engine | оператор
+	// Step — шаг автомата автоблокировки (миграция 0037): reserve | blocked | noop |
+	// simulated | failed | exhausted | capped | refused | ids; пусто — служебная
+	// строка или ручное действие. По нему движок восстанавливает решения после рестарта.
+	Step string `json:"step"`
+}
+
+// ResponsesSince — строки response_log с адресом и шагом автомата не старше since,
+// по времени. Ошибка ClickHouse, в том числе внутри ответа 200, возвращается без
+// текста строки (в нём может быть цитата данных).
+func (c *ClickHouse) ResponsesSince(ctx context.Context, since time.Time) ([]ResponseRow, error) {
+	// ts без toString: псевдоним с именем колонки перекрыл бы её в WHERE, а DateTime
+	// в JSONEachRow и так строка «2006-01-02 15:04:05».
+	out, err := c.do(ctx, `SELECT ts, incident_id, rule_id, ip, mode, executor, dry_run, ok, detail, reason, actor, step
+		FROM response_log WHERE ip != '' AND step != '' AND ts >= {since:DateTime}
+		ORDER BY ts FORMAT JSONEachRow`, nil,
+		map[string]string{"since": since.UTC().Format("2006-01-02 15:04:05")})
+	if err != nil {
+		return nil, fmt.Errorf("response_log: %w", err)
+	}
+	var rows []ResponseRow
+	for _, line := range bytes.Split(out, []byte("\n")) {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		var row struct {
+			ResponseRow
+			Exception string `json:"exception"`
+		}
+		if err := json.Unmarshal(line, &row); err != nil || row.Exception != "" || row.IncidentID == "" {
+			return nil, errors.New("response_log: неожиданная строка ответа ClickHouse")
+		}
+		rows = append(rows, row.ResponseRow)
+	}
+	return rows, nil
 }
 
 func (c *ClickHouse) InsertResponses(ctx context.Context, rows []ResponseRow) error {
