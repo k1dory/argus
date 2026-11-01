@@ -180,10 +180,10 @@ func parseSyslogLine(norm *normalize.Normalizer, zones parse.PeerZones, line str
 	switch {
 	case isQNAP:
 		e = qn
-	case hasCEF(line, sl.Message):
+	case hasCEF(line):
 		c, _ := parse.ParseCEF(line)
 		e = norm.FromCEF(c, sl, line)
-	case hasLEEF(line, sl.Message):
+	case hasLEEF(line):
 		l, _ := parse.ParseLEEF(line)
 		e = norm.FromLEEF(l, sl, line)
 	case parse.IsWAFErrorLine(line):
@@ -836,29 +836,12 @@ func logLevel() slog.Level {
 	return slog.LevelInfo
 }
 
-// hasCEF/hasLEEF — запись в формате CEF/LEEF по структуре syslog, а не поиском
-// подстроки: заголовок CEF/LEEF стоит в начале строки, в начале сообщения syslog
-// (в т.ч. RFC 5424 с BOM) или забран разборщиком RFC 3164 как тег приложения
-// («host CEF:0|…»). «CEF:» внутри данных (URI WAF, поле JSON Caddy) формата не задаёт.
-func hasCEF(line, msg string) bool  { return hasFormat(line, msg, "CEF") }
-func hasLEEF(line, msg string) bool { return hasFormat(line, msg, "LEEF") }
-
-func hasFormat(line, msg, name string) bool {
-	marker := name + ":"
-	clean := func(s string) string { return strings.TrimLeft(strings.TrimSpace(s), "\ufeff") }
-	if strings.HasPrefix(clean(line), marker) || strings.HasPrefix(clean(msg), marker) {
-		return true
-	}
-	sl, _ := parse.ParseSyslog(line)
-	if sl.Format == "raw" && !strings.HasPrefix(line, "<") {
-		// строка файла без PRI («Oct 29 17:39:38 host CEF:0|…»): тот же разбор заголовка
-		sl, _ = parse.ParseSyslog("<13>" + line)
-		if sl.Format != "raw" && strings.HasPrefix(clean(sl.Message), marker) {
-			return true
-		}
-	}
-	return sl.Format == "rfc3164" && strings.EqualFold(sl.AppName, name)
-}
+// hasCEF/hasLEEF — поиск маркера по строке, как прежде. Выбор разборщика по содержимому
+// строки подделывается данными запроса (URI, User-Agent в JSON Caddy), а каждая строковая
+// эвристика ломала настоящие CEF/LEEF (ревью #16, круги 2–5). Решение — отдельной задачей:
+// формат по источнику/транспорту (collector.yml), тесты в review/codex-waf-dispatch.
+func hasCEF(s string) bool  { return strings.Contains(s, "CEF:") }
+func hasLEEF(s string) bool { return strings.Contains(s, "LEEF:") }
 
 // replayPcap: collector replay-pcap file.pcap [--to http://host:8088] [--token T]
 // Достаёт UDP/TCP-полезную нагрузку из записи tcpdump и шлёт построчно в /ingest/syslog.

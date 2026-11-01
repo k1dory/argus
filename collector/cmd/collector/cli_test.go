@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/binary"
-	"github.com/devitex-soft/argus/collector/internal/parse"
 	"io"
 	"log/slog"
 	"net/http"
@@ -38,15 +37,11 @@ func TestEnvAndLogLevel(t *testing.T) {
 
 func TestHasCEFLEEF(t *testing.T) {
 	line := "<134>1 2026-01-01T00:00:00Z host app - - - CEF:0|Vendor|Product|1|100|name|5|src=1.2.3.4"
-	sl, _ := parse.ParseSyslog(line)
-	if !hasCEF(line, sl.Message) || hasLEEF(line, sl.Message) {
+	if !hasCEF(line) || hasLEEF(line) {
 		t.Error("CEF не распознан или принят за LEEF")
 	}
-	if !hasLEEF("LEEF:2.0|IBM|QRadar|1|x|", "") || hasCEF("plain syslog", "plain syslog") {
+	if !hasLEEF("LEEF:2.0|IBM|QRadar|1|x|") || hasCEF("plain syslog") {
 		t.Error("LEEF/plain")
-	}
-	if waf := `[client 203.0.113.9] ModSecurity: Warning. [uri "/x?q=CEF:0|a"]`; hasCEF(waf, waf) {
-		t.Error("CEF: внутри данных запроса не выбирает разборщик CEF")
 	}
 }
 
