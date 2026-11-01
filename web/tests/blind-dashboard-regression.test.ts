@@ -140,6 +140,38 @@ test("blind: argus_ro не читает вердикт и его копии по
       `SELECT count() AS allowed FROM system.grants WHERE user_name = {user:String} AND (database = 'system' OR database IS NULL)`, { user });
     assert.equal(Number(allowed), 0, "у профиля argus_ro нет грантов на system.*");
 
+    // PR #24: отдельно проверяем фактические права ClickHouse. Отказ validateSql
+    // и отсутствие прямых грантов ещё не доказывают серверный ACCESS_DENIED.
+    // Транспорт настоящий, временная RO-учётка та же; readonly-профиль не меняем.
+    const directRo = async (sql: string) => {
+      const url = new URL(process.env.ARGUS_TEST_CLICKHOUSE_URL!);
+      url.searchParams.set("database", "argus");
+      url.searchParams.set("default_format", "JSONEachRow");
+      const response = await fetch(url, {
+        method: "POST", body: sql,
+        headers: {
+          Authorization: "Basic " + Buffer.from(`${user}:${process.env.CLICKHOUSE_RO_PASSWORD}`).toString("base64"),
+          "Content-Type": "text/plain",
+        },
+        signal: AbortSignal.timeout(25_000),
+      });
+      return { response, text: await response.text() };
+    };
+    const directControl = await directRo("SELECT 1 AS n");
+    assert.equal(directControl.response.status, 200, "учётка и транспорт RO работоспособны");
+    assert.deepEqual(JSON.parse(directControl.text), { n: 1 });
+    // Существование таблицы проверяется администратором: UNKNOWN_TABLE не
+    // принимается за доказательство того, что RO не может читать журнал.
+    await ch().chQuery("SELECT query FROM system.query_log LIMIT 0");
+    for (const sql of [
+      "SELECT query FROM system.query_log LIMIT 1",
+      `SELECT markdown FROM merge('argus', '^agent_verdicts$') WHERE position(markdown, '${marker}') > 0`,
+    ]) {
+      const denied = await directRo(sql);
+      assert.match(denied.text, /^Code:\s*497\.\s*DB::Exception:/m, `${sql}: нужен именно серверный ACCESS_DENIED`);
+      assert.ok(!denied.text.includes(`${marker}-${blindOpen}`), "исключение не содержит скрытую строку");
+    }
+
     // Агрегаты встроенного дашборда argus-siem по-прежнему считаются.
     assert.match(await preview(`SELECT count() AS n FROM incident_verdicts WHERE position(summary_ru, '${marker}') > 0`), /"n":2\b/);
   } finally {
