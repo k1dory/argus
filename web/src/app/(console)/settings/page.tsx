@@ -11,13 +11,14 @@ import { ResponseLog } from "@/components/console/response-log";
 import { muteRuleAction } from "@/lib/actions";
 import { mutedRulesList } from "@/lib/queries";
 import { APP_VERSION } from "@/lib/version";
-import { auditTail, licenseStats, listExceptions, respondStatus, responseLog, RESPOND_MODES } from "@/lib/argus-queries";
+import { auditTail, incidentGet, licenseStats, listExceptions, respondStatus, responseLog, RESPOND_MODES } from "@/lib/argus-queries";
 import { removeExceptionAction, unblockIpFormAction } from "@/lib/incident-actions";
 import { CreateUserForm, DeleteUserButton, ResetPasswordButton } from "@/components/console/users-form";
 import { ActionForm, ConfirmActionForm } from "@/components/console/action-form";
 import { StorageUnavailable } from "@/components/console/storage-error";
 import { safeQuery } from "@/lib/clickhouse";
 import { wazuhEnabled } from "@/lib/integrations";
+import { blindAuditTail } from "@/lib/blind";
 
 export const dynamic = "force-dynamic";
 export const metadata = { title: "Настройки" };
@@ -60,7 +61,8 @@ export default async function SettingsPage() {
       const [mutedRules, exceptions, audit, license, responses] = await Promise.all([
         wazuh ? mutedRulesList() : Promise.resolve([]), listExceptions(), auditTail(60), licenseStats(), responseLog({ limit: 40 }),
       ]);
-      return { mutedRules, exceptions, audit, license, responses };
+      // Вердикт агента по слепому незавершённому инциденту не читается и через общий журнал.
+      return { mutedRules, exceptions, audit: await blindAuditTail(audit, incidentGet), license, responses };
     }),
   ]);
 
