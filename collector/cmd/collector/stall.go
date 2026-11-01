@@ -16,18 +16,29 @@ import (
 // но не идут. Дольше SINK_STALL_AFTER (10m; 0 — выключено) — ERROR в журнал и
 // событие argus.collector / collector.sink_stalled мимо очереди (она и стоит); на
 // него срабатывает правило эксплуатации ops/collector-sink-stalled. Когда застрявших
-// батчей не остаётся — collector.sink_recovered, оно закрывает инцидент.
+// батчей не остаётся — collector.sink_recovered, оно закрывает инцидент. Оба
+// события несут attrs.transport=internal: у входящих событий это поле всегда
+// перезаписывает emit (udp/tcp/tls/http/file/pull), и правило по нему отличает
+// настоящее событие коллектора от присланного через /ingest/events.
 
 const defaultStallAfter = 10 * time.Minute
 
 type stallWatch struct {
-	after    time.Duration
-	stuck    func(now time.Time) time.Duration
-	pending  func() int
-	passes   func() uint64
-	insert   func(ctx context.Context, rows []any) error
-	reported bool // событие о застревании записано, ждём восстановления
+	after   time.Duration
+	stuck   func(now time.Time) time.Duration
+	pending func() int
+	passes  func() uint64
+	insert  func(ctx context.Context, rows []any) error
+	// open — эпизод застревания начат (сообщение о нём поставлено в outbox).
+	// outbox — события, ещё не записанные в ClickHouse: состояние и доставка
+	// разделены, неудачная запись не теряет эпизод и не глушит следующий.
+	open   bool
+	outbox []model.Event
 }
+
+// stallOutboxMax — потолок неотправленных событий (при долгой недоступности
+// ClickHouse старые пары «застряло / восстановилось» вытесняются).
+const stallOutboxMax = 32
 
 func stallAfter() time.Duration {
 	v := os.Getenv("SINK_STALL_AFTER")
@@ -42,27 +53,42 @@ func stallAfter() time.Duration {
 	return d
 }
 
+// tick — сменить состояние по возрасту застрявшего батча и доставить outbox одной
+// вставкой (не больше одной попытки за такт).
 func (w *stallWatch) tick(ctx context.Context, now time.Time) {
 	if w.after <= 0 {
 		return
 	}
 	d := w.stuck(now)
 	switch {
-	case d >= w.after && !w.reported:
+	case d >= w.after && !w.open:
 		slog.Error("запись в ClickHouse стоит: батч не продвигается", "stuck", d.Round(time.Second), "pending_rows", w.pending(), "stalled_passes", w.passes())
-		if err := w.insert(ctx, []any{w.event(now, "collector.sink_stalled", "failure", d)}); err != nil {
-			slog.Warn("событие collector.sink_stalled не записано, повтор на следующем такте", "err", err)
-			return
-		}
-		w.reported = true
-	case d == 0 && w.reported:
-		if err := w.insert(ctx, []any{w.event(now, "collector.sink_recovered", "success", 0)}); err != nil {
-			slog.Warn("событие collector.sink_recovered не записано, повтор на следующем такте", "err", err)
-			return
-		}
+		w.open = true
+		w.enqueue(w.event(now, "collector.sink_stalled", "failure", d))
+	case d == 0 && w.open:
 		slog.Info("запись в ClickHouse снова идёт")
-		w.reported = false
+		w.open = false
+		w.enqueue(w.event(now, "collector.sink_recovered", "success", 0))
 	}
+	if len(w.outbox) == 0 {
+		return
+	}
+	rows := make([]any, len(w.outbox))
+	for i, e := range w.outbox {
+		rows[i] = e
+	}
+	if err := w.insert(ctx, rows); err != nil {
+		slog.Warn("события стоп-сигнала не записаны, повтор на следующем такте", "events", len(w.outbox), "err", err)
+		return
+	}
+	w.outbox = w.outbox[:0]
+}
+
+func (w *stallWatch) enqueue(e model.Event) {
+	if len(w.outbox) >= stallOutboxMax {
+		w.outbox = append(w.outbox[:0], w.outbox[len(w.outbox)-stallOutboxMax+1:]...)
+	}
+	w.outbox = append(w.outbox, e)
 }
 
 func (w *stallWatch) event(now time.Time, action, outcome string, stuck time.Duration) model.Event {

@@ -40,7 +40,7 @@ func TestStallWatchEmitsOncePerEpisode(t *testing.T) {
 	}
 	stuck, fail = 10*time.Minute, true
 	tick()
-	if len(got) != 0 || w.reported {
+	if len(got) != 0 || len(w.outbox) != 1 {
 		t.Fatal("неудачная запись события не должна считаться отправленной")
 	}
 	fail = false

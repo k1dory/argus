@@ -3,7 +3,10 @@
 # Данные целы в очереди или spool, но в SIEM не идут — это сигнал оператору, а не
 # повод хитрее выбирать строки. Коллектор пишет collector.sink_stalled, когда батч
 # стоит дольше SINK_STALL_AFTER (10m), и collector.sink_recovered, когда застрявших
-# не осталось: оно и закрывает инцидент.
+# не осталось: оно и закрывает инцидент. Оба события коллектор пишет сам, с
+# attrs.transport: internal; у всего, что приходит снаружи (/ingest/events, syslog,
+# файлы, pull), это поле перезаписывает приём, и держатель ingest-токена не может ни
+# открыть, ни закрыть этот инцидент поддельным событием.
 title: "ARGUS: collector cannot write to ClickHouse"
 id: a41c-ops-066
 level: high
@@ -13,6 +16,7 @@ detection:
   selection:
     source: argus.collector
     action: collector.sink_stalled
+    attrs.transport: internal
   threshold:
     kind: count
     count: 1
@@ -23,6 +27,7 @@ detection:
 close_on:
   source: argus.collector
   action: collector.sink_recovered
+  attrs.transport: internal
 
 analyst:
   profile: mock             # разбор не нужен: смотрите журнал ClickHouse (system.errors, память, диск) и метрику argus_collector_spool_head_stuck_seconds
