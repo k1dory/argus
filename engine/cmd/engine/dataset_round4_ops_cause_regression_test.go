@@ -70,8 +70,10 @@ func TestPR64Round4OpsDatasetLabelsAreModelOptions(t *testing.T) {
 				Scenario  string            `json:"scenario"`
 				Labels    map[string]string `json:"labels"`
 				Questions map[string]struct {
-					Type     string            `json:"type"`
-					Criteria map[string]string `json:"criteria"`
+					Type string `json:"type"`
+					// Score-вопросы v2 (severity_level, ops_urgency) несут шкалу
+					// массивом — разбираем criteria только у проверяемого вопроса.
+					Criteria json.RawMessage `json:"criteria"`
 				} `json:"questions"`
 			}
 			if err := json.Unmarshal(output.Bytes(), &record); err != nil {
@@ -84,9 +86,13 @@ func TestPR64Round4OpsDatasetLabelsAreModelOptions(t *testing.T) {
 			if !ok || question.Type != "choice" {
 				t.Fatalf("export must ask the model for the labeled ops cause: %+v", record.Questions)
 			}
-			if _, ok := question.Criteria[record.Labels["ops_cause"]]; !ok {
+			var choices map[string]string
+			if err := json.Unmarshal(question.Criteria, &choices); err != nil {
+				t.Fatalf("ops_cause criteria: %v", err)
+			}
+			if _, ok := choices[record.Labels["ops_cause"]]; !ok {
 				t.Errorf("accepted closure cause %q became JSONL label %q outside model choices %v",
-					cause, record.Labels["ops_cause"], question.Criteria)
+					cause, record.Labels["ops_cause"], choices)
 			}
 		})
 	}
