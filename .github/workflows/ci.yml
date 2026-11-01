@@ -89,6 +89,9 @@ jobs:
           CLICKHOUSE_DB: argus
           CLICKHOUSE_USER: default
           CLICKHOUSE_PASSWORD: ci-only
+          # sources-console-role-ch создаёт пользователя с правами argus_console из
+          # migrate.sh — CREATE USER / GRANT, как делает migrate.sh в стеке.
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
         ports:
           - 8123:8123
     steps:
