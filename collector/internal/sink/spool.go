@@ -246,15 +246,67 @@ func (q *Queue) ack(b Batch) error {
 		return nil
 	}
 	if err := os.Remove(b.file); err != nil {
+		// Данные уже в ClickHouse, а файл не удалился (EACCES, EROFS, каталог
+		// недоступен): долг подтверждения. retryAcks удалит файл позже, и тогда же
+		// батч перестанет держать учёт места и стартовую отметку застревания.
+		q.mu.Lock()
+		q.ackDebt = append(q.ackDebt, Batch{file: b.file, diskSize: b.diskSize, restored: b.restored})
+		q.mu.Unlock()
 		return err
 	}
+	q.settleAck(b)
+	return syncDir(q.spool.dir)
+}
+
+func (q *Queue) settleAck(b Batch) {
 	q.mu.Lock()
+	defer q.mu.Unlock()
 	q.spool.used -= b.diskSize
 	if b.restored {
 		q.restoredPending--
 	}
+}
+
+// retryAcks — повторить удаление файлов батчей, записанных в ClickHouse, но не
+// подтверждённых (ack не удалил файл). Файла нет при доступном каталоге — его уже
+// нет, долг погашен. Зовётся писателем перед каждым батчем.
+func (q *Queue) retryAcks() {
+	if q.spool == nil {
+		return
+	}
+	q.mu.Lock()
+	debt := q.ackDebt
+	q.ackDebt = nil
 	q.mu.Unlock()
-	return syncDir(q.spool.dir)
+	if len(debt) == 0 {
+		return
+	}
+	var left []Batch
+	settled := false
+	for _, b := range debt {
+		err := os.Remove(b.file)
+		if err != nil && errors.Is(err, os.ErrNotExist) {
+			if _, derr := os.Stat(q.spool.dir); derr == nil {
+				err = nil
+			}
+		}
+		if err != nil {
+			left = append(left, b)
+			continue
+		}
+		q.settleAck(b)
+		settled = true
+	}
+	if settled {
+		if err := syncDir(q.spool.dir); err != nil {
+			slog.Warn("spool: fsync каталога после отложенного подтверждения не удался", "err", err)
+		}
+	}
+	if len(left) > 0 {
+		q.mu.Lock()
+		q.ackDebt = append(left, q.ackDebt...)
+		q.mu.Unlock()
+	}
 }
 
 func (q *Queue) SpoolBytes() int64 {

@@ -71,6 +71,7 @@ type Queue struct {
 	// прогресса; startedAt — момент старта (stall.go: отсчёт их застревания).
 	restoredPending int
 	startedAt       time.Time
+	ackDebt         []Batch // записаны, но файл не удалён (spool.go: retryAcks)
 }
 
 func NewQueue(maxRows int, st *Stats) *Queue {
@@ -284,6 +285,7 @@ func (w *Writer) Write(ctx context.Context, rows []any) {
 // WriteBatch вставляет один батч по стратегии; ctx — на ожидания, вставка сама
 // по себе не отменяется, чтобы при остановке успеть дописать.
 func (w *Writer) WriteBatch(ctx context.Context, b Batch) {
+	w.Queue.retryAcks()
 	if b.file != "" {
 		w.writeDurable(ctx, b)
 		return
