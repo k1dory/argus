@@ -125,7 +125,14 @@ func askModel(ctx context.Context, c *systemone.Client, r *dataset.Record) (data
 	if err != nil {
 		return dataset.ModelAnswers{}, err
 	}
-	ma := dataset.ModelAnswers{Model: orDefault(resp.Model, c.Model), Answers: resp.Answers}
+	// Ревизия модели — только та, что модель сообщила сама. Псевдоним из
+	// конфигурации (c.Model) ревизию не подтверждает: за ним выкатывают новые
+	// версии, а eval разделяет ответы по ревизии (ModelAnswers.Model).
+	rev := strings.TrimSpace(resp.Model)
+	if rev == "" {
+		return dataset.ModelAnswers{}, errors.New("systemone " + c.Name + ": model revision not reported")
+	}
+	ma := dataset.ModelAnswers{Model: rev, Answers: resp.Answers}
 	if !twoStep {
 		return ma, nil
 	}
@@ -136,7 +143,7 @@ func askModel(ctx context.Context, c *systemone.Client, r *dataset.Record) (data
 	}
 	// У записи одна версия модели на все ответы: если за псевдонимом модели
 	// между запросами выкатили другую ревизию, пару не смешиваем.
-	if resp2.Model != resp.Model {
+	if strings.TrimSpace(resp2.Model) != rev {
 		return dataset.ModelAnswers{}, errors.New("systemone " + c.Name + ": model revision changed between requests")
 	}
 	ma.Answers = maps.Clone(ma.Answers)
