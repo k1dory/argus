@@ -143,9 +143,11 @@ jobs:
     # Полный контур в docker compose: replay → инциденты и вердикты, argus_ro только читает,
     # затем API-смоук консоли (scripts/api-smoke.sh: приём → журнал → сессия разбора → вердикт →
     # паспорт). Требует docker, curl и jq на раннере (ubuntu-latest — есть).
+    # На каждом PR, не только на push в main: дважды ошибка контура (503 /api/sources,
+    # пропавшие источники) всплывала лишь после слияния. ~3 мин, после go/rules/web.
+    # Без buildx (fork-раннер, локально) e2e.sh сам поднимает стек без mcp/caddy.
     runs-on: ubuntu-latest
     needs: [go, rules, web]
-    if: github.event_name == 'push'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: ./scripts/e2e.sh
