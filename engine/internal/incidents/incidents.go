@@ -209,18 +209,10 @@ func (r *Registry) Apply(dets []eval.Detection, now time.Time) (created, updated
 		if ex, ok := r.open[key]; ok && isFinal(ex.Status) && inc.LastTS <= ex.LastTS {
 			// Закрытый инцидент по той же сработке без новых событий: absence
 			// и склеенные окна иначе заводили бы новый инцидент каждый цикл.
-			if ex.groupPending {
-				updated = append(updated, ex.bumpUpdated(now))
-			}
 			continue
 		}
 		if ex, ok := r.open[key]; ok && !isFinal(ex.Status) {
 			if inc.EventCount <= ex.EventCount && inc.LastTS <= ex.LastTS {
-				// Присвоенный group_key записывается отдельной версией строки и без
-				// новых событий: иначе после рестарта инцидент снова окажется без ключа.
-				if ex.groupPending {
-					updated = append(updated, ex.bumpUpdated(now))
-				}
 				continue // ничего нового
 			}
 			ex.EventCount, ex.LastTS, ex.Chain, ex.Sources, ex.Events = inc.EventCount, inc.LastTS, inc.Chain, inc.Sources, inc.Events
@@ -242,6 +234,22 @@ func (r *Registry) Apply(dets []eval.Detection, now time.Time) (created, updated
 		r.open[key] = inc
 		created = append(created, inc)
 	}
+	// Присвоенный group_key, ещё не подтверждённый Persisted, записывается
+	// отдельной версией строки каждый цикл — без новых событий и даже когда
+	// исходная сработка уже ушла из буфера: иначе после рестарта инцидент
+	// снова окажется без ключа.
+	inUpdated := make(map[*Incident]bool, len(updated))
+	for _, inc := range updated {
+		inUpdated[inc] = true
+	}
+	var pending []*Incident
+	for _, inc := range r.open {
+		if inc.groupPending && !inUpdated[inc] {
+			pending = append(pending, inc.bumpUpdated(now))
+		}
+	}
+	sort.Slice(pending, func(i, j int) bool { return pending[i].IncidentID < pending[j].IncidentID })
+	updated = append(updated, pending...)
 	return created, updated, dropped
 }
 
@@ -359,6 +367,7 @@ func (r *Registry) Reconcile(toWrite []*Incident, ops map[string]Operator, engin
 				// Оператор закрыл сам — движку нечего добавить; эскалация
 				// тишиной не перебивает статус, который оператор уже поставил.
 				inc.Status, inc.Owner, inc.Note = op.Status, op.Owner, op.Note
+				inc.groupPending = false // строка не пишется: повторять присвоение незачем
 				continue
 			}
 			// Закрытие движком: заметка оператора остаётся, наша дописывается.
@@ -369,7 +378,11 @@ func (r *Registry) Reconcile(toWrite []*Incident, ops map[string]Operator, engin
 		} else {
 			inc.Status, inc.Owner, inc.Note = op.Status, op.Owner, op.Note
 			if isFinal(op.Status) {
-				continue // оператор закрыл — новые события заведут новый инцидент
+				// Оператор закрыл — новые события заведут новый инцидент, а
+				// неподтверждённый group_key больше не повторяется (иначе каждый
+				// цикл сдвигал бы updated_at, и Prune инцидент не убрал бы).
+				inc.groupPending = false
+				continue
 			}
 		}
 		if op.UpdatedAt >= inc.UpdatedAt {
@@ -437,7 +450,14 @@ func (r *Registry) Close(ruleID, key, note string, evTS, now time.Time) *Inciden
 		if last := (&model.Event{TS: inc.LastTS}).Time(); !evTS.IsZero() && !last.IsZero() && !evTS.After(last) {
 			continue
 		}
-		if inc.ActorName == key || inc.Node == key || (inc.GroupKey != "" && inc.GroupKey == key) || strings.HasPrefix(k, ruleID+"|"+key+"|") {
+		// С group_key — только точное совпадение группы: префикс ключа реестра
+		// «правило|admin|…» у составной группы admin|адрес закрывал бы чужой адрес.
+		// Субъект, узел и префикс — для групп без ключа (и инцидентов до 0034).
+		match := inc.GroupKey == key
+		if inc.GroupKey == "" {
+			match = inc.ActorName == key || inc.Node == key || strings.HasPrefix(k, ruleID+"|"+key+"|")
+		}
+		if match {
 			inc.Status = StatusClosed
 			inc.Note = strings.TrimSpace(inc.Note + "\n" + note)
 			inc.UpdatedAt = model.FormatTS(now)[:19]
@@ -680,20 +700,20 @@ func (i *Incident) Summary() string {
 }
 
 // explicitGroup — group_by правила задан явно и не совпадает с тем, что уже
-// в ключе реестра (субъект, узел; адрес становится субъектом в build).
+// в ключе реестра (субъект, узел; одиночный адрес становится субъектом в build).
+// Составной ключ — всегда явный: адрес в нём в субъект не попадает, а close_on
+// ищет инцидент по тому же составному ключу (admin|NAS-B) в GroupKey.
 func explicitGroup(r *rules.Rule) bool {
 	gb := r.Detection.GroupBy
 	if r.Detection.Threshold != nil && r.Detection.Threshold.GroupBy != "" {
 		gb = r.Detection.Threshold.GroupBy
 	}
-	// Составной ключ только из субъекта, узла и адресов ничего не добавляет к
-	// ключу реестра «правило|субъект|узел» — как и одиночное поле.
-	for _, f := range strings.Split(gb, ",") {
-		switch strings.TrimSpace(f) {
-		case "", "actor.name", "node", "src.ip", "dst.ip":
-		default:
-			return true
-		}
+	if strings.Contains(gb, ",") {
+		return true
 	}
-	return false
+	switch strings.TrimSpace(gb) {
+	case "", "actor.name", "node", "src.ip", "dst.ip":
+		return false
+	}
+	return true
 }
