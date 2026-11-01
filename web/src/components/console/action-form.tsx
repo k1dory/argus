@@ -39,7 +39,10 @@ async function runAction<R extends ActionResult>(
       toast.error(err);
       return;
     }
-    if (successText) toast.success(successText);
+    // Выполнено с оговоркой движка (FormState.warning) — не тихий успех.
+    const warning = r && typeof r === "object" && "warning" in r && typeof r.warning === "string" ? r.warning : "";
+    if (warning) toast.warning(successText ?? "Выполнено с оговоркой", { description: warning, duration: Infinity });
+    else if (successText) toast.success(successText);
     onDone?.(r);
   } catch (e) {
     const msg = actionErrorText(e);

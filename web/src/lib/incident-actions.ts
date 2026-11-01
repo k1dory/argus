@@ -223,8 +223,13 @@ export async function blockIpAction(_prev: FormState, formData: FormData): Promi
   await audit(s.user, "respond.block_ip", ip, `${id} · ${res.error ?? (detail || "ok")}`);
   if (res.error) return { error: res.error };
   const failed = (res.results ?? []).filter((r) => !r.ok);
-  if (failed.length > 0) return { error: failed.map((r) => `${r.executor}: ${r.detail}`).join("; ") };
-  return { error: null, ok: true };
+  if (failed.length > 0) {
+    const error = failed.map((r) => `${r.executor}: ${r.detail}`).join("; ");
+    // Частичный успех: клиент показывает error, оговорка движка не должна потеряться.
+    return { error: res.warning ? `${error}. ${res.warning}` : error };
+  }
+  // 200 с оговоркой движка (журнал реагирования недоступен) — оператор должен её увидеть.
+  return res.warning ? { error: null, ok: true, warning: res.warning } : { error: null, ok: true };
 }
 
 /** Снятие блокировки: POST ${ENGINE_URL}/respond/unblock {ip, user, reason}.
@@ -251,8 +256,13 @@ export async function unblockIpAction(_prev: FormState, formData: FormData): Pro
   await audit(s.user, "respond.unblock_ip", ip, res.error ?? (detail || "ok"));
   if (res.error) return { error: res.error };
   const failed = (res.results ?? []).filter((r) => !r.ok);
-  if (failed.length > 0) return { error: failed.map((r) => `${r.executor}: ${r.detail}`).join("; ") };
-  return { error: null, ok: true };
+  if (failed.length > 0) {
+    const error = failed.map((r) => `${r.executor}: ${r.detail}`).join("; ");
+    // Частичный успех: клиент показывает error, оговорка движка не должна потеряться.
+    return { error: res.warning ? `${error}. ${res.warning}` : error };
+  }
+  // 200 с оговоркой движка (журнал реагирования недоступен) — оператор должен её увидеть.
+  return res.warning ? { error: null, ok: true, warning: res.warning } : { error: null, ok: true };
 }
 
 /** Та же разблокировка для форм без useActionState (ConfirmForm). */

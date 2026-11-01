@@ -435,18 +435,24 @@ type ResponseRow struct {
 	// simulated | failed | exhausted | capped | refused | ids | manual; пусто — служебная
 	// строка или ручное действие. По нему движок восстанавливает решения после рестарта.
 	Step string `json:"step"`
+	// Until — срок исключения адреса из автоблокировки (step=exclude, миграция 0038);
+	// у остальных строк пусто, в колонке — значение по умолчанию.
+	Until string `json:"until,omitempty"`
 }
 
 // ResponsesSince — строки response_log с адресом и шагом автомата не старше since,
 // по времени. Ошибка ClickHouse, в том числе внутри ответа 200, возвращается без
 // текста строки (в нём может быть цитата данных).
-func (c *ClickHouse) ResponsesSince(ctx context.Context, since time.Time) ([]ResponseRow, error) {
+func (c *ClickHouse) ResponsesSince(ctx context.Context, since, excludeSince time.Time) ([]ResponseRow, error) {
 	// ts без toString: псевдоним с именем колонки перекрыл бы её в WHERE, а DateTime
 	// в JSONEachRow и так строка «2006-01-02 15:04:05».
-	out, err := c.do(ctx, `SELECT ts, incident_id, rule_id, ip, mode, executor, dry_run, ok, detail, reason, actor, step
-		FROM response_log WHERE ip != '' AND step != '' AND ts >= {since:DateTime}
+	// Исключения адресов (step=exclude) и отложенные ими ключи (step=excluded) — за
+	// excludeSince: исключение живёт дольше окна решений, его отзыв всегда позже самого
+	// исключения, а ключ должен дожить до конца исключения.
+	out, err := c.do(ctx, `SELECT ts, incident_id, rule_id, ip, mode, executor, dry_run, ok, detail, reason, actor, step, until
+		FROM response_log WHERE ip != '' AND step != '' AND (ts >= {since:DateTime} OR (step IN ('exclude', 'excluded') AND ts >= {exclude_since:DateTime}))
 		ORDER BY ts FORMAT JSONEachRow`, nil,
-		map[string]string{"since": since.UTC().Format("2006-01-02 15:04:05")})
+		map[string]string{"since": since.UTC().Format("2006-01-02 15:04:05"), "exclude_since": excludeSince.UTC().Format("2006-01-02 15:04:05")})
 	if err != nil {
 		return nil, fmt.Errorf("response_log: %w", err)
 	}
@@ -459,7 +465,8 @@ func (c *ClickHouse) ResponsesSince(ctx context.Context, since time.Time) ([]Res
 			ResponseRow
 			Exception string `json:"exception"`
 		}
-		if err := json.Unmarshal(line, &row); err != nil || row.Exception != "" || row.IncidentID == "" {
+		// incident_id пустой — только у исключения адреса (step=exclude).
+		if err := json.Unmarshal(line, &row); err != nil || row.Exception != "" || (row.IncidentID == "" && row.Step != "exclude") {
 			return nil, errors.New("response_log: неожиданная строка ответа ClickHouse")
 		}
 		rows = append(rows, row.ResponseRow)

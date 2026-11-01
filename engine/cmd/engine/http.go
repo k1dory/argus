@@ -200,11 +200,41 @@ func (e *engine) handler() http.Handler {
 		for _, x := range res {
 			rows = append(rows, respRow(ts, "manual", actor, x, "", in.Reason))
 		}
-		// Ручной блок — решение оператора: автоматика по этому адресу больше не
-		// повторяет и не снимает его своим путём.
-		override, _ := e.operatorOverride(in.IP, actor, in.Reason, now)
-		e.logResponses(ctx, append(rows, override...))
-		writeJSON(w, http.StatusOK, map[string]any{"results": res, "ttl": e.resp.ManualTTL().String()})
+		out := map[string]any{"results": res, "ttl": e.resp.ManualTTL().String()}
+		blocked := false
+		for _, x := range res {
+			blocked = blocked || x.OK
+		}
+		if !blocked {
+			// Ни один исполнитель не заблокировал: решения оператора нет, автоматика по
+			// адресу работает как прежде (отказ — в results и журнале).
+			e.logResponses(ctx, rows)
+			writeJSON(w, http.StatusOK, out)
+			return
+		}
+		// Ручной блок — решение оператора по ключам адреса, которые есть сейчас:
+		// автоматика их больше не повторяет. Новые инциденты по адресу — как обычно
+		// (блок уже стоит — noop). Блок поставлен, поэтому решение применяется и при
+		// сбое журнала, но оператор видит предупреждение: после рестарта движок может
+		// не знать о решении.
+		var override []store.ResponseRow
+		var keys []string
+		if e.respReady(ctx, now) {
+			// Ключи, решение по которым применено, но не записано прошлым вызовом, —
+			// тоже: повтор после предупреждения дописывает потерянное решение.
+			override, keys, _ = e.operatorKeys(in.IP, actor, in.Reason, now)
+			e.applyKeys(keys, now, false)
+		} else {
+			// Ключи адреса из журнала ещё не прочитаны: блок стоит, их повторы дадут noop.
+			out["warning"] = "блок поставлен, но журнал реагирования не прочитан: ожидающие автоблокировки адреса не отменены"
+		}
+		if err := e.ch.InsertResponses(ctx, append(rows, override...)); err != nil {
+			slog.Error("response_log: ручной блок не записан", "ip", in.IP, "err", err)
+			out["warning"] = "блок поставлен, но журнал реагирования недоступен: решение оператора не сохранится после рестарта движка — повторите, когда журнал вернётся"
+		} else {
+			e.markSaved(keys)
+		}
+		writeJSON(w, http.StatusOK, out)
 	}))
 	// Снятие блокировки из консоли: {ip, user, reason}. 422 — блок не найден или
 	// снятие не настроено ни у одного исполнителя; отказ исполнителя — ok=false в results.
@@ -224,19 +254,53 @@ func (e *engine) handler() http.Handler {
 		now := time.Now()
 		ts := model.FormatTS(now)[:19]
 		ip := strings.TrimSpace(in.IP)
-		// Снятие — решение оператора и для ожидающей автоблокировки: ключи адреса
-		// конечные, повтор их больше не трогает (иначе снятый адрес заблокировался бы снова).
-		override, pending := e.operatorOverride(ip, actor, in.Reason, now)
+		// Снятие — решение оператора по ключам адреса, которые есть сейчас (и для
+		// ожидающей автоблокировки): они конечные, повтор их больше не трогает. Новый
+		// инцидент по адресу блокируется как обычно; не трогать адрес вообще —
+		// /respond/exclude. Решение сначала пишется в журнал: не записалось — 503,
+		// ничего не снято и не применено (иначе 200 обещал бы решение, которое
+		// рестарт забудет).
+		// Решение — по ключам адреса, поэтому они должны быть известны: при старте
+		// журнал читается до решения, иначе повтор из журнала вернул бы снятый блок.
+		if !e.respReady(ctx, now) {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "журнал реагирования не прочитан — снятие не выполнено, повторите позже"})
+			return
+		}
+		override, keys, pending := e.operatorKeys(ip, actor, in.Reason, now)
+		if len(keys) > 0 {
+			if err := e.ch.InsertResponses(ctx, override); err != nil {
+				slog.Error("response_log: решение оператора не записано — снятие не выполнено", "ip", ip, "err", err)
+				writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "журнал реагирования недоступен — снятие не выполнено, повторите позже"})
+				return
+			}
+			e.applyKeys(keys, now, true)
+		}
+		// Ключи, которые поставили блок, пока писался журнал: этот вызов снимает и их
+		// блок — тем же решением. Новые попытки, ещё не дошедшие до блока, не трогаются.
+		blocked := e.doneKeys(ip)
 		res, err := e.resp.Unblock(ctx, ip, in.Reason)
+		out := map[string]any{}
+		if late, lateKeys, _ := e.operatorKeysWhere(ip, actor, in.Reason, time.Now(), blocked); len(lateKeys) > 0 {
+			e.applyKeys(lateKeys, time.Now(), false)
+			if werr := e.ch.InsertResponses(ctx, late); werr != nil {
+				slog.Error("response_log: решение оператора по новым ключам не записано", "ip", ip, "keys", len(lateKeys), "err", werr)
+				out["warning"] = "блок снят, но журнал реагирования недоступен: решение по инцидентам, появившимся во время снятия, не сохранится после рестарта движка — повторите снятие, когда журнал вернётся"
+			} else {
+				e.markSaved(lateKeys)
+			}
+		}
 		if errors.Is(err, respond.ErrNotBlocked) && pending > 0 {
 			res, err = []respond.Result{{Executor: "argus", OK: true, IP: ip,
 				Detail: fmt.Sprintf("блокировки ещё не было — ожидающая автоблокировка отменена (%d)", pending)}}, nil
+		} else if errors.Is(err, respond.ErrNotBlocked) && len(keys) > 0 {
+			// Повтор после предупреждения: блок уже снят, недописанное решение записано.
+			res, err = []respond.Result{{Executor: "argus", OK: true, IP: ip,
+				Detail: fmt.Sprintf("блок уже снят — решение оператора записано в журнал (%d)", len(keys))}}, nil
 		}
 		rows := make([]store.ResponseRow, 0, len(res)+len(override)+1)
 		for _, x := range res {
 			rows = append(rows, respRow(ts, "manual_unblock", actor, x, "", in.Reason))
 		}
-		rows = append(rows, override...)
 		if err != nil {
 			rows = append(rows, respRow(ts, "manual_unblock", actor, respond.Result{Executor: "argus", IP: ip, Detail: err.Error()}, "", in.Reason))
 			e.logResponses(ctx, rows)
@@ -245,7 +309,86 @@ func (e *engine) handler() http.Handler {
 		}
 		e.logResponses(ctx, rows)
 		slog.Warn("manual unblock", "ip", ip, "actor", actor, "reason", in.Reason)
-		writeJSON(w, http.StatusOK, map[string]any{"results": res})
+		out["results"] = res
+		writeJSON(w, http.StatusOK, out)
+	}))
+	// Исключение адреса из автоблокировки на срок: {ip, ttl, user, reason}. Явное
+	// решение оператора — в отличие от снятия, действует на все инциденты адреса,
+	// в том числе будущие, до срока или отзыва. Активный блок не снимает (это
+	// /respond/unblock). Решение сначала пишется в журнал: не записалось — 503.
+	mux.HandleFunc("POST /respond/exclude", requireToken(e.token, func(w http.ResponseWriter, r *http.Request) {
+		var in struct{ IP, TTL, User, Reason string }
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&in); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ожидается {\"ip\":...,\"ttl\":\"24h\",\"user\":...,\"reason\":...}"})
+			return
+		}
+		ip, ok := respond.CanonicalIP(strings.TrimSpace(in.IP))
+		if !ok {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "некорректный адрес"})
+			return
+		}
+		ttl, err := time.ParseDuration(strings.TrimSpace(in.TTL))
+		if err != nil || ttl < time.Minute || ttl > excludeMaxTTL {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ttl — срок исключения от 1m до " + excludeMaxTTL.String() + " (например 24h)"})
+			return
+		}
+		if strings.TrimSpace(in.Reason) == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "нужна причина исключения (reason)"})
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(e.ctx), 30*time.Second)
+		defer cancel()
+		actor := orDefault(strings.TrimSpace(in.User), "оператор")
+		now := time.Now().UTC().Truncate(time.Second)
+		x := exclusion{at: now, until: now.Add(ttl), actor: actor, reason: in.Reason}
+		if err := e.ch.InsertResponses(ctx, []store.ResponseRow{excludeRow(ip, actor, in.Reason, now, x.until)}); err != nil {
+			slog.Error("response_log: исключение адреса не записано", "ip", ip, "err", err)
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "журнал реагирования недоступен — исключение не применено, повторите позже"})
+			return
+		}
+		e.setExclusion(ip, x)
+		slog.Warn("ips: адрес исключён из автоблокировки", "ip", ip, "until", x.until, "actor", actor, "reason", in.Reason)
+		writeJSON(w, http.StatusOK, map[string]any{"ip": ip, "until": model.FormatTS(x.until)[:19]})
+	}))
+	// Отзыв исключения: {ip, user, reason}. 422 — адрес не исключён.
+	mux.HandleFunc("POST /respond/exclude/revoke", requireToken(e.token, func(w http.ResponseWriter, r *http.Request) {
+		var in struct{ IP, User, Reason string }
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&in); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ожидается {\"ip\":...,\"user\":...,\"reason\":...}"})
+			return
+		}
+		ip, ok := respond.CanonicalIP(strings.TrimSpace(in.IP))
+		if !ok {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "некорректный адрес"})
+			return
+		}
+		if strings.TrimSpace(in.Reason) == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "нужна причина отзыва (reason)"})
+			return
+		}
+		now := time.Now().UTC().Truncate(time.Second)
+		ctxRead, cancelRead := context.WithTimeout(context.WithoutCancel(e.ctx), 30*time.Second)
+		defer cancelRead()
+		// Исключения из журнала при старте ещё не прочитаны — 503, а не «не исключён».
+		if !e.respReady(ctxRead, now) {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "журнал реагирования не прочитан — исключение не отозвано, повторите позже"})
+			return
+		}
+		if _, excluded := e.excludedUntil(ip, now); !excluded {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "адрес не исключён из автоблокировки"})
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(e.ctx), 30*time.Second)
+		defer cancel()
+		actor := orDefault(strings.TrimSpace(in.User), "оператор")
+		if err := e.ch.InsertResponses(ctx, []store.ResponseRow{excludeRow(ip, actor, in.Reason, now, now)}); err != nil {
+			slog.Error("response_log: отзыв исключения не записан", "ip", ip, "err", err)
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "журнал реагирования недоступен — исключение не отозвано, повторите позже"})
+			return
+		}
+		e.setExclusion(ip, exclusion{at: now, until: now})
+		slog.Warn("ips: исключение адреса отозвано", "ip", ip, "actor", actor, "reason", in.Reason)
+		writeJSON(w, http.StatusOK, map[string]any{"ip": ip})
 	}))
 	// Состояние реагирования для консоли: режим и его источник, списки, активные блокировки.
 	mux.HandleFunc("GET /respond/status", requireToken(e.token, func(w http.ResponseWriter, r *http.Request) {
@@ -255,6 +398,7 @@ func (e *engine) handler() http.Handler {
 			"mode": mode, "mode_from": from, "enabled": e.resp.Enabled(), "ttl": e.resp.TTL().String(), "manual_ttl": e.resp.ManualTTL().String(),
 			"allowlist": e.resp.Allowlist(), "never_block": e.resp.NeverBlock(), "trusted_sources": e.resp.TrustedSources(),
 			"active": e.resp.Active(), "config_errors": e.resp.ConfigErrors(), "pending": e.resp.Pending(),
+			"excluded": e.exclusions(time.Now()),
 		})
 	}))
 	// Переразбор инцидента по запросу из консоли (кнопка в карточке): через
@@ -282,6 +426,17 @@ func (e *engine) handler() http.Handler {
 		fmt.Fprintf(w, "analyze scheduled: %s\n", id)
 	}))
 	return mux
+}
+
+// activeBlock — у адреса есть активная блокировка.
+func (e *engine) activeBlock(ip string) bool {
+	c, ok := respond.CanonicalIP(ip)
+	for _, b := range e.resp.Active() {
+		if b.IP == ip || (ok && b.IP == c) {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *engine) logResponses(ctx context.Context, rows []store.ResponseRow) {

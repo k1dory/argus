@@ -13,9 +13,11 @@ import (
 func TestResponsesSinceStepLive(t *testing.T) {
 	c := liveStore(t)
 	ctx := context.Background()
-	for _, stmt := range migrationStatements(t, filepath.Join("..", "..", "..", "clickhouse", "migrations", "0037_response_log_step.sql")) {
-		if _, err := c.do(ctx, stmt, nil, nil); err != nil {
-			t.Fatal(err)
+	for _, m := range []string{"0037_response_log_step.sql", "0038_response_log_until.sql"} {
+		for _, stmt := range migrationStatements(t, filepath.Join("..", "..", "..", "clickhouse", "migrations", m)) {
+			if _, err := c.do(ctx, stmt, nil, nil); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
 	id := fmt.Sprintf("INC-STEP-%d", time.Now().UnixNano())
@@ -28,18 +30,32 @@ func TestResponsesSinceStepLive(t *testing.T) {
 		{TS: ts(0), IncidentID: id, IP: "203.0.113.8", Mode: "ips", Executor: "ngfw", OK: 1},
 		{TS: ts(0), IncidentID: id, Mode: "ips", Executor: "argus", Step: "capped"},
 	}
+	// Исключение адреса (0038): за 30 дней читается и вне окна решений, старше — нет.
+	exclIP := "198.51.100.7"
+	rows = append(rows,
+		ResponseRow{TS: ts(-10 * 24 * time.Hour), IP: exclIP, Mode: "manual", Executor: "argus", Step: "exclude", Until: ts(10 * 24 * time.Hour), Actor: id},
+		ResponseRow{TS: ts(-40 * 24 * time.Hour), IP: exclIP, Mode: "manual", Executor: "argus", Step: "exclude", Until: ts(-39 * 24 * time.Hour), Actor: id},
+		// ключ, отложенный исключением 3 суток назад, — тоже за окном исключений
+		ResponseRow{TS: ts(-72 * time.Hour), IncidentID: id + "-X", IP: exclIP, Mode: "manual", Executor: "argus", Step: "excluded", Actor: id},
+	)
 	if err := c.InsertResponses(ctx, rows); err != nil {
 		t.Fatal(err)
 	}
-	got, err := c.ResponsesSince(ctx, now.Add(-48*time.Hour))
+	got, err := c.ResponsesSince(ctx, now.Add(-48*time.Hour), now.Add(-30*24*time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
-	var mine []ResponseRow
+	var mine, excl []ResponseRow
 	for _, r := range got {
 		if r.IncidentID == id {
 			mine = append(mine, r)
 		}
+		if r.IP == exclIP && r.Actor == id {
+			excl = append(excl, r)
+		}
+	}
+	if len(excl) != 2 || excl[0].Step != "exclude" || excl[0].Until != ts(10*24*time.Hour) || excl[0].IncidentID != "" || excl[1].Step != "excluded" {
+		t.Fatalf("исключение адреса за 30 дней: %+v", excl)
 	}
 	if len(mine) != 2 || mine[0].TS != ts(0) || mine[0].RuleID != "t-waf" {
 		t.Fatalf("строки с шагом и адресом в окне: %+v", mine)

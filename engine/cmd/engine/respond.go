@@ -166,8 +166,8 @@ func (e *engine) autoRespond(ctx context.Context, incs []*incidents.Incident, no
 			continue
 		}
 		state := e.respStatus(inc.IncidentID)
-		if state == "done" {
-			continue
+		if state == "done" && !e.hasExcludedKeys(inc.IncidentID, now) {
+			continue // решено; заново — только ключи, исключение которых кончилось
 		}
 		reason := inc.RuleTitle + " (" + inc.RuleID + ")"
 		trusted, untrusted, why := e.splitTrusted(inc)
