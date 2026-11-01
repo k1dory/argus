@@ -301,7 +301,7 @@ func TestWAFNodeOrder(t *testing.T) {
 	}{
 		{"coraza в файле с WAF_NODE", coraza, listen.Peer{Addr: "waf.error", Transport: "file", Node: "waf-01", Format: parse.FormatWAFCoraza}, "waf-01"},
 		{"coraza в файле без WAF_NODE — адрес сервера", coraza, listen.Peer{Addr: "waf.error", Transport: "file", Format: parse.FormatWAFCoraza}, "172.19.0.4"},
-		{"coraza от агента (формат в SD): hostname syslog важнее node:", `<134>1 2026-10-29T08:40:44Z waf-host caddy - - [argus container="caddy" format="waf-coraza"] ` + coraza, listen.Peer{Addr: "10.0.0.5", Transport: "tls", Node: "cfg-node"}, "waf-host"},
+		{"coraza от агента (формат в SD, HTTP с токеном): hostname syslog важнее node:", `<134>1 2026-10-29T08:40:44Z waf-host caddy - - [argus container="caddy" format="waf-coraza"] ` + coraza, listen.Peer{Addr: "10.0.0.5", Transport: "http", Node: "cfg-node"}, "waf-host"},
 		// Error-лог ModSecurity — не WAF (только JSON-аудит): syslog, узел — отправитель.
 		{"ModSecurity: атакующий Host: dc01.corp не узел, событие не WAF", nginx, listen.Peer{Addr: "10.0.0.7", Transport: "udp"}, "10.0.0.7"},
 		{"ModSecurity: node: источника перебивает, событие не WAF", nginx, listen.Peer{Addr: "nginx.error", Transport: "file", Node: "nginx-01", Format: parse.FormatWAFCoraza}, "nginx-01"},

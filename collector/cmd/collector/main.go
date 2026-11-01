@@ -169,19 +169,24 @@ func mergeAttrs(e *model.Event, attrs map[string]string) {
 }
 
 // parseSyslogLine — одна строка syslog/файла/HTTP в событие. Разборщик CEF, LEEF или
-// Coraza выбирается по объявленному формату источника, а не по содержимому строки:
-// SD-параметр агента [argus format="…"] в заголовке RFC 5424, иначе peer.Format
-// (SYSLOG_PEER_FORMAT по адресу отправителя или files[].format). Без объявления —
-// syslog и вендорные разборщики по заголовку. Строка ModSecurity — всегда syslog с
-// attrs.waf_unparsed=1: её error-лог надёжно не разобрать, источник — JSON-аудит.
+// Coraza выбирается по объявленному формату источника, а не по содержимому строки.
+// Конфигурация главнее всего: peer.Format (SYSLOG_PEER_FORMAT по адресу отправителя,
+// files[].format). SD-параметр [argus format="…"] учитывается, только если конфигурация
+// формат не задала и отправитель доверенный — HTTP-приём с токеном (агент) или TLS с
+// проверенным клиентским сертификатом; от UDP/TCP/TLS без сертификата это просто данные.
+// Без объявления — syslog и вендорные разборщики по заголовку. Строка ModSecurity —
+// всегда syslog с attrs.waf_unparsed=1, раньше любых других разборщиков: её error-лог
+// надёжно не разобрать, источник — JSON-аудит.
 // Происхождение (peer, peer_cn, scope) ставит только коллектор; в конце — повторная
 // чистка значений, записанных после Ensure нормализатора.
 func parseSyslogLine(norm *normalize.Normalizer, zones parse.PeerZones, line string, peer listen.Peer) (model.Event, bool) {
 	sl, _ := parse.ParseSyslog(line)
 	sl = sl.InZone(zones.Lookup(peer.Addr))
 	format := peer.Format
-	if f := strings.TrimSpace(sl.Structured["argus.format"]); f != "" {
-		format = f
+	if format == "" && (peer.Transport == "http" || peer.CN != "") {
+		if f := strings.TrimSpace(sl.Structured["argus.format"]); parse.ValidFormat(f) {
+			format = f
+		}
 	}
 	// Полезная нагрузка: текст после заголовка syslog, если он есть.
 	payload := line
@@ -196,6 +201,12 @@ func parseSyslogLine(norm *normalize.Normalizer, zones parse.PeerZones, line str
 	switch {
 	case isQNAP:
 		e = qn
+	case parse.IsModSecurityLine(line) && !recordBefore(payload, format):
+		// До CEF/LEEF и вендорных разборщиков: msg/uri ModSecurity (CEF-запись, «/credentials»)
+		// не должны выбрать другой разборщик. Но запись объявленного CEF/LEEF, в расширении
+		// которой есть текст «ModSecurity:», остаётся CEF/LEEF (recordBefore).
+		unparsedWAF = true
+		e = norm.FromSyslog(sl, line)
 	case format == parse.FormatCEF && hasCEF(line):
 		c, _ := parse.ParseCEF(line)
 		e = norm.FromCEF(c, sl, line)
@@ -215,10 +226,6 @@ func parseSyslogLine(norm *normalize.Normalizer, zones parse.PeerZones, line str
 		e = norm.FromWAF(wf, line)
 		wafNode(&e, sl.Hostname, peer)
 	default:
-		if format == "" && (hasCEF(payload) || hasLEEF(payload) || parse.IsWAFErrorLine(payload)) {
-			undeclaredFormat(peer)
-		}
-		unparsedWAF = parse.IsWAFErrorLine(payload)
 		if sq, ok := parse.ParseSquid(sl.Message, sl.Hostname); ok {
 			e = sq
 		} else if jk, ok := parse.ParseJenkins(sl.Message, sl.Hostname); ok {
@@ -229,6 +236,13 @@ func parseSyslogLine(norm *normalize.Normalizer, zones parse.PeerZones, line str
 			e = vr
 		} else {
 			e = norm.FromSyslog(sl, line)
+			// Ни один разборщик не узнал строку, а она похожа на CEF/LEEF/Coraza: формат
+			// источника не объявлен (переходный релиз — предупреждение и счётчик). По всей
+			// строке: ParseSyslog может съесть «CEF:» как TAG или часть HOSTNAME.
+			if format == "" && (hasCEF(line) || hasLEEF(line) || parse.IsWAFErrorLine(line)) {
+				undeclaredFormat(peer)
+			}
+			unparsedWAF = parse.IsWAFErrorLine(line)
 		}
 	}
 	if unparsedWAF {
@@ -987,6 +1001,7 @@ func logLevel() slog.Level {
 var (
 	undeclaredFormatTotal atomic.Uint64
 	undeclaredWarned      sync.Map // peer.Addr → time.Time последнего предупреждения
+	undeclaredStores      atomic.Uint64
 )
 
 func undeclaredFormat(peer listen.Peer) {
@@ -995,9 +1010,36 @@ func undeclaredFormat(peer listen.Peer) {
 	if last, ok := undeclaredWarned.Load(peer.Addr); ok && now.Sub(last.(time.Time)) < time.Minute {
 		return
 	}
+	// Таблица не растёт без предела при смене адресов (UDP): раз в 64 предупреждения
+	// записи старше минуты удаляются — им и так положено новое предупреждение.
+	if undeclaredStores.Add(1)%64 == 0 {
+		undeclaredWarned.Range(func(k, v any) bool {
+			if now.Sub(v.(time.Time)) >= time.Minute {
+				undeclaredWarned.Delete(k)
+			}
+			return true
+		})
+	}
 	undeclaredWarned.Store(peer.Addr, now)
 	slog.Warn("необъявленный формат: строка похожа на CEF/LEEF/WAF, разобрана как syslog — объявите SYSLOG_PEER_FORMAT, files[].format или [argus format=…]",
 		"peer", peer.Addr, "transport", peer.Transport)
+}
+
+// recordBefore — в теле сообщения (после заголовка syslog) у объявленного CEF/LEEF
+// заголовок записи стоит раньше «ModSecurity:» или его там нет (TAG «ModSecurity:» в
+// заголовке): это запись CEF/LEEF, а не строка error-лога ModSecurity с CEF внутри msg.
+func recordBefore(line, format string) bool {
+	marker := ""
+	switch format {
+	case parse.FormatCEF:
+		marker = "CEF:"
+	case parse.FormatLEEF:
+		marker = "LEEF:"
+	default:
+		return false
+	}
+	i, j := strings.Index(line, marker), strings.Index(line, "ModSecurity: ")
+	return i >= 0 && (j < 0 || i < j)
 }
 
 func hasCEF(s string) bool  { return strings.Contains(s, "CEF:") }

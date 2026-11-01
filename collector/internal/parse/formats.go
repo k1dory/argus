@@ -1,6 +1,7 @@
 package parse
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/netip"
 	"strings"
@@ -74,13 +75,32 @@ func (f PeerFormats) Lookup(addr string) string {
 	return f[best].format
 }
 
-// ParseCorazaLine — строка объявленного формата waf-coraza: Coraza (в том числе в
-// JSON-логе Caddy). Строка ModSecurity не принимается: её msg и uri не экранированы,
-// и запрос подделывает метаданные правила — источник ModSecurity только JSON-аудит.
+// ParseCorazaLine — строка объявленного формата waf-coraza: только JSON-объект лога
+// Caddy с logger http.handlers.waf и строкой Coraza в msg. Голый текст, битый JSON,
+// JSON-строка или массив не принимаются; строка ModSecurity — тоже: её msg и uri не
+// экранированы, и запрос подделывает метаданные правила — источник ModSecurity только
+// JSON-аудит.
 func ParseCorazaLine(line string) (WAF, bool) {
-	w, ok := ParseWAFErrorLine(line)
+	t := strings.TrimSpace(line)
+	if !strings.HasPrefix(t, "{") {
+		return WAF{}, false
+	}
+	var j struct {
+		Logger string `json:"logger"`
+		Msg    string `json:"msg"`
+	}
+	if json.Unmarshal([]byte(t), &j) != nil || j.Logger != "http.handlers.waf" || j.Msg == "" {
+		return WAF{}, false
+	}
+	w, ok := ParseWAFErrorLine(t)
 	if !ok || w.Product != "coraza" {
 		return WAF{}, false
 	}
 	return w, true
+}
+
+// IsModSecurityLine — строка error-лога ModSecurity (в том числе в обёртке syslog).
+// Такая строка — всегда syslog с attrs.waf_unparsed=1, до любых других разборщиков.
+func IsModSecurityLine(line string) bool {
+	return strings.Contains(line, "ModSecurity: ")
 }

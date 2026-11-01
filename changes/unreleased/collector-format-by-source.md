@@ -1,7 +1,9 @@
 - **Несовместимо: формат строк объявляет источник, error-лог ModSecurity больше не источник
   WAF.** Разборщик CEF, LEEF и Coraza выбирается по объявлению — `SYSLOG_PEER_FORMAT`
   («адрес|CIDR=cef|leef|waf-coraza»), `files[].format` (`waf-audit`, `waf-coraza`, `lines`) или
-  SD-параметр агента `[argus format="…"]`, — а не по содержимому строки: «CEF:», «LEEF:»,
+  SD-параметр агента `[argus format="…"]` (только от доверенного агента — HTTP-приём с токеном
+  или TLS с клиентским сертификатом — и только если формат не задан конфигурацией), — а не по
+  содержимому строки: «CEF:», «LEEF:»,
   «Coraza:» в данных (имя файла, User-Agent) больше не меняют разборщик. Строки
   `ModSecurity: …` из error-лога nginx/Apache — обычный syslog с `attrs.waf_unparsed=1`, без
   `http.attack`, `rule_ids` и решения: их `msg`/`uri` не экранированы и подделываются запросом.
