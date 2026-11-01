@@ -243,6 +243,53 @@
     or (argus_git is defined and argus_git.changed | default(false))
   changed_when: true
 
+# Миграции идут одноразовым сервисом migrator (scripts/migrate.sh) внутри make deploy /
+# make up: compose запускает его на каждом up, остальные сервисы ждут его успеха. Здесь
+# — явная проверка результата: код выхода migrator и последняя применённая миграция
+# (иначе 497/503 из-за непримененного гранта видны только в консоли), затем ожидание
+# фоновых мутаций MATERIALIZE — до их конца запросы идут запасным путём (источники по
+# heartbeat, паспорт без индекса). Пароль админа ClickHouse берётся из окружения
+# контейнера clickhouse, в argv и вывод Ansible не попадает.
+- name: "Миграции: migrator завершился успешно"
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      id="$(docker compose ps -aq migrator)"
+      test -n "$id" || { echo "контейнер migrator не найден"; exit 1; }
+      code="$(docker inspect -f '{{ '{{' }}.State.ExitCode{{ '}}' }}' "$id")"
+      if [ "$code" != 0 ]; then docker compose logs --tail=40 migrator; echo "migrator: код $code"; exit 1; fi
+      docker compose exec -T clickhouse sh -c 'clickhouse-client --user "$CLICKHOUSE_USER"' <<'SQL'
+      SELECT max(name) FROM argus.schema_migrations
+      SQL
+    executable: /bin/bash
+    chdir: "{{ argus_dir }}"
+  register: argus_migrations
+  changed_when: false
+
+# Строка «незавершённых|частей к обработке|причина сбоя» (причина пуста — сбоя нет).
+- name: "Миграции: дождаться фоновых мутаций (MATERIALIZE)"
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      docker compose exec -T clickhouse sh -c 'clickhouse-client --user "$CLICKHOUSE_USER" --format TSVRaw' <<'SQL'
+      SELECT concat(toString(countIf(NOT is_done)), '|', toString(sumIf(parts_to_do, NOT is_done)), '|',
+                    anyIf(concat(table, ': ', latest_fail_reason), NOT is_done AND latest_fail_reason != ''))
+      FROM system.mutations WHERE database = 'argus'
+      SQL
+    executable: /bin/bash
+    chdir: "{{ argus_dir }}"
+  register: argus_mutations
+  changed_when: false
+  retries: "{{ argus_mutations_retries }}"
+  delay: "{{ argus_mutations_delay_sec }}"
+  until: >-
+    argus_mutations.rc == 0 and
+    ((argus_mutations.stdout.split('|', 2) + ['', '', ''])[0] | trim == '0'
+     or (argus_mutations.stdout.split('|', 2) + ['', '', ''])[2] | trim | length > 0)
+  failed_when: >-
+    argus_mutations.rc != 0
+    or (argus_mutations.stdout.split('|', 2) + ['', '', ''])[0] | trim != '0'
+
 - name: Дождаться консоли
   ansible.builtin.uri:
     url: https://localhost:8443/api/version

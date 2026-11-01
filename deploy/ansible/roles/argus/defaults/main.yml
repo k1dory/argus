@@ -58,6 +58,11 @@ argus_backup_cron_minute: "0"
 argus_up_timeout_sec: 1800
 argus_ready_retries: 60
 argus_ready_delay_sec: 10
+# Фоновые мутации миграций (MATERIALIZE индекса/проекции по всей events) после выкатки:
+# опрос system.mutations, 120 × 30 с = час. Не успели — плейбук падает с остатком
+# parts_to_do (стек при этом уже поднят и работает); latest_fail_reason — падение сразу.
+argus_mutations_retries: 120
+argus_mutations_delay_sec: 30
 
 # Что исключить при rsync рабочей копии (argus_source: local).
 argus_rsync_excludes:
