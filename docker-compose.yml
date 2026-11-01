@@ -259,6 +259,7 @@ services:
       SYSLOG_PEER_TZ: ${SYSLOG_PEER_TZ:-}                   # пояс отправителей RFC 3164 без смещения: 192.168.0.59=Europe/Moscow,…
       SYSLOG_PEER_FORMAT: ${SYSLOG_PEER_FORMAT:-}           # формат отправителей: 10.0.0.5=cef,10.1.0.0/16=leef (без объявления — syslog)
       FLOW_NAT_ADDRS: ${FLOW_NAT_ADDRS:-}                   # внешние адреса NAT: потоки с ними → attrs.post_nat=1 (копия уже учтённого)
+      ASN_DB_FILE: ${ASN_DB_FILE:-}                         # таблица IP→ASN (iptoasn TSV/.gz в /asn): attrs.src_asn/dst_asn; пусто — без ASN
       SINK_PENDING_ROWS: ${SINK_PENDING_ROWS:-200000}       # оперативный буфер перед дисковой очередью; при заполнении — обратное давление
       SINK_SPOOL_DIR: /state/spool
       SINK_SPOOL_BYTES: ${SINK_SPOOL_BYTES:-8589934592}    # 8 ГБ на collector-state; при заполнении приём блокируется
@@ -280,6 +281,9 @@ services:
     volumes:
       - ${WAF_LOG_DIR:-./sample/waf}:/logs/waf:ro
       - ./collector/certs:/certs:ro     # syslog TLS: сертификат/ключ/CA клиентов
+      # Таблица ASN — каталогом, не файлом: scripts/asn-update.sh заменяет файл
+      # переименованием, и смонтированный файл держал бы старый inode.
+      - ${ASN_DB_DIR:-./collector/asn}:/asn:ro
       - collector-state:/state          # курсоры pull-источников (S3); права — volume-init
     ports:
       - "5514:5514/udp"

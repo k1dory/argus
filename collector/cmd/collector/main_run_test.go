@@ -143,6 +143,13 @@ batch:
 	t.Setenv("SINK_SPOOL_BYTES", "1048576")
 	t.Setenv("INTERNAL_NETS", "10.0.0.0/8, 192.168.0.0/16")
 	t.Setenv("LOG_LEVEL", "warn")
+	// Таблица ASN: 45.33.0.0/17 — AS63949; ASN из тела события не доверяется.
+	asnPath := filepath.Join(dir, "ip2asn.tsv")
+	if err := os.WriteFile(asnPath, []byte("1.0.0.0\t1.0.0.255\t13335\tUS\tCLOUDFLARENET\n45.33.0.0\t45.33.127.255\t63949\tUS\tAKAMAI-LINODE-AP Akamai Connected Cloud\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ASN_DB_FILE", asnPath)
+	t.Setenv("ASN_DB_MIN_ROWS", "2")
 
 	if u := healthURL(cfgPath); u != fmt.Sprintf("http://127.0.0.1:%d/healthz", httpPort) {
 		t.Errorf("healthURL из конфига: %q", u)
@@ -215,7 +222,8 @@ batch:
 	if code := post("/ingest/syslog", "CEF:0|Vendor|Product|1|100|Blocked|7|src=203.0.113.9 dst=10.0.0.5\nLEEF:2.0|IBM|QRadar|1|x|src=203.0.113.10\n", "tok-e2e"); code/100 != 2 {
 		t.Errorf("/ingest/syslog: %d", code)
 	}
-	if code := post("/ingest/events", `{"ts":"2026-01-01 00:00:03.000","source":"vector.test","action":"login","outcome":"success","src_ip":"10.1.2.3","dst_ip":"203.0.113.1","attrs":{"transport":"tls"}}`+"\n", "tok-e2e"); code/100 != 2 {
+	if code := post("/ingest/events", `{"ts":"2026-01-01 00:00:03.000","source":"vector.test","action":"login","outcome":"success","src_ip":"10.1.2.3","dst_ip":"203.0.113.1","attrs":{"transport":"tls","src_asn":"666","dst_asn":"666","dst_as_org":"spoofed"}}`+"\n"+
+		`{"ts":"2026-01-01 00:00:03.500","source":"vector.asn","action":"scan","outcome":"failure","src_ip":"45.33.32.156","dst_ip":"10.0.0.7","attrs":{"src_asn":"13335","src_as_org":"spoofed"}}`+"\n", "tok-e2e"); code/100 != 2 {
 		t.Errorf("/ingest/events: %d", code)
 	}
 	// Файл на хосте.
@@ -239,7 +247,7 @@ batch:
 
 	// Ждём не число строк, а каждый транспорт: udp, tcp, http (CEF, LEEF,
 	// событие), файл. UDP пересылается раз в полсекунды, пока не дошёл.
-	markers := []string{`"transport":"udp"`, `"transport":"tcp"`, `"transport":"http"`, `"transport":"file"`, `"source":"vector.test"`, `"scope":"outbound"`}
+	markers := []string{`"transport":"udp"`, `"transport":"tcp"`, `"transport":"http"`, `"transport":"file"`, `"source":"vector.test"`, `"scope":"outbound"`, `"src_asn":"63949"`, `"src_as_org":"AKAMAI-LINODE-AP Akamai Connected Cloud"`}
 	// Ожидание до готовности, а не пауза: 60 с стоят времени только при сбое (под -race на раннере).
 	deadline := time.Now().Add(60 * time.Second)
 	var all string
@@ -271,6 +279,11 @@ batch:
 	}
 	if strings.Contains(all, `"transport":"tls"`) {
 		t.Error("transport из тела события не должен переживать приём")
+	}
+	for _, spoof := range []string{`"666"`, `"spoofed"`, `"src_asn":"13335"`, `"dst_asn"`} {
+		if strings.Contains(all, spoof) {
+			t.Errorf("ASN из тела события пережил приём: %s", spoof)
+		}
 	}
 
 	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {

@@ -49,6 +49,15 @@ argus_identities_src: ""
 argus_cmdb_src: ""
 argus_etc_dir: /etc/argus
 
+# ASN публичных адресов в событиях коллектора (attrs.src_asn и т.д.): таблица iptoasn.com
+# скачивается на хост в argus_asn_dir (scripts/asn-update.sh — проверка и атомарная замена)
+# и обновляется по cron; коллектор перечитывает её без рестарта.
+argus_asn: false
+argus_asn_dir: /var/lib/argus/asn
+argus_asn_url: https://iptoasn.com/data/ip2asn-combined.tsv.gz
+argus_asn_cron_hour: "4"
+argus_asn_cron_minute: "17"
+
 # Резервные копии: scripts/backup.sh по cron от root.
 argus_backup_cron: true
 argus_backup_cron_hour: "3"

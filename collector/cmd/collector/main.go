@@ -28,6 +28,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/devitex-soft/argus/collector/internal/asn"
 	"github.com/devitex-soft/argus/collector/internal/listen"
 	"github.com/devitex-soft/argus/collector/internal/model"
 	"github.com/devitex-soft/argus/collector/internal/normalize"
@@ -357,6 +358,34 @@ func attrsFromStructured(e *model.Event, sd map[string]string) {
 	}
 }
 
+// openASN — таблица ASN из ASN_DB_FILE (TSV iptoasn.com, можно .gz) с проверкой
+// раз в ASN_DB_RELOAD (по умолчанию минута) и порогом ASN_DB_MIN_ROWS диапазонов.
+// Без ASN_DB_FILE таблицы нет: поля ASN только удаляются из входящих событий.
+func openASN(ctx context.Context) (*asn.DB, error) {
+	path := strings.TrimSpace(os.Getenv("ASN_DB_FILE"))
+	if path == "" {
+		return nil, nil
+	}
+	minRows, every := 10000, time.Minute
+	if raw := os.Getenv("ASN_DB_MIN_ROWS"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 {
+			return nil, fmt.Errorf("ASN_DB_MIN_ROWS должен быть положительным числом: %q", raw)
+		}
+		minRows = n
+	}
+	if raw := os.Getenv("ASN_DB_RELOAD"); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d < time.Second {
+			return nil, fmt.Errorf("ASN_DB_RELOAD — длительность не меньше 1s: %q", raw)
+		}
+		every = d
+	}
+	db := asn.Open(path, minRows)
+	go db.Watch(ctx, every)
+	return db, nil
+}
+
 func env(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -518,6 +547,11 @@ func main() {
 		}
 	}()
 
+	asnDB, err := openASN(ctx)
+	if err != nil {
+		slog.Error("ASN_DB", "err", err)
+		os.Exit(1)
+	}
 	queue := make(chan queuedEvent, cfg.Batch.PendingRows)
 	// emit всегда сам проставляет attrs.transport: значение из тела события
 	// (например, /ingest/events с "transport":"tls") доверять нельзя — по нему
@@ -527,6 +561,8 @@ func main() {
 			e.Attrs = map[string]string{}
 		}
 		e.Attrs["transport"] = transport
+		// ASN — тоже только свой: по src_asn движок склеивает сканы.
+		asn.Enrich(e.Attrs, e.SrcIP, e.DstIP, asnDB.Table())
 		// Направление для любого события с двумя адресами (NGFW, firewall, syslog), не только
 		// NetFlow: правила про «снаружи внутрь» одни на все источники.
 		if e.SrcIP != "" && e.DstIP != "" && e.Attrs["scope"] == "" {
@@ -713,6 +749,7 @@ func main() {
 				events[i].Attrs = map[string]string{}
 			}
 			events[i].Attrs["transport"] = "http"
+			asn.Enrich(events[i].Attrs, events[i].SrcIP, events[i].DstIP, asnDB.Table())
 			// Направление — и для готовых событий NDJSON (агенты Vector, журналы фаерволов).
 			if events[i].SrcIP != "" && events[i].DstIP != "" && events[i].Attrs["scope"] == "" {
 				events[i].Attrs["scope"] = norm.FlowScope(events[i].SrcIP, events[i].DstIP)
