@@ -116,3 +116,42 @@ func readRegistryPackagingYAML(t *testing.T, path string, into any) {
 		t.Fatal(err)
 	}
 }
+
+// Корневой .dockerignore пропускает только engine/, rules/ и fixtures/events/ —
+// он действует на любую сборку с context: . Сейчас из корня собирается только
+// engine; новый такой сервис должен сначала поправить .dockerignore.
+func TestOnlyEngineBuildsFromRoot(t *testing.T) {
+	var compose struct {
+		Services map[string]struct {
+			Build yaml.Node `yaml:"build"`
+		} `yaml:"services"`
+	}
+	readRegistryPackagingYAML(t, "docker-compose.yml", &compose)
+	for name, svc := range compose.Services {
+		var ctx string
+		switch svc.Build.Kind {
+		case yaml.ScalarNode:
+			ctx = svc.Build.Value
+		case yaml.MappingNode:
+			var b struct {
+				Context string `yaml:"context"`
+			}
+			if err := svc.Build.Decode(&b); err != nil {
+				t.Fatal(err)
+			}
+			ctx = b.Context
+		default:
+			continue
+		}
+		if c := filepath.Clean(ctx); (c == "." || c == "./") && name != "engine" {
+			t.Errorf("compose: %s собирается из корня — корневой .dockerignore пропустит только engine/, rules/, fixtures/events/", name)
+		}
+	}
+	raw, err := os.ReadFile(filepath.Join("..", ".github", "workflows", "release.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "matrix.service == 'engine' && '.'") {
+		t.Error("release.yml: корневой контекст должен быть только у engine")
+	}
+}
