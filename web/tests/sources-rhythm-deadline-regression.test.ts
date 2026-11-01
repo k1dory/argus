@@ -30,12 +30,16 @@ type FixtureBody = (t: FixtureContext) => Promise<void>;
 
 type SetupOptions = {
   reportDelaysMs?: readonly number[];
+  // Перевод только системных часов Node после соответствующего отчёта.
+  // Часы CH и фактическая длительность запросов/таймеров не меняются.
+  wallClockAdjustmentsMs?: readonly number[];
   heartbeatAgeSec?: number;
   stopAtInsert?: boolean;
 };
 
 async function runSetup(reportDelayMs: number, options: SetupOptions = {}) {
   let nowMs = START_MS;
+  let wallClockOffsetMs = 0;
   let reportCount = 0;
   let failure: unknown;
   const skipped: string[] = [];
@@ -50,9 +54,10 @@ async function runSetup(reportDelayMs: number, options: SetupOptions = {}) {
     lastMs: START_MS - 3_600_000 + leavesSec * 1000,
   }));
   class FixtureDate extends Date {
-    constructor(value: string | number = nowMs) { super(value); }
-    static now() { return nowMs; }
+    constructor(value: string | number = nowMs + wallClockOffsetMs) { super(value); }
+    static now() { return nowMs + wallClockOffsetMs; }
   }
+  const performance = { now: () => nowMs - START_MS };
   const client = {
     chQuery: async (sql: string, params: Record<string, unknown>) => {
       assert.match(sql, /^SELECT toString\(now\(\) - toIntervalSecond\(\{s:UInt32\}\)\) AS ts$/);
@@ -67,6 +72,7 @@ async function runSetup(reportDelayMs: number, options: SetupOptions = {}) {
   };
   const dependencies: Record<string, unknown> = {
     "node:assert/strict": assert,
+    "node:perf_hooks": { performance },
     "node:test": {
       before: () => undefined,
       after: () => undefined,
@@ -102,6 +108,7 @@ async function runSetup(reportDelayMs: number, options: SetupOptions = {}) {
           silent_for_sec: (snapshotMs - START_MS) / 1000 + options.heartbeatAgeSec,
         }];
         nowMs += options.reportDelaysMs?.[reportCount - 1] ?? reportDelayMs;
+        wallClockOffsetMs += options.wallClockAdjustmentsMs?.[reportCount - 1] ?? 0;
         return { sources, omitted: 0 };
       },
     },
@@ -110,6 +117,7 @@ async function runSetup(reportDelayMs: number, options: SetupOptions = {}) {
   // она не заменяет ОС-песочницу при запуске тестового процесса.
   const context = createContext({
     Date: FixtureDate,
+    performance,
     Array,
     setTimeout: (resolve: () => void, delayMs: number) => {
       assert.ok(Number.isFinite(delayMs) && delayMs > 0);
@@ -183,3 +191,55 @@ test("PR97: baseline, завершившийся ровно на 90-й секу�
   assert.equal(result.skipped.length, 0);
   assert.equal(result.elapsedMs, WAIT_BUDGET_MS);
 });
+
+// Регрессии дельты a7d00f9..92f0f83: Date.now() — системное время, которое
+// может скачком измениться. Бюджет длительности должен идти по монотонным часам.
+// Исполняется исходный callback, формула spent/wait здесь не дублируется.
+for (const adjustmentMs of [0, -5000]) {
+  test(`PR97: сдвиг часов Node ${adjustmentMs} мс не разрешает ожидание сверх бюджета`, { timeout: 5000 }, async () => {
+    const result = await runSetup(1000, {
+      heartbeatAgeSec: 3600 - 60,
+      wallClockAdjustmentsMs: [adjustmentMs],
+      stopAtInsert: true,
+    });
+    // Первый отчёт занял 1 с; до безопасного cap остаётся ещё 90 с.
+    // При откате Date.now() на 5 с HEAD считает spent === -4 и разрешает таймер.
+    assert.deepEqual(result.waits, [], "1 с отчёта + 90 с ожидания уже превышают бюджет");
+    assert.deepEqual(result.commands, [], "до отказа setup не должен записывать cap");
+    assert.equal(result.failure, undefined, "отказ должен быть явным skip без исключения");
+    assert.equal(result.skipped.length, 1);
+    assert.ok(result.skipped[0].length > 0);
+    assert.equal(result.reportCount, 1);
+    assert.equal(result.elapsedMs, 1000);
+  });
+}
+
+test("PR97: откат часов Node после ожидания не разрешает INSERT на 91-й секунде", { timeout: 5000 }, async () => {
+  const result = await runSetup(0, {
+    heartbeatAgeSec: 3600 - 57,
+    reportDelaysMs: [1000, 3000],
+    wallClockAdjustmentsMs: [0, -5000],
+    stopAtInsert: true,
+  });
+  assert.equal(result.elapsedMs, 91_000, "фактическая длительность: 1 с + 87 с + 3 с");
+  assert.deepEqual(result.waits, [{ atMs: 1000, delayMs: 87_000 }]);
+  assert.deepEqual(result.commands, [], "откат Date.now() не возвращает истраченные 5 с бюджета");
+  assert.equal(result.failure, undefined);
+  assert.equal(result.skipped.length, 1, "по истечении длительности нужен явный skip");
+  assert.ok(result.skipped[0].length > 0);
+});
+
+for (const adjustmentMs of [0, 120_000]) {
+  test(`PR97: сдвиг часов Node +${adjustmentMs} мс не пропускает допустимый cap`, { timeout: 5000 }, async () => {
+    const result = await runSetup(1000, {
+      heartbeatAgeSec: 61 * 60,
+      wallClockAdjustmentsMs: [adjustmentMs],
+      stopAtInsert: true,
+    });
+    assert.equal(result.elapsedMs, 1000, "реальная длительность — только один короткий отчёт");
+    assert.deepEqual(result.waits, [], "для этого baseline ожидание не требуется");
+    assert.deepEqual(result.skipped, [], "перевод часов вперёд не должен выключать проверки LIMIT/omitted");
+    assert.equal(result.failure, result.stopAfterInsert, "setup должен дойти до INSERT");
+    assert.equal(result.commands.length, 1);
+  });
+}
