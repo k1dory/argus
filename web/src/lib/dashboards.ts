@@ -85,7 +85,8 @@ export function scanSql(sql: string): SqlScan {
       continue;
     }
     let commentEnd = -1;
-    if (c === "-" && sql[i + 1] === "-") {
+    if ((c === "-" && sql[i + 1] === "-") || (c === "/" && sql[i + 1] === "/")) {
+      // «//» — тоже строчный комментарий в лексере ClickHouse 24.8.
       const nl = sql.indexOf("\n", i);
       commentEnd = nl < 0 ? sql.length : nl;
     } else if (c === "#") {
@@ -120,6 +121,22 @@ export function scanSql(sql: string): SqlScan {
   return { ok: true, code, noComments };
 }
 
+const SQL_KEYWORDS = new Set(["FROM", "WHERE", "GROUP", "ORDER", "LIMIT", "HAVING", "UNION", "EXCEPT", "INTERSECT",
+  "SETTINGS", "AS", "AND", "OR", "NOT", "IN", "IS", "LIKE", "ILIKE", "BETWEEN", "JOIN", "INNER", "LEFT", "RIGHT", "FULL",
+  "CROSS", "ARRAY", "ON", "USING", "PREWHERE", "SAMPLE", "FINAL", "WITH", "WINDOW", "QUALIFY", "OFFSET", "INTO", "ASC", "DESC"]);
+
+/** Есть ли выходная секция «FORMAT <имя>» в тексте без литералов и комментариев. */
+function hasOutputFormat(code: string): boolean {
+  for (const m of code.matchAll(/\bFORMAT\b\s*([A-Za-z_][A-Za-z0-9_]*)?\s*(\()?/gi)) {
+    const name = m[1];
+    if (!name || m[2]) continue; // format(…) или format без имени после него
+    if (SQL_KEYWORDS.has(name.toUpperCase())) continue; // колонка format перед FROM/…
+    if (/\bAS\s*$/i.test(code.slice(0, m.index))) continue; // алиас «AS format»
+    return true;
+  }
+  return false;
+}
+
 export function validateSql(sql: string): string | null {
   const s = sql.trim();
   if (!s) return "Пустой запрос";
@@ -129,9 +146,11 @@ export function validateSql(sql: string): string | null {
   if (scan.code.includes(";")) return "Один запрос без «;»";
   if (!/^(select|with)\b/i.test(s)) return "Разрешены только SELECT / WITH";
   // По исходному тексту и по тексту без комментариев: `url/**/(` ловится вторым.
-  // Формат ответа ставит консоль (JSONEachRow): иной FORMAT (JSONCompactEachRow,
-  // TabSeparated…) ломает разбор строк и прячет ошибки в данных.
-  if (/\bFORMAT\b/i.test(scan.code)) return "FORMAT задаёт консоль — уберите его из запроса";
+  // Формат ответа ставит консоль (JSONEachRow): выходная секция FORMAT <имя> (JSONCompact…,
+  // TabSeparated) ломает разбор строк. Функция format(…), алиас «AS format» и колонка
+  // format перед ключевым словом — не выходная секция. Дополнительно executePanel
+  // проверяет форму ответа: каждая строка — объект.
+  if (hasOutputFormat(scan.code)) return "FORMAT задаёт консоль — уберите его из запроса";
   if (FORBIDDEN.test(s) || FORBIDDEN.test(scan.noComments)) return "Запрос содержит запрещённое ключевое слово";
   return null;
 }
@@ -240,9 +259,16 @@ async function executePanel(sql: string, range: RangeKey, signal?: AbortSignal):
     }
     // result_overflow_mode=break режет по блокам, строк бывает больше лимита.
     const lines = text.split("\n").filter(Boolean);
-    const rows = lines.slice(0, PANEL_MAX_ROWS).map((l) => JSON.parse(l) as Record<string, unknown>);
-    const columns = rows.length ? Object.keys(rows[0]) : [];
-    return { columns, rows, ms: Date.now() - started, ...(lines.length > PANEL_MAX_ROWS ? { truncated: true } : {}) };
+    const rows = lines.slice(0, PANEL_MAX_ROWS).map((l) => JSON.parse(l) as unknown);
+    // Каждая строка JSONEachRow — объект; массив ([7] из JSONCompactEachRow) или скаляр —
+    // не тот формат: не отдавать и не кэшировать.
+    if (!rows.every((r) => r !== null && typeof r === "object" && !Array.isArray(r))) {
+      console.error("panel query: ответ не JSONEachRow (строка не объект)");
+      return { columns: [], rows: [], error: "ответ ClickHouse не в формате JSONEachRow", ms: Date.now() - started };
+    }
+    const objects = rows as Record<string, unknown>[];
+    const columns = objects.length ? Object.keys(objects[0]) : [];
+    return { columns, rows: objects, ms: Date.now() - started, ...(lines.length > PANEL_MAX_ROWS ? { truncated: true } : {}) };
   } catch (e) {
     if (e instanceof SyntaxError) {
       // e.message цитирует фрагмент ответа (данные, например FORMAT TabSeparated).

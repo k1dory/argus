@@ -298,12 +298,17 @@ export function clickhouseState(): Promise<ServiceState> {
     try {
       const url = new URL(CH_URL);
       url.searchParams.set("query", "SELECT 1");
+      url.searchParams.set("wait_end_of_query", "1");
       const resp = await fetch(url, {
         headers: { Authorization: "Basic " + Buffer.from(`${CH_USER}:${CH_PASSWORD}`).toString("base64") },
         cache: "no-store",
         signal: AbortSignal.timeout(PING_TIMEOUT_MS),
       });
-      return { ok: resp.ok, detail: resp.ok ? `ClickHouse отвечает · ${Date.now() - started} мс` : `ClickHouse: HTTP ${resp.status}`, checkedAt: Date.now() };
+      await resp.body?.cancel();
+      // Исправность — статус 2xx и нет кода исключения в заголовке (как в chFetch).
+      const code = headerChCode(resp.headers.get("X-ClickHouse-Exception-Code"));
+      const ok = resp.ok && code == null;
+      return { ok, detail: ok ? `ClickHouse отвечает · ${Date.now() - started} мс` : `ClickHouse: ${shortChError("", resp.status, code).message}`, checkedAt: Date.now() };
     } catch (e) {
       return pingFail("ClickHouse", e);
     }
