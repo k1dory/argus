@@ -41,9 +41,14 @@ for f in CHANGELOG.md VERSION; do
 done
 # Флаги индекса assume-unchanged (строчная буква) и skip-worktree (S) прячут локальные
 # правки от git diff: прочитался бы старый blob, а файл удалился бы.
-if git ls-files -v -- CHANGELOG.md VERSION changes | grep -q '^[a-zS]'; then
-    fail "на CHANGELOG.md, VERSION или changes/ стоят флаги assume-unchanged/skip-worktree — снимите их"
-fi
+# Вывод git — в переменную, не в пайп с grep -q: тот выходит на первом совпадении, git
+# получает SIGPIPE, и при pipefail проверка ложно считается пройденной.
+flags="$(git ls-files -v -- CHANGELOG.md VERSION changes)" || fail "git ls-files -v не выполнен"
+while IFS= read -r line; do
+    case "$line" in
+        [a-z]*|S*) fail "на CHANGELOG.md, VERSION или changes/ стоят флаги assume-unchanged/skip-worktree — снимите их" ;;
+    esac
+done <<< "$flags"
 git diff --quiet -- CHANGELOG.md VERSION changes ||
     fail "незакоммиченные изменения в CHANGELOG.md, VERSION или changes/ — закоммитьте их"
 git diff --cached --quiet -- CHANGELOG.md VERSION changes ||
