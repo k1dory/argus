@@ -27,12 +27,16 @@
   vars:
     # Разбор — только если текст ровно той формы, что пишет migrate.sh (write_status):
     # иначе (мусор, подмена, обрыв) статуса нет, и from_json не вызывается.
-    text: "{{ (argus_migrator_status_raw.content | b64decode | trim) if (argus_migrator_status_raw.content is defined) else '' }}"
+    # Текст статуса не кладётся в отдельную переменную: ansible-core до 2.19 превращает
+    # JSON-строку, полученную шаблоном, в словарь, и шаблон формы сравнивался бы не со строкой.
+    b64: "{{ argus_migrator_status_raw.content | default('') }}"
     status_re: >-
       ^\{"exit":[0-9]{1,3},"stage":"[a-z]{0,16}","file":"[0-9A-Za-z_.-]{0,128}","last_applied":"[0-9A-Za-z_.-]{0,128}",
       "code":(null|[0-9]{1,6}),"name":"[A-Z0-9_]{0,64}","weak_vars":\[("CLICKHOUSE_[A-Z_]{1,40}"(,"CLICKHOUSE_[A-Z_]{1,40}")*)?\],
       "run":"[0-9A-Za-z_.-]{0,128}"\}$
-    raw: "{{ (text | from_json) if (text is match(status_re | replace(' ', ''))) else {} }}"
+    raw: >-
+      {{ (b64 | b64decode | trim | from_json)
+         if (b64 and ((b64 | b64decode | trim) is match(status_re | replace(' ', '')))) else {} }}
     raw_map: "{{ raw if (raw is mapping) else {} }}"
     container: "{{ (argus_migrator_container.stdout | default('')).split() }}"
     safe_name: '^[0-9A-Za-z_.-]{1,128}$'
