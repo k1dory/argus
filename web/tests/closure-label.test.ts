@@ -100,6 +100,6 @@ test("метка в истории одной строкой; автоматик
     "легитимно, разрешено · без эскалации · уровень: high · Discovery · T1046 · вслепую");
   assert.equal(closureLabelText({ disposition: "benign_authorized", escalate: false, severity_correct: true, blind: false }), "легитимно, разрешено · без эскалации · уровень верен",
     "событие 0033 без severity_level");
-  assert.equal(closureLabelText({ ops_cause: "network", ops_act_now: true, ops_urgency: 4, ops_action: "fixed", blind: false }), "сеть · действовать сейчас · срочность 4 · устранено");
+  assert.equal(closureLabelText({ ops_cause: "network", ops_act_now: true, ops_urgency: 4, ops_action: "fixed", blind: false }), "сеть · действовать сейчас: да · срочность 4 · устранено");
   assert.equal(closureLabelText({ disposition: "", escalate: null, severity_correct: null, ops_cause: "", ops_action: "", blind: false }), "");
 });

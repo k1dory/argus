@@ -5,7 +5,7 @@ import "server-only";
 // инцидент closed / false_positive в incidents_current. Вердикт агента — вердикт
 // последней сессии разбора, начатой не позже этой метки (одна сессия — один вердикт,
 // как в карточке). Ответы DevOps (правила ops.*, без disposition) входят в число ответов
-// и в долю ложных (ops_cause = false_positive), в согласие с агентом — нет. Запрос
+// и в долю ложных (статус false_positive), в согласие с агентом — нет. Запрос
 // уходит без настроек, даже без умолчания консоли (max_execution_time: null), и
 // исполним от argus_ro: его политики argus_ro_blind скрывают только незавершённые
 // слепые инциденты, а они сюда не входят.
@@ -24,6 +24,7 @@ export const AGREEMENT_SQL = `WITH
     SELECT incident_id,
            argMax(disposition, (changed_at, revision)) AS disposition,
            argMax(ops_cause, (changed_at, revision)) AS ops_cause,
+           argMax(status, (changed_at, revision)) AS close_status,
            argMax(blind, (changed_at, revision)) AS blind,
            max(changed_at) AS closed_at
     FROM incident_state_events
@@ -58,7 +59,9 @@ export const AGREEMENT_SQL = `WITH
   )
 SELECT d.rule_id AS rule_id, any(d.rule_title) AS rule_title, c.blind AS blind,
        count() AS labeled,
-       countIf(c.disposition = 'false_positive' OR c.ops_cause = 'false_positive') AS fp,
+       -- Ложное — по статусу закрытия: у ИБ и DevOps (0036) он согласован с меткой, у
+       -- старых меток DevOps (0033) причины false_positive нет, а статус есть.
+       countIf(c.close_status = 'false_positive') AS fp,
        countIf(c.disposition != '' AND transform(v.verdict, [${VERDICTS}], [${DISPOSITIONS}], '') != '') AS compared,
        countIf(c.disposition != '' AND transform(v.verdict, [${VERDICTS}], [${DISPOSITIONS}], '') = c.disposition) AS agreed,
        countIf(c.disposition != '' AND v.verdict = 'undetermined') AS undetermined,
