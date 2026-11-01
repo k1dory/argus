@@ -65,6 +65,7 @@ func TestPR94WidenedGroupPendingSurvivesFailedWrite(t *testing.T) {
 			t.Run(fmt.Sprintf("status=%s/threshold=%t", operatorStatus, threshold), func(t *testing.T) {
 				oldRule := compositeRegressionRule(t, "object", threshold)
 				newRule := compositeRegressionRule(t, "object, attrs.detail", threshold)
+				newRule.Detection.GroupByPrevious = "object" // явная миграция ключа (group_by_previous)
 				start := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
 				first := &model.Event{
 					TS: model.FormatTS(start), Source: "fixture", Action: "test.failure",

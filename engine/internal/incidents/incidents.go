@@ -186,16 +186,28 @@ func (inc *Incident) regKey() string {
 	return k
 }
 
-// widenedGroup — открытый инцидент того же правила, субъекта и узла, чей group_key —
-// начало составного key по границе «|» (ключ до того, как в group_by добавили поля
-// в конец). Длинные префиксы — первыми. base — «правило|субъект|узел».
-func (r *Registry) widenedGroup(base, key string) (*Incident, string) {
-	parts := strings.Split(key, "|")
-	for k := len(parts) - 1; k >= 1; k-- {
-		old := strings.Join(parts[:k], "|")
-		lk := base + "|" + old
-		if ex, ok := r.open[lk]; ok && ex.GroupKey == old && !isFinal(ex.Status) {
-			return ex, lk
+// previousGroup — открытый инцидент, заведённый до смены group_by (поле правила
+// group_by_previous): то же правило, субъект и узел, а group_key — ключ события
+// группы по прежнему group_by. Сравнение — по полям, а не по строке ключа реестра:
+// «|» внутри значения или субъекта не делает чужой инцидент своим. Без
+// group_by_previous — nil: смена ключа заводит новые инциденты.
+func (r *Registry) previousGroup(d eval.Detection, inc *Incident) (*Incident, string) {
+	prev := strings.TrimSpace(d.Rule.Detection.GroupByPrevious)
+	if prev == "" || len(d.Events) == 0 || !explicitGroupBy(prev) {
+		return nil, ""
+	}
+	get := rules.Getter(prev)
+	if get == nil {
+		return nil, ""
+	}
+	old := get(d.Events[0])
+	if old == "" || old == "-" || old == inc.GroupKey {
+		return nil, ""
+	}
+	for k, ex := range r.open {
+		if ex.RuleID == d.Rule.ID && ex.ActorName == inc.ActorName && ex.Node == inc.Node &&
+			ex.GroupKey == old && !isFinal(ex.Status) {
+			return ex, k
 		}
 	}
 	return nil, ""
@@ -219,10 +231,10 @@ func (r *Registry) Apply(dets []eval.Detection, now time.Time) (created, updated
 				ex.GroupKey = inc.GroupKey
 				r.open[key] = ex
 				ex.groupPending = true
-			} else if ex, lk := r.widenedGroup(legacy, inc.GroupKey); ex != nil {
-				// group_by правила дополнили полями (attrs.peer → attrs.peer, attrs.source):
-				// открытый инцидент со старым ключом-префиксом забирает первая группа
-				// нового ключа — без второго инцидента и с решениями оператора.
+			} else if ex, lk := r.previousGroup(d, inc); ex != nil {
+				// group_by правила сменили (group_by_previous): открытый инцидент со
+				// старым ключом забирает первая группа нового ключа — без второго
+				// инцидента и с решениями оператора.
 				delete(r.open, lk)
 				ex.GroupKey = inc.GroupKey
 				r.open[key] = ex
@@ -736,6 +748,11 @@ func explicitGroup(r *rules.Rule) bool {
 	if r.Detection.Threshold != nil && r.Detection.Threshold.GroupBy != "" {
 		gb = r.Detection.Threshold.GroupBy
 	}
+	return explicitGroupBy(gb)
+}
+
+// explicitGroupBy — group_by, значение которого пишется в group_key инцидента.
+func explicitGroupBy(gb string) bool {
 	if strings.Contains(gb, ",") {
 		return true
 	}

@@ -63,6 +63,11 @@ type Rule struct {
 		// GroupBy — ключ склейки правила без порога (у порога — threshold.group_by),
 		// по умолчанию actor.name. Составной ключ — поля через запятую: «node, object».
 		GroupBy string `yaml:"group_by"`
+		// GroupByPrevious — прежний group_by (или threshold.group_by) при его смене:
+		// открытый инцидент, заведённый со старым ключом, продолжает первая группа
+		// нового ключа, у событий которой старый ключ совпадает (то же правило,
+		// субъект и узел). Без поля смена group_by заводит новые инциденты.
+		GroupByPrevious string `yaml:"group_by_previous"`
 	} `yaml:"detection"`
 	Enrich    []any          `yaml:"enrich"` // edr.process_tree: 120s | ngfw.sessions: 120s | cmdb.owner
 	Analyst   Analyst        `yaml:"analyst"`
@@ -278,6 +283,15 @@ func (r *Rule) Window() time.Duration {
 	return 10 * time.Minute
 }
 
+// normGroupBy — group_by без пробелов вокруг полей, для сравнения.
+func normGroupBy(gb string) string {
+	parts := strings.Split(gb, ",")
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
+	}
+	return strings.Join(parts, ",")
+}
+
 func (r *Rule) GroupBy() string {
 	if r.Detection.Threshold != nil && r.Detection.Threshold.GroupBy != "" {
 		return r.Detection.Threshold.GroupBy
@@ -475,6 +489,14 @@ func LoadFile(path string) (*Rule, error) {
 	}
 	if gb := r.GroupBy(); Getter(gb) == nil {
 		return nil, fmt.Errorf("group_by: неизвестное поле %q", gb)
+	}
+	if prev := strings.TrimSpace(r.Detection.GroupByPrevious); prev != "" {
+		if Getter(prev) == nil {
+			return nil, fmt.Errorf("group_by_previous: неизвестное поле %q", prev)
+		}
+		if normGroupBy(prev) == normGroupBy(r.GroupBy()) {
+			return nil, fmt.Errorf("group_by_previous совпадает с group_by %q — миграции ключа нет, поле лишнее", r.GroupBy())
+		}
 	}
 	for _, f := range r.CloseMatch {
 		if Getter(f) == nil {

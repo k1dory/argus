@@ -28,6 +28,9 @@ detection:
     attrs.transport: internal
   condition: selection
   group_by: attrs.peer, attrs.source
+  # до #88 склейка была только по отправителю: открытые инциденты со старым ключом
+  # продолжает первая пара того же отправителя (INC-5312 на argus1)
+  group_by_previous: attrs.peer
 
 dedupe: 24h
 

@@ -31,6 +31,7 @@ func TestPR94WidenedGroupChecksStructuredIdentity(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			oldRule := compositeRegressionRule(t, "object", false)
 			newRule := compositeRegressionRule(t, "object, attrs.detail", false)
+			newRule.Detection.GroupByPrevious = "object" // явная миграция ключа (group_by_previous)
 			oldRule.ID, newRule.ID = tc.old.rule, tc.next.rule
 			start := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
 			first := &model.Event{
