@@ -44,12 +44,13 @@ test("метка ответа в теле workflow — только поля clo
     return new Response("{}", { status: 200 });
   });
   await incidentTransition({ id: "INC-7", kind: "status", status: "closed", reason: "проверено по журналу", actor: "alice", role: "analyst",
-    label: { disposition: "malicious", escalate: true, severity_correct: false } });
+    label: { disposition: "malicious", escalate: true, severity_level: 2, attack_tactic: "credential-access", attack_technique: "T1110.001" } });
   await incidentTransition({ id: "INC-8", kind: "status", status: "closed", reason: "плановые работы на узле", actor: "alice", role: "analyst",
-    label: { ops_cause: "planned_work", ops_action: "no_action" } });
+    label: { ops_cause: "disk", ops_act_now: true, ops_urgency: 3, ops_action: "" } });
   for (const body of bodies) {
     assert.equal(typeof body.label, "object");
     for (const k of Object.keys(body.label as object)) assert.ok(allowed.has(k), `поле метки ${k} движок отвергнет`);
   }
-  assert.deepEqual(bodies[0].label, { disposition: "malicious", escalate: true, severity_correct: false });
+  assert.deepEqual(bodies[0].label, { disposition: "malicious", escalate: true, severity_level: 2, attack_tactic: "credential-access", attack_technique: "T1110.001" });
+  assert.ok(!allowed.has("severity_correct") && !allowed.has("attack_version"), "их вычисляет движок, консоль не присылает");
 });

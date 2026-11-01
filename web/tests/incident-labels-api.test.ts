@@ -16,7 +16,9 @@ const route = require("../src/app/api/incidents/labels/route") as { GET: (req: R
 
 const label = {
   event_id: "12345678-9abc-4def-8abc-123456789abc", incident_id: "INC-4", changed_at: "2026-11-01 10:00:00.123", actor: "analyst", status: "closed",
-  disposition: "benign_authorized", escalate: false, severity_correct: true, ops_cause: "", ops_action: "",
+  disposition: "benign_authorized", escalate: false, severity_level: 3, severity_correct: true,
+  attack_tactic: "discovery", attack_technique: "T1046", attack_version: "20.0",
+  ops_cause: "", ops_act_now: null, ops_urgency: null, ops_action: "",
   blind: true, reason: "Проверено по журналу", rule_id: "fixture-rule", rule_title: "Fixture", level: "high", tags: ["attack.t1110"],
 };
 let seq = 0;

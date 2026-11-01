@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/devitex-soft/argus/engine/internal/attack"
 	"github.com/devitex-soft/argus/engine/internal/incidents"
 	"github.com/devitex-soft/argus/engine/internal/store"
 )
@@ -15,7 +16,7 @@ import (
 func labelContractEngine(t *testing.T, status string, tags []string) (*engine, *fakeCH) {
 	t.Helper()
 	f := newFakeCH(t)
-	inc, err := json.Marshal(incidents.Incident{IncidentID: "INC-4", Status: status, Owner: "anna", Tags: tags})
+	inc, err := json.Marshal(incidents.Incident{IncidentID: "INC-4", Status: status, Owner: "anna", Tags: tags, Level: "high"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,8 +33,9 @@ func assertLabelWire(t *testing.T, raw string, overrides map[string]any) map[str
 		t.Fatalf("state event is not JSON: %v", err)
 	}
 	want := map[string]any{
-		"disposition": "", "escalate": nil, "severity_correct": nil,
-		"ops_cause": "", "ops_action": "", "blind": false, "labeled_by_human": false,
+		"disposition": "", "escalate": nil, "severity_level": nil, "severity_correct": nil,
+		"attack_tactic": "", "attack_technique": "", "attack_version": "",
+		"ops_cause": "", "ops_act_now": nil, "ops_urgency": nil, "ops_action": "", "blind": false, "labeled_by_human": false,
 	}
 	for k, v := range overrides {
 		want[k] = v
@@ -54,21 +56,33 @@ func TestClosureLabelHTTPAndStoredEvent(t *testing.T) {
 		want                      map[string]any
 	}{
 		{name: "human security closure keeps explicit false", kind: "status", status: "closed",
-			label: `{"disposition":"malicious","escalate":false,"severity_correct":false}`, code: http.StatusOK,
-			want: map[string]any{"disposition": "malicious", "escalate": false, "severity_correct": false, "blind": true, "labeled_by_human": true}},
+			label: `{"disposition":"malicious","escalate":false,"severity_level":1,"attack_tactic":"credential-access","attack_technique":"T1110.001"}`, code: http.StatusOK,
+			want: map[string]any{"disposition": "malicious", "escalate": false, "severity_level": float64(1), "severity_correct": false,
+				"attack_tactic": "credential-access", "attack_technique": "T1110.001", "attack_version": attackVersion(), "blind": true, "labeled_by_human": true}},
+		{name: "severity_correct is computed from the rule level", kind: "status", status: "closed",
+			label: `{"disposition":"malicious","escalate":true,"severity_level":3,"attack_tactic":"other","attack_technique":"other"}`, code: http.StatusOK,
+			want: map[string]any{"disposition": "malicious", "escalate": true, "severity_level": float64(3), "severity_correct": true,
+				"attack_tactic": "other", "attack_technique": "other", "attack_version": attackVersion(), "blind": true, "labeled_by_human": true}},
+		{name: "caller cannot send severity_correct", kind: "status", status: "closed",
+			label: `{"disposition":"malicious","escalate":false,"severity_level":1,"attack_tactic":"credential-access","attack_technique":"T1110.001","severity_correct":true}`, code: http.StatusBadRequest},
+		{name: "caller cannot send attack_version", kind: "status", status: "closed",
+			label: `{"disposition":"malicious","escalate":false,"severity_level":1,"attack_tactic":"credential-access","attack_technique":"T1110.001","attack_version":"1.0"}`, code: http.StatusBadRequest},
 		{name: "human ops closure keeps nullable security fields", kind: "status", status: "closed", tags: []string{"ops.storage"},
-			label: `{"ops_cause":"real_failure","ops_action":"fixed"}`, code: http.StatusOK,
-			want: map[string]any{"ops_cause": "real_failure", "ops_action": "fixed", "blind": true, "labeled_by_human": true}},
+			label: `{"ops_cause":"disk","ops_act_now":false,"ops_urgency":2,"ops_action":"fixed"}`, code: http.StatusOK,
+			want: map[string]any{"ops_cause": "disk", "ops_act_now": false, "ops_urgency": float64(2), "ops_action": "fixed", "blind": true, "labeled_by_human": true}},
+		{name: "ops action is optional", kind: "status", status: "closed", tags: []string{"ops.storage"},
+			label: `{"ops_cause":"deploy","ops_act_now":true,"ops_urgency":4}`, code: http.StatusOK,
+			want: map[string]any{"ops_cause": "deploy", "ops_act_now": true, "ops_urgency": float64(4), "blind": true, "labeled_by_human": true}},
 		{name: "legacy take needs no label", kind: "take", code: http.StatusOK},
 		{name: "closing without label rejected", kind: "status", status: "closed", code: http.StatusConflict},
 		{name: "null is not an explicit false answer", kind: "status", status: "closed",
-			label: `{"disposition":"malicious","escalate":null,"severity_correct":false}`, code: http.StatusConflict},
+			label: `{"disposition":"malicious","escalate":null,"severity_level":1,"attack_tactic":"other","attack_technique":"other"}`, code: http.StatusConflict},
 		{name: "label on nonfinal transition rejected", kind: "status", status: "observing",
-			label: `{"disposition":"malicious","escalate":false,"severity_correct":false}`, code: http.StatusConflict},
+			label: `{"disposition":"malicious","escalate":false,"severity_level":1,"attack_tactic":"credential-access","attack_technique":"T1110.001"}`, code: http.StatusConflict},
 		{name: "caller cannot override blind sample", kind: "status", status: "closed",
-			label: `{"disposition":"malicious","escalate":false,"severity_correct":false,"blind":false}`, code: http.StatusBadRequest},
+			label: `{"disposition":"malicious","escalate":false,"severity_level":1,"attack_tactic":"credential-access","attack_technique":"T1110.001","blind":false}`, code: http.StatusBadRequest},
 		{name: "caller cannot override human provenance", kind: "status", status: "closed",
-			label: `{"disposition":"malicious","escalate":false,"severity_correct":false,"labeled_by_human":false}`, code: http.StatusBadRequest},
+			label: `{"disposition":"malicious","escalate":false,"severity_level":1,"attack_tactic":"credential-access","attack_technique":"T1110.001","labeled_by_human":false}`, code: http.StatusBadRequest},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			initial := incidents.StatusInProgress
@@ -124,3 +138,5 @@ func TestAutomaticClosureNeverProducesHumanLabel(t *testing.T) {
 		t.Fatalf("wrong automatic provenance: %#v", stored)
 	}
 }
+
+func attackVersion() string { return attack.Version() }

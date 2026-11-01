@@ -296,11 +296,17 @@ export type IncidentStateEvent = {
   status: IncidentStatus;
   owner: string;
   reason: string;
-  /** Метка ответа (миграция 0033); у переходов без завершения и у автоматики пустая. */
+  /** Метка ответа (миграции 0033, 0036); у переходов без завершения и у автоматики пустая. */
   disposition: string;
   escalate: boolean | null;
+  severity_level: number | null;
   severity_correct: boolean | null;
+  attack_tactic: string;
+  attack_technique: string;
+  attack_version: string;
   ops_cause: string;
+  ops_act_now: boolean | null;
+  ops_urgency: number | null;
   ops_action: string;
   blind: boolean;
   labeled_by_human: boolean;
@@ -309,7 +315,8 @@ export type IncidentStateEvent = {
 export async function incidentStateHistory(id: string, limit = 200): Promise<IncidentStateEvent[]> {
   const rows = await chQuery<IncidentStateEvent>(
     `SELECT event_id, revision, changed_at, actor, kind, status, owner, reason,
-            disposition, escalate, severity_correct, ops_cause, ops_action, blind, labeled_by_human
+            disposition, escalate, severity_level, severity_correct, attack_tactic, attack_technique, attack_version,
+            ops_cause, ops_act_now, ops_urgency, ops_action, blind, labeled_by_human
      FROM incident_state_events WHERE incident_id = {id:String}
      ORDER BY revision DESC LIMIT {limit:UInt32}`, { id, limit: Math.min(10_000, Math.max(1, Math.floor(limit))) },
   );
@@ -322,8 +329,9 @@ import type { LabelCursor } from "./label-cursor";
 
 export type IncidentLabelRow = {
   event_id: string; incident_id: string; changed_at: string; actor: string; status: IncidentStatus;
-  disposition: string; escalate: boolean | null; severity_correct: boolean | null;
-  ops_cause: string; ops_action: string; blind: boolean; reason: string;
+  disposition: string; escalate: boolean | null; severity_level: number | null; severity_correct: boolean | null;
+  attack_tactic: string; attack_technique: string; attack_version: string;
+  ops_cause: string; ops_act_now: boolean | null; ops_urgency: number | null; ops_action: string; blind: boolean; reason: string;
   rule_id: string; rule_title: string; level: string; tags: string[];
 };
 
@@ -344,7 +352,8 @@ export async function incidentLabels(since: string, limit: number, after?: Label
   return chQuery<IncidentLabelRow>(
     `WITH labels AS (
        SELECT event_id, incident_id, changed_at, actor, status, disposition, escalate,
-              severity_correct, ops_cause, ops_action, blind, reason
+              severity_level, severity_correct, attack_tactic, attack_technique, attack_version,
+              ops_cause, ops_act_now, ops_urgency, ops_action, blind, reason
        FROM incident_state_events
        WHERE labeled_by_human AND kind = 'status' AND status IN ('closed', 'false_positive')
          -- changed_at — DateTime64(3). Доли мельче миллисекунды в since не округляются

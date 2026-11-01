@@ -1,7 +1,7 @@
 // Метрики слепой выборки на живом ClickHouse: настоящий AGREEMENT_SQL по фикстурам
 // в incidents / incident_state_events / agent_verdicts. Открытые инциденты,
-// автозакрытия, метки DevOps и закрытия вне окна в агрегаты не входят; вердикт
-// после закрытия не учитывается. Тот же запрос от argus_ro (политики argus_ro_blind
+// автозакрытия и закрытия вне окна в агрегаты не входят; ответы DevOps входят в число
+// ответов и долю ложных, но не в согласие с агентом; вердикт после закрытия не учитывается. Тот же запрос от argus_ro (политики argus_ro_blind
 // из migrate.sh) даёт те же числа, а сырой агрегат по agent_verdicts у argus_ro не
 // видит вердикт открытого слепого инцидента.
 import { after, before, test } from "node:test";
@@ -32,7 +32,7 @@ test("agreement: только завершённые с ответом чело�
   };
   type Case = {
     blind: boolean; rule?: string; closeAgo?: number; kind?: string; human?: boolean;
-    disposition?: string; status?: string; verdicts?: [string, number][];
+    disposition?: string; opsCause?: string; status?: string; verdicts?: [string, number][];
   };
   const cases: Record<string, Case> = {
     blindAgree: { blind: true, disposition: "malicious", verdicts: [["true_positive", 2 * DAY]] },
@@ -49,7 +49,10 @@ test("agreement: только завершённые с ответом чело�
     // Закрытие с видом status, но не от человека: учитывать нельзя, даже с disposition.
     unlabeled: { blind: false, human: false, disposition: "malicious", verdicts: [["true_positive", 2 * DAY]] },
     blindOpen: { blind: true, status: "", verdicts: [["false_positive", 2 * DAY]] },
-    ops: { blind: false, rule: opsRule, disposition: "", verdicts: [["true_positive", 2 * DAY]] },
+    // DevOps (0036): причина «ложное срабатывание» входит в долю ложных; вердикт агента
+    // у ответа без disposition ни с чем не сравнивается.
+    opsFalsePositive: { blind: false, rule: opsRule, opsCause: "false_positive", status: "false_positive", verdicts: [["true_positive", 2 * DAY]] },
+    opsDisk: { blind: false, rule: opsRule, opsCause: "disk", verdicts: [["undetermined", 2 * DAY]] },
   };
   const ids = Object.fromEntries(Object.entries(cases).map(([name, c]) => [name, pick(c.blind)])) as Record<keyof typeof cases, string>;
   const all = Object.values(ids);
@@ -66,7 +69,7 @@ test("agreement: только завершённые с ответом чело�
         SELECT {e:String}, {id:String}, 1, parseDateTime64BestEffort({at:String}, 3, 'UTC'), 'anna', {kind:String}, {status:String}, 'anna', 'fixture',
           {d:String}, false, true, {oc:String}, {oa:String}, {blind:Bool}, {human:Bool}`,
       { e: randomUUID(), id, at: chTs(closeAt), kind: c.kind ?? "status", status: c.status ?? "closed", d: c.disposition ?? "",
-        oc: name === "ops" ? "planned_work" : "", oa: name === "ops" ? "no_action" : "",
+        oc: c.opsCause ?? "", oa: "",
         blind: String(c.blind), human: String(c.human ?? true) });
     }
     for (const [verdict, before] of c.verdicts ?? []) {
@@ -82,13 +85,14 @@ test("agreement: только завершённые с ответом чело�
   const expected30 = [
     { rule_id: rule, rule_title: "Agreement fixture", blind: 0, labeled: 4, fp: 3, compared: 2, agreed: 2, undetermined: 1, no_verdict: 1 },
     { rule_id: rule, rule_title: "Agreement fixture", blind: 1, labeled: 3, fp: 0, compared: 3, agreed: 2, undetermined: 0, no_verdict: 0 },
+    { rule_id: opsRule, rule_title: "Agreement fixture", blind: 0, labeled: 2, fp: 1, compared: 0, agreed: 0, undetermined: 0, no_verdict: 0 },
   ];
   const sql = metrics().AGREEMENT_SQL;
   const p30 = metrics().agreementParams("30d", now + 1000);
   assert.deepEqual(ours(await ch().chQuery<AgreementSqlRow>(sql, p30)), expected30,
-    "открытый, автозакрытие, метка DevOps и закрытие вне окна не входят; поздний вердикт не считается");
+    "открытый, автозакрытие и закрытие вне окна не входят; DevOps — только в ответах и ложных; поздний вердикт не считается");
   const p7 = metrics().agreementParams("7d", now + 1000);
-  assert.deepEqual(ours(await ch().chQuery<AgreementSqlRow>(sql, p7)).map((r) => [r.blind, r.labeled, r.fp]), [[0, 3, 2], [1, 3, 0]],
+  assert.deepEqual(ours(await ch().chQuery<AgreementSqlRow>(sql, p7)).map((r) => [r.blind, r.labeled, r.fp]), [[0, 3, 2], [1, 3, 0], [0, 2, 1]],
     "закрытие десятидневной давности в окно 7 дней не входит");
 
   const m = await metrics().agreementMetrics("30d", now + 1000);
@@ -97,7 +101,9 @@ test("agreement: только завершённые с ответом чело�
   assert.deepEqual([mine.labeled, mine.false_positive.k, mine.blind.agreement.k, mine.blind.agreement.n, mine.sighted.agreement.k, mine.sighted.agreement.n],
     [7, 3, 2, 3, 2, 2]);
   assert.equal(mine.false_positive.low_data, true, "n < 20 помечается");
-  assert.ok(!m.rules.some((r) => r.rule_id === opsRule), "метки DevOps не участвуют");
+  const ops = m.rules.find((r) => r.rule_id === opsRule);
+  assert.deepEqual([ops?.labeled, ops?.false_positive.k, ops?.blind.agreement.n, ops?.sighted.agreement.n], [2, 1, 0, 0],
+    "DevOps: доля ложных по причине, согласия с агентом нет");
 
   const user = `agreement_ro_${run}`, policy = `agreement_ro_${run}`, password = `fixture-${randomBytes(16).toString("hex")}`;
   const cleanup = await createBlindRo(user, policy, password);

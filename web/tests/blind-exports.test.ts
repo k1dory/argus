@@ -44,7 +44,8 @@ mocks.queries.incidentFirstResponse = async () => ts;
 mocks.queries.incidentStateHistory = async () => status === "closed" ? [{
   event_id: "12345678-9abc-4def-8abc-123456789abc", revision: 1, changed_at: ts, actor: "analyst",
   kind: "status", status: "closed", owner: "analyst", reason: "Проверено человеком", disposition: "benign_authorized",
-  escalate: false, severity_correct: true, ops_cause: "", ops_action: "", blind: true, labeled_by_human: true,
+  escalate: false, severity_level: 3, severity_correct: true, attack_tactic: "discovery", attack_technique: "T1046", attack_version: "20.0",
+  ops_cause: "", ops_act_now: null, ops_urgency: null, ops_action: "", blind: true, labeled_by_human: true,
 }] : [];
 mocks.queries.chQuery = async (sql) => sql.includes("FROM console_audit") ? actions : [];
 mocks.queries.agentVerdictsFor = async () => [{
