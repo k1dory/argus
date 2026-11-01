@@ -166,6 +166,17 @@ export function encodeParam(value: string | number, type: string | undefined): s
   return type !== undefined && STRING_PARAM_TYPE.test(type.trim()) ? escapeChString(text) : text;
 }
 
+/** Параметров в URL не больше стольких байт — остальное телом (см. chFetchWithSlot). */
+export const PARAMS_IN_URL_MAX = 64 * 1024;
+
+/** Граница multipart, которой нет ни в одной части. */
+function multipartBoundary(parts: string[]): string {
+  for (;;) {
+    const b = `argus-${crypto.randomUUID()}`;
+    if (!parts.some((p) => p.includes(b))) return b;
+  }
+}
+
 function chFetch(sql: string, params: Record<string, string | number>, settings: ChSettings, format: string | null): Promise<string> {
   return chLimit(() => chFetchWithSlot(sql, params, settings, format));
 }
@@ -183,16 +194,31 @@ async function chFetchWithSlot(sql: string, params: Record<string, string | numb
   // ошибкой с X-ClickHouse-Exception-Code, а не строкой в конце тела со статусом 200.
   url.searchParams.set("wait_end_of_query", "1");
   const types = paramTypes(sql);
-  for (const [key, value] of Object.entries(params)) url.searchParams.set(`param_${key}`, encodeParam(value, types.get(key)));
+  const encoded = Object.entries(params).map(([key, value]) => [`param_${key}`, encodeParam(value, types.get(key))] as const);
+  // Параметры — в URL, пока он короткий; большие (массивы значений сотен персон) — телом
+  // multipart/form-data вместе с запросом: URI ClickHouse не длиннее 1 MiB
+  // (http_max_uri_size), и запрос с тысячей персон иначе получил бы HTTP 414. Только для
+  // чтения: у INSERT в теле — данные.
+  let body: string = sql;
+  let contentType = "text/plain";
+  const urlBytes = encoded.reduce((n, [k, v]) => n + k.length + encodeURIComponent(v).length + 2, 0);
+  if (urlBytes > PARAMS_IN_URL_MAX && !/^\s*INSERT\b/i.test(sql)) {
+    const boundary = multipartBoundary([sql, ...encoded.map(([, v]) => v)]);
+    contentType = `multipart/form-data; boundary=${boundary}`;
+    body = [["query", sql] as const, ...encoded].map(([name, value]) =>
+      `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`).join("") + `--${boundary}--\r\n`;
+  } else {
+    for (const [key, value] of encoded) url.searchParams.set(key, value);
+  }
   let resp: Response;
   try {
     resp = await fetch(url, {
       method: "POST",
       headers: {
         Authorization: "Basic " + Buffer.from(`${CH_USER}:${CH_PASSWORD}`).toString("base64"),
-        "Content-Type": "text/plain",
+        "Content-Type": contentType,
       },
-      body: sql,
+      body,
       cache: "no-store",
       signal: AbortSignal.timeout(CH_TIMEOUT_MS),
     });

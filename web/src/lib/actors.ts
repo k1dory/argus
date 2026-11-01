@@ -98,18 +98,26 @@ export async function listPersons(range: ActorRange, now = Date.now()): Promise<
   const incidents = new Map<string, number>();
   const plan = activityPlan(persons.map((p) => ({ id: p.person_id, aliases: byPerson.get(p.person_id) ?? [] })), w);
   const eventsQuery = plan.persons.length ? (async () => {
+    // Предфильтр: до PREFILTER_INDEX_MAX значений — hasAny по idx_actor_keys, больше — IN.
     const pf = aliasPrefilter(persons.flatMap((p) => byPerson.get(p.person_id) ?? []));
-    const rows = await chQuery<{ p: string | number; events: string | number; last_ts: string }>(
-      `SELECT p, count() AS events, toString(max(ts)) AS last_ts
-       FROM (SELECT ts, ${plan.sql} AS ps FROM events
-             WHERE ts >= parseDateTime64BestEffort({from:String}, 3, 'UTC') AND ts < parseDateTime64BestEffort({to:String}, 3, 'UTC') AND ${pf.sql})
-       ARRAY JOIN ps AS p GROUP BY p`,
+    const rows = await chQuery<{ hits: (string | number)[]; n: string | number; last_ts: string }>(
+      `SELECT hits, count() AS n, toString(max(ts)) AS last_ts
+       FROM (SELECT ts, ${plan.hits} AS hits FROM events
+             WHERE ts >= parseDateTime64BestEffort({from:String}, 3, 'UTC') AND ts < parseDateTime64BestEffort({to:String}, 3, 'UTC')
+               AND ${pf.sql})
+       WHERE notEmpty(hits) GROUP BY hits`,
       { from: chTs(w.fromMs), to: chTs(w.toMs), ...pf.params, ...plan.params },
     );
+    // Набор классов → персоны без повторов: строка засчитывается персоне один раз.
     for (const r of rows) {
-      const id = plan.persons[Number(r.p) - 1];
-      const n = Number(r.events);
-      if (id) events.set(id, { events: n, last_ts: n > 0 ? String(r.last_ts) : null });
+      const nos = new Set(r.hits.flatMap((c) => plan.owners[Number(c) - 1] ?? []));
+      const n = Number(r.n), last = String(r.last_ts);
+      for (const no of nos) {
+        const id = plan.persons[no - 1];
+        if (!id) continue;
+        const cur = events.get(id);
+        events.set(id, { events: (cur?.events ?? 0) + n, last_ts: cur?.last_ts && cur.last_ts > last ? cur.last_ts : last });
+      }
     }
   })() : Promise.resolve();
   const incidentQueries: Promise<void>[] = [];

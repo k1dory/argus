@@ -63,10 +63,10 @@ globalThis.fetch = (async (url: URL | string, init?: RequestInit) => {
   const p = u.searchParams;
   calls.push({ sql, params: p });
   if (sql.startsWith("INSERT")) return fail.insert ? new Response("Code: 241. DB::Exception: Memory limit exceeded", { status: 500 }) : new Response("");
-  if (sql.includes("ARRAY JOIN ps AS p") && sql.includes("FROM events")) {
-    // Активность списка персон: по строке на номер персоны из плана (ap_pi).
-    const nos = [...new Set((p.get("param_ap_pi") ?? "[]").slice(1, -1).split(",").filter(Boolean))];
-    return rows(nos.map((n) => ({ p: n, events: "2", last_ts: "2026-10-24 11:00:00.000" })));
+  if (sql.includes("GROUP BY hits") && sql.includes("FROM events")) {
+    // Активность списка персон: одна строка с набором всех классов плана (ap_vf).
+    const classes = (p.get("param_ap_vf") ?? "[]").slice(1, -1).split(",").filter(Boolean).map((_, i) => i + 1);
+    return rows([{ hits: classes, n: "2", last_ts: "2026-10-24 11:00:00.000" }]);
   }
   if (sql.includes("countIf(")) {
     // Список персон: на персону — e<j>/l<j> или i<j>; отвечаем по именам колонок из SQL.
@@ -388,7 +388,7 @@ test("список персон: один проход по ключам стр�
   const { listPersons } = require("../src/lib/actors") as typeof import("../src/lib/actors"); // eslint-disable-line @typescript-eslint/no-require-imports -- после моков
   const from = since();
   const list = await listPersons("7d");
-  const evs = calls.slice(from).filter((c) => c.sql.includes("FROM events"));
+  const evs = calls.slice(from).filter((c) => c.sql.includes("FROM events") && c.sql.includes("GROUP BY hits"));
   assert.equal(evs.length, 1, "один проход по окну событий на всех персон");
   const ev = evs[0];
   assert.ok(!ev.sql.includes("cityHash64") && !ev.sql.includes("uniqExact") && !ev.sql.includes("JOIN events"), "два разных события в одну мс — два события");
@@ -396,7 +396,7 @@ test("список персон: один проход по ключам стр�
   assert.match(ev.sql, /transform\(lowerUTF8\(actor_name\), \{ap_k1:Array\(String\)\}/, "поиск по ключу строки");
   assert.ok((ev.params.get("param_ap_k1") ?? "").includes("'project_7_bot'"), "значения алиасов — массивом-параметром");
   // Предфильтр в WHERE: без него поиск шёл бы по всему окну (100+ млн строк за 7 суток).
-  assert.match(ev.sql, /WHERE ts >= .* AND hasAny\(\[actor_name, lowerUTF8\(actor_name\), src_ip, lowerUTF8\(node\)\], \{pf_keys:Array\(String\)\}\)/, "мало значений — предфильтр по индексу ключей алиасов");
+  assert.match(ev.sql, /WHERE ts >= [\s\S]* AND hasAny\(\[actor_name, lowerUTF8\(actor_name\), src_ip, lowerUTF8\(node\)\], \{pf_keys:Array\(String\)\}\)/, "мало значений — предфильтр по индексу ключей алиасов");
   const allVals = [...ev.params.entries()].map(([, v]) => v).join(" ");
   assert.ok(allVals.includes("'project_7_bot'"));
   assert.ok(!allVals.includes("held_bot"), "удержанный алиас не фильтрует и не считается");
