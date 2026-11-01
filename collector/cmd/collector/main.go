@@ -21,6 +21,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"testing"
 	"time"
 	_ "time/tzdata" // пояса SYSLOG_PEER_TZ и в образе без /usr/share/zoneinfo
 
@@ -405,8 +406,13 @@ func main() {
 	norm := &normalize.Normalizer{Rules: cfg.Sources, PIIFields: cfg.PIIFields}
 	st := &stats{perMin: map[string]uint32{}, listener: map[string]string{}, bySource: map[string]uint64{}}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	sigCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	// Отмена изнутри (приёмник не открыл порт) — отдельно от сигналов: обработчики
+	// SIGINT/SIGTERM снимаются только при выходе из main, после дренажа. Иначе SIGTERM
+	// от compose stop посреди дозаписи батча убивал бы процесс и терял батч.
+	ctx, cancel := context.WithCancel(sigCtx)
+	defer cancel()
 
 	queue := make(chan queuedEvent, cfg.Batch.PendingRows)
 	// emit всегда сам проставляет attrs.transport: значение из тела события
@@ -621,6 +627,10 @@ func main() {
 	}
 
 	var wg sync.WaitGroup
+	// Приёмник, который не смог открыть порт (занят, нет прав), останавливает весь
+	// коллектор: процесс без HTTP- или syslog-приёма выглядел бы живым и молча терял
+	// события. Остановка штатная — принятое дописывается, затем код выхода 1.
+	var listenerFailed atomic.Bool
 	run := func(name string, f func() error) {
 		wg.Add(1)
 		go func() {
@@ -630,19 +640,29 @@ func main() {
 			}
 		}()
 	}
+	runListener := func(name string, f func() error) {
+		run(name, func() error {
+			err := f()
+			if err != nil && !errors.Is(err, http.ErrServerClosed) && ctx.Err() == nil {
+				listenerFailed.Store(true)
+				cancel()
+			}
+			return err
+		})
+	}
 	tcpOpts := listen.TCPOptions{MaxConns: cfg.Listeners.Syslog.MaxConns, MaxConnsPerIP: cfg.Listeners.Syslog.MaxConnsPerIP}
 	if a := cfg.Listeners.Syslog.UDP; a != "" {
-		run("syslog udp", func() error { return listen.SyslogUDP(ctx, a, lines) })
+		runListener("syslog udp", func() error { return listen.SyslogUDP(ctx, a, lines) })
 	}
 	if a := cfg.Listeners.Syslog.TCP; a != "" {
-		run("syslog tcp", func() error { return listen.SyslogTCP(ctx, a, tcpOpts, lines) })
+		runListener("syslog tcp", func() error { return listen.SyslogTCP(ctx, a, tcpOpts, lines) })
 	}
 	if a := tlsCfg.Addr; a != "" {
 		to := listen.TLSOptions{Cert: tlsCfg.Cert, Key: tlsCfg.Key, ClientCA: tlsCfg.ClientCA, Dev: dev}
-		run("syslog tls", func() error { return listen.SyslogTLS(ctx, a, to, tcpOpts, lines) })
+		runListener("syslog tls", func() error { return listen.SyslogTLS(ctx, a, to, tcpOpts, lines) })
 	}
 	if a := cfg.Listeners.NetFlow.UDP; a != "" {
-		run("netflow udp", func() error { return listen.NetFlowUDP(ctx, a, packets) })
+		runListener("netflow udp", func() error { return listen.NetFlowUDP(ctx, a, packets) })
 	}
 	// Опрашиваемые источники: CrowdStrike Falcon, S3-бакеты (Yandex/VK Cloud).
 	if cfg.Falcon.ClientID != "" {
@@ -654,7 +674,7 @@ func main() {
 		run("s3 "+sc.Name, func() error { listen.Guard("s3 "+sc.Name, func() { src.Run(ctx) }); return nil })
 	}
 	srv := &http.Server{Addr: cfg.Listeners.HTTP.Addr, Handler: handlers.Mux(), ReadHeaderTimeout: 5 * time.Second}
-	run("http", func() error {
+	runListener("http", func() error {
 		slog.Info("http listening", "addr", cfg.Listeners.HTTP.Addr)
 		return srv.ListenAndServe()
 	})
@@ -698,6 +718,13 @@ func main() {
 	slog.Info("collector started", "batch", strconv.Itoa(cfg.Batch.Size), "sources", len(cfg.Sources),
 		"max_conns", tcpOpts.MaxConns, "pending_rows", cfg.Batch.PendingRows, "netflow_exporters", len(dec.Allow))
 	wg.Wait()
+	if listenerFailed.Load() {
+		slog.Error("приёмник не запустился — коллектор остановлен")
+		// Тесты вызывают main() в своём процессе и ждут его возврата.
+		if !testing.Testing() {
+			os.Exit(1)
+		}
+	}
 }
 
 // drainIdle — тишина в queue, после которой при остановке считаем остаток вычитанным.
