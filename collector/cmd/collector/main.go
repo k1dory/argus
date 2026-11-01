@@ -836,6 +836,10 @@ func logLevel() slog.Level {
 	return slog.LevelInfo
 }
 
+// hasCEF/hasLEEF — поиск маркера по строке, как прежде. Выбор разборщика по содержимому
+// строки подделывается данными запроса (URI, User-Agent в JSON Caddy), а каждая строковая
+// эвристика ломала настоящие CEF/LEEF (ревью #16, круги 2–5). Решение — отдельной задачей:
+// формат по источнику/транспорту (collector.yml), тесты в review/codex-waf-dispatch.
 func hasCEF(s string) bool  { return strings.Contains(s, "CEF:") }
 func hasLEEF(s string) bool { return strings.Contains(s, "LEEF:") }
 
