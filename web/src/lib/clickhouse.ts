@@ -178,11 +178,18 @@ async function chFetchWithSlot(sql: string, params: Record<string, string | numb
     // В лог — только текст исключения. При HTTP 200 до него идут уже отданные строки
     // результата (комментарии, вердикты): им не место в журнале контейнера.
     const detail = exception ? text.slice(exception.index, exception.index + 2000) : resp.ok ? "(тело ответа не логируется)" : text.slice(0, 2000);
-    console.error(`clickhouse ${resp.status}:`, detail, "\nSQL:", sql.slice(0, 500));
+    console.error(`clickhouse ${resp.status}:`, detail, "\nSQL:", sqlForLog(sql));
     const { message, code } = shortChError(exception ? text.slice(exception.index) : text, resp.status);
     throw new ClickHouseError(headerCode > 0 && code == null ? `код ${headerCode}: запрос не выполнен` : message, resp.status, code ?? (headerCode > 0 ? headerCode : null));
   }
   return text;
+}
+
+/** SQL для журнала: INSERT … FORMAT JSONEachRow несёт строки в теле запроса (вердикт
+ *  агента, комментарий) — в лог идёт только заголовок до имени формата. */
+export function sqlForLog(sql: string): string {
+  const format = /\bFORMAT\s+\w+/i.exec(sql);
+  return (format ? `${sql.slice(0, format.index + format[0].length)} <данные не логируются>` : sql).slice(0, 500);
 }
 
 /** settings — серверные настройки ClickHouse на запрос (max_execution_time и т.п.). */
