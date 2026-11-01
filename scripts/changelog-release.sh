@@ -6,7 +6,8 @@
 #   scripts/changelog-release.sh 1.0.0-rc29 [2026-11-01]
 # Порядок: старые записи «Не выпущено», затем фрагменты по пути (LC_ALL=C).
 #
-# Отказ без изменений: раздел версии уже есть; выпускать нечего; changes или
+# Отказ без изменений: раздел версии уже есть (кроме досборки после частично
+# удалённых фрагментов — см. ниже); выпускать нечего; changes или
 # changes/unreleased — симлинк или ведёт за пределы checkout; среди фрагментов симлинк,
 # каталог с именем *.md или не обычный файл (иначе в публикуемый CHANGELOG мог бы
 # попасть чужой файл, например .env); обход каталога неполон (find с ошибкой).
@@ -29,8 +30,9 @@ fail() { echo "$*" >&2; exit 1; }
 
 # Строки передаются в awk через ENVIRON: -v раскрывает «\t» и прочие escape-последовательности.
 export CL_VER="$ver" CL_DATE="$date"
+resume=0
 if awk 'index($0, "## " ENVIRON["CL_VER"] " — ") == 1 { found = 1 } END { exit !found }' "$log"; then
-    fail "в CHANGELOG.md уже есть раздел $ver"
+    resume=1   # раздел уже есть: допустима только досборка (см. ниже)
 fi
 awk '$0 == "## Не выпущено" { found = 1 } END { exit !found }' "$log" ||
     fail "в CHANGELOG.md нет раздела «## Не выпущено»"
@@ -61,6 +63,28 @@ if [ -d "$dir" ]; then
         fi
         frags+=("$f")
     done < "$work/sorted"
+fi
+
+# Досборка: прошлый запуск заменил CHANGELOG.md, но удалить все фрагменты не смог
+# (каталог без права записи). Раздел версии уже есть; если текст каждого оставшегося
+# фрагмента дословно в нём, остаётся только удалить фрагменты — без второго раздела и
+# без дублей. Иначе (раздел есть, фрагменты новые или его нет вовсе) — отказ.
+if [ "$resume" = 1 ]; then
+    [ ${#frags[@]} -gt 0 ] || fail "в CHANGELOG.md уже есть раздел $ver"
+    section="$(awk 'index($0, "## " ENVIRON["CL_VER"] " — ") == 1 { p = 1; next } /^## / { p = 0 } p' "$log")"
+    for f in "${frags[@]}"; do
+        note="$(cat -- "$f")"
+        [ -n "$note" ] && [[ "$section" == *"$note"* ]] ||
+            fail "в CHANGELOG.md уже есть раздел $ver, а фрагмента ${f#"$root"/} в нём нет — нужна новая версия"
+    done
+    rm_tracked=()
+    for f in "${frags[@]}"; do
+        if git -C "$root" --literal-pathspecs ls-files --error-unmatch -- "$f" >/dev/null 2>&1; then rm_tracked+=("$f"); fi
+    done
+    [ ${#rm_tracked[@]} -eq 0 ] || git -C "$root" --literal-pathspecs rm -q --cached -- "${rm_tracked[@]}"
+    rm -f -- "${frags[@]}"
+    echo "CHANGELOG.md: раздел $ver уже собран — удалены оставшиеся фрагменты: ${#frags[@]}"
+    exit 0
 fi
 
 {
@@ -95,12 +119,17 @@ for f in "${frags[@]}"; do
         tracked+=("$f")
     fi
 done
+# Индекс сохраняется копией целиком: откат через git reset вернул бы фрагменты из HEAD
+# и потерял staged-правки (и чужие staged-изменения).
+index_file="$(git -C "$root" rev-parse --git-path index)"
+case "$index_file" in /*) ;; *) index_file="$root/$index_file" ;; esac
+[ ! -e "$index_file" ] || cp -p -- "$index_file" "$work/index"
 if [ ${#tracked[@]} -gt 0 ]; then
     git -C "$root" --literal-pathspecs rm -q --cached -- "${tracked[@]}" ||
         fail "git rm не выполнен (занят индекс?) — ничего не изменено, повторите"
 fi
 if ! mv -f -- "$new" "$log"; then
-    [ ${#tracked[@]} -eq 0 ] || git -C "$root" --literal-pathspecs reset -q -- "${tracked[@]}" || true
+    [ ! -e "$work/index" ] || cp -p -- "$work/index" "$index_file" || true
     fail "не удалось записать CHANGELOG.md — фрагменты и индекс оставлены как были"
 fi
 [ ${#frags[@]} -eq 0 ] || rm -f -- "${frags[@]}"

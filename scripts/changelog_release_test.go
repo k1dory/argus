@@ -514,3 +514,121 @@ func TestReleaseDoesNotLoseNotesWithBackslashInTempDirectory(t *testing.T) {
 	}
 	f.absent(fragment)
 }
+
+// A failed rename must restore the index as it was before the release, including
+// staged additions and edits. Resetting these paths to HEAD is not a rollback.
+func TestReleaseRenameFailurePreservesExactStagedFragments(t *testing.T) {
+	for _, state := range []string{"committed", "staged edit", "staged addition"} {
+		t.Run(state, func(t *testing.T) {
+			f := newReleaseFixture(t)
+			const fragment = "changes/unreleased/valuable.md"
+			const committedNote = "- previously committed note\n"
+			const stagedNote = "- prepared release note, not committed yet\n"
+			if state != "staged addition" {
+				f.write(fragment, committedNote)
+			}
+			f.commit()
+			wantNote := committedNote
+			if state != "committed" {
+				wantNote = stagedNote
+				f.write(fragment, wantNote)
+				f.gitOK("--literal-pathspecs", "add", "--", fragment)
+			}
+			// A rollback must preserve unrelated staged work as well.
+			f.write("operator-note.txt", "unrelated staged work\n")
+			f.gitOK("add", "--", "operator-note.txt")
+			indexBefore := f.gitOK("ls-files", "--stage")
+
+			// Deterministic rename failure, without requiring privileged ownership
+			// changes or racing chmod against mktemp. All other tools stay real.
+			bin := filepath.Join(f.scratch, "rename-failure-bin")
+			if err := os.Mkdir(bin, 0700); err != nil {
+				t.Fatal(err)
+			}
+			shim := "#!/bin/sh\nprintf '%s\\n' 'QA: injected rename failure' >&2\nexit 73\n"
+			if err := os.WriteFile(filepath.Join(bin, "mv"), []byte(shim), 0700); err != nil {
+				t.Fatal(err)
+			}
+			for i, entry := range f.env {
+				if strings.HasPrefix(entry, "PATH=") {
+					f.env[i] = "PATH=" + bin + string(os.PathListSeparator) + strings.TrimPrefix(entry, "PATH=")
+				}
+			}
+
+			out, err := f.release("2.0.0")
+			if err == nil {
+				t.Fatalf("release reported success despite the failed rename:\n%s", out)
+			}
+			if state == "committed" && !strings.Contains(out, "QA: injected rename failure") {
+				t.Fatalf("the control fixture failed before reaching the rename:\n%s", out)
+			}
+			if f.read("CHANGELOG.md") != legacyLog || f.read(fragment) != wantNote {
+				t.Errorf("failed rename changed the changelog or fragment content:\n%s", out)
+			}
+			if got := f.gitOK("ls-files", "--stage"); got != indexBefore {
+				t.Errorf("failed rename discarded staged state (%s)\nindex before:\n%s\nindex after:\n%s\nscript output:\n%s", state, indexBefore, got, out)
+			}
+		})
+	}
+}
+
+// Removing the fragments is the last fallible step. If only part of that cleanup
+// succeeds, fixing the filesystem error and retrying must finish the same release
+// without losing notes or requiring a second version containing duplicate notes.
+func TestReleaseCanRetryAfterPartialFragmentRemoval(t *testing.T) {
+	for _, tracked := range []bool{false, true} {
+		t.Run(fmt.Sprintf("tracked=%t", tracked), func(t *testing.T) {
+			f := newReleaseFixture(t)
+			const removable = "changes/unreleased/a-removable.md"
+			const blocked = "changes/unreleased/z-locked/pending.md"
+			const removableNote = "- note from the removable fragment\n"
+			const blockedNote = "- note from the fragment whose unlink fails\n"
+			if !tracked {
+				f.commit()
+			}
+			f.write(removable, removableNote)
+			f.write(blocked, blockedNote)
+			if tracked {
+				f.commit()
+			}
+			locked := filepath.Dir(filepath.Join(f.root, blocked))
+			if err := os.Chmod(locked, 0500); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.Chmod(locked, 0700) })
+			probePath := filepath.Join(locked, "permission-probe")
+			probe, err := os.OpenFile(probePath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+			if err == nil {
+				probe.Close()
+				_ = os.Remove(probePath)
+				t.Skip("requires an unprivileged user for the non-writable directory fixture")
+			}
+			if !os.IsPermission(err) {
+				t.Fatalf("unexpected permission probe error: %v", err)
+			}
+
+			firstOut, firstErr := f.release("2.0.0")
+			if err := os.Chmod(locked, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if firstErr == nil {
+				t.Fatalf("release succeeded despite an unremovable fragment:\n%s", firstOut)
+			}
+			if f.read(blocked) != blockedNote {
+				t.Fatal("the retained fragment changed after the failed release")
+			}
+			out, err := f.release("2.0.0")
+			if err != nil {
+				t.Fatalf("release cannot finish after the unlink failure is fixed\nfirst: %v\n%s\nretry: %v\n%s", firstErr, firstOut, err, out)
+			}
+			f.absent(removable)
+			f.absent(blocked)
+			log := f.read("CHANGELOG.md")
+			for _, marker := range []string{"## 2.0.0 — ", "- legacy entry", removableNote, blockedNote} {
+				if strings.Count(log, marker) != 1 {
+					t.Errorf("cleanup retry lost or duplicated %q:\n%s", marker, log)
+				}
+			}
+		})
+	}
+}
