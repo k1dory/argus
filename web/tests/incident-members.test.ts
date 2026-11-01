@@ -27,9 +27,7 @@ test("memberBlockState: категории по последней записи 
   assert.equal(memberBlockState({ ...base, executor: "ngfw.edge" }), "blocked");
   assert.equal(memberBlockState({ ...base, executor: "ngfw.edge", ok: 0, detail: "HTTP 500 <html>…" }), "failed");
   assert.equal(memberBlockState({ ...base, executor: "ngfw.edge", mode: "simulate" }), "simulated");
-  assert.equal(memberBlockState({ ...base, executor: "argus", detail: "потолок блокировок инцидента: 32 новых адресов за 1h0m0s (collapse.block_cap) — адрес не заблокирован, решение за аналитиком" }), "capped");
   assert.equal(memberBlockState({ ...base, executor: "argus", mode: "ids", detail: "режим IDS: автоответ выключен" }), "ids");
   assert.equal(memberBlockState({ ...base, executor: "argus", detail: "ожидание: доверенных событий 0 из 1 (respond.min_events)" }), "waiting");
   assert.equal(memberBlockState({ ...base, executor: "argus", detail: "203.0.113.10 в allowlist" }), "refused");
-  assert.equal(memberBlockState({ ...base, executor: "argus", detail: "резерв: блок адреса перед вызовом исполнителей" }), "unconfirmed");
 });

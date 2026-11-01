@@ -14,7 +14,7 @@ import (
 
 func pr49CollapsedRule(id string) *rules.Rule {
 	r := &rules.Rule{ID: id, Title: id, Level: "medium", AutoClose: "2h",
-		Collapse: &rules.Collapse{By: "src.net", Group: "inbound-scan", BlockCap: 32, BlockCapWindow: "1h"}}
+		Collapse: &rules.Collapse{By: "src.net", Group: "inbound-scan"}}
 	r.Detection.Threshold = &rules.Threshold{Kind: "count", Count: 1, GroupBy: "src.ip", Window: "10m"}
 	return r
 }

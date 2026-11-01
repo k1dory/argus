@@ -243,7 +243,7 @@ export default async function IncidentPage({ params }: PageProps<"/incidents/[id
                           <td className="whitespace-nowrap py-1 pr-3 text-muted-foreground">{formatTs(m.last)}</td>
                           <td className="py-1 pr-3">{fmtNum(m.events)}</td>
                           <td className="py-1 pr-3 text-muted-foreground">{m.rules.join(", ")}</td>
-                          <td className={state === "blocked" ? "py-1 text-[var(--status-err)]" : state === "capped" || state === "failed" || state === "unconfirmed" ? "py-1 text-[var(--status-warn)]" : "py-1 text-muted-foreground"}>{MEMBER_BLOCK_LABEL[state]}</td>
+                          <td className={state === "blocked" ? "py-1 text-[var(--status-err)]" : state === "failed" ? "py-1 text-[var(--status-warn)]" : "py-1 text-muted-foreground"}>{MEMBER_BLOCK_LABEL[state]}</td>
                         </tr>
                       );
                     })}

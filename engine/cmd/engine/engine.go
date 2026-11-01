@@ -79,13 +79,9 @@ type engine struct {
 	sysMu  sync.Mutex
 	storms map[string]*incidents.Incident // rule_id → открытый инцидент «шторм»
 
-	respMu       sync.Mutex
-	respState    map[string]respEntry            // incident_id (у склеенного — incident_id|адрес) → что автоответ уже решил
-	respCap      map[string][]time.Time          // incident_id → время новых блокировок склеенного инцидента (collapse.block_cap)
-	respCapIP    map[string]map[string]time.Time // incident_id → адрес → его место в respCap
-	respFlight   map[string]bool                 // ключ «incident|адрес» — по нему идёт попытка (respond_collapsed.go)
-	respRetrying map[string]bool                 // ключи, повтор которых начал beforeRetry
-	respCycles   int                             // циклов с последней чистки respState по возрасту
+	respMu     sync.Mutex
+	respState  map[string]respEntry // incident_id → что автоответ уже решил
+	respCycles int                  // циклов с последней чистки respState по возрасту
 
 	// absence — последние события групп правил «молчание», вне буфера кандидатов:
 	// потолок буфера (ENGINE_BUFFER_MAX) их не выбрасывает. Пишет и читает только
@@ -112,7 +108,7 @@ type engine struct {
 const identRetryMax = 10000
 
 type respEntry struct {
-	state string // waiting | done | capped
+	state string // waiting | done
 	at    time.Time
 }
 
@@ -233,17 +229,13 @@ func newEngine(ctx context.Context, rulesDir string, rs []*rules.Rule, acfg anal
 		tg: notify.NewTelegram(os.Getenv("TELEGRAM_BOT_TOKEN"), acfg.Notify.Telegram.ChatID),
 		mail: notify.NewEmail(acfg.Notify.Email.Host, acfg.Notify.Email.Port, acfg.Notify.Email.From,
 			acfg.Notify.Email.User, acfg.Notify.Email.Password, acfg.Notify.Email.To, acfg.Notify.Email.StartTLS),
-		agg:          notify.NewAggregator(time.Minute, 5),
-		resp:         respond.New(acfg.Respond),
-		storms:       map[string]*incidents.Incident{},
-		respState:    map[string]respEntry{},
-		respCap:      map[string][]time.Time{},
-		respCapIP:    map[string]map[string]time.Time{},
-		respFlight:   map[string]bool{},
-		respRetrying: map[string]bool{},
-		excWarned:    map[string]bool{},
-		identFile:    env("IDENTITIES_FILE", ""),
-		absence:      eval.NewAbsenceState(0),
+		agg:       notify.NewAggregator(time.Minute, 5),
+		resp:      respond.New(acfg.Respond),
+		storms:    map[string]*incidents.Incident{},
+		respState: map[string]respEntry{},
+		excWarned: map[string]bool{},
+		identFile: env("IDENTITIES_FILE", ""),
+		absence:   eval.NewAbsenceState(0),
 	}
 	e.rules.Store(&rs)
 	var identStore identity.Store
@@ -270,9 +262,6 @@ func newEngine(ctx context.Context, rulesDir string, rs []*rules.Rule, acfg anal
 	if e.mail != nil {
 		e.mail.SetLimit(envInt("NOTIFY_EMAIL_PER_MINUTE", 20))
 	}
-	// Повтор автоблокировки адреса склеенного инцидента — тем же путём, что первая
-	// попытка: владелец ключа и запись-резерв в журнале (respond_collapsed.go).
-	e.resp.SetBeforeRetry(e.beforeRetry)
 	return e
 }
 

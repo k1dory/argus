@@ -85,43 +85,6 @@ func TestPR49HammerCannotSuppressSweepResponse(t *testing.T) {
 	}
 }
 
-// A fresh engine must preserve the 32 successful blocks still inside the
-// incident's one-hour budget, while permitting genuinely new member IPs.
-func TestPR49IncidentCapSurvivesRestart(t *testing.T) {
-	f := newFakeCH(t)
-	srv, blocks := pr49NGFW(t)
-	e := scanEngine(t, f, 32, ipsConfig(srv))
-	now := time.Date(2026, 11, 1, 10, 5, 0, 0, time.UTC)
-	var events []*model.Event
-	for i := 1; i <= 32; i++ {
-		events = append(events, portScan(fmt.Sprintf("203.0.113.%d", i), 3)...)
-	}
-	created, _ := e.applyEvents(events, now)
-	if len(created) != 1 {
-		t.Fatal("fixture must create one /24 incident")
-	}
-	e.autoRespond(context.Background(), snapshotIncidents(created), now)
-	if blocks.Load() != 32 {
-		t.Fatalf("pre-restart blocks=%d, want 32", blocks.Load())
-	}
-	restored := pr49PersistedIncident(t, created[0])
-	// Keep the same persisted response_log, but discard all process memory.
-	f.mu.Lock()
-	f.selects["FROM response_log"] = strings.Join(f.inserts["response_log"], "\n") + "\n"
-	f.mu.Unlock()
-	restarted := scanEngine(t, f, 32, ipsConfig(srv))
-	restarted.reg = incidents.NewRegistry(100, []incidents.Incident{restored})
-	restarted.restoreRespState([]incidents.Incident{restored}, now.Add(time.Minute))
-	created, updated := restarted.applyEvents(portScan("203.0.113.33", 3), now.Add(time.Minute))
-	if len(created) != 0 || len(updated) != 1 || updated[0].IncidentID != restored.IncidentID {
-		t.Fatal("new member must join the restored incident")
-	}
-	restarted.autoRespond(context.Background(), snapshotIncidents(updated), now.Add(time.Minute))
-	if blocks.Load() != 32 {
-		t.Fatalf("restart bypassed block_cap=32/1h: %d successful blocks in one incident within a minute", blocks.Load())
-	}
-}
-
 // Membership alone is not evidence of a response. Before restart B only
 // matched a rule without respond; a later scan by B must still be handled.
 func TestPR49RestartDoesNotMarkUnansweredMemberDone(t *testing.T) {
@@ -188,54 +151,4 @@ func TestPR49RemovedMemberRuleDoesNotPanic(t *testing.T) {
 		}
 	}()
 	e.autoRespond(context.Background(), snapshotIncidents(updated), now.Add(time.Minute))
-}
-
-// The first executor outage queues 33 retries and returns all reservations.
-// Recovery must not execute all 33 through expireBlocks outside block_cap.
-// The production responder has a real one-minute backoff and no public clock
-// injection, so this integration regression waits for that first retry only.
-func TestPR49RetriesRespectIncidentCap(t *testing.T) {
-	if testing.Short() {
-		t.Skip("exercises the real one-minute responder retry backoff")
-	}
-	var recovered atomic.Bool
-	var successful atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if req.URL.Path != "/block" {
-			t.Errorf("unexpected executor path %q", req.URL.Path)
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		if !recovered.Load() {
-			http.Error(w, "fixture executor unavailable", http.StatusServiceUnavailable)
-			return
-		}
-		successful.Add(1)
-	}))
-	t.Cleanup(srv.Close)
-	f := newFakeCH(t)
-	e := scanEngine(t, f, 32, ipsConfig(srv))
-	now := time.Now()
-	var events []*model.Event
-	for i := 1; i <= 33; i++ {
-		events = append(events, portScan(fmt.Sprintf("203.0.113.%d", i), 3)...)
-	}
-	created, _ := e.applyEvents(events, now)
-	if len(created) != 1 {
-		t.Fatal("fixture must create one /24 incident")
-	}
-	e.autoRespond(context.Background(), snapshotIncidents(created), now)
-	if successful.Load() != 0 || len(e.resp.Active()) != 0 {
-		t.Fatal("all first attempts must fail")
-	}
-	recovered.Store(true)
-	// Split the real wait into two bounded sleeps; no deployed service is used.
-	time.Sleep(31 * time.Second)
-	time.Sleep(30 * time.Second)
-	e.expireBlocks(context.Background(), time.Now())
-	if got := successful.Load(); got == 0 {
-		t.Fatal("fixture did not reach the retry path")
-	} else if got > 32 {
-		t.Fatalf("retry bypassed block_cap=32/1h: %d successful blocks, cap ledger=%d", got, len(e.respCap[created[0].IncidentID]))
-	}
 }

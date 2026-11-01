@@ -8,14 +8,12 @@ export type IncidentMember = { ip: string; first: string; last: string; events: 
 
 export type MemberBlockRow = { ip: string; executor: string; mode: string; dry_run: number; ok: number; detail: string };
 
-export type MemberBlockState = "blocked" | "unconfirmed" | "released" | "simulated" | "capped" | "ids" | "waiting" | "refused" | "failed" | "none";
+export type MemberBlockState = "blocked" | "released" | "simulated" | "ids" | "waiting" | "refused" | "failed" | "none";
 
 export const MEMBER_BLOCK_LABEL: Record<MemberBlockState, string> = {
   blocked: "заблокирован",
-  unconfirmed: "блок, итог не записан — проверьте NGFW",
   released: "блок снят (TTL или оператор)",
   simulated: "симуляция блока",
-  capped: "потолок блокировок — решение за аналитиком",
   ids: "IDS: автоответ выключен",
   waiting: "ожидание доверенных событий",
   refused: "не блокируется (allowlist / адрес)",
@@ -59,12 +57,8 @@ export function memberBlockState(row: MemberBlockRow | undefined): MemberBlockSt
     if (!row.ok) return "failed";
     return row.dry_run || row.mode === "simulate" ? "simulated" : "blocked";
   }
-  if (row.detail.startsWith("потолок блокировок инцидента")) return "capped";
   if (row.detail.startsWith("режим IDS")) return "ids";
   if (row.detail.startsWith("ожидание:")) return "waiting";
-  // Запись-резерв перед вызовом исполнителей без итога после неё: исполнитель мог
-  // заблокировать, а итог не записался.
-  if (row.detail.startsWith("резерв:")) return "unconfirmed";
   // Адрес уже заблокирован другим инцидентом или оператором — блок есть, это не отказ.
   if (row.detail.startsWith("уже заблокирован")) return "blocked";
   return "refused";

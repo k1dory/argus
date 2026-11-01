@@ -84,7 +84,7 @@ func TestPR49Round3BudgetPreservesPerAddressMinEvents(t *testing.T) {
 	}
 	e.autoRespond(context.Background(), snapshotIncidents(created), now)
 	if got := blocks.Load(); got != 32 {
-		t.Fatalf("all 32 sources have 80 trusted events and fit block_cap=32, but only %d blocked after retaining %d/2560 events",
+		t.Fatalf("all 32 sources have 80 trusted events but only %d blocked after retaining %d/2560 events",
 			got, len(created[0].Events))
 	}
 }

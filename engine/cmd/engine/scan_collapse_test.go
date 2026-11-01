@@ -25,7 +25,7 @@ detection:
   threshold: {kind: distinct, field: dst.port, distinct: 3, window: 10m, group_by: src.ip}
   condition: selection and threshold
 auto_close: 2h
-collapse: {by: src.net, group: inbound-scan, block_cap: %d, block_cap_window: 1h}
+collapse: {by: src.net, group: inbound-scan}
 respond: {action: block_ip, target: src.ip, min_level: medium, ttl: 1h}
 `
 
@@ -38,7 +38,7 @@ detection:
   threshold: {kind: count, count: 3, window: 10m, group_by: src.ip}
   condition: selection and threshold
 auto_close: 2h
-collapse: {by: src.net, group: inbound-scan, block_cap: %d, block_cap_window: 1h}
+collapse: {by: src.net, group: inbound-scan}
 `
 
 func flow(ts, ip string, port uint16) *model.Event {
@@ -64,11 +64,12 @@ func hammer(ip string, n int) []*model.Event {
 	return evs
 }
 
+// capN — от прежнего потолка блокировок, не используется (потолок — отдельный PR).
 func scanEngine(t *testing.T, f *fakeCH, capN int, rcfg respond.Config) *engine {
 	t.Helper()
 	dir := rulesDirWith(t, map[string]string{
-		"scan.yml":   fmt.Sprintf(scanPortsRule, capN),
-		"hammer.yml": fmt.Sprintf(scanHammerRule, capN),
+		"scan.yml":   scanPortsRule,
+		"hammer.yml": scanHammerRule,
 	})
 	return testEngine(t, f, dir, rcfg, "s", "s")
 }
@@ -128,43 +129,6 @@ func TestScanCollapseOneIncidentTwoBlocks(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if *blocks != 2 {
 		t.Fatalf("повторная блокировка: %d", *blocks)
-	}
-}
-
-// Потолок новых блоков инцидента за окно: сверх него адрес не блокируется, а в
-// журнал — пометка «решение за аналитиком».
-func TestScanCollapseIncidentCap(t *testing.T) {
-	f := newFakeCH(t)
-	srv, blocks := ngfw(t)
-	e := scanEngine(t, f, 2, ipsConfig(srv))
-	now := time.Date(2026, 11, 1, 10, 5, 0, 0, time.UTC)
-	var evs []*model.Event
-	for _, ip := range []string{"198.51.100.1", "198.51.100.2", "198.51.100.3"} {
-		evs = append(evs, portScan(ip, 3)...)
-	}
-	created, _ := e.applyEvents(evs, now)
-	if len(created) != 1 || len(created[0].Members) != 3 {
-		t.Fatalf("инцидент: %+v", created)
-	}
-	e.autoRespond(context.Background(), snapshotIncidents(created), now)
-	rows := f.waitRows(t, "response_log", 3)
-	if *blocks != 2 || len(blockedIPs(rows)) != 2 {
-		t.Fatalf("потолок 2: блоков %d rows=%v", *blocks, rows)
-	}
-	capped := 0
-	for _, r := range rows {
-		if strings.Contains(r, "потолок блокировок инцидента") && strings.Contains(r, "решение за аналитиком") {
-			capped++
-		}
-	}
-	if capped != 1 {
-		t.Fatalf("пометка потолка: %v", rows)
-	}
-	// Окно потолка прошло, но адрес уже решён (capped) — сам не блокируется.
-	e.autoRespond(context.Background(), snapshotIncidents(created), now.Add(2*time.Hour))
-	time.Sleep(50 * time.Millisecond)
-	if *blocks != 2 {
-		t.Fatalf("capped-адрес заблокирован позже: %d", *blocks)
 	}
 }
 
