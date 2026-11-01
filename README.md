@@ -292,6 +292,8 @@ make replay                                   # залить записанны�
 По этой сводке правило `a41c-ops-067` (`rules/ops/collector-clock-skew.yml`, low) заводит
 один инцидент на отправителя за сутки: RFC 3164 без пояса — задать `SYSLOG_PEER_TZ`, иначе
 настроить NTP на устройстве.
+Адрес устройства — в объекте события и цепочке инцидента. `attrs.peer` у событий по HTTP
+(`/ingest/*`) — всегда адрес соединения: присланный в событии не принимается.
 Вебхуки требуют заголовок `X-Argus-Token: $ARGUS_INGEST_TOKEN` (стенд `ARGUS_DEV=1` — без
 него). Запись tcpdump: `docker compose exec collector /collector replay-pcap file.pcap`.
 Пропускная способность: `./scripts/bench-ingest.sh 200000` (см. CHANGELOG).
