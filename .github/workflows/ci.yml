@@ -121,6 +121,25 @@ jobs:
           version: latest
       - run: opa test policies -v
 
+  changelog:
+    # Фрагменты changelog (changes/unreleased/README.md): PR кладёт свой файл
+    # changes/unreleased/<ветка>.md, а CHANGELOG.md правит только релиз (вместе с VERSION,
+    # scripts/changelog-release.sh). Иначе параллельные PR конфликтуют в «Не выпущено».
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          changed="$(git diff --name-only "$BASE"...HEAD)"
+          if grep -qx CHANGELOG.md <<<"$changed" && ! grep -qx VERSION <<<"$changed"; then
+            echo "::error file=CHANGELOG.md::CHANGELOG.md правится только в релизе (с VERSION). Запись PR — файл changes/unreleased/${GITHUB_HEAD_REF//\//-}.md, см. changes/unreleased/README.md"
+            exit 1
+          fi
+
   compose:
     # Конфигурация compose валидна (со стендовыми секретами .env.dev) с профилями
     # и без них, скрипты проходят bash -n / shellcheck, все образы собираются (без запуска).

@@ -32,6 +32,8 @@ jobs:
           tag="${GITHUB_REF_NAME#v}"; ver="$(cat VERSION)"
           [ "$tag" = "$ver" ] || { echo "тег v$tag, а VERSION=$ver"; exit 1; }
           grep -q "^## $ver " CHANGELOG.md || { echo "в CHANGELOG.md нет раздела $ver"; exit 1; }
+          left="$(find changes/unreleased -name '*.md' ! -name README.md 2>/dev/null)"
+          [ -z "$left" ] || { echo "несобранные фрагменты changelog (scripts/changelog-release.sh $ver):"; echo "$left"; exit 1; }
           echo "version=$ver" >> "$GITHUB_OUTPUT"
 
   images:
