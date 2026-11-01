@@ -30,6 +30,12 @@ ROOT = ROLE.parents[3]
 TASKS = yaml.safe_load((ROLE / "tasks/main.yml").read_text(encoding="utf-8"))
 DEFAULTS = yaml.safe_load((ROLE / "defaults/main.yml").read_text(encoding="utf-8"))
 DEPLOY_REGISTERS = {"argus_up", "argus_deploy", "argus_migrations", "argus_mutations"}
+STATUS_TASKS = yaml.safe_load((ROLE / "tasks/migrator_status.yml").read_text(encoding="utf-8"))
+CONTAINER_ID = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+DEFAULT_STATUS = {
+    "exit": 0, "stage": "done", "file": "", "last_applied": "0031_events_source_last_projection.sql",
+    "code": None, "name": "", "weak_vars": [], "run": CONTAINER_ID[:12],
+}
 
 
 def leaf_tasks(tasks, inherited=None):
@@ -90,7 +96,7 @@ if tool == "make" and args in (["up"], ["deploy"]):
 if tool == "docker":
     if args[:2] == ["compose", "ps"]:
         record("ps")
-        print("fixture-migrator")
+        print("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
         sys.exit(0)
     if args[:1] == ["inspect"]:
         record("inspect")
@@ -128,6 +134,17 @@ class MigrationTasksTest(unittest.TestCase):
             for name in ("bin", "home", "tmp", "local", "remote", "async", "collections"):
                 (work / name).mkdir(mode=0o700)
             (work / "state.json").write_text(json.dumps(state), encoding="utf-8")
+            # Статус migrate.sh (run/migrator/migrate.json) и общий файл задач роли рядом
+            # с плейбуком — include_tasks ищет его относительно плейбука.
+            (work / "run" / "migrator").mkdir(parents=True)
+            status = state.get("status_raw")
+            if status is None:
+                # Компактно, как write_status в migrate.sh (printf без пробелов).
+                status = json.dumps({**DEFAULT_STATUS, **state.get("status", {})}, separators=(",", ":"))
+            if status != "":
+                (work / "run" / "migrator" / "migrate.json").write_text(status, encoding="utf-8")
+            (work / "migrator_status.yml").write_text(
+                (ROLE / "tasks/migrator_status.yml").read_text(encoding="utf-8"), encoding="utf-8")
             (work / "VERSION").write_text("regression-fixture\n", encoding="utf-8")
             for tool in ("docker", "make"):
                 script = work / "bin" / tool
@@ -233,9 +250,12 @@ class MigrationTasksTest(unittest.TestCase):
         def seconds(value):
             return float(renderer.from_string(str(value)).render(DEFAULTS))
 
-        for register in ("argus_migrations", "argus_mutations"):
+        probes = {
+            "argus_migrator_container": next(t for t in STATUS_TASKS if t.get("register") == "argus_migrator_container"),
+            "argus_mutations": task_for("argus_mutations"),
+        }
+        for register, task in probes.items():
             with self.subTest(register=register):
-                task = task_for(register)
                 action_timeout = seconds(task.get("timeout", 0))
                 async_timeout = seconds(task.get("async", 0))
                 poll = seconds(task.get("poll", 15))
@@ -257,11 +277,14 @@ class MigrationTasksTest(unittest.TestCase):
                 rc, output, calls = self.run_play({
                     "make_rc": 2,
                     "migrator_rc": 1,
-                    "migrator_log": "migrate: apply 0031.sql\nCode: 241. MEMORY_LIMIT_EXCEEDED",
+                    "status": {"exit": 1, "stage": "migrations", "file": "0031_events_source_last_projection.sql",
+                               "last_applied": "0030_search_text_index.sql", "code": 241, "name": "MEMORY_LIMIT_EXCEEDED"},
                 }, images=images)
                 self.assertIn("make", calls, output)
                 self.assertNotEqual(rc, 0, "Ошибка миграции не должна становиться успешным деплоем")
-                self.assertIn("logs", calls, "Ansible остановился до чтения лога migrator:\n" + output)
+                self.assertIn("0031_events_source_last_projection.sql", output, "диагностика из статуса migrate.sh")
+                self.assertIn("MEMORY_LIMIT_EXCEEDED", output)
+                self.assertNotIn("logs", calls, "лог migrator не читается вовсе")
                 self.assertNotIn("mutations", calls, "После отказа migrator нельзя продолжать ожидание мутаций")
 
     def test_resumed_diagnostics_do_not_disclose_clickhouse_password_verifier(self):
@@ -286,8 +309,9 @@ class MigrationTasksTest(unittest.TestCase):
         rc, output, calls = self.run_play({
             "migrator_rc": 1,
             "migrator_log": fixture_log,
+            "status": {"exit": 1, "stage": "users", "code": 76, "name": "CANNOT_WRITE_ACCESS_ENTITY"},
         }, start_at=task_for("argus_migrations")["name"])
-        self.assertIn("logs", calls, output)
+        self.assertNotIn("logs", calls, "лог migrator не читается вовсе")
         self.assertNotEqual(rc, 0, output)
         self.assertNotIn(verifier, output, "Хеш пароля ClickHouse попал в stdout Ansible")
         self.assertNotIn(salt, output, "Соль пароля ClickHouse попала в stdout Ansible")

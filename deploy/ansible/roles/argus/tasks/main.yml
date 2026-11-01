@@ -208,13 +208,21 @@
   no_log: true
 
 # Миграции идут одноразовым сервисом migrator (scripts/migrate.sh) внутри make deploy /
-# make up: compose запускает его на каждом up, остальные сервисы ждут его успеха. Подъём
-# стека и проверка migrator — блоки с общим rescue: при отказе (compose падает раньше
-# проверки) rescue печатает код выхода и хвост лога migrator и роняет прогон. В логе clickhouse-
-# client печатает упавший запрос целиком — ALTER USER … BY '<хеш>' SALT '<соль>' из
-# migrate.sh, поэтому значения после BY и SALT маскируются до вывода. Пароль админа
-# ClickHouse берётся из окружения контейнера clickhouse, в argv и вывод не попадает.
-# timeout на пробах: retries/delay не прерывают зависший docker exec.
+# make up: compose запускает его на каждом up, остальные сервисы ждут его успеха.
+# Результат роль берёт только из статуса, который migrate.sh пишет при выходе в
+# run/migrator/migrate.json: код выхода, этап, файл миграции (имя из каталога), последняя
+# применённая, код ошибки ClickHouse и имя из errorCodeToName, имена переменных с
+# дефолтными паролями, id запуска. Лог migrator не читается вовсе: упавший запрос в нём —
+# ALTER USER … BY '<хеш>' SALT '<соль>', и надёжно вырезать из него секреты нельзя.
+# Каждое поле перед выводом проверяется по шаблону; id запуска сверяется с контейнером,
+# чтобы не показать статус прошлого прогона. timeout на пробах: retries/delay не
+# прерывают зависший docker.
+- name: Каталог статуса migrator
+  ansible.builtin.file:
+    path: "{{ argus_dir }}/run/migrator"
+    state: directory
+    mode: "0755"
+
 - name: Поднять стек
   block:
     - name: Собрать и поднять стек (первый прогон собирает образы, это долго)
@@ -237,89 +245,36 @@
       changed_when: "'Started' in argus_deploy.stdout or 'Created' in argus_deploy.stdout or 'Recreated' in argus_deploy.stdout or 'Pulled' in argus_deploy.stdout"
       when: argus_images == 'registry'
   rescue: &argus_migrator_rescue
-    # SQL из лога не выводится вовсе: clickhouse-client печатает упавший запрос целиком
-    # (ALTER USER … BY '<хеш>' SALT '<соль>', PASSWORD словаря), а надёжно замаскировать
-    # литералы SQL нельзя. Свободный текст тоже не выводится — ни исключения (throwIf с
-    # произвольным сообщением), ни строк после него. migrate.sh падает на первой ошибке
-    # (set -e), поэтому после первой «Code: N. DB::Exception:» прогона его собственных
-    # сообщений нет: всё до начала следующего прогона («migrate: waiting for clickhouse»)
-    # — продолжение исключения или SQL и отбрасывается, даже если похоже на «migrate: …».
-    # Выводятся: код выхода, имя файла миграции (только вида 0031_имя.sql), отказ
-    # migrate.sh с именами переменных CLICKHOUSE_*, код ошибки и имена исключений
-    # ClickHouse (UPPER_SNAKE). Полный лог — на хосте, команда в сообщении.
-    - name: "Миграции: код выхода migrator и причина отказа (без SQL)"
-      ansible.builtin.shell:
-        cmd: |
-          set -uo pipefail
-          id="$(docker compose ps -aq migrator)"
-          [ -n "$id" ] && echo "migrator: код $(docker inspect -f '{{ '{{' }}.State.ExitCode{{ '}}' }}' "$id")"
-          docker compose logs --no-color --tail=400 migrator 2>&1 | awk '
-            function names(text,    out, n, i, w, words) {
-              out = ""; n = split(text, words, /[^A-Za-z0-9_]+/)
-              for (i = 1; i <= n; i++) {
-                w = words[i]
-                if (w ~ /^[A-Z][A-Z0-9_]*_[A-Z0-9_]+$/ && length(w) <= 64 && index(" " out " ", " " w " ") == 0) out = out (out == "" ? "" : " ") w
-              }
-              return out
-            }
-            { sub(/^[^|]*\| ?/, "") }
-            /^migrate: waiting for clickhouse/ { apply = ""; refusal = ""; code = ""; failed = 0; next }
-            failed { next }
-            /^migrate: apply / {
-              file = substr($0, 16)
-              apply = (file ~ /^[0-9][0-9][0-9][0-9]_[a-z0-9_]+\.sql$/) ? "migrate: apply " file : "migrate: apply <имя файла скрыто>"
-              next
-            }
-            /^migrate: ОТКАЗ/ { refusal = "migrate: ОТКАЗ — дефолтные пароли: " names($0); next }
-            /^Code: [0-9]+\. DB::Exception:/ {
-              split($0, head, ".")
-              code = head[1]; n = names(substr($0, length(head[1]) + 2))
-              if (n != "") code = code " (" n ")"
-              failed = 1
-            }
-            END {
-              if (apply != "") print apply
-              if (refusal != "") print refusal
-              if (code != "") print code
-            }'
-        executable: /bin/bash
-        chdir: "{{ argus_dir }}"
-      register: argus_migrator_log
-      changed_when: false
-      failed_when: false
-      timeout: "{{ argus_probe_timeout_sec }}"
+    - name: "Миграции: статус migrator"
+      ansible.builtin.include_tasks: migrator_status.yml
 
     - name: "Выкатка не удалась"
       ansible.builtin.fail:
         msg: >-
           Подъём стека или миграции не удались («{{ ansible_failed_task.name | default('?') }}»).
-          migrator: {{ argus_migrator_log.stdout_lines | default([]) | join(' / ') }}.
+          {{ argus_migrator_summary }}.
           Полный лог (содержит SQL с хешами паролей, в тикеты и чаты не копировать):
           cd {{ argus_dir }} && docker compose logs migrator
 
 - name: Проверить миграции
   block:
-    - name: "Миграции: migrator завершился успешно"
-      ansible.builtin.shell:
-        cmd: |
-          set -euo pipefail
-          id="$(docker compose ps -aq migrator)"
-          test -n "$id" || { echo "контейнер migrator не найден"; exit 1; }
-          code="$(docker inspect -f '{{ '{{' }}.State.ExitCode{{ '}}' }}' "$id")"
-          if [ "$code" != 0 ]; then echo "migrator: код $code"; exit 1; fi
-          docker compose exec -T clickhouse sh -c 'clickhouse-client --user "$CLICKHOUSE_USER"' <<'SQL'
-          SELECT max(name) FROM argus.schema_migrations
-          SQL
-        executable: /bin/bash
-        chdir: "{{ argus_dir }}"
-      register: argus_migrations
-      changed_when: false
-      timeout: "{{ argus_probe_timeout_sec }}"
-  rescue: *argus_migrator_rescue
+    - name: "Миграции: статус migrator"
+      ansible.builtin.include_tasks: migrator_status.yml
 
-- name: "Миграции: последняя применённая"
-  ansible.builtin.debug:
-    msg: "{{ argus_migrations.stdout | default('') | trim }}"
+    - name: "Миграции: migrator завершился успешно"
+      ansible.builtin.assert:
+        that:
+          - argus_migrator_fresh | bool
+          - argus_migrator_state.exit | default(-1) | int == 0
+          - argus_migrator_state.stage | default('') == 'done'
+        fail_msg: "{{ argus_migrator_summary }}"
+        quiet: true
+      register: argus_migrations
+
+    - name: "Миграции: последняя применённая"
+      ansible.builtin.debug:
+        msg: "{{ argus_migrator_summary }}"
+  rescue: *argus_migrator_rescue
 
 # По имени, а не по 127.0.0.1: клиент без SNI получает сертификат default_sni
 # (CONSOLE_HOST), а для имени localhost Caddy выпускает свой всегда.

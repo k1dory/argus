@@ -28,3 +28,5 @@ docker-compose.override.yml
 
 # артефакты c8/istanbul (npx c8 в web пишет в корень репозитория)
 coverage/
+# статус migrator (scripts/migrate.sh → run/migrator/migrate.json)
+/run/

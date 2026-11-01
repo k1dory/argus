@@ -1,0 +1,68 @@
+# Статус migrator из run/migrator/migrate.json (пишет scripts/migrate.sh при выходе) и
+# код выхода контейнера. Только поля статуса, каждое — по шаблону; лог migrator не
+# читается. Результат: argus_migrator_state (проверенные поля), argus_migrator_fresh
+# (статус этого запуска контейнера), argus_migrator_summary (строка для вывода).
+- name: "Миграции: контейнер migrator — id и код выхода"
+  ansible.builtin.shell:
+    cmd: |
+      set -uo pipefail
+      id="$(docker compose ps -aq migrator | head -n 1)"
+      [ -n "$id" ] || exit 0
+      code="$(docker inspect -f '{{ '{{' }}.State.ExitCode{{ '}}' }}' "$id")"
+      printf '%s %s\n' "${id:0:12}" "$code"
+    executable: /bin/bash
+    chdir: "{{ argus_dir }}"
+  register: argus_migrator_container
+  changed_when: false
+  failed_when: false
+  timeout: "{{ argus_probe_timeout_sec }}"
+
+- name: "Миграции: статус migrate.sh"
+  ansible.builtin.slurp:
+    src: "{{ argus_dir }}/run/migrator/migrate.json"
+  register: argus_migrator_status_raw
+  failed_when: false
+
+- name: "Миграции: разобрать статус"
+  vars:
+    # Разбор — только если текст ровно той формы, что пишет migrate.sh (write_status):
+    # иначе (мусор, подмена, обрыв) статуса нет, и from_json не вызывается.
+    # Текст статуса не кладётся в отдельную переменную: ansible-core до 2.19 превращает
+    # JSON-строку, полученную шаблоном, в словарь, и шаблон формы сравнивался бы не со строкой.
+    b64: "{{ argus_migrator_status_raw.content | default('') }}"
+    status_re: >-
+      ^\{"exit":[0-9]{1,3},"stage":"[a-z]{0,16}","file":"[0-9A-Za-z_.-]{0,128}","last_applied":"[0-9A-Za-z_.-]{0,128}",
+      "code":(null|[0-9]{1,6}),"name":"[A-Z0-9_]{0,64}","weak_vars":\[("CLICKHOUSE_[A-Z_]{1,40}"(,"CLICKHOUSE_[A-Z_]{1,40}")*)?\],
+      "run":"[0-9A-Za-z_.-]{0,128}"\}$
+    raw: >-
+      {{ (b64 | b64decode | trim | from_json)
+         if (b64 and ((b64 | b64decode | trim) is match(status_re | replace(' ', '')))) else {} }}
+    raw_map: "{{ raw if (raw is mapping) else {} }}"
+    container: "{{ (argus_migrator_container.stdout | default('')).split() }}"
+    safe_name: '^[0-9A-Za-z_.-]{1,128}$'
+  ansible.builtin.set_fact:
+    argus_migrator_state:
+      exit: "{{ raw_map.exit if (raw_map.exit | default('') | string) is match('^[0-9]{1,3}$') else -1 }}"
+      stage: "{{ raw_map.stage if (raw_map.stage | default('') | string) is match('^(check|wait|migrations|users|done)$') else '' }}"
+      file: "{{ raw_map.file if (raw_map.file | default('') | string) is match(safe_name) else '' }}"
+      last_applied: "{{ raw_map.last_applied if (raw_map.last_applied | default('') | string) is match(safe_name) else '' }}"
+      code: "{{ raw_map.code if (raw_map.code | default('') | string) is match('^[0-9]{1,6}$') else '' }}"
+      name: "{{ raw_map.name if (raw_map.name | default('') | string) is match('^[A-Z0-9_]{1,64}$') else '' }}"
+      weak_vars: "{{ (raw_map.weak_vars | default([]) if (raw_map.weak_vars | default([]) is sequence and raw_map.weak_vars | default([]) is not string) else []) | map('string') | select('match', '^CLICKHOUSE_[A-Z_]{1,40}$') | list }}"
+    argus_migrator_container_id: "{{ container[0] if (container | length == 2 and container[0] is match('^[0-9a-f]{12}$')) else '' }}"
+    argus_migrator_container_exit: "{{ container[1] if (container | length == 2 and container[1] is match('^[0-9]{1,3}$')) else '' }}"
+    argus_migrator_fresh: >-
+      {{ (raw_map.run | default('') | string) is match('^[0-9a-f]{12}$')
+         and (raw_map.run | string) == (container[0] if container | length == 2 else '') }}
+
+- name: "Миграции: сводка статуса"
+  ansible.builtin.set_fact:
+    argus_migrator_summary: >-
+      migrator: {{ ('контейнер ' ~ argus_migrator_container_id ~ ', код выхода ' ~ argus_migrator_container_exit)
+                   if argus_migrator_container_id else 'контейнер не найден' }};
+      {{ ('статус: этап ' ~ (argus_migrator_state.stage or '?') ~ ', код ' ~ argus_migrator_state.exit
+          ~ ((', файл ' ~ argus_migrator_state.file) if argus_migrator_state.file else '')
+          ~ ((', последняя применённая ' ~ argus_migrator_state.last_applied) if argus_migrator_state.last_applied else '')
+          ~ ((', ClickHouse код ' ~ argus_migrator_state.code ~ ((' (' ~ argus_migrator_state.name ~ ')') if argus_migrator_state.name else '')) if argus_migrator_state.code else '')
+          ~ ((', дефолтные пароли: ' ~ (argus_migrator_state.weak_vars | join(' '))) if argus_migrator_state.weak_vars else ''))
+         if argus_migrator_fresh | bool else 'статуса этого запуска нет (run/migrator/migrate.json старый или отсутствует)' }}
