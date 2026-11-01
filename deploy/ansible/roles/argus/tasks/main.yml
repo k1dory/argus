@@ -178,6 +178,31 @@
     mode: "0600"
   when: argus_enable_mcp
 
+# ASN: каталог на хосте монтируется в коллектор (/asn). Первое скачивание — после up
+# (таблицу проверяет `collector asn-check` из образа запущенного коллектора); его сбой
+# выкатку не останавливает: коллектор работает без ASN и подхватит файл, когда его
+# положит cron (перечитывание по mtime).
+- name: ASN — каталог таблицы
+  ansible.builtin.file:
+    path: "{{ argus_asn_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: argus_asn
+
+- name: ".env: таблица ASN"
+  ansible.builtin.lineinfile:
+    path: "{{ argus_dir }}/.env"
+    regexp: "^#?{{ item.key }}="
+    line: "{{ item.key }}={{ item.value }}"
+    mode: "0600"
+  loop:
+    - { key: ASN_DB_DIR, value: "{{ argus_asn_dir if argus_asn else './collector/asn' }}" }
+    - { key: ASN_DB_FILE, value: "{{ '/asn/ip2asn-combined.tsv.gz' if argus_asn else '' }}" }
+  loop_control:
+    label: "{{ item.key }}"
+
 - name: ".env: образы из реестра и ключ подписи"
   ansible.builtin.lineinfile:
     path: "{{ argus_dir }}/.env"
@@ -335,6 +360,30 @@
   retries: 12
   delay: 5
   until: argus_collector_ready.status == 200
+
+- name: ASN — скачать таблицу, если её ещё нет
+  ansible.builtin.command:
+    cmd: "./scripts/asn-update.sh {{ argus_asn_dir | quote }} {{ argus_asn_url | quote }}"
+    chdir: "{{ argus_dir }}"
+    creates: "{{ argus_asn_dir }}/ip2asn-combined.tsv.gz"
+  register: argus_asn_fetch
+  failed_when: false
+  when: argus_asn
+
+- name: ASN — таблица не скачана
+  ansible.builtin.debug:
+    msg: "asn-update.sh: {{ argus_asn_fetch.stderr | default('') }} — коллектор работает без ASN, повтор по cron"
+  when: argus_asn and (argus_asn_fetch.rc | default(0)) != 0
+
+- name: ASN — ежедневное обновление таблицы
+  ansible.builtin.cron:
+    name: argus asn update
+    user: root
+    hour: "{{ argus_asn_cron_hour }}"
+    minute: "{{ argus_asn_cron_minute }}"
+    # cron режет команду на первом неэкранированном %: URL зеркал и подписанные ссылки его содержат.
+    job: "{{ (argus_dir ~ '/scripts/asn-update.sh ' ~ (argus_asn_dir | quote) ~ ' ' ~ (argus_asn_url | quote)) | replace('%', '\\%') }} >> /var/log/argus-asn.log 2>&1"
+    state: "{{ 'present' if argus_asn else 'absent' }}"
 
 - name: Резервные копии по cron
   ansible.builtin.cron:

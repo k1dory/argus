@@ -28,6 +28,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/devitex-soft/argus/collector/internal/asn"
 	"github.com/devitex-soft/argus/collector/internal/listen"
 	"github.com/devitex-soft/argus/collector/internal/model"
 	"github.com/devitex-soft/argus/collector/internal/normalize"
@@ -357,6 +358,72 @@ func attrsFromStructured(e *model.Event, sd map[string]string) {
 	}
 }
 
+// openASN — таблица ASN из ASN_DB_FILE (TSV iptoasn.com, можно .gz) с проверкой
+// раз в ASN_DB_RELOAD (по умолчанию минута) и порогом ASN_DB_MIN_ROWS диапазонов.
+// Без ASN_DB_FILE таблицы нет: поля ASN только удаляются из входящих событий.
+func openASN(ctx context.Context) (*asn.DB, error) {
+	path := strings.TrimSpace(os.Getenv("ASN_DB_FILE"))
+	if path == "" {
+		return nil, nil
+	}
+	minRows, err := asnMinRows()
+	if err != nil {
+		return nil, err
+	}
+	every := time.Minute
+	if raw := os.Getenv("ASN_DB_RELOAD"); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d < time.Second {
+			return nil, fmt.Errorf("ASN_DB_RELOAD — длительность не меньше 1s: %q", raw)
+		}
+		every = d
+	}
+	db := asn.Open(path, minRows)
+	go db.Watch(ctx, every)
+	return db, nil
+}
+
+// asnMinRows — порог ASN_DB_MIN_ROWS (по умолчанию 10000) для коллектора и asn-check.
+func asnMinRows() (int, error) {
+	raw := os.Getenv("ASN_DB_MIN_ROWS")
+	if raw == "" {
+		return 10000, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 {
+		return 0, fmt.Errorf("ASN_DB_MIN_ROWS должен быть положительным числом: %q", raw)
+	}
+	return n, nil
+}
+
+// asnCheck — `collector asn-check FILE`: та же проверка таблицы ASN, что при
+// загрузке (asn.Parse, ASN_DB_MIN_ROWS). Её зовёт scripts/asn-update.sh до замены
+// файла. 0 — годна, 1 — нет, 2 — неверный вызов.
+func asnCheck(args []string) int {
+	if len(args) != 1 {
+		fmt.Fprintln(os.Stderr, "usage: collector asn-check FILE")
+		return 2
+	}
+	minRows, err := asnMinRows()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "asn-check:", err)
+		return 2
+	}
+	f, err := os.Open(args[0])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "asn-check:", err)
+		return 1
+	}
+	defer f.Close()
+	t, err := asn.Parse(f, minRows)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "asn-check:", err)
+		return 1
+	}
+	fmt.Println(t.Rows())
+	return 0
+}
+
 func env(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -443,6 +510,8 @@ func main() {
 			os.Exit(replayPcap(os.Args[2:]))
 		case "healthcheck":
 			os.Exit(healthcheck(healthURL(env("COLLECTOR_CONFIG", "")), 3*time.Second))
+		case "asn-check":
+			os.Exit(asnCheck(os.Args[2:]))
 		}
 	}
 	cfg, err := loadConfig(env("COLLECTOR_CONFIG", ""))
@@ -518,6 +587,11 @@ func main() {
 		}
 	}()
 
+	asnDB, err := openASN(ctx)
+	if err != nil {
+		slog.Error("ASN_DB", "err", err)
+		os.Exit(1)
+	}
 	queue := make(chan queuedEvent, cfg.Batch.PendingRows)
 	// emit всегда сам проставляет attrs.transport: значение из тела события
 	// (например, /ingest/events с "transport":"tls") доверять нельзя — по нему
@@ -527,6 +601,8 @@ func main() {
 			e.Attrs = map[string]string{}
 		}
 		e.Attrs["transport"] = transport
+		// ASN — тоже только свой: по src_asn движок склеивает сканы.
+		asn.Enrich(e.Attrs, e.SrcIP, e.DstIP, asnDB.Table())
 		// Направление для любого события с двумя адресами (NGFW, firewall, syslog), не только
 		// NetFlow: правила про «снаружи внутрь» одни на все источники.
 		if e.SrcIP != "" && e.DstIP != "" && e.Attrs["scope"] == "" {
@@ -713,6 +789,7 @@ func main() {
 				events[i].Attrs = map[string]string{}
 			}
 			events[i].Attrs["transport"] = "http"
+			asn.Enrich(events[i].Attrs, events[i].SrcIP, events[i].DstIP, asnDB.Table())
 			// Направление — и для готовых событий NDJSON (агенты Vector, журналы фаерволов).
 			if events[i].SrcIP != "" && events[i].DstIP != "" && events[i].Attrs["scope"] == "" {
 				events[i].Attrs["scope"] = norm.FlowScope(events[i].SrcIP, events[i].DstIP)
@@ -741,7 +818,8 @@ func main() {
 				"queue": len(queue), "pending_rows": pq.Rows(), "pending_bytes": pq.Bytes(), "spool_bytes": pq.SpoolBytes(), "spool_capacity_bytes": pq.SpoolCapacityBytes(), "dead_letter": ws.DeadLetter.Load(), "panics": listen.Metrics.Panics.Load()}
 		},
 		Metrics: func(full bool) string {
-			return st.prometheus(len(queue), pq.Rows(), pq.Bytes(), ws, full) + fmt.Sprintf("argus_collector_spool_bytes %d\nargus_collector_spool_capacity_bytes %d\nargus_collector_undeclared_format_total %d\nargus_collector_unrecognized_record_total %d\n", pq.SpoolBytes(), pq.SpoolCapacityBytes(), undeclaredFormatTotal.Load(), unrecognizedRecordTotal.Load())
+			return st.prometheus(len(queue), pq.Rows(), pq.Bytes(), ws, full) + fmt.Sprintf("argus_collector_spool_bytes %d\nargus_collector_spool_capacity_bytes %d\nargus_collector_spool_head_stuck_seconds %d\nargus_collector_sink_stalled_passes_total %d\nargus_collector_undeclared_format_total %d\nargus_collector_unrecognized_record_total %d\n",
+				pq.SpoolBytes(), pq.SpoolCapacityBytes(), int64(pq.StuckFor(time.Now()).Seconds()), ws.StalledPasses.Load(), undeclaredFormatTotal.Load(), unrecognizedRecordTotal.Load())
 		},
 	}
 
@@ -824,6 +902,9 @@ func main() {
 		writers.Wait()
 		return nil
 	})
+	stall := &stallWatch{after: stallAfter(), stuck: pq.StuckFor, pending: pq.Rows,
+		passes: ws.StalledPasses.Load, insert: ch.InsertEvents}
+	run("sink-stall", func() error { listen.Guard("sink-stall", func() { stall.run(ctx) }); return nil })
 	// Heartbeat раз в минуту — источник виден живым даже без событий.
 	run("heartbeat", func() error {
 		t := time.NewTicker(time.Minute)

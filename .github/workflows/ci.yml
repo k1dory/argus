@@ -167,7 +167,7 @@ jobs:
   scripts:
     # Регрессии скриптов репозитория и run-блоков workflow (Go вне модулей, только std):
     # scripts/changelog-release.sh и проверки changelog в ci.yml / release.yml исполняются
-    # на временных git-репозиториях.
+    # на временных git-репозиториях, scripts/asn-update.sh — на временных каталогах.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -177,6 +177,7 @@ jobs:
           cache: false
       - run: |
           go test -count=1 ./scripts/changelog_release_test.go
+          go test -count=1 ./scripts/asn_update_test.go
           go test -count=1 ./.github/workflows/changelog_test.go
 
   ansible:

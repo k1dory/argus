@@ -31,7 +31,17 @@ API. Wazuh подключается как модуль, а не как цент
   на диск. При заполнении очереди HTTP возвращает `503` с `Retry-After`, а
   TCP/TLS-источники получают обратное давление. UDP не подтверждает доставку.
   После аварии возможен повтор последнего батча, поэтому при анализе сырых
-  событий учитывайте семантику «как минимум один раз».
+  событий учитывайте семантику «как минимум один раз». Если батч проход за проходом
+  возвращается в очередь без прогресса (ClickHouse отвечает, но не принимает),
+  коллектор считает это застреванием: `argus_collector_spool_head_stuck_seconds`,
+  `argus_collector_sink_stalled_passes_total`, а дольше `SINK_STALL_AFTER` (10m; `0` —
+  выключено) — ERROR в журнал и событие `argus.collector` / `collector.sink_stalled`,
+  инцидент `a41c-ops-066` (закрывается событием `collector.sink_recovered`). События
+  доставляются по одному за такт и по порядку, недоставленные ждут следующего такта. После
+  старта коллектор, как только застрявших батчей нет, один раз шлёт `sink_recovered`
+  (`attrs.startup=1`): инцидент, открытый до перезапуска, не остаётся висеть. Батчи,
+  поднятые из spool при старте, считаются стоящими с момента старта, пока их не запишут
+  или не сократят: восстановление после рестарта — только после настоящего прогресса.
 - `engine/` — Go. Ядро корреляции: Sigma-подобные правила из `rules/*.yml`
   (selection / filter / threshold с окнами и distinct), инциденты со статусами
   отработки, LLM-аналитик по строгой JSON-схеме за интерфейсом `analyst.Backend`
@@ -272,6 +282,25 @@ make replay                                   # залить записанны�
 Вебхуки требуют заголовок `X-Argus-Token: $ARGUS_INGEST_TOKEN` (стенд `ARGUS_DEV=1` — без
 него). Запись tcpdump: `docker compose exec collector /collector replay-pcap file.pcap`.
 Пропускная способность: `./scripts/bench-ingest.sh 200000` (см. CHANGELOG).
+
+**ASN публичных адресов.** Коллектор ставит `attrs.src_asn` / `src_as_org` и `attrs.dst_asn` /
+`dst_as_org` (номер AS — число строкой, без «AS») у каждого события с публичным `src_ip` /
+`dst_ip`. По `src_asn` движок склеивает сканы из облаков. Таблица — локальный файл
+[iptoasn.com](https://iptoasn.com) (`ip2asn-combined.tsv.gz`, PDDL), коллектор внешних запросов
+не делает. Включение: `ASN_DB_FILE=/asn/ip2asn-combined.tsv.gz`, каталог хоста `ASN_DB_DIR`
+монтируется в `/asn`. Обновление — `scripts/asn-update.sh <ASN_DB_DIR>` по cron; в роли argus —
+`argus_asn: true`, ежедневно. Скрипт проверяет файл тем же разбором, что и коллектор
+(`collector asn-check FILE`: `ASN_CHECK`, `collector` из PATH или образ запущенного контейнера
+без сети) с порогом `ASN_DB_MIN_ROWS` из `.env` стека, тем же, что у коллектора, и только
+годную таблицу атомарно ставит на место прежней. Обычный файл на месте
+таблицы обязателен: симлинк отклоняется. Коллектор перечитывает файл по mtime (`ASN_DB_RELOAD`, по умолчанию 1m) и
+проверяет его ещё раз: пять полей, адреса, диапазоны по возрастанию без пересечений, не меньше
+`ASN_DB_MIN_ROWS` строк. Битая таблица не заменяет прежнюю, в журнал коллектора уходит
+предупреждение. Поля ASN, присланные в теле события (`/ingest/events`, syslog), не принимаются
+никогда: коллектор удаляет их всегда, даже без таблицы. У частных и зарезервированных адресов
+(блоки реестров IANA Special-Purpose с Globally Reachable = False: RFC 1918, 100.64/10,
+loopback, документационные, 3fff::/20, 5f00::/16 и т. п.; публичные AS112, AMT и ORCHIDv2
+внутри них обогащаются) и у AS 0 («Not routed») полей нет.
 
 Утечка секрета в CI (`ci-secret-echo`) автоматикой закрывается только отзывом доказанно того
 же токена: у утечки и у события `*_revoked` из аудита (`source` `*.audit`) совпадают
@@ -997,6 +1026,7 @@ Wazuh — популярный open-source HIDS, поэтому его подд�
 |---|---|---|
 | Событий нет, источники «молчат» на `/sources` | `docker compose logs collector`, `curl -s localhost:8088/metrics \| grep spool` | переполнен spool → место на диске `collector-state`; источник не доходит → файрвол, `INGEST_BIND`, токен `X-Argus-Token` |
 | Инциденты не появляются при живом потоке | `docker compose logs engine`, `GET :8090/rules` (ошибки загрузки правил) | `./scripts/argus rules test`; `POST :8090/reload` с `ENGINE_TOKEN` после правки правил |
+| Инцидент `a41c-ops-066` (коллектор не пишет) | `curl -s localhost:8088/metrics \| grep stuck`, `docker compose logs collector \| grep "запись в ClickHouse стоит"`, `system.errors` и `system.query_log` ClickHouse | данные ждут в spool; чинить ClickHouse (память, диск, `max_*` профиля `argus_collector`), коллектор допишет сам |
 | Инцидент `a41c-ops-062` (диск ClickHouse) | `df -h` на томе `clickhouse-data`, `SELECT * FROM system.disks` | расширить раздел или снизить TTL в миграции; ClickHouse при нехватке места отклоняет вставки, не затирает старое |
 | Консоль отвечает 503 «хранилище недоступно» | `docker compose ps clickhouse`, `docker compose logs migrator` | `migrator` отказывает на слабых паролях; после восстановления ClickHouse консоль поднимается сама |
 | Паспорт не открывается, «журнал действий недоступен» | таблица `argus.console_audit` и права `argus_console` | без записи в журнал ПДн не отдаются намеренно; восстановить ClickHouse, затем повторить |
