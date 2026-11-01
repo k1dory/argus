@@ -287,11 +287,11 @@ func TestLiveIncidentsStateAndOperatorViews(t *testing.T) {
 	if rev, err := c.IncidentRevision(ctx, openID); err != nil || rev != 0 {
 		t.Fatalf("ревизия до переходов: %d %v", rev, err)
 	}
-	e1, err := c.AppendIncidentState(ctx, openID, "ivan", "take", incidents.StatusInProgress, "ivan", "")
+	e1, err := c.AppendIncidentState(ctx, openID, "ivan", "take", incidents.StatusInProgress, "ivan", "", ClosureLabel{})
 	if err != nil || e1.Revision != 1 || len(e1.EventID) != 36 {
 		t.Fatalf("переход 1: %v %+v", err, e1)
 	}
-	e2, err := c.AppendIncidentState(ctx, openID, "ivan", "status", "observing", "ivan", "смотрим")
+	e2, err := c.AppendIncidentState(ctx, openID, "ivan", "status", "observing", "ivan", "смотрим", ClosureLabel{})
 	if err != nil || e2.Revision != 2 || e2.EventID == e1.EventID {
 		t.Fatalf("переход 2: %v %+v", err, e2)
 	}
@@ -303,8 +303,23 @@ func TestLiveIncidentsStateAndOperatorViews(t *testing.T) {
 		t.Fatalf("incidents_current после переходов: %v %+v", err, cur)
 	}
 	// Закрытый детектором инцидент переходами не оживает.
-	if _, err := c.AppendIncidentState(ctx, closedID, "ivan", "take", incidents.StatusInProgress, "ivan", ""); err != nil {
+	if _, err := c.AppendIncidentState(ctx, closedID, "ivan", "take", incidents.StatusInProgress, "ivan", "", ClosureLabel{}); err != nil {
 		t.Fatal(err)
+	}
+	// Метка ответа (миграция 0033) пишется и читается теми же колонками; null
+	// у эскалации отличим от false.
+	no := false
+	if _, err := c.AppendIncidentState(ctx, closedID, "ivan", "status", incidents.StatusClosed, "ivan", "проверено, угрозы нет",
+		ClosureLabel{Disposition: "benign_authorized", SeverityCorrect: &no, Blind: true, LabeledByHuman: true}); err != nil {
+		t.Fatal(err)
+	}
+	labelRow, err := c.do(ctx, `SELECT disposition, escalate, severity_correct, blind, labeled_by_human FROM incident_state_events
+		WHERE incident_id = {id:String} AND kind = 'status' FORMAT JSONEachRow`, nil, map[string]string{"id": closedID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(labelRow)); got != `{"disposition":"benign_authorized","escalate":null,"severity_correct":false,"blind":true,"labeled_by_human":true}` {
+		t.Fatalf("метка ответа: %s", got)
 	}
 	if cur, err = c.CurrentIncident(ctx, closedID); err != nil || cur.Status != incidents.StatusClosed {
 		t.Fatalf("закрытый остаётся закрытым: %v %+v", err, cur)
@@ -432,7 +447,7 @@ func TestLiveRiskReport(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.AppendIncidentState(ctx, fresh, "petr", "take", incidents.StatusInProgress, "petr", ""); err != nil {
+	if _, err := c.AppendIncidentState(ctx, fresh, "petr", "take", incidents.StatusInProgress, "petr", "", ClosureLabel{}); err != nil {
 		t.Fatal(err)
 	}
 	r, err := c.RiskReport(ctx)
