@@ -162,6 +162,7 @@ func Parse(r io.Reader, minRows int) (*Table, error) {
 }
 
 // cleanOrg — название без управляющих символов, не длиннее MaxOrgLen байт.
+// Результат — собственная копия: подстрока поля держала бы всю строку файла.
 func cleanOrg(s string) string {
 	s = strings.Map(func(r rune) rune {
 		if r < 0x20 || r == 0x7f || r == 0xfffd {
@@ -176,30 +177,47 @@ func cleanOrg(s string) string {
 		}
 		s = s[:cut]
 	}
-	return s
+	return strings.Clone(s)
 }
 
-// special — частные и зарезервированные диапазоны (IANA special-purpose):
-// для них ASN не ставится, даже если таблица что-то вернула бы.
-var special = func() []netip.Prefix {
-	var out []netip.Prefix
-	for _, s := range []string{
-		"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
-		"172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24", "192.88.99.0/24", "192.168.0.0/16",
-		"198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
-		"::/128", "::1/128", "64:ff9b:1::/48", "100::/64", "2001::/23", "2001:db8::/32",
-		"2002::/16", "fc00::/7", "fe80::/10", "ff00::/8",
-	} {
-		out = append(out, netip.MustParsePrefix(s))
+func prefixes(list ...string) []netip.Prefix {
+	out := make([]netip.Prefix, len(list))
+	for i, s := range list {
+		out[i] = netip.MustParsePrefix(s)
 	}
 	return out
-}()
+}
+
+// special — блоки реестров IANA IPv4/IPv6 Special-Purpose Address Registry с
+// Globally Reachable = False или N/A (сверено с реестрами 2025-10), плюс multicast
+// и 255.255.255.255. Для них ASN не ставится, что бы ни вернула таблица.
+var special = prefixes(
+	"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+	"172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24", "192.88.99.0/24", "192.168.0.0/16",
+	"198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
+	"::/128", "::1/128", "::ffff:0:0/96", "64:ff9b:1::/48", "100::/64", "100:0:0:1::/64",
+	"2001::/23", "2001:db8::/32", "2002::/16", "3fff::/20", "5f00::/16",
+	"fc00::/7", "fe80::/10", "ff00::/8",
+)
+
+// reachable — более узкие блоки внутри special с Globally Reachable = True:
+// они публичные (AS112, AMT, ORCHIDv2, Drone DET, anycast PCP/TURN).
+var reachable = prefixes(
+	"192.0.0.9/32", "192.0.0.10/32",
+	"2001:1::1/128", "2001:1::2/128", "2001:1::3/128", "2001:3::/32",
+	"2001:4:112::/48", "2001:20::/28", "2001:30::/28",
+)
 
 // Public — адрес вне частных и зарезервированных диапазонов.
 func Public(a netip.Addr) bool {
 	a = a.Unmap()
 	if !a.IsValid() || a.Zone() != "" {
 		return false
+	}
+	for _, p := range reachable {
+		if p.Contains(a) {
+			return true
+		}
 	}
 	for _, p := range special {
 		if p.Contains(a) {

@@ -366,14 +366,11 @@ func openASN(ctx context.Context) (*asn.DB, error) {
 	if path == "" {
 		return nil, nil
 	}
-	minRows, every := 10000, time.Minute
-	if raw := os.Getenv("ASN_DB_MIN_ROWS"); raw != "" {
-		n, err := strconv.Atoi(raw)
-		if err != nil || n < 1 {
-			return nil, fmt.Errorf("ASN_DB_MIN_ROWS должен быть положительным числом: %q", raw)
-		}
-		minRows = n
+	minRows, err := asnMinRows()
+	if err != nil {
+		return nil, err
 	}
+	every := time.Minute
 	if raw := os.Getenv("ASN_DB_RELOAD"); raw != "" {
 		d, err := time.ParseDuration(raw)
 		if err != nil || d < time.Second {
@@ -384,6 +381,47 @@ func openASN(ctx context.Context) (*asn.DB, error) {
 	db := asn.Open(path, minRows)
 	go db.Watch(ctx, every)
 	return db, nil
+}
+
+// asnMinRows — порог ASN_DB_MIN_ROWS (по умолчанию 10000) для коллектора и asn-check.
+func asnMinRows() (int, error) {
+	raw := os.Getenv("ASN_DB_MIN_ROWS")
+	if raw == "" {
+		return 10000, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 {
+		return 0, fmt.Errorf("ASN_DB_MIN_ROWS должен быть положительным числом: %q", raw)
+	}
+	return n, nil
+}
+
+// asnCheck — `collector asn-check FILE`: та же проверка таблицы ASN, что при
+// загрузке (asn.Parse, ASN_DB_MIN_ROWS). Её зовёт scripts/asn-update.sh до замены
+// файла. 0 — годна, 1 — нет, 2 — неверный вызов.
+func asnCheck(args []string) int {
+	if len(args) != 1 {
+		fmt.Fprintln(os.Stderr, "usage: collector asn-check FILE")
+		return 2
+	}
+	minRows, err := asnMinRows()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "asn-check:", err)
+		return 2
+	}
+	f, err := os.Open(args[0])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "asn-check:", err)
+		return 1
+	}
+	defer f.Close()
+	t, err := asn.Parse(f, minRows)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "asn-check:", err)
+		return 1
+	}
+	fmt.Println(t.Rows())
+	return 0
 }
 
 func env(key, def string) string {
@@ -472,6 +510,8 @@ func main() {
 			os.Exit(replayPcap(os.Args[2:]))
 		case "healthcheck":
 			os.Exit(healthcheck(healthURL(env("COLLECTOR_CONFIG", "")), 3*time.Second))
+		case "asn-check":
+			os.Exit(asnCheck(os.Args[2:]))
 		}
 	}
 	cfg, err := loadConfig(env("COLLECTOR_CONFIG", ""))

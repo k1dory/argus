@@ -15,6 +15,25 @@ import (
 	"time"
 )
 
+// TestMain собирает настоящий коллектор: скрипт проверяет таблицу его же
+// `collector asn-check`, найденным в PATH.
+func TestMain(m *testing.M) {
+	bin, err := os.MkdirTemp("", "asn-update-bin")
+	if err != nil {
+		panic(err)
+	}
+	build := exec.Command("go", "build", "-o", filepath.Join(bin, "collector"), "./cmd/collector")
+	build.Dir = filepath.Join("..", "collector")
+	build.Stdout, build.Stderr = os.Stderr, os.Stderr
+	if err := build.Run(); err != nil {
+		panic("сборка collector: " + err.Error())
+	}
+	os.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	code := m.Run()
+	os.RemoveAll(bin)
+	os.Exit(code)
+}
+
 func gz(t *testing.T, body string) []byte {
 	t.Helper()
 	var b bytes.Buffer
@@ -185,5 +204,27 @@ func TestPR56ASNUpdateLeavesRegularSymlinkTargetIntact(t *testing.T) {
 	current, err := os.ReadFile(outside)
 	if err != nil || !bytes.Equal(current, previous) {
 		t.Fatalf("regular symlink target was modified: %v", err)
+	}
+}
+
+// Отказ проверяющего (ASN_CHECK) — таблица не заменяется, даже годная по форме.
+func TestASNUpdateRejectedByChecker(t *testing.T) {
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "ip2asn-combined.tsv.gz")
+	previous := gz(t, "1.0.0.0\t1.0.0.255\t13335\tUS\tX\n8.8.8.0\t8.8.8.255\t15169\tUS\tY\n")
+	if err := os.WriteFile(dest, previous, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(t.TempDir(), "next.gz")
+	if err := os.WriteFile(src, gz(t, "9.9.9.0\t9.9.9.255\t19281\tUS\tQ\n45.33.0.0\t45.33.127.255\t63949\tUS\tA\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("bash", "asn-update.sh", dir, "file://"+src)
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + t.TempDir(), "ASN_DB_MIN_ROWS=2", "ASN_CHECK=false"}
+	if out, err := cmd.CombinedOutput(); err == nil {
+		t.Fatalf("отказ проверяющего проигнорирован:\n%s", out)
+	}
+	if now, _ := os.ReadFile(dest); !bytes.Equal(now, previous) {
+		t.Error("таблица заменена вопреки проверяющему")
 	}
 }
