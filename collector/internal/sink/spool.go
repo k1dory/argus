@@ -337,9 +337,18 @@ func (q *Queue) retryAcks() {
 		}
 	}
 	if len(left) > 0 {
+		// Долг возвращается — и таймер должен быть: параллельный retryAcks мог
+		// на это время опустошить ackDebt, и ackRetryLoop уже вышел, увидев пустой список.
 		q.mu.Lock()
 		q.ackDebt = append(left, q.ackDebt...)
+		start := !q.ackRetrying && !q.closed
+		if start {
+			q.ackRetrying = true
+		}
 		q.mu.Unlock()
+		if start {
+			go q.ackRetryLoop()
+		}
 	}
 }
 
