@@ -111,7 +111,7 @@
    "title": "Network: inbound port scan",
    "tags": [
     "attack.reconnaissance",
-    "attack.t1046"
+    "attack.t1595"
    ]
   },
   "a41c-net-071": {
@@ -132,7 +132,7 @@
    "title": "Firewall: inbound deny burst across ports",
    "tags": [
     "attack.reconnaissance",
-    "attack.t1046"
+    "attack.t1595"
    ]
   },
   "a41c-net-074": {
@@ -152,14 +152,15 @@
   "a41c-net-076": {
    "title": "Proxy: access to a published service from outside the expected country",
    "tags": [
-    "attack.reconnaissance"
+    "attack.reconnaissance",
+    "attack.t1595"
    ]
   },
   "a41c-ops-040": {
    "title": "Wazuh agent went silent",
    "tags": [
     "attack.defense_impairment",
-    "attack.t1489"
+    "attack.t1685"
    ]
   },
   "a41c-ops-060": {
@@ -235,6 +236,7 @@
    "title": "WAF: critical RCE/LFI attempt with high anomaly score",
    "tags": [
     "attack.execution",
+    "attack.initial_access",
     "attack.t1190",
     "attack.t1059"
    ]
