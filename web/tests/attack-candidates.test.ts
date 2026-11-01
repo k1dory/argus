@@ -18,7 +18,8 @@ const ROOT = path.resolve(__dirname, "../..");
 
 function ruleFiles(dir: string): string[] {
   return fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
-    e.isDirectory() ? ruleFiles(path.join(dir, e.name)) : e.name.endsWith(".yml") ? [path.join(dir, e.name)] : []);
+    // Как rules.Files в engine: .yml и .yaml, каталоги tests (описания тестов правил) на любом уровне пропускаются.
+    e.isDirectory() ? (e.name === "tests" ? [] : ruleFiles(path.join(dir, e.name))) : /\.ya?ml$/.test(e.name) ? [path.join(dir, e.name)] : []);
 }
 const rules = ruleFiles(path.join(ROOT, "rules")).map((f) => ({ file: path.relative(ROOT, f), ...(yaml.load(fs.readFileSync(f, "utf8")) as { tags?: string[] }) }));
 
@@ -59,8 +60,7 @@ test("теги правил: техника относится к одной и�
   assert.deepEqual(mismatched, [], "техника из чужой тактики: кандидаты и тактика по умолчанию разойдутся");
   // Эксплуатационные правила (ops.*) — без ATT&CK; правилу ИБ без техники форма
   // закрытия подбирает кандидатов только по тактике.
-  // rules/tests/ — описания тестов правил, а не правила (у них нет тегов).
-  const noTechnique = rules.filter((r) => !r.file.startsWith("rules/tests/") && !(r.tags ?? []).some((t) => t.startsWith("ops.")) && !ruleTechniques(r.tags ?? []).length).map((r) => r.file);
+  const noTechnique = rules.filter((r) => !(r.tags ?? []).some((t) => t.startsWith("ops.")) && !ruleTechniques(r.tags ?? []).length).map((r) => r.file);
   assert.deepEqual(noTechnique, [], "правило ИБ без attack.tNNNN");
 });
 

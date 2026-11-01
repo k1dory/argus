@@ -152,8 +152,8 @@
   "a41c-net-076": {
    "title": "Proxy: access to a published service from outside the expected country",
    "tags": [
-    "attack.reconnaissance",
-    "attack.t1595"
+    "attack.initial_access",
+    "attack.t1078"
    ]
   },
   "a41c-ops-040": {
