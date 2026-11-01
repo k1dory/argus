@@ -279,6 +279,16 @@ make replay                                   # залить записанны�
 | всё остальное (RFC 5424/3164, в том числе ISO-время в заголовке BSD как у rsyslog, сырой текст) | syslog | `:5514` |
 | свои события единой схемы | NDJSON | `POST …:8089/ingest/events` |
 
+
+**Часы источника в будущем.** Если `ts` события дальше `COLLECTOR_CLOCK_SKEW_MAX` (по
+умолчанию `10m`, `0` — выключено) от момента приёма, коллектор ставит `ts` = время приёма, а
+исходное значение кладёт в `attrs.ts_original`. Так событие не выпадает на часы из окон
+правил: на argus1 QNAP без пояса писал время на 3 ч вперёд, пока не задали `SYSLOG_PEER_TZ`.
+Присланный в событии `ts_original` не принимается никогда. Сводка по отправителям — событие
+`argus.collector` / `collector.clock_skew` раз в минуту (`attrs.peer`, `attrs.source`,
+`attrs.count`, `value` — наибольшее расхождение в секундах) и счётчик
+`argus_collector_clock_skew_total`. Пояс для RFC 3164 по-прежнему лучше задать в
+`SYSLOG_PEER_TZ`: замена ставит время приёма, а не настоящее.
 Вебхуки требуют заголовок `X-Argus-Token: $ARGUS_INGEST_TOKEN` (стенд `ARGUS_DEV=1` — без
 него). Запись tcpdump: `docker compose exec collector /collector replay-pcap file.pcap`.
 Пропускная способность: `./scripts/bench-ingest.sh 200000` (см. CHANGELOG).
