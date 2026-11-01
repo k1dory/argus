@@ -598,3 +598,30 @@ func TestRespondKeyOperatorOverrideSurvivesRestart(t *testing.T) {
 		t.Fatal("решение оператора освобождает место")
 	}
 }
+
+// Журнал недоступен — решение оператора не применяется и не подтверждается: 503,
+// блок стоит, ключ не manual; журнал вернулся — снятие проходит.
+func TestRespondKeyUnblockJournalFailureIs503(t *testing.T) {
+	f := newFakeCH(t)
+	x := newKeyExecutor(t)
+	x.available.Store(true)
+	e := keyEngine(t, f, x, 4)
+	ctx, now := context.Background(), time.Now().UTC().Truncate(time.Second)
+	e.autoRespond(ctx, []*incidents.Incident{capInc("INC-1", "203.0.113.7")}, now)
+	if len(e.resp.Active()) != 1 {
+		t.Fatal("фикстура: автоблок стоит")
+	}
+	setFail(f, "response_log", true)
+	code, body := do(t, e.handler(), "POST", "/respond/unblock", "s", `{"ip":"203.0.113.7","user":"qa","reason":"ложное"}`)
+	setFail(f, "response_log", false)
+	if code != http.StatusServiceUnavailable || len(e.resp.Active()) != 1 {
+		t.Fatalf("журнал недоступен: HTTP %d %s, активных %d", code, body, len(e.resp.Active()))
+	}
+	if _, manual := e.manualAt("203.0.113.7"); manual {
+		t.Fatal("незаписанное решение оператора применено")
+	}
+	code, body = do(t, e.handler(), "POST", "/respond/unblock", "s", `{"ip":"203.0.113.7","user":"qa","reason":"ложное"}`)
+	if code != http.StatusOK || len(e.resp.Active()) != 0 || countSteps(f, stepManual) != 1 {
+		t.Fatalf("журнал вернулся: HTTP %d %s", code, body)
+	}
+}

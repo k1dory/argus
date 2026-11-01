@@ -459,7 +459,8 @@ func (c *ClickHouse) ResponsesSince(ctx context.Context, since time.Time) ([]Res
 			ResponseRow
 			Exception string `json:"exception"`
 		}
-		if err := json.Unmarshal(line, &row); err != nil || row.Exception != "" || row.IncidentID == "" {
+		// incident_id пустой — только у решения оператора по адресу (step=manual).
+		if err := json.Unmarshal(line, &row); err != nil || row.Exception != "" || (row.IncidentID == "" && row.Step != "manual") {
 			return nil, errors.New("response_log: неожиданная строка ответа ClickHouse")
 		}
 		rows = append(rows, row.ResponseRow)

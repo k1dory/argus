@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/devitex-soft/argus/engine/internal/incidents"
@@ -116,6 +118,9 @@ func (e *engine) storeKey(key string, k respKey) {
 	if cur := e.respKeys[key]; cur != nil && cur.state == keyManual {
 		return // оператор решил, пока шла попытка
 	}
+	if at, manual := e.respManual[k.ip]; manual {
+		k.state, k.at = keyManual, at // решение по адресу принято, пока шла первая попытка
+	}
 	e.respKeys[key] = &k
 }
 
@@ -211,6 +216,11 @@ func (e *engine) attemptKey(ctx context.Context, base respKey, now time.Time) (r
 		}
 		k.attempts, k.slotSpace = cur.attempts, cur.slotSpace
 	}
+	if at, manual := e.manualAt(k.ip); manual {
+		k.state, k.at = keyManual, at
+		e.storeKey(key, k)
+		return nil // оператор заблокировал или снял адрес вручную
+	}
 	ts := model.FormatTS(now)[:19]
 	mode, _ := e.resp.Mode() // снимок режима — один на всю попытку
 	set := func(state string) {
@@ -247,6 +257,9 @@ func (e *engine) attemptKey(ctx context.Context, base respKey, now time.Time) (r
 	k.slotSpace = mode
 	release := func() { e.capRelease(ck, key) }
 	reserve := func() error {
+		if _, manual := e.manualAt(k.ip); manual {
+			return errManualDecision // решение оператора принято, пока попытка ждала замка адреса
+		}
 		row := keyRow(ts, mode, k, stepReserve, respond.Result{Executor: "argus", OK: true, Detail: "резерв: блок адреса перед вызовом исполнителей"})
 		return e.ch.InsertResponses(ctx, []store.ResponseRow{row})
 	}
@@ -261,6 +274,10 @@ func (e *engine) attemptKey(ctx context.Context, base respKey, now time.Time) (r
 	switch outcome {
 	case respond.OutcomeReserveFailed:
 		release()
+		if errors.Is(err, errManualDecision) {
+			set(keyManual)
+			return nil
+		}
 		set(keyReserveFailed)
 		slog.Warn("ips: резерв в response_log не записан — адрес не блокируется до следующей попытки", "incident", k.incident, "ip", k.ip, "err", err)
 		return nil
@@ -381,6 +398,9 @@ func (e *engine) restoreKeysLocked(ctx context.Context, now time.Time) bool {
 		if !ok {
 			continue
 		}
+		if row.IncidentID == "" {
+			continue // решение оператора по адресу — ниже, не ключ
+		}
 		key := keyOf(row.IncidentID, ip)
 		at, perr := time.ParseInLocation("2006-01-02 15:04:05", row.TS, time.UTC)
 		if perr != nil {
@@ -404,6 +424,16 @@ func (e *engine) restoreKeysLocked(ctx context.Context, now time.Time) bool {
 	}
 	doubtful := 0
 	e.respMu.Lock()
+	for _, row := range rows {
+		if row.Step != stepManual || row.IncidentID != "" {
+			continue
+		}
+		ip, ok := respond.CanonicalIP(row.IP)
+		at, perr := time.ParseInLocation("2006-01-02 15:04:05", row.TS, time.UTC)
+		if ok && perr == nil && at.After(e.respManual[ip]) {
+			e.respManual[ip] = at
+		}
+	}
 	for key, l := range byKey {
 		if _, known := e.respKeys[key]; known {
 			continue // свежее локальное состояние главнее журнала
@@ -456,6 +486,10 @@ func (e *engine) restoreKeysLocked(ctx context.Context, now time.Time) bool {
 			k.state = keyManual
 		default:
 			continue
+		}
+		if at, manual := e.respManual[row.IP]; manual && !l.at.After(at) {
+			// Решение оператора по адресу позже последней строки ключа.
+			k.state, k.at, holdsSlot = keyManual, at, false
 		}
 		e.respKeys[key] = k
 		if holdsSlot {
@@ -532,48 +566,86 @@ func (e *engine) takeDeferred() []*incidents.Incident {
 	return out
 }
 
-// operatorOverride — ручная блокировка или снятие адреса: все ключи адреса
-// переходят в конечное «решение оператора» (с записью в журнал, чтобы пережить
-// рестарт) и отдают места; автоповтор их больше не трогает. Возвращает строки
-// журнала и число ключей, по которым ещё ждала автоблокировка.
+// errManualDecision — решение оператора по адресу принято до резерва попытки.
+var errManualDecision = errors.New("решение оператора по адресу")
+
+// manualAt — время решения оператора по адресу (ручной блок или снятие); ok=false —
+// решения нет. Решение — по адресу, а не по ключам: оно действует и на попытку,
+// которая ещё в полёте без записи в respKeys, и на ключи, ещё не прочитанные из
+// журнала при старте.
+func (e *engine) manualAt(ip string) (time.Time, bool) {
+	e.respMu.Lock()
+	defer e.respMu.Unlock()
+	at, ok := e.respManual[ip]
+	return at, ok
+}
+
+// operatorOverride — строка журнала решения оператора по адресу (incident_id пустой,
+// step=manual): по ней восстановление делает manual все ключи адреса, последняя
+// строка которых не позже решения. pending — сколько автоблокировок адреса ещё ждало
+// (ключи с неконечным состоянием и попытки в полёте). Решение не применяется:
+// вызывающий сначала пишет строку в журнал, и только при успехе — applyOverride.
 func (e *engine) operatorOverride(ip, actor, reason string, now time.Time) (rows []store.ResponseRow, pending int) {
 	ip, ok := respond.CanonicalIP(ip)
 	if !ok {
 		return nil, 0
 	}
-	ts := model.FormatTS(now)[:19]
+	row := respRow(model.FormatTS(now)[:19], "manual", actor, respond.Result{Executor: "argus", OK: true, IP: ip,
+		Detail: "решение оператора: автоблокировка адреса больше не выполняется"}, "", reason)
+	row.Step = stepManual
 	e.respMu.Lock()
 	defer e.respMu.Unlock()
-	for key, k := range e.respKeys {
-		if k.ip != ip || k.state == keyManual {
-			continue
-		}
-		if !terminal(k.state) {
+	for _, k := range e.respKeys {
+		if k.ip == ip && !terminal(k.state) {
 			pending++
 		}
+	}
+	for key := range e.respFlight {
+		if _, kip, _ := strings.Cut(key, "|"); kip == ip && e.respKeys[key] == nil {
+			pending++ // первая попытка в полёте, ключа в respKeys ещё нет
+		}
+	}
+	return []store.ResponseRow{row}, pending
+}
+
+// applyOverride — решение оператора записано: адрес и все его ключи — manual,
+// места отданы. Итог попытки, которая сейчас в полёте, тоже станет manual (storeKey).
+func (e *engine) applyOverride(ip string, now time.Time) {
+	ip, ok := respond.CanonicalIP(ip)
+	if !ok {
+		return
+	}
+	e.respMu.Lock()
+	defer e.respMu.Unlock()
+	e.respManual[ip] = now
+	for key, k := range e.respKeys {
+		if k.ip != ip {
+			continue
+		}
 		if k.slotSpace != "" {
-			ck := capKey(k.slotSpace, k.ruleID, k.ip)
-			if slots := e.respSlots[ck]; slots != nil {
+			if slots := e.respSlots[capKey(k.slotSpace, k.ruleID, k.ip)]; slots != nil {
 				delete(slots, key)
 			}
 		}
 		k.state, k.at = keyManual, now
-		row := respRow(ts, "manual", actor, respond.Result{Executor: "argus", OK: true, IP: ip, Incident: k.incident,
-			Detail: "решение оператора: автоблокировка адреса по инциденту отменена"}, k.ruleID, reason)
-		row.Step = stepManual
-		rows = append(rows, row)
 	}
-	return rows, pending
 }
 
 // pruneKeysLocked — конечные ключи старше ttl и места старше окна хранения.
 func (e *engine) pruneKeysLocked(now time.Time, ttl time.Duration) {
+	// Срок — не меньше окна хранения (block_cap_window может быть длиннее 48 ч):
+	// иначе ключ «manual» или занятое место исчезли бы раньше, чем их запись в журнале.
+	keep := max(ttl, e.respRetention())
 	for key, k := range e.respKeys {
-		if terminal(k.state) && now.Sub(k.at) > ttl {
+		if terminal(k.state) && now.Sub(k.at) > keep {
 			delete(e.respKeys, key)
 		}
 	}
-	keep := max(ttl, e.respRetention())
+	for ip, at := range e.respManual {
+		if now.Sub(at) > keep {
+			delete(e.respManual, ip)
+		}
+	}
 	for ck, slots := range e.respSlots {
 		for key, at := range slots {
 			if now.Sub(at) > keep {

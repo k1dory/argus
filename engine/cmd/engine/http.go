@@ -201,10 +201,17 @@ func (e *engine) handler() http.Handler {
 			rows = append(rows, respRow(ts, "manual", actor, x, "", in.Reason))
 		}
 		// Ручной блок — решение оператора: автоматика по этому адресу больше не
-		// повторяет и не снимает его своим путём.
+		// повторяет и не снимает его своим путём. Блок уже стоит, поэтому решение
+		// применяется и при сбое журнала, но оператор видит предупреждение: после
+		// рестарта движок может не знать о решении.
 		override, _ := e.operatorOverride(in.IP, actor, in.Reason, now)
-		e.logResponses(ctx, append(rows, override...))
-		writeJSON(w, http.StatusOK, map[string]any{"results": res, "ttl": e.resp.ManualTTL().String()})
+		e.applyOverride(in.IP, now)
+		out := map[string]any{"results": res, "ttl": e.resp.ManualTTL().String()}
+		if err := e.ch.InsertResponses(ctx, append(rows, override...)); err != nil {
+			slog.Error("response_log: ручной блок не записан", "ip", in.IP, "err", err)
+			out["warning"] = "блок поставлен, но журнал реагирования недоступен: решение оператора не сохранится после рестарта движка — повторите, когда журнал вернётся"
+		}
+		writeJSON(w, http.StatusOK, out)
 	}))
 	// Снятие блокировки из консоли: {ip, user, reason}. 422 — блок не найден или
 	// снятие не настроено ни у одного исполнителя; отказ исполнителя — ok=false в results.
@@ -224,9 +231,21 @@ func (e *engine) handler() http.Handler {
 		now := time.Now()
 		ts := model.FormatTS(now)[:19]
 		ip := strings.TrimSpace(in.IP)
-		// Снятие — решение оператора и для ожидающей автоблокировки: ключи адреса
-		// конечные, повтор их больше не трогает (иначе снятый адрес заблокировался бы снова).
+		// Снятие — решение оператора и для ожидающей автоблокировки: адрес и его ключи
+		// конечные, повтор их больше не трогает (иначе снятый адрес заблокировался бы
+		// снова). Решение сначала пишется в журнал: не записалось — 503, ничего не
+		// снято и не применено (иначе 200 обещал бы решение, которое рестарт забудет).
 		override, pending := e.operatorOverride(ip, actor, in.Reason, now)
+		if pending > 0 || e.activeBlock(ip) {
+			if err := e.ch.InsertResponses(ctx, override); err != nil {
+				slog.Error("response_log: решение оператора не записано — снятие не выполнено", "ip", ip, "err", err)
+				writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "журнал реагирования недоступен — снятие не выполнено, повторите позже"})
+				return
+			}
+			e.applyOverride(ip, now)
+		} else {
+			override = nil
+		}
 		res, err := e.resp.Unblock(ctx, ip, in.Reason)
 		if errors.Is(err, respond.ErrNotBlocked) && pending > 0 {
 			res, err = []respond.Result{{Executor: "argus", OK: true, IP: ip,
@@ -236,7 +255,6 @@ func (e *engine) handler() http.Handler {
 		for _, x := range res {
 			rows = append(rows, respRow(ts, "manual_unblock", actor, x, "", in.Reason))
 		}
-		rows = append(rows, override...)
 		if err != nil {
 			rows = append(rows, respRow(ts, "manual_unblock", actor, respond.Result{Executor: "argus", IP: ip, Detail: err.Error()}, "", in.Reason))
 			e.logResponses(ctx, rows)
@@ -282,6 +300,17 @@ func (e *engine) handler() http.Handler {
 		fmt.Fprintf(w, "analyze scheduled: %s\n", id)
 	}))
 	return mux
+}
+
+// activeBlock — у адреса есть активная блокировка.
+func (e *engine) activeBlock(ip string) bool {
+	c, ok := respond.CanonicalIP(ip)
+	for _, b := range e.resp.Active() {
+		if b.IP == ip || (ok && b.IP == c) {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *engine) logResponses(ctx context.Context, rows []store.ResponseRow) {

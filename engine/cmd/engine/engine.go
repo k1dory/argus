@@ -91,6 +91,7 @@ type engine struct {
 	// инцидентов, отложенных до чтения журнала.
 	respRestoreMu     sync.Mutex
 	respDeferred      map[string]*incidents.Incident
+	respManual        map[string]time.Time // адрес → время решения оператора (ручной блок или снятие)
 	respDeferredOrder []string
 
 	// absence — последние события групп правил «молчание», вне буфера кандидатов:
@@ -244,10 +245,10 @@ func newEngine(ctx context.Context, rulesDir string, rs []*rules.Rule, acfg anal
 		storms:    map[string]*incidents.Incident{},
 		respState: map[string]respEntry{},
 		respKeys:  map[string]*respKey{}, respFlight: map[string]bool{}, respSlots: map[string]map[string]time.Time{},
-		respDeferred: map[string]*incidents.Incident{},
-		excWarned:    map[string]bool{},
-		identFile:    env("IDENTITIES_FILE", ""),
-		absence:      eval.NewAbsenceState(0),
+		respDeferred: map[string]*incidents.Incident{}, respManual: map[string]time.Time{},
+		excWarned: map[string]bool{},
+		identFile: env("IDENTITIES_FILE", ""),
+		absence:   eval.NewAbsenceState(0),
 	}
 	e.rules.Store(&rs)
 	var identStore identity.Store
