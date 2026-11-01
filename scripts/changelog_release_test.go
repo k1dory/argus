@@ -475,6 +475,47 @@ func TestReleaseRefusesIndexHiddenLocalEdits(t *testing.T) {
 	}
 }
 
+// PR #37: grep -q stops reading at the first hidden index entry. With pipefail,
+// a large ls-files output can then turn a successful match into SIGPIPE from
+// Git, bypassing the refusal. git rm also trusts assume-unchanged, so this can
+// delete the only copy of a maintainer's local edits.
+func TestReleaseRefusesIndexHiddenLocalEditsWithLargeListing(t *testing.T) {
+	f := newReleaseFixture(t)
+	const fragment = "changes/unreleased/000-local.md"
+	const committed = "- committed release note\n"
+	const local = committed + "- unique maintainer draft absent from HEAD\n"
+	f.write(fragment, committed)
+	f.write("VERSION", "1.0.0\n")
+
+	// Real tracked archive files sort after the hidden entry and make ls-files
+	// write over 1 MiB, beyond ordinary pipe buffers. Keeping them outside
+	// unreleased avoids thousands of cat-file subprocesses during the release.
+	// Each filename stays below the 255-byte component limit on Linux and macOS.
+	for i := 0; i < 4096; i++ {
+		name := fmt.Sprintf("changes/zz-archive/%04d-%s.md", i, strings.Repeat("archive-note-", 18))
+		f.write(name, "- archived note\n")
+	}
+	f.commit()
+	f.gitOK("update-index", "--assume-unchanged", "--", fragment)
+	f.write(fragment, local)
+	f.gitOK("diff", "--quiet", "--", "CHANGELOG.md", "VERSION", "changes")
+	f.gitOK("diff", "--cached", "--quiet", "--", "CHANGELOG.md", "VERSION", "changes")
+	listing := f.gitOK("ls-files", "-v", "--", "CHANGELOG.md", "VERSION", "changes")
+	if len(listing) <= 1<<20 || !strings.Contains(listing, "\nh "+fragment+"\n") {
+		t.Fatal("fixture must contain a hidden local edit followed by a large tracked listing")
+	}
+	index := f.gitOK("ls-files", "--stage")
+
+	out, err := f.release("2.0.0")
+	if err == nil {
+		t.Errorf("release accepted an assume-unchanged edit with a large index listing:\n%s", out)
+	}
+	f.unchanged(t, legacyLog, index)
+	if data, err := os.ReadFile(filepath.Join(f.root, fragment)); err != nil || string(data) != local {
+		t.Errorf("release lost the only copy of local edits: data=%q error=%v\n%s", data, err, out)
+	}
+}
+
 // Fail the final cat after the shell has opened/truncated its destination.
 // Fragment reads still use the real cat. This models a failed output write
 // without exhausting the disk and works even when tests run as root.
