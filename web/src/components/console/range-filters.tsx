@@ -39,14 +39,25 @@ function RangeFiltersForm({ time = false, timeLabel = "Точный интерв
   const set = (k: string, v: string) => setValues((s) => ({ ...s, [k]: v }));
   const active = all.some((k) => params.get(k)) || legacy.some((k) => params.get(k));
 
-  const go = (vals: Record<string, string>) => {
+  const go = (vals: Record<string, string>, reset = false) => {
     const next = new URLSearchParams(params);
-    for (const k of all) {
+    const val = (k: string) => {
       const v = (vals[k] ?? "").trim();
-      if (v && v !== ANY) next.set(k, v);
+      return v && v !== ANY ? v : "";
+    };
+    for (const k of all) {
+      const v = val(k);
+      if (v) next.set(k, v);
       else next.delete(k);
     }
-    for (const k of [...legacy, "page"]) next.delete(k);
+    // Устаревший параметр (level=…) снимается, только когда его заменяет новое значение
+    // того же поля (level_min/level_max) или при сбросе: применение одного времени его сохраняет.
+    for (const k of legacy) {
+      const f = fields.find((x) => x.key === k);
+      const superseded = f ? keysOf(f).some((key) => val(key)) : false;
+      if (reset || superseded) next.delete(k);
+    }
+    next.delete("page");
     // Точный интервал главнее пресета: пресет снимается, чтобы ссылка читалась однозначно.
     if (time && (next.get("from") || next.get("to"))) {
       next.delete("range");
@@ -104,7 +115,7 @@ function RangeFiltersForm({ time = false, timeLabel = "Точный интерв
           variant="ghost"
           className="min-h-9"
           onClick={() => {
-            if (!pending) go({});
+            if (!pending) go({}, true);
           }}
         >
           сбросить диапазоны

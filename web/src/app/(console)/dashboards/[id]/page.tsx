@@ -10,7 +10,7 @@ import { RangePicker } from "@/components/console/range-picker";
 import { StorageUnavailable } from "@/components/console/storage-error";
 import { Button } from "@/components/ui/button";
 import { requirePageSession, ROLE_RANK } from "@/lib/auth";
-import { parseRange, safeQuery } from "@/lib/clickhouse";
+import { safeQuery } from "@/lib/clickhouse";
 import { deleteDashboardAction } from "@/lib/dashboard-actions";
 import { getDashboard, refreshSeconds, runPanelQuery, stripPanelDetail, type PanelData } from "@/lib/dashboards";
 import { isLongRange } from "@/lib/shared/time";
@@ -34,9 +34,10 @@ export default async function DashboardPage({ params, searchParams }: PageProps<
   const { id } = await params;
   if (!ID_RE.test(id)) notFound();
   const sp = await searchParams;
-  const range = parseRange(sp.range as string | undefined);
-  // Точный интервал (from/to, UTC) главнее пресета: макросы $__timeFilter/$__from/$__to получают его границы параметрами.
-  const time = parseTimeFilter(sp, { defaultRange: range });
+  // Пресет (range или period) — только из белого списка общего парсера; точный интервал
+  // (from/to, UTC) главнее пресета: макросы $__timeFilter/$__from/$__to получают его границы параметрами.
+  const time = parseTimeFilter(sp, { defaultRange: "24h" });
+  const range = time.range ?? "24h";
   const window = time.from ? time : range;
   const specRes = await safeQuery(() => getDashboard(id));
   if (!specRes.ok) {

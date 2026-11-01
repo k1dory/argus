@@ -61,7 +61,8 @@ export function parseJournalParams(sp: Params): JournalFilters {
   };
   let sev = sevOf(getFilterParam(sp, "level_min") ?? g("sev"), 1);
   let sevMax = sevOf(getFilterParam(sp, "level_max"), 0);
-  if (sev !== undefined && sevMax !== undefined && sev > sevMax) [sev, sevMax] = [Math.max(1, sevMax), sev];
+  // Перепутанные границы — местами; нижняя 0 значит «без нижней границы» (severity=0 остаётся в окне).
+  if (sev !== undefined && sevMax !== undefined && sev > sevMax) [sev, sevMax] = [sevMax > 0 ? sevMax : undefined, sev];
   if (sevMax === 10) sevMax = undefined;
   // Точный интервал: невалидные даты отбрасываются, перепутанные границы меняются местами.
   const time = parseTimeFilter(sp, { defaultRange: "24h" });

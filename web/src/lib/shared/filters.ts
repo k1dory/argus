@@ -230,7 +230,9 @@ export function ordinalRankSQL(col: string, scale: Ordinal, params: Params, name
 export function ordinalConditions(col: string, r: OrdinalRange, scale: Ordinal, params: Params, name: string): string[] {
   if (!r.min && !r.max) return [];
   const rank = ordinalRankSQL(col, scale, params, name);
-  return numConditions(rank, { min: r.min ? rankOf(r.min, scale) : undefined, max: r.max ? rankOf(r.max, scale) : undefined }, params, name, "UInt8");
+  // Нижняя граница всегда не меньше 1: значение вне шкалы (пусто, Untriaged, info) даёт ранг 0
+  // и не должно проходить «не выше» — так же, как его отвергает inOrdinal.
+  return numConditions(rank, { min: r.min ? rankOf(r.min, scale) : 1, max: r.max ? rankOf(r.max, scale) : undefined }, params, name, "UInt8");
 }
 
 export function inOrdinal(value: string, r: OrdinalRange, scale: Ordinal): boolean {
