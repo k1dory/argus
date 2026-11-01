@@ -4,19 +4,23 @@
 title: "Firewall: inbound deny burst across ports"
 id: a41c-net-073
 level: low
-tags: [attack.reconnaissance, attack.t1046]
+tags: [attack.reconnaissance, attack.t1595]   # ATT&CK v20: скан снаружи — Active Scanning (T1046 — разведка изнутри, discovery)
 
 detection:
   selection:
     action: net.firewall
     outcome: deny
+  # Источник из частных и служебных диапазонов — разведка изнутри (T1046, Discovery),
+  # а не Active Scanning снаружи: такой поток этим правилом не размечается.
+  filter:
+    src.ip|regex: '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|127\.|169\.254\.|::1$|f[cd][0-9a-f]{2}:|fe[89ab][0-9a-f]:)'
   threshold:
     kind: distinct
     field: dst.port
     distinct: 30
     window: 10m
     group_by: src.ip
-  condition: selection and threshold
+  condition: selection and not filter and threshold
 
 # Фон интернета: сотни сканеров в сутки. Без новых событий два часа — закрывается
 # автоматикой; повтор с того же адреса заводит новый инцидент.

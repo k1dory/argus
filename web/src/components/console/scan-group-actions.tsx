@@ -25,7 +25,8 @@ function Confirm({ count }: { count: number }) {
   </label>;
 }
 
-export type GroupFilter = { status?: string; level?: string; q?: string; queue?: string };
+/** ranges — строка параметров диапазонов очереди (from, level_min, …), сервер разбирает её тем же парсером. */
+export type GroupFilter = { status?: string; level?: string; q?: string; queue?: string; ranges?: string };
 
 /**
  * Показанный состав (incident_id) и условия очереди, при которых он показан:
@@ -40,6 +41,7 @@ function Hidden({ op, subnet, ids, filter }: { op: string; subnet: string; ids: 
     <input type="hidden" name="f_level" value={filter.level ?? ""} />
     <input type="hidden" name="f_q" value={filter.q ?? ""} />
     <input type="hidden" name="f_queue" value={filter.queue ?? ""} />
+    <input type="hidden" name="f_ranges" value={filter.ranges ?? ""} />
   </>;
 }
 

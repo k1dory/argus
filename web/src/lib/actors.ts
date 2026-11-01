@@ -77,6 +77,8 @@ export type PersonSummary = Person & { aliases: number; events: number; incident
 
 /** Персон в одном запросе инцидентов: на каждую — countIf по её предикату. */
 const PERSONS_PER_QUERY = 100;
+/** SQL одного запроса инцидентов не длиннее стольких байт (текст SQL — ASCII). */
+const INCIDENT_SQL_MAX = 64 * 1024;
 
 /**
  * Список персон с активностью за период. События — один проход по окну на всех
@@ -86,8 +88,9 @@ const PERSONS_PER_QUERY = 100;
  * Инциденты — по субъектным алиасам, действовавшим на first_ts инцидента,
  * партиями по PERSONS_PER_QUERY персон (incidents_current невелик).
  */
-export async function listPersons(range: ActorRange, now = Date.now()): Promise<PersonSummary[]> {
-  const w = clampWindow(rangeWindow(range, now));
+/** Сводка персон за период: ключ пресета или точное окно (не шире 30 дней — clampWindow). */
+export async function listPersons(range: ActorRange | Window, now = Date.now()): Promise<PersonSummary[]> {
+  const w = clampWindow(typeof range === "string" ? rangeWindow(range, now) : range);
   const [persons, aliases] = await Promise.all([
     chQuery<PersonRow>(`${PERSONS_LATEST} ORDER BY display, person_id LIMIT 5000`),
     allAliases(),
@@ -98,38 +101,58 @@ export async function listPersons(range: ActorRange, now = Date.now()): Promise<
   const incidents = new Map<string, number>();
   const plan = activityPlan(persons.map((p) => ({ id: p.person_id, aliases: byPerson.get(p.person_id) ?? [] })), w);
   const eventsQuery = plan.persons.length ? (async () => {
+    // Предфильтр: до PREFILTER_INDEX_MAX значений — hasAny по idx_actor_keys, больше — IN.
     const pf = aliasPrefilter(persons.flatMap((p) => byPerson.get(p.person_id) ?? []));
-    const rows = await chQuery<{ p: string | number; events: string | number; last_ts: string }>(
-      `SELECT p, count() AS events, toString(max(ts)) AS last_ts
-       FROM (SELECT ts, ${plan.sql} AS ps FROM events
-             WHERE ts >= parseDateTime64BestEffort({from:String}, 3, 'UTC') AND ts < parseDateTime64BestEffort({to:String}, 3, 'UTC') AND ${pf.sql})
-       ARRAY JOIN ps AS p GROUP BY p`,
+    // Внутренний GROUP BY — по набору классов (наборов бывает больше, чем персон: 300 uid ×
+    // 300 узлов дают 90 000), внешний раскрывает наборы в персоны (plan.who) и сводит до
+    // персон: строк в ответе не больше, чем персон, и предел max_result_rows с break
+    // (действует только на итог) обрезать их не может.
+    const rows = await chQuery<{ p: string | number; n: string | number; last_ts: string }>(
+      `SELECT p, sum(n) AS n, toString(max(last)) AS last_ts
+       FROM (SELECT hits, count() AS n, max(ts) AS last
+             FROM (SELECT ts, ${plan.hits} AS hits FROM events
+                   WHERE ts >= parseDateTime64BestEffort({from:String}, 3, 'UTC') AND ts < parseDateTime64BestEffort({to:String}, 3, 'UTC')
+                     AND ${pf.sql})
+             WHERE notEmpty(hits) GROUP BY hits)
+       ARRAY JOIN ${plan.who} AS p GROUP BY p`,
       { from: chTs(w.fromMs), to: chTs(w.toMs), ...pf.params, ...plan.params },
     );
+    // Персон не больше 5000 (LIMIT выше), предел — 20000: дойти до него ответ может только
+    // обрезанным, и такие счётчики не выдаются за полные.
+    if (rows.length >= SEARCH_SETTINGS.max_result_rows) throw new Error(`listPersons: ответ активности обрезан на ${rows.length} строках`);
     for (const r of rows) {
       const id = plan.persons[Number(r.p) - 1];
-      const n = Number(r.events);
-      if (id) events.set(id, { events: n, last_ts: n > 0 ? String(r.last_ts) : null });
+      if (id) events.set(id, { events: Number(r.n), last_ts: String(r.last_ts) });
     }
   })() : Promise.resolve();
   const incidentQueries: Promise<void>[] = [];
-  for (let i = 0; i < persons.length; i += PERSONS_PER_QUERY) {
-    const chunk = persons.slice(i, i + PERSONS_PER_QUERY).filter((p) => (byPerson.get(p.person_id) ?? []).length > 0);
-    if (!chunk.length) continue;
-    const incParams: Record<string, string | number> = { from: chTs(w.fromMs), to: chTs(w.toMs) };
-    const incCols: string[] = [];
-    chunk.forEach((p, j) => {
-      const pi = aliasPredicate((byPerson.get(p.person_id) ?? []).filter((a) => ACTOR_KINDS.includes(a.kind)), w, `p${j}_`, "first_ts");
-      Object.assign(incParams, pi.params);
-      incCols.push(`countIf(${pi.sql}) AS i${j}`);
-    });
+  const incidentChunk = (chunk: string[], cols: string[], incParams: Record<string, string | number>) => {
     incidentQueries.push(chQuery<Record<string, string | number>>(
-      `SELECT ${incCols.join(", ")} FROM incidents_current WHERE created_at >= parseDateTimeBestEffort({from:String}) AND created_at < parseDateTimeBestEffort({to:String})`,
+      `SELECT ${cols.join(", ")} FROM incidents_current WHERE created_at >= parseDateTimeBestEffort({from:String}) AND created_at < parseDateTimeBestEffort({to:String})`,
       incParams,
     ).then((inc) => {
-      chunk.forEach((p, j) => incidents.set(p.person_id, Number(inc[0]?.[`i${j}`] ?? 0)));
+      chunk.forEach((id, j) => incidents.set(id, Number(inc[0]?.[`i${j}`] ?? 0)));
     }));
+  };
+  // Партия — не больше PERSONS_PER_QUERY персон и INCIDENT_SQL_MAX байт SQL: с длинными
+  // параметрами запрос уходит полем формы (clickhouse.ts), а у поля предел 128 КиБ.
+  let chunk: string[] = [], cols: string[] = [], incParams: Record<string, string | number> = {}, sqlBytes = 0;
+  for (const p of persons) {
+    const own = (byPerson.get(p.person_id) ?? []).filter((a) => ACTOR_KINDS.includes(a.kind));
+    if (!(byPerson.get(p.person_id) ?? []).length) continue;
+    let pi = aliasPredicate(own, w, `p${chunk.length}_`, "first_ts");
+    if (chunk.length && (chunk.length >= PERSONS_PER_QUERY || sqlBytes + pi.sql.length > INCIDENT_SQL_MAX)) {
+      incidentChunk(chunk, cols, incParams);
+      chunk = []; cols = []; incParams = {}; sqlBytes = 0;
+      pi = aliasPredicate(own, w, "p0_", "first_ts");
+    }
+    if (!chunk.length) Object.assign(incParams, { from: chTs(w.fromMs), to: chTs(w.toMs) });
+    Object.assign(incParams, pi.params);
+    cols.push(`countIf(${pi.sql}) AS i${chunk.length}`);
+    chunk.push(p.person_id);
+    sqlBytes += pi.sql.length + 20;
   }
+  if (chunk.length) incidentChunk(chunk, cols, incParams);
   await Promise.all([eventsQuery, ...incidentQueries]);
   return persons.map((p) => ({
     ...toPerson(p),

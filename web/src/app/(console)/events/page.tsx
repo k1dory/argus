@@ -73,7 +73,7 @@ export default async function JournalPage({ searchParams }: PageProps<"/events">
           <section className="frame" aria-label="Гистограмма событий по времени">
             <div className="frame__inner px-4 pt-4 pb-3">
               {r.data.series.length === 0 ? (
-                <Empty className="py-10 text-center">Нет событий {period}.</Empty>
+                <Empty className="py-10 text-center">Нет событий {period}{chips.length ? ` по фильтрам: ${chips.map((c) => `${c.label} ${c.value}`).join(", ")}` : ""}.</Empty>
               ) : (
                 <JournalHistogram
                   bars={fillBars(r.data.series, r.data.bucketMinutes, windowBounds(f).startMs, windowBounds(f).endMs)}

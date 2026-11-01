@@ -18,9 +18,11 @@ import {
   searchErrorMessage, searchFacets, searchPage, searchSeries, seriesTotal, SERIES_SETTINGS, type Facet, type IndexKey, type SearchPlan,
 } from "@/lib/search";
 import type { SeriesPoint } from "@/lib/queries";
-import { parseRange } from "@/lib/shared/ranges";
 import { appendTerm } from "@/lib/shared/search-query";
 import { fmtMs, fmtNum, isLongRange } from "@/lib/shared/time";
+import { RangeFilters } from "@/components/console/range-filters";
+import { parseTimeFilter, rangeLabel } from "@/lib/shared/filters";
+import { parseSearchLevel, searchLevelField } from "@/lib/shared/page-filters";
 
 export const dynamic = "force-dynamic";
 export const metadata: Metadata = { title: "Поиск" };
@@ -32,27 +34,32 @@ const HINT = {
   events: 'kubectl · source:k8s.audit actor:oidc:i.petrov · severity>=7 · attr.rule_groups:sshd · src:10.20.* -outcome:allow',
 };
 
-const DT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/;
-
 export default async function SearchPage({ searchParams }: PageProps<"/search">) {
   await requirePageSession();
   const sp = await searchParams;
   const g = (k: string) => (typeof sp[k] === "string" ? (sp[k] as string) : undefined);
-  const dt = (v: string | undefined) => (v && DT_RE.test(v) ? v : undefined);
+  const index = parseIndex(g("index"));
+  // Точный интервал (невалидные даты отброшены, границы по порядку) и порог уровня индекса.
+  const time = parseTimeFilter(sp, { defaultRange: "24h" });
+  const level = parseSearchLevel(sp, index);
   const input = {
-    index: parseIndex(g("index")),
+    index,
     q: (g("q") ?? "").slice(0, MAX_QUERY_LEN),
-    range: parseRange(g("range")),
-    from: dt(g("from")),
-    to: dt(g("to")),
+    range: time.range ?? "24h",
+    from: time.from,
+    to: time.to,
     page: clampPage(g("page")),
     showMuted: g("muted") === "1",
+    levelMin: level.min,
+    levelMax: level.max,
   };
+  const levelText = rangeLabel(level.min !== undefined ? String(level.min) : undefined, level.max !== undefined ? String(level.max) : undefined);
   const def = INDEXES[input.index];
 
   const query = (patch: Record<string, string | undefined>) => {
     const p = new URLSearchParams();
-    const merged: Record<string, string | undefined> = { index: input.index, q: input.q, range: input.range, from: input.from, to: input.to, muted: input.showMuted ? "1" : undefined, ...patch };
+    const merged: Record<string, string | undefined> = { index: input.index, q: input.q, range: input.range, from: input.from, to: input.to, muted: input.showMuted ? "1" : undefined,
+      level_min: level.min !== undefined ? String(level.min) : undefined, level_max: level.max !== undefined ? String(level.max) : undefined, ...patch };
     for (const [k, v] of Object.entries(merged)) if (v) p.set(k, v);
     return p;
   };
@@ -85,6 +92,10 @@ export default async function SearchPage({ searchParams }: PageProps<"/search">)
           <input type="hidden" name="index" value={input.index} />
           <input type="hidden" name="range" value={input.range} />
           {input.showMuted && <input type="hidden" name="muted" value="1" />}
+          {input.from && <input type="hidden" name="from" value={input.from} />}
+          {input.to && <input type="hidden" name="to" value={input.to} />}
+          {level.min !== undefined && <input type="hidden" name="level_min" value={level.min} />}
+          {level.max !== undefined && <input type="hidden" name="level_max" value={level.max} />}
           <div className="flex flex-wrap gap-2">
             <Label htmlFor="search-q" className="sr-only">Строка запроса</Label>
             <Input id="search-q" name="q" defaultValue={input.q} maxLength={MAX_QUERY_LEN} placeholder={HINT[input.index]} spellCheck={false} autoFocus className="h-10 min-w-0 flex-1 px-3 font-mono sm:min-w-[24rem]" />
@@ -94,16 +105,11 @@ export default async function SearchPage({ searchParams }: PageProps<"/search">)
             <span>индекс:</span>
             {availableIndexes().map((k) => (
               <Button key={k} asChild variant="secondary" size="sm" aria-pressed={k === input.index}>
-                <Link href={href({ index: k, page: undefined })}>{INDEX_LABEL[k]}</Link>
+                <Link href={href({ index: k, page: undefined, level_min: undefined, level_max: undefined })}>{INDEX_LABEL[k]}</Link>
               </Button>
             ))}
-            <span className="ml-2" title="Время вводится и трактуется в UTC, как в ClickHouse">точный интервал, UTC:</span>
-            <Label htmlFor="search-from" className="sr-only">Начало интервала (UTC)</Label>
-            <input id="search-from" type="datetime-local" name="from" defaultValue={input.from} aria-label="Начало интервала, UTC" className="h-8 border border-border bg-[var(--surface-deep)] px-2 font-mono text-xs" />
-            <span aria-hidden>—</span>
-            <Label htmlFor="search-to" className="sr-only">Конец интервала (UTC)</Label>
-            <input id="search-to" type="datetime-local" name="to" defaultValue={input.to} aria-label="Конец интервала, UTC" className="h-8 border border-border bg-[var(--surface-deep)] px-2 font-mono text-xs" />
             {(input.from || input.to) && <Link href={href({ from: undefined, to: undefined, page: undefined })} className="underline">сбросить интервал</Link>}
+            {levelText && <Link href={href({ level_min: undefined, level_max: undefined, page: undefined })} className="underline">сбросить уровень {levelText}</Link>}
             {input.index === "alerts" && (
               <Link href={href({ muted: input.showMuted ? undefined : "1", page: undefined })} className="underline">
                 {input.showMuted ? "скрыть заглушённые правила" : "показать заглушённые правила"}
@@ -112,6 +118,9 @@ export default async function SearchPage({ searchParams }: PageProps<"/search">)
           </div>
           {formError && <p role="alert" className="text-sm text-destructive">{formError}</p>}
         </form>
+        <div className="mt-3 border-t border-border/60 pt-3">
+          <RangeFilters time fields={[searchLevelField(input.index)]} idPrefix="search" />
+        </div>
       </Panel>
 
       {plan && r?.ok && seriesP && facetsP ? (
@@ -129,6 +138,7 @@ export default async function SearchPage({ searchParams }: PageProps<"/search">)
           href={href}
           exportHref={exportHref}
           exportName={exportName}
+          emptyHint={[input.from || input.to ? "интервал" : null, levelText ? `уровень ${levelText}` : null].filter(Boolean).join(", ")}
         />
       ) : null}
     </>
@@ -161,7 +171,9 @@ function SearchResults({
   href,
   exportHref,
   exportName,
+  emptyHint,
 }: {
+  emptyHint: string;
   plan: SearchPlan;
   rows: Record<string, unknown>[];
   /** Следующая страница подтверждена лишней прочитанной строкой. */
@@ -217,7 +229,7 @@ function SearchResults({
               </thead>
               <tbody>
                 {rows.length === 0 && (
-                  <tr><td colSpan={def.columns.length + 1} className="py-8 text-center font-mono text-muted-foreground">Ничего не найдено — измените запрос или интервал</td></tr>
+                  <tr><td colSpan={def.columns.length + 1} className="py-8 text-center font-mono text-muted-foreground">Ничего не найдено{emptyHint ? ` (активны: ${emptyHint})` : ""} — измените запрос или интервал</td></tr>
                 )}
                 {rows.map((row, i) => <SearchHit key={`${String(row.time ?? "")}|${i}`} row={row} columns={def.columns} index={index} />)}
               </tbody>

@@ -16,18 +16,27 @@ import { safeQuery } from "@/lib/clickhouse";
 import { ROLE_RANK } from "@/lib/shared/incidents";
 import { engineRules, rulesFalsePositives } from "@/lib/argus-queries";
 import { fmtNum, formatAgo, formatTs } from "@/lib/shared/time";
+import { RangeFilters } from "@/components/console/range-filters";
+import { describeChips, inOrdinal, INCIDENT_LEVELS, inRange } from "@/lib/shared/filters";
+import { parseRuleRanges, RULE_RANGE_FIELDS, ruleRangeChips } from "@/lib/shared/page-filters";
 
 export const dynamic = "force-dynamic";
 export const metadata: Metadata = { title: "Правила корреляции" };
 
-export default async function RulesPage() {
+export default async function RulesPage({ searchParams }: PageProps<"/rules">) {
   const session = await requirePageSession();
+  // Правила приходят с движка целиком (HTTP без фильтров) — пороги применяются здесь, в памяти.
+  // Окна времени у списка нет: правило не событие, статистика ложных — всегда за 30 дней.
+  const ranges = parseRuleRanges(await searchParams);
+  const filtersText = describeChips(ruleRangeChips(ranges));
   // Правила — с движка (HTTP), статистика ложных — из ClickHouse: падение одного не гасит другое.
   const [engine, fpRes] = await Promise.all([engineRules(), safeQuery(() => rulesFalsePositives())]);
   const { rules, health, error } = engine;
   const fp = fpRes.data ?? {};
   const now = new Date();
   const lastRun = typeof health?.last_run === "string" ? health.last_run : null;
+  const fpPct = (id: string): number => (fp[id]?.total ? (100 * fp[id].false_positive) / fp[id].total : 0);
+  const shown = rules.filter((r) => inOrdinal(r.Level, ranges.level, INCIDENT_LEVELS) && inRange(fp[r.ID]?.total ?? 0, ranges.incidents) && inRange(fpPct(r.ID), ranges.fp));
 
   return (
     <>
@@ -61,7 +70,8 @@ export default async function RulesPage() {
 
           {fpRes.error && <StorageUnavailable reason={fpRes.error} label="Статистика ложных недоступна" />}
 
-          <Panel label="Загруженные правила" meta="argus rules test — прогон на записанном трафике">
+          <Panel label={shown.length === rules.length ? "Загруженные правила" : `Загруженные правила · ${fmtNum(shown.length)} из ${fmtNum(rules.length)}`} meta="argus rules test — прогон на записанном трафике">
+            <div className="mb-4"><RangeFilters fields={RULE_RANGE_FIELDS} idPrefix="rules" /></div>
             <div className="c-well overflow-x-auto p-2">
               <Table>
                 <TableHeader>
@@ -80,7 +90,10 @@ export default async function RulesPage() {
                   {rules.length === 0 && (
                     <TableRow><TableCell colSpan={8} className="py-8 text-center font-mono text-muted-foreground">Движок не загрузил ни одного правила — проверьте каталог rules/.</TableCell></TableRow>
                   )}
-                  {rules.map((r) => (
+                  {rules.length > 0 && shown.length === 0 && (
+                    <TableRow><TableCell colSpan={8} className="py-8 text-center font-mono text-muted-foreground">Нет правил по фильтрам: {filtersText} — ослабьте пороги.</TableCell></TableRow>
+                  )}
+                  {shown.map((r) => (
                     <TableRow key={r.ID} className="border-border/40">
                       <TableCell className="font-mono text-xs">{r.ID}</TableCell>
                       <TableCell className="text-sm whitespace-normal">{r.Title}</TableCell>

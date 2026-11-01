@@ -18,7 +18,8 @@ const ROOT = path.resolve(__dirname, "../..");
 
 function ruleFiles(dir: string): string[] {
   return fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
-    e.isDirectory() ? ruleFiles(path.join(dir, e.name)) : e.name.endsWith(".yml") ? [path.join(dir, e.name)] : []);
+    // Как rules.Files в engine: .yml и .yaml, каталоги tests (описания тестов правил) на любом уровне пропускаются.
+    e.isDirectory() ? (e.name === "tests" ? [] : ruleFiles(path.join(dir, e.name))) : /\.ya?ml$/.test(e.name) ? [path.join(dir, e.name)] : []);
 }
 const rules = ruleFiles(path.join(ROOT, "rules")).map((f) => ({ file: path.relative(ROOT, f), ...(yaml.load(fs.readFileSync(f, "utf8")) as { tags?: string[] }) }));
 
@@ -46,6 +47,21 @@ test("теги правил: каждая техника из attack.tNNNN ес�
     .filter((t) => !ruleTechniques([t]).length).map((t) => `${r.file}: ${t}`));
   assert.deepEqual(missing, [], "обновите справочник или тег правила");
   assert.ok(rules.filter((r) => ruleTechniques(r.tags ?? []).length).length >= 20, "контроль: правила с техниками найдены");
+});
+
+test("теги правил: техника относится к одной из тактик правила, у правил ИБ техника есть", () => {
+  const byId = new Map(dictionary.techniques.map((t) => [t.id, t]));
+  const mismatched = rules.flatMap((r) => {
+    const tactics = ruleTactics(r.tags ?? []);
+    if (!tactics.length) return [];
+    return ruleTechniques(r.tags ?? []).filter((id) => !byId.get(id)?.tactics.some((x) => tactics.includes(x)))
+      .map((id) => `${r.file}: ${id} (${byId.get(id)?.tactics.join(", ")}) не в ${tactics.join(", ")}`);
+  });
+  assert.deepEqual(mismatched, [], "техника из чужой тактики: кандидаты и тактика по умолчанию разойдутся");
+  // Эксплуатационные правила (ops.*) — без ATT&CK; правилу ИБ без техники форма
+  // закрытия подбирает кандидатов только по тактике.
+  const noTechnique = rules.filter((r) => !(r.tags ?? []).some((t) => t.startsWith("ops.")) && !ruleTechniques(r.tags ?? []).length).map((r) => r.file);
+  assert.deepEqual(noTechnique, [], "правило ИБ без attack.tNNNN");
 });
 
 test("кандидаты: для каждого правила и тактики — не больше 20, без повторов, теги правила первыми", () => {

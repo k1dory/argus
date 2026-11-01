@@ -25,6 +25,8 @@ import { isIncidentStatus, type IncidentStatus } from "./shared/incidents";
 import type { ClosureLabel } from "./shared/closure-label";
 import { addrSQL, blockState, GROUP_ROWS_PAGE, GROUPS_PAGE, isSubnetKey, levelOfRank, SCAN_GROUP_RULES, subnetSQL, type BlockRow, type BlockState } from "./shared/scan-groups";
 import { AGENT_VERDICT_SESSION_ORDER } from "./shared/triage-verdict";
+import { INCIDENT_LEVELS, numConditions, ordinalConditions, timeCondition, type NumRange, type TimeFilter } from "./shared/filters";
+import type { IncidentRanges } from "./shared/page-filters";
 
 
 export type IncidentRow = {
@@ -53,7 +55,11 @@ export type IncidentRow = {
 
 const LATEST = `SELECT * FROM incidents_current`;
 
-type IncidentFilter = { status?: string; level?: string; q?: string; page?: number; pageSize?: number; queue?: "open" | "mine" | "unassigned" | "overdue"; user?: string; groupScans?: boolean };
+export type IncidentFilter = {
+  status?: string; level?: string; q?: string; page?: number; pageSize?: number; queue?: "open" | "mine" | "unassigned" | "overdue"; user?: string; groupScans?: boolean;
+  /** Диапазоны (lib/shared/page-filters): окно по first_ts, уровень не ниже/не выше, число событий. */
+  ranges?: Partial<IncidentRanges>;
+};
 
 /** Условия очереди (поиск, статус, уровень, очередь) — общие для списка и групп сканов. */
 function incidentConditions(filter: IncidentFilter, params: Record<string, string | number>): string[] {
@@ -70,6 +76,12 @@ function incidentConditions(filter: IncidentFilter, params: Record<string, strin
     having.push("level = {level:String}");
     params.level = filter.level;
   }
+  // incidents_current — представление над ReplacingMergeTree с ключом incident_id:
+  // ни партиций, ни ключа по времени у него нет, условие окна — по агрегированной строке.
+  const r = filter.ranges;
+  if (r?.time) having.push(...timeCondition("first_ts", r.time, params, "inc_t"));
+  if (r?.level) having.push(...ordinalConditions("level", r.level, INCIDENT_LEVELS, params, "inc_lvl"));
+  if (r?.events) having.push(...numConditions("event_count", r.events, params, "inc_ev", "UInt64"));
   if (filter.queue === "open") {
     having.push("status NOT IN ('closed', 'false_positive')");
   } else if (filter.queue === "mine") {
@@ -536,7 +548,7 @@ export async function sourcesHealthReport(): Promise<SourcesReport> {
   type Num = number | string; // ClickHouse JSON: UInt32/Float64 приходят числами, count() — строкой
   type Hour = { source: string; source_class: string; events_1h: Num; eps_60s: Num; last_ts: string; last_sec: Num; pii_share: Num | null; now_sec: Num };
   type Rhythm = { source: string; events_window: Num; gap_q: Num | null; last_sec: Num; now_sec: Num };
-  type Stale = { source: string; source_class: string; last_ts: string; last_sec: Num; stale_total: Num };
+  type Stale = { source: string; source_class: string; last_ts: string; last_sec: Num; stale_total: Num; now_sec?: Num };
   const days = RHYTHM_WINDOW_DAYS;
   const [hour, rhythm, staleRows] = await Promise.all([
     chQuery<Hour>(
@@ -545,7 +557,7 @@ export async function sourcesHealthReport(): Promise<SourcesReport> {
               max(received_at) AS last_ts, toUnixTimestamp(max(received_at)) AS last_sec,
               round(100 * avg(pii), 1) AS pii_share, toUnixTimestamp(now()) AS now_sec
        FROM events WHERE received_at >= now() - INTERVAL 1 HOUR
-       GROUP BY source ORDER BY events_1h DESC`,
+       GROUP BY source ORDER BY events_1h DESC, source`,
     ),
     chQuery<Rhythm>(
       `SELECT source, events_window, arrayReduce('quantileExactWeighted({q:Float64})', gaps, gaps) AS gap_q, last_sec, now_sec
@@ -559,7 +571,7 @@ export async function sourcesHealthReport(): Promise<SourcesReport> {
     ),
     chQuery<Stale>(
       `SELECT source, any(source_class) AS source_class, max(received_at) AS last_ts,
-              toUnixTimestamp(max(received_at)) AS last_sec, count() OVER () AS stale_total
+              toUnixTimestamp(max(received_at)) AS last_sec, count() OVER () AS stale_total, toUnixTimestamp(now()) AS now_sec
        FROM events WHERE ${SOURCE_LAST_READY} GROUP BY source
        HAVING last_ts >= now() - INTERVAL {days:UInt32} DAY AND last_ts < now() - INTERVAL 1 HOUR
        ORDER BY last_ts DESC, source LIMIT {lim:UInt32}
@@ -595,7 +607,7 @@ export async function sourcesHealthReport(): Promise<SourcesReport> {
     type Named = Omit<Stale, "stale_total">;
     beyondLimit = (await chQuery<Named>(
       `SELECT source, any(source_class) AS source_class, max(received_at) AS last_ts,
-              toUnixTimestamp(max(received_at)) AS last_sec
+              toUnixTimestamp(max(received_at)) AS last_sec, toUnixTimestamp(now()) AS now_sec
        FROM events WHERE source IN {names:Array(String)} AND ${SOURCE_LAST_READY} GROUP BY source
        HAVING last_ts >= now() - INTERVAL {days:UInt32} DAY AND last_ts < now() - INTERVAL 1 HOUR
        SETTINGS force_optimize_projection = 1`,
@@ -618,9 +630,14 @@ export async function sourcesHealthReport(): Promise<SourcesReport> {
   const unionTotal = Math.max(projTotal, proj.length + beyondLimit.length) + heartbeatOnly.length;
   const omitted = Math.max(0, unionTotal - staleShown.length);
   const byStale = new Map(staleShown.map((r) => [r.source, r]));
+  // «Сейчас» — по часам ClickHouse, как last_sec: часы Node на другой машине (или в
+  // контейнере) могут расходиться с базой, и silent_for_sec сдвинулся бы на разницу.
+  // Date.now() — только если ни один запрос не вернул строк (тогда и источников нет).
+  const chNow = [hour[0]?.now_sec, rhythm[0]?.now_sec, staleRows?.[0]?.now_sec, beyondLimit[0]?.now_sec]
+    .map((v) => Number(v)).find((v) => Number.isFinite(v) && v > 0);
   const sources = [...hour.map((r) => r.source), ...staleShown.map((r) => r.source)].map((source) => {
     const h = byHour.get(source), rh = byRhythm.get(source), st = byStale.get(source);
-    const now = Number(h?.now_sec ?? rh?.now_sec ?? Math.floor(Date.now() / 1000));
+    const now = Number(h?.now_sec ?? rh?.now_sec ?? st?.now_sec ?? chNow ?? Math.floor(Date.now() / 1000));
     // Последнее событие: таблица событий точнее heartbeat (минутная гранулярность).
     const last = Number(h?.last_sec ?? st?.last_sec ?? rh?.last_sec ?? now);
     const lastTs = h?.last_ts ?? st?.last_ts ?? "";
@@ -659,13 +676,18 @@ export type EventRow = {
   pii: number;
 };
 
-export async function eventsRecent(source?: string, limit = 60): Promise<EventRow[]> {
+/** Лента «Источников»: окно по received_at (minmax-индекс idx_received_at, 0028) и порог серьёзности. */
+export type RecentFilters = { time?: TimeFilter; severity?: NumRange };
+
+export async function eventsRecent(source?: string, limit = 60, f: RecentFilters = {}): Promise<EventRow[]> {
   const params: Record<string, string | number> = { limit };
-  let where = "received_at >= now() - INTERVAL 24 HOUR";
+  const conds = timeCondition("received_at", f.time ?? { range: "24h" }, params, "rcv");
   if (source) {
-    where += " AND source = {source:String}";
+    conds.push("source = {source:String}");
     params.source = source;
   }
+  if (f.severity) conds.push(...numConditions("severity", f.severity, params, "sev", "UInt8"));
+  const where = conds.join(" AND ");
   return chQuery<EventRow>(
     `SELECT ts, received_at, source, action, outcome, severity, actor_name, object, node, src_ip, dst_ip, dst_port, pii
      FROM events WHERE ${where} ORDER BY received_at DESC, ts DESC LIMIT {limit:UInt32}`,
@@ -1044,7 +1066,7 @@ export async function requestRevokeExclusion(ip: string, user: string, reason: s
 }
 
 export { blockCandidates, publicIpsFromChain } from "./shared/respond";
-import { blockCandidates as blockCandidatesRaw } from "./shared/respond";
+import { blockCandidates as blockCandidatesRaw, isOpsIncident } from "./shared/respond";
 
 /** Свои сети из INTERNAL_NETS (те же, что у коллектора для attrs.scope и у движка в allowlist). */
 export function ownNets(): string[] {
@@ -1052,7 +1074,9 @@ export function ownNets(): string[] {
 }
 
 /** Кандидаты на блокировку с учётом собственных сетей инсталляции. */
-export function blockCandidatesFor(inc: { actor_name: string; chain: string[] }): string[] {
+export function blockCandidatesFor(inc: { actor_name: string; chain: string[]; tags?: string[] }): string[] {
+  // Инцидент эксплуатации — не повод блокировать: кнопок нет, и blockIpAction их не примет.
+  if (isOpsIncident(inc.tags)) return [];
   return blockCandidatesRaw(inc.actor_name, inc.chain, ownNets());
 }
 

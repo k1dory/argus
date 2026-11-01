@@ -74,8 +74,8 @@ function fullRoutes(): Route[] {
     { when: (s) => s.includes("LEFT JOIN"), rows: () => [] },
     { when: (s) => s.includes("FROM identity_aliases") && s.includes("WHERE person_id = {id:String}"), rows: () => aliases.filter((a) => a.person_id === "i.petrov") },
     { when: (s) => s.includes("FROM identity_aliases"), rows: () => aliases },
-    // Активность списка: номер персоны в плане (1 — первая персона с алиасами), события, последнее.
-    { when: (s) => s.includes("ARRAY JOIN ps AS p") && s.includes("FROM events"), rows: () => [{ p: 1, events: 5, last_ts: "2026-10-29 09:00:00.000" }] },
+    // Активность списка: персона 1 плана — первая персона с алиасами.
+    { when: (s) => s.includes("GROUP BY hits") && s.includes("FROM events"), rows: () => [{ p: 1, n: 5, last_ts: "2026-10-29 09:00:00.000" }] },
     { when: (s) => s.includes("countIf(") && s.includes("FROM incidents_current"), rows: () => [{ i0: 0, i1: 2 }] },
     { when: (s) => s.includes("groupUniqArray"), rows: () => [
       { actor_name: "a.smirnova", count: 40, first_ts: TS, last_ts: TS, sources: ["idp"] },
@@ -140,7 +140,7 @@ test("список: сводка по персонам — события и и�
   assert.match(text, /служебная/);
   assert.match(text, /platform/);
   assert.match(text, /2026-10-29 09:00:00/, "последняя активность i.petrov");
-  const evs = fetched.filter((s) => s.includes("FROM events") && s.includes("ARRAY JOIN ps AS p"));
+  const evs = fetched.filter((s) => s.includes("FROM events") && s.includes("GROUP BY hits"));
   assert.equal(evs.length, 1, "события всех персон — одним проходом");
   assert.match(evs[0], /transform\(lowerUTF8\(actor_name\), \{ap_k1:Array\(String\)\}/, "login сравнивается без регистра");
   assert.ok(!evs[0].includes("ivan@corp.local"), "значения — параметрами, не в тексте SQL");
@@ -346,4 +346,30 @@ test("по алиасу: неоднозначно — кандидаты с ин
   text = await pageText(await byAliasPage.default(props({}, { v: "guest7" })));
   assert.match(text, /недоступн/i);
   assert.ok(!/Привязать к персоне/.test(text), "без хранилища форма не показывается");
+});
+
+/* ===== Диапазоны списка ===== */
+
+test("список: пороги событий/инцидентов сужают персон; точное окно уходит в запрос параметрами", async () => {
+  await auth.createSession("analyst1", "analyst");
+  // events_min=1 — только i.petrov (5 событий).
+  let text = await pageText(await actorsPage.default(props({}, { range: "24h", events_min: "1" })));
+  assert.match(text, /Иван Петров/);
+  assert.doesNotMatch(text, /Анна Смирнова/, "у a.smirnova нет событий за окно");
+  assert.doesNotMatch(text, /служебная/, "svc.backup без событий");
+  // incidents_min=1 — только a.smirnova (два инцидента).
+  text = await pageText(await actorsPage.default(props({}, { incidents_min: "1" })));
+  assert.match(text, /Анна Смирнова/);
+  assert.doesNotMatch(text, /Иван Петров/);
+  // Пороги, под которые никто не подходит, — пустое состояние с перечнем фильтров.
+  text = await pageText(await actorsPage.default(props({}, { events_min: "100", incidents_max: "0" })));
+  assert.match(text, /Нет персон по фильтрам: событий ≥ 100, инцидентов ≤ 0/);
+  assert.match(text, /Персон 3/, "сводные плитки — по всем персонам");
+  // Точное окно: границы — параметрами from/to запроса событий, подпись — интервал.
+  const seen: URLSearchParams[] = [];
+  routes = routes.map((r) => (r.when("GROUP BY hits FROM events") ? { ...r, rows: (p: URLSearchParams) => { seen.push(p); return r.rows(p); } } : r));
+  text = await pageText(await actorsPage.default(props({}, { from: "2026-10-28T00:00", to: "2026-10-29T00:00" })));
+  assert.match(text, /активность интервал 2026-10-28 00:00 — 2026-10-29 00:00 UTC/);
+  assert.equal(seen[0]?.get("param_from"), "2026-10-28 00:00:00.000");
+  assert.equal(seen[0]?.get("param_to"), "2026-10-29 00:00:00.000");
 });

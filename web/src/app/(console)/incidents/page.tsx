@@ -30,6 +30,10 @@ import { hideVerdicts } from "@/lib/blind";
 import { INCIDENT_LEVEL_LABELS } from "@/lib/shared/labels";
 import { clampPage } from "@/lib/shared/limits";
 import { fmtNum, formatAgo, formatTs } from "@/lib/shared/time";
+import { RangeFilters } from "@/components/console/range-filters";
+import { RangePicker } from "@/components/console/range-picker";
+import { describeChips } from "@/lib/shared/filters";
+import { INCIDENT_RANGE_FIELDS, INCIDENT_RANGE_KEYS, incidentRangeChips, parseIncidentRanges, pickParams } from "@/lib/shared/page-filters";
 
 export const dynamic = "force-dynamic";
 export const metadata: Metadata = { title: "Инциденты" };
@@ -63,21 +67,29 @@ export default async function IncidentsPage({ searchParams }: PageProps<"/incide
   const gpage = clampPage(params.gpage);
   const spage = clampPage(params.spage);
   const canEdit = ROLE_RANK[session.role] >= ROLE_RANK.analyst;
+  // Диапазоны: окно по началу, уровень не ниже/не выше, событий в цепочке. level=… — прежний точный уровень (кнопки ниже).
+  const ranges = parseIncidentRanges(params);
+  const rangeQs = pickParams(params, INCIDENT_RANGE_KEYS);
+  const rangeChips = incidentRangeChips(ranges);
 
   const href = (patch: Record<string, string | undefined>) => {
     const qs = new URLSearchParams();
+    // Ссылки листания (page/gpage/spage, раскрытие подсети) сохраняют страницы групп; смена
+    // фильтра (статус, уровень, очередь, вид сканов) начинает все списки с первой страницы.
+    const paging = Object.keys(patch).every((k) => k === "page" || k === "gpage" || k === "spage" || k === "subnet");
     const next = { status, level, q, queue, scans: scansList ? "list" : undefined, subnet,
-      gpage: gpage > 1 ? String(gpage) : undefined, spage: spage > 1 ? String(spage) : undefined, page: undefined as string | undefined, ...patch };
+      gpage: paging && gpage > 1 ? String(gpage) : undefined, spage: paging && spage > 1 ? String(spage) : undefined, ...Object.fromEntries(new URLSearchParams(rangeQs)),
+      page: undefined as string | undefined, ...patch };
     for (const [k, v] of Object.entries(next)) if (v) qs.set(k, v);
     const s = qs.toString();
     return s ? `/incidents?${s}` : "/incidents";
   };
 
   const r = await safeQuery(async () => {
-    const [list, stats] = await Promise.all([incidentsList({ status, level, q, page, queue, user: session.user, groupScans: !scansList }), incidentStats()]);
+    const [list, stats] = await Promise.all([incidentsList({ status, level, q, page, queue, user: session.user, groupScans: !scansList, ranges }), incidentStats()]);
     return { list, stats };
   });
-  const filter = { status, level, q, queue, user: session.user } as const;
+  const filter = { status, level, q, queue, user: session.user, ranges } as const;
   // Группы и раскрытая подсеть — отдельно: их недоступность не мешает очереди.
   const groups = r.ok && !scansList ? await safeQuery(() => scanGroups({ ...filter, page: gpage }, GROUPS_PAGE)) : null;
   const expanded = r.ok && !scansList && subnet ? await safeQuery(async () => {
@@ -200,7 +212,7 @@ export default async function IncidentsPage({ searchParams }: PageProps<"/incide
                   </div>
                 )}
                 {canEdit && spage === 1 && expanded.data.rows.length > 0 && expanded.data.rows.length <= GROUP_ACTION_MAX && <ScanGroupActions subnet={subnet}
-                  ids={expanded.data.rows.map((x) => x.incident_id)} filter={{ status, level, q, queue }}
+                  ids={expanded.data.rows.map((x) => x.incident_id)} filter={{ status, level, q, queue, ranges: rangeQs }}
                   attack={attackFormOptions([...new Set(expanded.data.rows.flatMap((x) => x.tags))])}
                   isAdmin={session.role === "admin"} users={expanded.data.users.map((u) => ({ name: u.name, role: u.role }))} />}
                 {canEdit && (spage > 1 || expanded.data.rows.length > GROUP_ACTION_MAX) && (
@@ -222,6 +234,7 @@ export default async function IncidentsPage({ searchParams }: PageProps<"/incide
               {level && <input type="hidden" name="level" value={level} />}
               {queue && <input type="hidden" name="queue" value={queue} />}
               {scansList && <input type="hidden" name="scans" value="list" />}
+              {[...new URLSearchParams(rangeQs)].map(([k, v]) => <input key={k} type="hidden" name={k} value={v} />)}
               <div className="w-full space-y-1 sm:w-96">
                 <Label htmlFor="inc-q" className="c-label">Поиск</Label>
                 <Input id="inc-q" name="q" defaultValue={q ?? ""} maxLength={200} placeholder="INC-…, правило, субъект, узел, источник" className="h-10 px-3" />
@@ -251,9 +264,16 @@ export default async function IncidentsPage({ searchParams }: PageProps<"/incide
               <span className="mx-2 h-5 w-px bg-border" aria-hidden />
               {LEVELS.map((l) => (
                 <Button key={l} asChild variant="secondary" size="sm" aria-pressed={level === l}>
-                  <Link href={href({ level: level === l ? undefined : l })}>{INCIDENT_LEVEL_LABELS[l]}</Link>
+                  <Link href={href({ level: level === l ? undefined : l, level_min: undefined, level_max: undefined })}>{INCIDENT_LEVEL_LABELS[l]}</Link>
                 </Button>
               ))}
+            </div>
+            <div className="mb-5 space-y-3 border-t border-border/60 pt-4">
+              <div className="flex flex-wrap items-center gap-3">
+                <span className="c-label">Начало инцидента</span>
+                <RangePicker value={ranges.time.range} keys={["24h", "7d", "30d"]} anyLabel="Всё время" />
+              </div>
+              <RangeFilters time timeLabel="Начало, точный интервал UTC" fields={INCIDENT_RANGE_FIELDS} legacy={["level"]} idPrefix="inc" />
             </div>
             <div className="c-well overflow-x-auto p-2">
               <Table className="min-w-[1050px] table-fixed">
@@ -277,7 +297,7 @@ export default async function IncidentsPage({ searchParams }: PageProps<"/incide
                   {r.data.list.rows.length === 0 && (
                     <TableRow>
                       <TableCell colSpan={8} className="py-8 text-center font-mono text-muted-foreground">
-                        {q || status || level || queue ? "По этим условиям инцидентов нет — снимите фильтры" : "Инцидентов нет — движок ждёт событий (make replay заливает записанный трафик)"}
+                        {q || status || level || queue || rangeChips.length ? `По этим условиям инцидентов нет${rangeChips.length ? ` (${describeChips(rangeChips)})` : ""} — снимите фильтры` : "Инцидентов нет — движок ждёт событий (make replay заливает записанный трафик)"}
                       </TableCell>
                     </TableRow>
                   )}

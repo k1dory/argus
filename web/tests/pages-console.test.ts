@@ -46,7 +46,8 @@ const isNotFound = (e: unknown): boolean => e instanceof Error && /NEXT_HTTP_ERR
 const down = () => new ClickHouseError("ClickHouse недоступен: нет соединения");
 
 /* ===== fetch: ClickHouse по подстроке SQL, движок по пути ===== */
-type Route = { when: (sql: string) => boolean; rows: () => Record<string, unknown>[] };
+// rows получает параметры запроса (param_*): фильтры диапазонов проверяются по тому, что дошло до ClickHouse.
+type Route = { when: (sql: string) => boolean; rows: (params: URLSearchParams) => Record<string, unknown>[] };
 let routes: Route[] = [];
 let chDown = false;
 const fetched: string[] = [];
@@ -57,7 +58,7 @@ globalThis.fetch = (async (input: URL | string | Request, init?: RequestInit) =>
   if (chDown) throw Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:9"), { cause: { code: "ECONNREFUSED" } });
   if (url.includes("/healthz")) return new Response("{}", { status: 503 });
   if (url.includes("query=SELECT")) return new Response("1\n");
-  for (const r of routes) if (r.when(sql)) return new Response(r.rows().map((x) => JSON.stringify(x)).join("\n") + "\n");
+  for (const r of routes) if (r.when(sql)) return new Response(r.rows(new URL(url).searchParams).map((x) => JSON.stringify(x)).join("\n") + "\n");
   return new Response("");
 }) as typeof fetch;
 
@@ -580,4 +581,189 @@ test("layout Wazuh: без модуля — 404, с модулем — дети 
   assert.match(stripTags(ge), /ARGUS SIEM · ошибка/);
   assert.match(stripTags(ge), /digest d1/);
   assert.doesNotMatch(stripTags(ge), /secret/);
+});
+
+/* ===== Диапазонные фильтры: параметр сужает выдачу ===== */
+
+/* eslint-disable @typescript-eslint/no-require-imports -- общие хелперы фильтров, как у страниц */
+const F = require("../src/lib/shared/filters") as typeof import("../src/lib/shared/filters");
+/* eslint-enable @typescript-eslint/no-require-imports */
+
+test("инциденты: окно по началу, уровень не ниже и событий от — доходят до запроса и сужают очередь; level=… остаётся точным", async () => {
+  await auth.createSession("viewer1", "viewer");
+  const ROWS = [
+    incidentRow({ incident_id: "INC-1", level: "critical", event_count: 40, first_ts: "2026-10-29 09:00:00" }),
+    incidentRow({ incident_id: "INC-2", level: "medium", event_count: 3, first_ts: "2026-10-29 09:00:00" }),
+    incidentRow({ incident_id: "INC-3", level: "high", event_count: 12, first_ts: "2026-10-01 09:00:00" }),
+  ];
+  const seen: Record<string, unknown>[] = [];
+  // Мок применяет фильтр так же, как условие запроса: уровень — по шкале, окно — по first_ts.
+  mocks.queries.incidentsList = async (...args: unknown[]) => {
+    const f = args[0] as { level?: string; ranges?: import("../src/lib/shared/page-filters").IncidentRanges };
+    seen.push(f as Record<string, unknown>);
+    const r = f.ranges!;
+    const rows = ROWS.filter((x) => (!f.level || x.level === f.level) && F.inOrdinal(x.level, r.level, F.INCIDENT_LEVELS)
+      && F.inRange(x.event_count, r.events) && F.inTime(x.first_ts, r.time, Date.UTC(2026, 9, 29, 12)));
+    return { rows, total: rows.length, page: 1, pageSize: 50 };
+  };
+  let text = await pageText(await incidents.default(props({}, { level_min: "high" })));
+  assert.match(text, /Очередь · 2 инцидентов/);
+  assert.match(text, /INC-1/);
+  assert.doesNotMatch(text, /INC-2/);
+  text = await pageText(await incidents.default(props({}, { events_min: "10", from: "2026-10-28T00:00" })));
+  assert.match(text, /Очередь · 1 инцидентов/);
+  assert.match(text, /INC-1/);
+  assert.deepEqual((seen.at(-1)!.ranges as { time: unknown }).time, { from: "2026-10-28T00:00" });
+  // Прежняя ссылка level=medium — точный уровень, не диапазон.
+  text = await pageText(await incidents.default(props({}, { level: "medium" })));
+  assert.match(text, /INC-2/);
+  assert.doesNotMatch(text, /INC-1/);
+  // Пустая очередь называет активные диапазоны.
+  text = await pageText(await incidents.default(props({}, { level_min: "critical", events_max: "5", range: "7d" })));
+  assert.match(text, /По этим условиям инцидентов нет \(начало 7 дней, уровень ≥ критический, событий ≤ 5\) — снимите фильтры/);
+  // Ссылки очереди сохраняют диапазоны; кнопка точного уровня их снимает.
+  const markup = html(await incidents.default(props({}, { level_min: "high", from: "2026-10-28T00:00" })) as React.ReactElement, "/incidents");
+  assert.match(markup, /href="\/incidents\?queue=open&amp;from=2026-10-28T00%3A00&amp;level_min=high"/);
+  assert.match(markup, /href="\/incidents\?level=critical&amp;from=2026-10-28T00%3A00"/);
+});
+
+test("источники: фильтры таблицы (последний приём, событий за час, EPS) и ленты (окно поступления, серьёзность)", async () => {
+  await auth.createSession("viewer1", "viewer");
+  mocks.queries.sourcesHealth = async () => [
+    { source: "linux.auth", source_class: "syslog", events_1h: 120, eps_60s: 2, last_ts: "2026-10-29 10:00:00", pii_share: 0, alive: 1, events_window: 9000, rhythm_sec: 60, silence_threshold_sec: 300, silent_for_sec: 10 },
+    { source: "ci.nightly", source_class: "cicd", events_1h: 0, eps_60s: 0, last_ts: "2026-10-27 03:00:00", pii_share: 0, alive: 0, events_window: 3, rhythm_sec: 86400, silence_threshold_sec: 259200, silent_for_sec: 300000 },
+  ];
+  const FEED = [
+    { ts: NOW, received_at: NOW, source: "linux.auth", action: "login", outcome: "failure", severity: 8, actor_name: "root", object: "", node: "bastion", src_ip: "", dst_ip: "", dst_port: 0, pii: 0 },
+    { ts: NOW, received_at: NOW, source: "linux.auth", action: "cron.run", outcome: "success", severity: 1, actor_name: "cron", object: "", node: "bastion", src_ip: "", dst_ip: "", dst_port: 0, pii: 0 },
+  ];
+  let feedArgs: unknown[] = [];
+  mocks.queries.eventsRecent = async (...args: unknown[]) => {
+    feedArgs = args;
+    const f = (args[2] ?? {}) as { severity?: { min?: number; max?: number } };
+    return FEED.filter((e) => F.inRange(e.severity, f.severity ?? {}));
+  };
+  let text = await pageText(await sources.default(props({}, { seen_to: "2026-10-28T00:00" })));
+  assert.match(text, /ci\.nightly/);
+  assert.doesNotMatch(text, /linux\.auth syslog/, "приём позже окна — строки нет");
+  text = await pageText(await sources.default(props({}, { events_min: "1" })));
+  assert.doesNotMatch(text, /ci\.nightly/);
+  text = await pageText(await sources.default(props({}, { eps_min: "100" })));
+  assert.match(text, /Нет источников по фильтрам: EPS ≥ 100/);
+
+  text = await pageText(await sources.default(props({}, { level_min: "5", range: "7d" })));
+  assert.match(text, /login/);
+  assert.doesNotMatch(text, /cron\.run/);
+  assert.deepEqual(feedArgs[2], { time: { range: "7d" }, severity: { min: 5 } });
+  text = await pageText(await sources.default(props({}, { level_min: "10" })));
+  assert.match(text, /Поступлений по фильтрам нет: серьёзность ≥ 10/);
+});
+
+test("правила: уровень не ниже, инцидентов за 30 дней и доля ложных — фильтр в памяти по ответу движка", async () => {
+  await auth.createSession("viewer1", "viewer");
+  mocks.queries.engineRules = async () => ({
+    rules: [
+      { ID: "ssh.bruteforce", Title: "Перебор SSH", Level: "high", File: "linux/ssh.yml", Tags: [], Threshold: true, Profile: "" },
+      { ID: "k8s.exec", Title: "exec в pod", Level: "medium", File: "k8s/exec.yml", Tags: [], Threshold: false, Profile: "" },
+      { ID: "vpn.geo", Title: "VPN из новой страны", Level: "critical", File: "vpn/geo.yml", Tags: [], Threshold: false, Profile: "" },
+    ],
+    health: null,
+    error: null,
+  });
+  mocks.queries.rulesFalsePositives = async () => ({
+    "ssh.bruteforce": { rule_id: "ssh.bruteforce", total: 4, false_positive: 1, closed: 3 },
+    "vpn.geo": { rule_id: "vpn.geo", total: 10, false_positive: 8, closed: 2 },
+  });
+  let text = await pageText(await rules.default(props({}, { level_min: "high" })));
+  assert.match(text, /Загруженные правила · 2 из 3/);
+  assert.doesNotMatch(text, /exec в pod/);
+  text = await pageText(await rules.default(props({}, { fp_min: "50" })));
+  assert.match(text, /VPN из новой страны/);
+  assert.doesNotMatch(text, /Перебор SSH/);
+  text = await pageText(await rules.default(props({}, { incidents_min: "1", level_max: "high" })));
+  assert.match(text, /Перебор SSH/);
+  assert.doesNotMatch(text, /VPN из новой страны|exec в pod/);
+  text = await pageText(await rules.default(props({}, { incidents_min: "100" })));
+  assert.match(text, /Нет правил по фильтрам: инцидентов ≥ 100/);
+});
+
+test("поиск: level_min/level_max — условие на серьёзность индекса параметрами; форма запроса их сохраняет", async () => {
+  await auth.createSession("viewer1", "viewer");
+  const EVENTS = [
+    { time: NOW, severity: 8, source: "linux.auth", action: "login", outcome: "failure", actor_name: "root", node: "bastion", src_ip: "203.0.113.5", object: "", raw: "" },
+    { time: NOW, severity: 2, source: "linux.auth", action: "cron.run", outcome: "success", actor_name: "cron", node: "bastion", src_ip: "", object: "", raw: "" },
+  ];
+  const lvl = (p: URLSearchParams, v: number) => (p.get("param_lvl_min") === null || v >= Number(p.get("param_lvl_min"))) && (p.get("param_lvl_max") === null || v <= Number(p.get("param_lvl_max")));
+  routes = [
+    { when: (s) => s.includes("FROM events WHERE") && s.includes("OFFSET"), rows: (p) => EVENTS.filter((e) => lvl(p, e.severity)) },
+    { when: (s) => s.includes("toStartOfInterval(ts"), rows: (p) => [{ bucket: NOW, low: String(EVENTS.filter((e) => lvl(p, e.severity) && e.severity < 3).length), high: "0", critical: String(EVENTS.filter((e) => lvl(p, e.severity) && e.severity >= 8).length) }] },
+  ];
+  let markup = html(await search.default(props({}, { index: "events", level_min: "5" })) as React.ReactElement, "/search");
+  const text = stripTags(markup);
+  assert.match(text, /203\.0\.113\.5/);
+  assert.doesNotMatch(text, /cron\.run/);
+  assert.match(text, /сбросить уровень ≥ 5/);
+  assert.match(markup, /name="level_min" value="5"/, "отправка формы запроса сохраняет порог");
+  markup = html(await search.default(props({}, { index: "events", level_min: "9" })) as React.ReactElement, "/search");
+  assert.match(stripTags(markup), /Ничего не найдено \(активны: уровень ≥ 9\)/);
+});
+
+test("журнал: «серьёзность до» (level_max) уходит в запрос как severity <= параметром и сужает ленту", async () => {
+  await auth.createSession("viewer1", "viewer");
+  const row = (id: string, severity: number, action: string) => ({ time: NOW, received: NOW, id, severity, source: "linux.auth", source_class: "syslog", vendor: "", product: "", action, outcome: "", actor_name: "root", actor_kind: "user", object: "", node: "bastion", session_id: "", src_ip: "", src_port: 0, dst_ip: "", dst_port: 0, proto: "", bytes: 0, packets: 0, value: 0, unit: "", pii: 0, attrs: {}, raw: "" });
+  const FEED = [row("1", 9, "rootkit.found"), row("2", 2, "cron.run")];
+  let sql = "";
+  routes = [
+    { when: (s) => s.includes("{seal:UInt32}"), rows: () => [{ n: NOW }] },
+    { when: (s) => s.includes("cityHash64"), rows: (p) => {
+      // Порог из условия severity <= {pN:…}: ищем имя параметра в SQL и применяем как ClickHouse.
+      const m = /severity <= \{(p\d+):/.exec(sql);
+      const max = m ? Number(p.get(`param_${m[1]}`)) : Infinity;
+      return FEED.filter((e) => e.severity <= max);
+    } },
+  ];
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: URL | string | Request, init?: RequestInit) => {
+    if (String(init?.body ?? "").includes("cityHash64")) sql = String(init?.body);
+    return origFetch(input, init);
+  }) as typeof fetch;
+  try {
+    const text = await pageText(await journal.default(props({}, { level_max: "4" })));
+    assert.match(sql, /severity <= \{p\d+:/);
+    assert.match(text, /cron\.run/);
+    assert.doesNotMatch(text, /rootkit\.found/);
+    assert.match(text, /серьёзность ≤ 4/);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("дашборд: точный интервал — границы $__timeFilter параметрами argus_from/argus_to, панели считают только окно", async () => {
+  await auth.createSession("viewer1", "viewer");
+  const spec = { id: "win", title: "Окно", description: "", refresh: "", panels: [{ id: "p", title: "Итого", type: "stat", sql: "SELECT count() AS total FROM events WHERE $__timeFilter(ts)", w: 6, h: 3 }] };
+  const TS = ["2026-10-01 10:00:00", "2026-10-20 10:00:00", "2026-10-21 10:00:00"];
+  let body = "";
+  routes = [
+    { when: (s) => s.includes("FROM console_dashboards") && s.includes("WHERE id ="), rows: () => [{ id: spec.id, title: spec.title, updated_max: NOW, updated_by: "admin", provisioned: 0, spec: JSON.stringify(spec), deleted: 0 }] },
+    { when: (s) => s.includes("count() AS total"), rows: (p) => {
+      const from = p.get("param_argus_from"), to = p.get("param_argus_to");
+      return [{ total: TS.filter((t) => (!from || t >= from) && (!to || t <= to)).length }];
+    } },
+  ];
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: URL | string | Request, init?: RequestInit) => {
+    if (String(init?.body ?? "").includes("count() AS total")) body = String(init?.body);
+    return origFetch(input, init);
+  }) as typeof fetch;
+  try {
+    let text = await pageText(await dashboard.default(props({ id: "win" }, { range: "30d" })));
+    assert.match(text, /total 3/);
+    assert.match(body, /ts >= now\(\) - INTERVAL 720 HOUR AND ts <= now\(\)/);
+    text = await pageText(await dashboard.default(props({ id: "win" }, { from: "2026-10-15T00:00", to: "2026-10-31T00:00" })));
+    assert.match(text, /total 2/);
+    assert.match(body, /ts >= toDateTime\(\{argus_from:String\}, 'UTC'\) AND ts <= toDateTime\(\{argus_to:String\}, 'UTC'\)/);
+    assert.doesNotMatch(body, /2026-10-15/, "даты не вклеены в SQL");
+  } finally {
+    globalThis.fetch = origFetch;
+  }
 });

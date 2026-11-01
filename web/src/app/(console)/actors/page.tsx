@@ -14,6 +14,9 @@ import { parseActorRange } from "@/lib/shared/actors";
 import { RANGES } from "@/lib/shared/ranges";
 import { searchHref } from "@/lib/shared/search-href";
 import { fmtNum, formatAgo, formatTs } from "@/lib/shared/time";
+import { RangeFilters } from "@/components/console/range-filters";
+import { describeChips, inRange, timeBounds, timeLabel } from "@/lib/shared/filters";
+import { ACTOR_RANGE_FIELDS, actorRangeChips, parseActorRanges, pickParams } from "@/lib/shared/page-filters";
 
 export const dynamic = "force-dynamic";
 export const metadata: Metadata = { title: "Субъекты" };
@@ -21,14 +24,24 @@ export const metadata: Metadata = { title: "Субъекты" };
 export default async function ActorsPage({ searchParams }: PageProps<"/actors">) {
   const session = await requireActorAccess();
   const sp = await searchParams;
-  const range = parseActorRange(typeof sp.range === "string" ? sp.range : undefined);
-  const [pr, ur] = await Promise.all([safeQuery(() => listPersons(range)), safeQuery(() => unboundSubjects("24h"))]);
+  // Точное окно активности (не шире 30 дней) главнее пресета; пороги событий и инцидентов — по итогам за окно.
+  // Пресет — из общего парсера (range или синоним period), по умолчанию 7 дней.
+  const ranges = parseActorRanges(sp);
+  const range = parseActorRange(ranges.time.range);
+  // Смена пресета сохраняет числовые пороги и снимает точное окно.
+  const keep = pickParams(sp, ["events_min", "events_max", "incidents_min", "incidents_max"]);
+  const bounds = ranges.time.from ? timeBounds(ranges.time) : null;
+  const window = bounds ? { fromMs: bounds.startMs, toMs: bounds.endMs } : null;
+  const periodLabel = window ? `интервал ${timeLabel(ranges.time)}` : `за ${RANGES[range].label}`;
+  const filtersText = describeChips(actorRangeChips(ranges));
+  const [pr, ur] = await Promise.all([safeQuery(() => listPersons(window ?? range)), safeQuery(() => unboundSubjects("24h"))]);
+  const persons = pr.ok ? pr.data.filter((p) => inRange(p.events, ranges.events) && inRange(p.incidents, ranges.incidents)) : [];
   const isAdmin = session.role === "admin";
 
   return (
     <>
       <PageHeader title="Субъекты" subtitle="Паспорт — срез журнала по человеку или служебной учётке за период с учётом времени действия алиасов. Каждый просмотр паспорта записывается в журнал действий.">
-        <ActorRangeLinks current={range} base="/actors" />
+        <ActorRangeLinks current={window ? "" : range} base={keep ? `/actors?${keep}` : "/actors"} />
       </PageHeader>
 
       <Panel label="Кому принадлежит" meta="почта, логин, телефон, IP, хост — чей сейчас, чей раньше, где встречался">
@@ -41,13 +54,16 @@ export default async function ActorsPage({ searchParams }: PageProps<"/actors">)
         <>
           <div className="grid grid-cols-2 gap-6 md:grid-cols-4">
             <StatTile label="Персон" value={fmtNum(pr.data.length)} />
-            <StatTile label={`Активны за ${RANGES[range].label}`} value={fmtNum(pr.data.filter((p) => p.events > 0).length)} />
+            <StatTile label={`Активны ${periodLabel}`} value={fmtNum(pr.data.filter((p) => p.events > 0).length)} />
             <StatTile label="Служебных учёток" value={fmtNum(pr.data.filter((p) => p.kind === "service").length)} />
             <StatTile label="С инцидентами" value={fmtNum(pr.data.filter((p) => p.incidents > 0).length)} led={pr.data.some((p) => p.incidents > 0) ? "var(--status-warn)" : "var(--status-ok)"} />
           </div>
 
-          <Panel label={`Персоны · активность за ${RANGES[range].label}`} meta="события и инциденты считаются по алиасам в их интервалах действия">
-            {pr.data.length === 0 ? (
+          <Panel label={`Персоны · активность ${periodLabel}`} meta="события и инциденты считаются по алиасам в их интервалах действия">
+            <div className="mb-4"><RangeFilters time timeLabel="Окно активности, UTC (до 30 дней)" fields={ACTOR_RANGE_FIELDS} idPrefix="actors" /></div>
+            {pr.data.length > 0 && persons.length === 0 ? (
+              <p className="text-sm text-muted-foreground">Нет персон по фильтрам: {filtersText} — ослабьте пороги или расширьте окно.</p>
+            ) : pr.data.length === 0 ? (
               <div className="space-y-2 text-sm text-muted-foreground">
                 <p>Персон пока нет.</p>
                 <p>Источники: файл <span className="font-mono">identities.yml</span> у движка, события <span className="font-mono">identity.alias</span> от экспортеров, <span className="font-mono">PUT /api/v1/identities</span> или привязка непривязанного субъекта ниже.</p>
@@ -68,7 +84,7 @@ export default async function ActorsPage({ searchParams }: PageProps<"/actors">)
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {pr.data.map((p) => (
+                    {persons.map((p) => (
                       <TableRow key={p.person_id} className="border-border/40">
                         <TableCell><Link href={`/actors/${encodeURIComponent(p.person_id)}?range=${range}`} className="text-[var(--ring)] hover:underline">{p.display || p.person_id}</Link></TableCell>
                         <TableCell className="font-mono text-xs"><Copyable value={p.person_id} label="Идентификатор" /></TableCell>

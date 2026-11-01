@@ -10,10 +10,12 @@ import { RangePicker } from "@/components/console/range-picker";
 import { StorageUnavailable } from "@/components/console/storage-error";
 import { Button } from "@/components/ui/button";
 import { requirePageSession, ROLE_RANK } from "@/lib/auth";
-import { parseRange, safeQuery } from "@/lib/clickhouse";
+import { safeQuery } from "@/lib/clickhouse";
 import { deleteDashboardAction } from "@/lib/dashboard-actions";
 import { getDashboard, refreshSeconds, runPanelQuery, stripPanelDetail, type PanelData } from "@/lib/dashboards";
 import { isLongRange } from "@/lib/shared/time";
+import { RangeFilters } from "@/components/console/range-filters";
+import { parseTimeFilter } from "@/lib/shared/filters";
 
 export const dynamic = "force-dynamic";
 
@@ -31,7 +33,12 @@ export default async function DashboardPage({ params, searchParams }: PageProps<
   const canEdit = ROLE_RANK[session.role] >= ROLE_RANK.analyst;
   const { id } = await params;
   if (!ID_RE.test(id)) notFound();
-  const range = parseRange((await searchParams).range as string | undefined);
+  const sp = await searchParams;
+  // Пресет (range или period) — только из белого списка общего парсера; точный интервал
+  // (from/to, UTC) главнее пресета: макросы $__timeFilter/$__from/$__to получают его границы параметрами.
+  const time = parseTimeFilter(sp, { defaultRange: "24h" });
+  const range = time.range ?? "24h";
+  const window = time.from ? time : range;
   const specRes = await safeQuery(() => getDashboard(id));
   if (!specRes.ok) {
     return (
@@ -47,7 +54,7 @@ export default async function DashboardPage({ params, searchParams }: PageProps<
   // Результат панели живёт в кэше процесса ровно интервал автообновления:
   // несколько вкладок дежурных не гоняют один SQL параллельно.
   const ttlMs = refreshSec > 0 ? refreshSec * 1000 : 0;
-  const results = await Promise.all(spec.panels.map((p) => runPanelQuery(p.sql, range, ttlMs)));
+  const results = await Promise.all(spec.panels.map((p) => runPanelQuery(p.sql, window, ttlMs)));
   const data: Record<string, PanelData> = {};
   spec.panels.forEach((p, i) => (data[p.id] = canEdit ? results[i] : stripPanelDetail(results[i])));
 
@@ -73,10 +80,11 @@ export default async function DashboardPage({ params, searchParams }: PageProps<
           )}
         </div>
       </PageHeader>
+      <RangeFilters time idPrefix="dash" />
       {spec.panels.length === 0 ? (
         <Panel label="Пусто"><Empty>В дашборде нет панелей{canEdit ? " — добавьте их в редакторе." : "."}</Empty></Panel>
       ) : (
-        <DashboardGrid panels={spec.panels} data={data} longRange={isLongRange(range)} />
+        <DashboardGrid panels={spec.panels} data={data} longRange={isLongRange(range, time.from)} />
       )}
     </>
   );

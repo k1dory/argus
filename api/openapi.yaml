@@ -179,6 +179,18 @@ paths:
         - $ref: "#/components/parameters/Range"
         - $ref: "#/components/parameters/From"
         - $ref: "#/components/parameters/To"
+        - name: level_min
+          in: query
+          description: Уровень не ниже — `rule_level` 0…15 у `alerts`, `severity` 0…10 у `events` (кламп к шкале; не число — игнорируется).
+          schema:
+            type: integer
+            minimum: 0
+        - name: level_max
+          in: query
+          description: Уровень не выше, та же шкала. Перепутанные `level_min`/`level_max` меняются местами.
+          schema:
+            type: integer
+            minimum: 0
         - name: page
           in: query
           description: Страница по 50 строк, 1…1000 (вне диапазона приводится к границе; страниц больше 200 поиск не отдаёт).
@@ -329,10 +341,51 @@ paths:
             $ref: "#/components/schemas/IncidentStatus"
         - name: level
           in: query
-          description: Уровень из правила (`low|medium|high|critical`); значение вне `^[a-z]{1,16}$` игнорируется.
+          description: Уровень из правила (`low|medium|high|critical`), точное совпадение; значение вне `^[a-z]{1,16}$` игнорируется.
           schema:
             type: string
             pattern: "^[a-z]{1,16}$"
+        - name: level_min
+          in: query
+          description: Уровень не ниже (порядок `low < medium < high < critical`); чужое значение игнорируется.
+          schema:
+            type: string
+            enum: [low, medium, high, critical]
+        - name: level_max
+          in: query
+          description: Уровень не выше; перепутанные границы меняются местами.
+          schema:
+            type: string
+            enum: [low, medium, high, critical]
+        - name: range
+          in: query
+          description: Окно по началу инцидента (`first_ts`) назад от «сейчас»; без него и без `from`/`to` — все инциденты.
+          schema:
+            $ref: "#/components/schemas/RangeKey"
+        - name: from
+          in: query
+          description: Начало окна по `first_ts`, `YYYY-MM-DDTHH:MM[:SS]` (UTC); главнее `range`.
+          schema:
+            type: string
+            pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$'
+        - name: to
+          in: query
+          description: Конец окна по `first_ts` (UTC); без него — «сейчас».
+          schema:
+            type: string
+            pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$'
+        - name: events_min
+          in: query
+          description: Событий в цепочке (`event_count`) не меньше.
+          schema:
+            type: integer
+            minimum: 0
+        - name: events_max
+          in: query
+          description: Событий в цепочке не больше.
+          schema:
+            type: integer
+            minimum: 0
         - name: q
           in: query
           description: Подстрока по id, названию и id правила, субъекту, узлу и источникам (до 200 символов).

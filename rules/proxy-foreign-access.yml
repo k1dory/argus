@@ -4,7 +4,7 @@
 title: "Proxy: access to a published service from outside the expected country"
 id: a41c-net-076
 level: low
-tags: [attack.reconnaissance]
+tags: [attack.initial_access, attack.t1078]   # ATT&CK v20: успешный доступ из необычной географии — признак чужих учётных данных (Valid Accounts), не скан
 
 detection:
   selection:

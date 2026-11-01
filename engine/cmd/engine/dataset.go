@@ -4,18 +4,21 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
 	"maps"
 	"os"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/devitex-soft/argus/engine/internal/analyst"
 	"github.com/devitex-soft/argus/engine/internal/dataset"
+	"github.com/devitex-soft/argus/engine/internal/registry"
 	"github.com/devitex-soft/argus/engine/internal/store"
 	"github.com/devitex-soft/argus/engine/internal/systemone"
 )
@@ -86,7 +89,7 @@ func exportDataset(ctx context.Context, src labeledSource, w io.Writer, o datase
 			}
 			if c.Name == "jev" && r.PII {
 				st.PIISkippedJev++
-				r.Models[c.Name] = dataset.ModelAnswers{Model: c.Model, Error: "pii: не отправлялся в облако"}
+				r.Models[c.Name] = dataset.ModelAnswers{Error: "pii: не отправлялся в облако"}
 				return
 			}
 			cctx, cancel := context.WithTimeout(ctx, 90*time.Second)
@@ -94,7 +97,7 @@ func exportDataset(ctx context.Context, src labeledSource, w io.Writer, o datase
 			ma, err := askModel(cctx, c, r)
 			if err != nil {
 				st.ModelErrors++
-				r.Models[c.Name] = dataset.ModelAnswers{Model: c.Model, Error: err.Error()}
+				r.Models[c.Name] = dataset.ModelAnswers{Error: err.Error()}
 				return
 			}
 			r.Models[c.Name] = ma
@@ -123,7 +126,14 @@ func askModel(ctx context.Context, c *systemone.Client, r *dataset.Record) (data
 	if err != nil {
 		return dataset.ModelAnswers{}, err
 	}
-	ma := dataset.ModelAnswers{Model: orDefault(resp.Model, c.Model), Answers: resp.Answers}
+	// Ревизия модели — только та, что модель сообщила сама. Псевдоним из
+	// конфигурации (c.Model) ревизию не подтверждает: за ним выкатывают новые
+	// версии, а eval разделяет ответы по ревизии (ModelAnswers.Model).
+	rev := strings.TrimSpace(resp.Model)
+	if !reportedRevision(rev) {
+		return dataset.ModelAnswers{}, errors.New("systemone " + c.Name + ": model revision not reported")
+	}
+	ma := dataset.ModelAnswers{Model: rev, Answers: resp.Answers}
 	if !twoStep {
 		return ma, nil
 	}
@@ -132,10 +142,33 @@ func askModel(ctx context.Context, c *systemone.Client, r *dataset.Record) (data
 	if err != nil {
 		return dataset.ModelAnswers{}, fmt.Errorf("attack_technique: %w", err)
 	}
+	// У записи одна версия модели на все ответы: если за псевдонимом модели
+	// между запросами выкатили другую ревизию, пару не смешиваем.
+	if strings.TrimSpace(resp2.Model) != rev {
+		return dataset.ModelAnswers{}, errors.New("systemone " + c.Name + ": model revision changed between requests")
+	}
 	ma.Answers = maps.Clone(ma.Answers)
 	ma.Answers["attack_technique"] = resp2.Answers["attack_technique"]
 	ma.Questions = map[string]systemone.Question{"attack_technique": tq}
 	return ma, nil
+}
+
+// backendNames — имена бэкендов, которые приходят в model вместо ревизии:
+// upstream laya-serve (laya/agent.py, Agent.predict_batch) отвечает
+// «laya-rl-agent» для любого чекпойнта, и смена модели за ним невидима.
+// laya-serve для ARGUS должен отдавать в model версию или хеш чекпойнта.
+var backendNames = map[string]bool{"laya-rl-agent": true}
+
+// revisionRe — белый формат ревизии: только ASCII без пробелов. Невидимые
+// символы (U+200B, BOM), омоглифы (кириллическая «а»), полноширинные буквы и
+// внутренние пробелы в него не входят — сравнивать с backendNames после
+// нормализации не нужно: такая строка отклоняется целиком.
+var revisionRe = regexp.MustCompile(`^[A-Za-z0-9._:@+/-]{1,128}$`)
+
+// reportedRevision — модель сообщила ревизию (после strings.TrimSpace, он
+// снимает и Unicode-пробелы): строка белого формата и не имя бэкенда.
+func reportedRevision(rev string) bool {
+	return revisionRe.MatchString(rev) && !backendNames[strings.ToLower(rev)]
 }
 
 // choiceOf — выбранный вариант: choice, а без него — наибольшая вероятность.
@@ -181,6 +214,13 @@ func datasetCmd(args []string) int {
 		return 2
 	}
 	analyst.SetDatasetSecret([]byte(secret))
+	// Реестр поставляемого набора — из копии в образе (ARGUS_SHIPPED_DIR,
+	// по умолчанию /usr/share/argus/shipped). Без него каждое правило было бы
+	// «[rule]», а каждое действие — «[action]»: выгрузка бесполезна, поэтому отказ.
+	if err := registry.LoadEnv(); err != nil {
+		fmt.Fprintln(os.Stderr, "реестр поставляемого набора:", err)
+		return 2
+	}
 	laya, jev := systemone.FromEnv(os.Getenv)
 	var list []string
 	if *models != "" {

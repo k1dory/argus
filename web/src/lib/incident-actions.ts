@@ -23,6 +23,7 @@ import {
 } from "./argus-queries";
 import { GROUP_ACTION_MAX, isSubnetKey, parseIncidentIds } from "./shared/scan-groups";
 import { isIncidentStatus } from "./shared/incidents";
+import { parseIncidentRanges } from "./shared/page-filters";
 import { closureLabelText, isOpsIncident, parseClosureLabel, type ClosureLabel } from "./shared/closure-label";
 
 const INCIDENT_ID_RE = /^INC-\d{1,9}$/;
@@ -222,7 +223,11 @@ export async function blockIpAction(_prev: FormState, formData: FormData): Promi
   await audit(s.user, "respond.block_ip", ip, `${id} · ${res.error ?? (detail || "ok")}`);
   if (res.error) return { error: res.error };
   const failed = (res.results ?? []).filter((r) => !r.ok);
-  if (failed.length > 0) return { error: failed.map((r) => `${r.executor}: ${r.detail}`).join("; ") };
+  if (failed.length > 0) {
+    const error = failed.map((r) => `${r.executor}: ${r.detail}`).join("; ");
+    // Частичный успех: клиент показывает error, оговорка движка не должна потеряться.
+    return { error: res.warning ? `${error}. ${res.warning}` : error };
+  }
   // 200 с оговоркой движка (журнал реагирования недоступен) — оператор должен её увидеть.
   return res.warning ? { error: null, ok: true, warning: res.warning } : { error: null, ok: true };
 }
@@ -251,7 +256,11 @@ export async function unblockIpAction(_prev: FormState, formData: FormData): Pro
   await audit(s.user, "respond.unblock_ip", ip, res.error ?? (detail || "ok"));
   if (res.error) return { error: res.error };
   const failed = (res.results ?? []).filter((r) => !r.ok);
-  if (failed.length > 0) return { error: failed.map((r) => `${r.executor}: ${r.detail}`).join("; ") };
+  if (failed.length > 0) {
+    const error = failed.map((r) => `${r.executor}: ${r.detail}`).join("; ");
+    // Частичный успех: клиент показывает error, оговорка движка не должна потеряться.
+    return { error: res.warning ? `${error}. ${res.warning}` : error };
+  }
   // 200 с оговоркой движка (журнал реагирования недоступен) — оператор должен её увидеть.
   return res.warning ? { error: null, ok: true, warning: res.warning } : { error: null, ok: true };
 }
@@ -304,6 +313,8 @@ export async function scanGroupAction(_prev: FormState, formData: FormData): Pro
   const filter = {
     status: String(formData.get("f_status") ?? "") || undefined,
     level: String(formData.get("f_level") ?? "") || undefined,
+    // Диапазоны очереди (from, level_min, …) — тем же парсером, что страница.
+    ranges: parseIncidentRanges(new URLSearchParams(String(formData.get("f_ranges") ?? "").slice(0, 2000))),
     q: String(formData.get("f_q") ?? "").trim().slice(0, 200) || undefined,
     queue: fq === "open" || fq === "mine" || fq === "unassigned" || fq === "overdue" ? fq : undefined,
     user: s.user,

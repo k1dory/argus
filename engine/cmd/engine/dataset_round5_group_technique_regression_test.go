@@ -43,7 +43,9 @@ func TestPR64Round5ScanGroupTechniqueRemainsAnAvailableTarget(t *testing.T) {
 	// (web/src/app/(console)/incidents/page.tsx). scanGroupAction then applies
 	// ONE selected label to every incident, with the normal workflow checks.
 	const tactic = "reconnaissance"
-	for _, technique := range []string{"T1046", "T1595.001"} {
+	// Техники самих правил группы: скан портов — T1595 (с #72; было T1046, тактика
+	// discovery), обход хостов — T1595.001.
+	for _, technique := range []string{"T1595", "T1595.001"} {
 		t.Run(technique, func(t *testing.T) {
 			if !slices.Contains(attack.Candidates(groupTags, tactic), technique) {
 				t.Fatalf("fixture choice %s must be offered by the group form", technique)
