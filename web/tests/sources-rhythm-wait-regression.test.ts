@@ -31,7 +31,7 @@ const timestamp = (sec: number) => new Date(sec * 1000).toISOString().slice(0, 1
 const seconds = (value: unknown) => Date.parse(String(value).replace(" ", "T") + "Z") / 1000;
 type Params = Record<string, string | number>;
 type Sample = { source: string; ageSec: number };
-type FixtureContext = { test: (name: string, body: () => Promise<void>) => Promise<void> };
+type FixtureContext = { skip: (reason?: string) => void; test: (name: string, body: () => Promise<void>) => Promise<void> };
 type FixtureBody = (t: FixtureContext) => Promise<void>;
 type Options = {
   events: Sample[];
@@ -49,6 +49,7 @@ async function runFixture(t: TestContext, options: Options) {
   const waits: number[] = [];
   const reports: queries.SourcesReport[] = [];
   const subtests: string[] = [];
+  const skipped: string[] = [];
   const subtestFailures: { name: string; error: unknown }[] = [];
   const stopAfterInsert = new Error("INSERT cap записан; проверки живой БД не запускаем");
   const waitBudgetExceeded = new Error("виртуальное ожидание превысило дедлайн live-lock");
@@ -177,6 +178,8 @@ async function runFixture(t: TestContext, options: Options) {
   assert.equal(bodies.length, 1);
   try {
     await bodies[0]({
+      // Как node:test: skip только отмечает тест; вызов фиксируется и проверяется.
+      skip: (reason) => { skipped.push(reason ?? ""); },
       test: async (name, body) => {
         subtests.push(name);
         // Как node:test: сбой дочернего теста фиксируется, но t.test разрешается,
@@ -186,7 +189,7 @@ async function runFixture(t: TestContext, options: Options) {
     });
   } catch (error) { failure = error; }
   assert.ok(reports.length > 0, `production baseline должен быть прочитан: ${String(failure)}`);
-  return { waits, reports, subtests, subtestFailures, failure, cap, now, corruptions };
+  return { waits, reports, subtests, subtestFailures, failure, cap, now, corruptions, skipped };
 }
 
 function assertFixturePass(result: Awaited<ReturnType<typeof runFixture>>) {
@@ -294,6 +297,8 @@ function assertFixtureSkipped(result: Awaited<ReturnType<typeof runFixture>>) {
   assert.deepEqual(result.waits, [], "ожидание дольше 90 с отклоняется до таймера");
   assert.equal(result.cap, undefined, "пропущенная фикстура не вставляется");
   assert.equal(result.subtests.length, 0, "проверки cap после skip не выполняются");
+  assert.equal(result.skipped.length, 1, "отказ от ожидания — явный skip, а не пустой return");
+  assert.ok(result.skipped[0].length > 0, "skip объясняет причину");
 }
 
 for (const ageSec of [HOUR - 60, 60, -86400]) {
