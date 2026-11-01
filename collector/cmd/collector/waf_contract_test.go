@@ -13,17 +13,39 @@ import (
 	"github.com/devitex-soft/argus/collector/internal/listen"
 	"github.com/devitex-soft/argus/collector/internal/model"
 	"github.com/devitex-soft/argus/collector/internal/normalize"
+	"github.com/devitex-soft/argus/collector/internal/parse"
 )
 
 // Exercise the registered HTTP route with the production parser callbacks;
 // capture the batch at the durable-queue boundary without network or ClickHouse.
 func wafHTTPBatch(t *testing.T, path, body, remote string) []model.Event {
 	t.Helper()
+	return wafHTTPBatchAs(t, path, body, remote, "")
+}
+
+// formatOf — объявление формата для фикстуры теста: источник в бою объявляет его
+// конфигом (SYSLOG_PEER_FORMAT, files[].format, [argus format=…]); тест знает, что шлёт.
+func formatOf(fixture string) string {
+	switch {
+	case strings.Contains(fixture, "CEF:"):
+		return parse.FormatCEF
+	case strings.Contains(fixture, "LEEF:"):
+		return parse.FormatLEEF
+	case strings.Contains(fixture, "Coraza: "):
+		return parse.FormatWAFCoraza
+	}
+	return ""
+}
+
+// wafHTTPBatchAs — то же с объявленным форматом отправителя (как SYSLOG_PEER_FORMAT).
+func wafHTTPBatchAs(t *testing.T, path, body, remote, format string) []model.Event {
+	t.Helper()
 	n := &normalize.Normalizer{}
 	var events []model.Event
 	h := &listen.HTTPHandlers{
 		Token: "waf-contract-token",
 		ParseLine: func(line string, peer listen.Peer) (model.Event, bool) {
+			peer.Format = format
 			return parseSyslogLine(n, nil, line, peer)
 		},
 		ParseWAFAudit: func(obj json.RawMessage, peer listen.Peer) (model.Event, bool) {
@@ -118,6 +140,8 @@ func modSecurityError(prefix, host string) string {
 
 // Host is client-controlled even when it looks like an IP. Three chosen Host
 // values on one WAF must not manufacture three nodes for the autoblock rule.
+// Error-лог ModSecurity — не источник WAF: строка остаётся syslog (waf_unparsed=1), и
+// Host клиента из неё не становится ни узлом, ни http_host/server_addr.
 func TestWAFModSecurityNumericHostNeverBecomesNode(t *testing.T) {
 	for _, prefix := range []string{
 		"2026/10/30 12:00:03 [error] 31#31: *7",
@@ -130,17 +154,12 @@ func TestWAFModSecurityNumericHostNeverBecomesNode(t *testing.T) {
 				if len(events) != 1 {
 					t.Fatalf("accepted %d events, want 1", len(events))
 				}
-				if e := events[0]; e.Node != "10.0.0.7" || e.DstIP != "" || e.Attrs["server_addr"] != "" || e.Attrs["http_host"] != host {
-					t.Fatalf("client Host became trusted server identity: %+v", e)
+				if e := events[0]; e.Node != "10.0.0.7" || e.SourceClass == "waf" || e.Attrs["http_host"] != "" || e.Attrs["server_addr"] != "" || e.Attrs["waf_unparsed"] != "1" {
+					t.Fatalf("ModSecurity error-log treated as WAF or client Host trusted: %+v", e)
 				}
-				for _, tc := range []struct{ line, configured, want string }{
-					{line, "waf-from-config", "waf-from-config"},
-					{`<134>1 2026-10-30T12:00:03Z waf-from-syslog nginx - - - ` + line, "waf-from-config", "waf-from-syslog"},
-				} {
-					e, ok := parseSyslogLine(&normalize.Normalizer{}, nil, tc.line, listen.Peer{Addr: "10.0.0.7", Node: tc.configured})
-					if !ok || e.Node != tc.want || e.Attrs["http_host"] != host {
-						t.Fatalf("trusted node precedence: ok=%v want=%q event=%+v", ok, tc.want, e)
-					}
+				e, ok := parseSyslogLine(&normalize.Normalizer{}, nil, `<134>1 2026-10-30T12:00:03Z waf-from-syslog nginx - - - `+line, listen.Peer{Addr: "10.0.0.7", Node: "waf-from-config"})
+				if !ok || e.Node != "waf-from-syslog" || e.SourceClass == "waf" || e.Attrs["http_host"] != "" {
+					t.Fatalf("syslog node precedence or WAF leak: ok=%v event=%+v", ok, e)
 				}
 			})
 		}

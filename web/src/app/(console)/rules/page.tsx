@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import Link from "next/link";
 import { Led, PageHeader, Panel, StatTile } from "@/components/console/panel";
 import { LevelBadge } from "@/components/console/incident-badges";
 import { StorageUnavailable } from "@/components/console/storage-error";
@@ -12,6 +13,7 @@ import {
 } from "@/components/ui/table";
 import { requirePageSession } from "@/lib/auth";
 import { safeQuery } from "@/lib/clickhouse";
+import { ROLE_RANK } from "@/lib/shared/incidents";
 import { engineRules, rulesFalsePositives } from "@/lib/argus-queries";
 import { fmtNum, formatAgo, formatTs } from "@/lib/shared/time";
 
@@ -19,7 +21,7 @@ export const dynamic = "force-dynamic";
 export const metadata: Metadata = { title: "Правила корреляции" };
 
 export default async function RulesPage() {
-  await requirePageSession();
+  const session = await requirePageSession();
   // Правила — с движка (HTTP), статистика ложных — из ClickHouse: падение одного не гасит другое.
   const [engine, fpRes] = await Promise.all([engineRules(), safeQuery(() => rulesFalsePositives())]);
   const { rules, health, error } = engine;
@@ -30,7 +32,12 @@ export default async function RulesPage() {
   return (
     <>
       <PageHeader title="Правила корреляции">
-        <span className="c-label">rules/*.yml в git · ни одного правила через веб-форму</span>
+        <span className="flex items-center gap-4">
+          <span className="c-label">rules/*.yml в git · ни одного правила через веб-форму</span>
+          {ROLE_RANK[session.role] >= ROLE_RANK.analyst && (
+            <Link href="/rules/agreement" className="text-sm text-[var(--ring)] hover:underline">Согласие с агентом</Link>
+          )}
+        </span>
       </PageHeader>
 
       {error ? (

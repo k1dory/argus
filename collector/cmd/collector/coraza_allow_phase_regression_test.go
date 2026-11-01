@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"github.com/devitex-soft/argus/collector/internal/parse"
 	"testing"
 
 	"github.com/devitex-soft/argus/collector/internal/listen"
@@ -29,8 +31,14 @@ func TestCorazaPartialAllowDoesNotEmitFinalTransaction(t *testing.T) {
 				fmt.Sprintf(`[client "203.0.113.50"] Coraza: Access denied (phase %d). Reject transaction [file "/etc/coraza/local.conf"] [id "1002"] [msg "Reject transaction"] [severity "critical"] [hostname "192.0.2.10"] [uri "/account"] [unique_id "same-transaction"]`, tc.denyPhase),
 			}
 			var events []model.Event
-			for _, line := range lines {
-				e, ok := parseSyslogLine(&normalize.Normalizer{}, nil, line, listen.Peer{Addr: "192.0.2.10", Node: "waf-01", Transport: "file"})
+			for _, msg := range lines {
+				// waf-coraza — JSON-лог Caddy: строка Coraza в msg объекта logger http.handlers.waf.
+				body, err := json.Marshal(map[string]string{"logger": "http.handlers.waf", "msg": msg})
+				if err != nil {
+					t.Fatal(err)
+				}
+				line := string(body)
+				e, ok := parseSyslogLine(&normalize.Normalizer{}, nil, line, listen.Peer{Addr: "192.0.2.10", Node: "waf-01", Transport: "file", Format: parse.FormatWAFCoraza})
 				if ok {
 					events = append(events, e)
 				}

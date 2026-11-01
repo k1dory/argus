@@ -75,7 +75,7 @@ type Config struct {
 		// Файлы на хосте (bind-mount): audit-лог WAF в JSON, error-лог, JSON-лог Caddy.
 		Files []struct {
 			Path      string `yaml:"path"`
-			Format    string `yaml:"format"`     // waf-audit | lines
+			Format    string `yaml:"format"`     // waf-audit | waf-coraza | lines
 			Source    string `yaml:"source"`     // метка для health/metrics
 			FromStart bool   `yaml:"from_start"` // читать с начала, а не с конца
 			// Node — узел для событий, в которых отправитель его не назвал (Coraza в
@@ -168,36 +168,62 @@ func mergeAttrs(e *model.Event, attrs map[string]string) {
 	}
 }
 
-// parseSyslogLine — одна строка syslog/файла/HTTP в событие: CEF, LEEF, WAF
-// error-лог, вендорные разборщики, иначе syslog. Происхождение (peer, peer_cn,
-// scope) ставит только коллектор; в конце — повторная чистка значений, записанных
-// после Ensure нормализатора.
+// parseSyslogLine — одна строка syslog/файла/HTTP в событие. Разборщик выбирается по
+// объявленному формату источника, а не по содержимому строки:
+//  1. формат объявлен — только его разборщик, без проверок маркеров ModSecurity или CEF
+//     в тексте: cef/leef — запись, с которой начинается сообщение приложения, waf-coraza —
+//     только JSON Caddy. Не разобралось — syslog (и waf_unparsed=1, если это строка WAF);
+//  2. формат не объявлен — syslog и вендорные разборщики. Похожее на CEF/LEEF/WAF
+//     содержимое разборщик не выбирает: только предупреждение «необъявленный формат», а
+//     строка WAF — syslog с waf_unparsed=1 (её не должен забрать Squid или Jenkins).
+//
+// Объявление — конфигурация (peer.Format: SYSLOG_PEER_FORMAT по адресу отправителя,
+// files[].format), а если она молчит — SD-параметр [argus format="…"] от доверенного
+// отправителя: HTTP-приём с токеном (агент) или TLS с проверенным клиентским сертификатом;
+// от UDP/TCP/TLS без сертификата это просто данные.
+// Происхождение (peer, peer_cn, scope) ставит только коллектор; в конце — повторная
+// чистка значений, записанных после Ensure нормализатора.
 func parseSyslogLine(norm *normalize.Normalizer, zones parse.PeerZones, line string, peer listen.Peer) (model.Event, bool) {
 	sl, _ := parse.ParseSyslog(line)
 	sl = sl.InZone(zones.Lookup(peer.Addr))
-	var e model.Event
-	// QNAP опознаётся по заголовку (qulogd), а не по тексту: имя файла в журнале доступа
-	// может содержать «CEF:», «LEEF:» или «ModSecurity:» и не должно менять разборщик.
-	qn, isQNAP := parse.ParseQNAP(sl)
-	switch {
-	case isQNAP:
-		e = qn
-	case hasCEF(line):
-		c, _ := parse.ParseCEF(line)
-		e = norm.FromCEF(c, sl, line)
-	case hasLEEF(line):
-		l, _ := parse.ParseLEEF(line)
-		e = norm.FromLEEF(l, sl, line)
-	case parse.IsWAFErrorLine(line):
-		// error-лог ModSecurity (Apache/nginx) или Coraza (в т.ч. JSON-лог Caddy).
-		// Строка может прийти в обёртке syslog (агент на хосте добавляет заголовок с
-		// именем хоста) — тогда разбирается текст после заголовка.
-		wafText := line
-		if sl.Format != "raw" && parse.IsWAFErrorLine(sl.Message) {
-			wafText = sl.Message
+	format := peer.Format
+	if format == "" && (peer.Transport == "http" || peer.CN != "") {
+		if f := strings.TrimSpace(sl.Structured["argus.format"]); parse.ValidFormat(f) {
+			format = f
 		}
-		wf, ok := parse.ParseWAFErrorLine(wafText)
+	}
+	// Полезная нагрузка: текст после заголовка syslog, если он есть.
+	payload := line
+	if sl.Format != "raw" {
+		payload = sl.Message
+	}
+	var e model.Event
+	unparsedWAF := false
+	switch format {
+	case parse.FormatCEF:
+		if rec, ok := appRecord(line, sl, "CEF:"); ok {
+			if c, ok := parse.ParseCEF(rec); ok {
+				e = norm.FromCEF(c, sl, line)
+				break
+			}
+		}
+		unparsedWAF = isWAFText(line, payload)
+		e = norm.FromSyslog(sl, line)
+		unrecognizedRecord(peer, format)
+	case parse.FormatLEEF:
+		if rec, ok := appRecord(line, sl, "LEEF:"); ok {
+			if l, ok := parse.ParseLEEF(rec); ok {
+				e = norm.FromLEEF(l, sl, line)
+				break
+			}
+		}
+		unparsedWAF = isWAFText(line, payload)
+		e = norm.FromSyslog(sl, line)
+		unrecognizedRecord(peer, format)
+	case parse.FormatWAFCoraza:
+		wf, ok := parse.ParseCorazaLine(payload)
 		if !ok {
+			unparsedWAF = isWAFText(line, payload)
 			e = norm.FromSyslog(sl, line)
 			break
 		}
@@ -207,7 +233,20 @@ func parseSyslogLine(norm *normalize.Normalizer, zones parse.PeerZones, line str
 		e = norm.FromWAF(wf, line)
 		wafNode(&e, sl.Hostname, peer)
 	default:
-		if sq, ok := parse.ParseSquid(sl.Message, sl.Hostname); ok {
+		// QNAP опознаётся по заголовку (qulogd): имя файла в его журнале доступа может
+		// содержать «CEF:», «LEEF:» или «ModSecurity:» и разборщик не меняет.
+		if qn, ok := parse.ParseQNAP(sl); ok {
+			e = qn
+			break
+		}
+		// Запись CEF/LEEF (в тех же трёх формах, что у объявленного) или строка WAF без
+		// объявления — syslog с предупреждением, раньше вендорных разборщиков: URL
+		// запроса в ней («/credentials») не должен выбрать Jenkins.
+		if waf := isWAFText(line, payload); waf || recordMarker(line, sl) != "" {
+			unparsedWAF = waf
+			e = norm.FromSyslog(sl, line)
+			undeclaredFormat(peer)
+		} else if sq, ok := parse.ParseSquid(sl.Message, sl.Hostname); ok {
 			e = sq
 		} else if jk, ok := parse.ParseJenkins(sl.Message, sl.Hostname); ok {
 			e = jk
@@ -217,7 +256,17 @@ func parseSyslogLine(norm *normalize.Normalizer, zones parse.PeerZones, line str
 			e = vr
 		} else {
 			e = norm.FromSyslog(sl, line)
+			// По всей строке: ParseSyslog может съесть «CEF:» как TAG или часть HOSTNAME.
+			if hasCEF(line) || hasLEEF(line) {
+				undeclaredFormat(peer)
+			}
 		}
+	}
+	if unparsedWAF {
+		if e.Attrs == nil {
+			e.Attrs = map[string]string{}
+		}
+		e.Attrs["waf_unparsed"] = "1"
 	}
 	if e.Node == "" {
 		e.Node = firstNonEmpty(peer.Node, peer.Addr)
@@ -531,7 +580,17 @@ func main() {
 		slog.Error("SYSLOG_PEER_TZ", "err", err)
 		os.Exit(1)
 	}
+	// Объявленные форматы отправителей: разборщик CEF/LEEF/Coraza выбирается по ним, а
+	// не по содержимому строки (SYSLOG_PEER_FORMAT="10.0.0.5=cef,10.1.0.0/16=leef").
+	peerFormats, err := parse.ParsePeerFormats(os.Getenv("SYSLOG_PEER_FORMAT"))
+	if err != nil {
+		slog.Error("SYSLOG_PEER_FORMAT", "err", err)
+		os.Exit(1)
+	}
 	parseLine := func(line string, peer listen.Peer) (model.Event, bool) {
+		if peer.Format == "" {
+			peer.Format = peerFormats.Lookup(peer.Addr)
+		}
 		return parseSyslogLine(norm, peerZones, line, peer)
 	}
 	lines := func(line string, peer listen.Peer) {
@@ -562,7 +621,12 @@ func main() {
 				}
 			}
 		} else {
+			// lines — строки syslog/текста; waf-coraza — JSON-лог Caddy с Coraza. Error-лог
+			// ModSecurity источником WAF не бывает — только waf-audit (SecAuditLogFormat JSON).
 			peer := listen.Peer{Addr: src, Transport: "file", Node: fcfg.Node}
+			if fcfg.Format == parse.FormatWAFCoraza {
+				peer.Format = parse.FormatWAFCoraza
+			}
 			handle = func(line string) {
 				if e, ok := parseLine(line, peer); ok {
 					mergeAttrs(&e, fcfg.Attrs)
@@ -677,7 +741,8 @@ func main() {
 				"queue": len(queue), "pending_rows": pq.Rows(), "pending_bytes": pq.Bytes(), "spool_bytes": pq.SpoolBytes(), "spool_capacity_bytes": pq.SpoolCapacityBytes(), "dead_letter": ws.DeadLetter.Load(), "panics": listen.Metrics.Panics.Load()}
 		},
 		Metrics: func(full bool) string {
-			return st.prometheus(len(queue), pq.Rows(), pq.Bytes(), ws, full) + fmt.Sprintf("argus_collector_spool_bytes %d\nargus_collector_spool_capacity_bytes %d\nargus_collector_spool_head_stuck_seconds %d\nargus_collector_sink_stalled_passes_total %d\n", pq.SpoolBytes(), pq.SpoolCapacityBytes(), int64(pq.StuckFor(time.Now()).Seconds()), ws.StalledPasses.Load())
+			return st.prometheus(len(queue), pq.Rows(), pq.Bytes(), ws, full) + fmt.Sprintf("argus_collector_spool_bytes %d\nargus_collector_spool_capacity_bytes %d\nargus_collector_spool_head_stuck_seconds %d\nargus_collector_sink_stalled_passes_total %d\nargus_collector_undeclared_format_total %d\nargus_collector_unrecognized_record_total %d\n",
+				pq.SpoolBytes(), pq.SpoolCapacityBytes(), int64(pq.StuckFor(time.Now()).Seconds()), ws.StalledPasses.Load(), undeclaredFormatTotal.Load(), unrecognizedRecordTotal.Load())
 		},
 	}
 
@@ -951,6 +1016,132 @@ func logLevel() slog.Level {
 // строки подделывается данными запроса (URI, User-Agent в JSON Caddy), а каждая строковая
 // эвристика ломала настоящие CEF/LEEF (ревью #16, круги 2–5). Решение — отдельной задачей:
 // формат по источнику/транспорту (collector.yml), тесты в review/codex-waf-dispatch.
+// undeclaredFormat — строка похожа на CEF/LEEF/WAF, но формат источника не объявлен:
+// разбирается как syslog. На переходный релиз — счётчик в /metrics и предупреждение
+// не чаще раза в минуту на отправителя, чтобы при переходе ничего не ушло молча.
+// Таблица отправителей ограничена undeclaredMaxPeers: при переполнении записи старше
+// минуты удаляются, а если места всё равно нет — одно сводное предупреждение в минуту
+// вместо поштучных (смена адресов UDP не раздувает память).
+const undeclaredMaxPeers = 1024
+
+var (
+	undeclaredFormatTotal atomic.Uint64
+	undeclaredWarned      sync.Map      // peer.Addr → time.Time последнего предупреждения
+	undeclaredStores      atomic.Uint64 // записей в undeclaredWarned (оценка сверху)
+	undeclaredSeen        atomic.Uint64 // новых отправителей — для периодической чистки
+	undeclaredMu          sync.Mutex
+	undeclaredOverflowAt  time.Time
+)
+
+func undeclaredFormat(peer listen.Peer) {
+	undeclaredFormatTotal.Add(1)
+	now := time.Now()
+	if last, ok := undeclaredWarned.Load(peer.Addr); ok && now.Sub(last.(time.Time)) < time.Minute {
+		return
+	}
+	undeclaredMu.Lock()
+	defer undeclaredMu.Unlock()
+	if _, known := undeclaredWarned.Load(peer.Addr); !known {
+		// Раз в 64 новых отправителя и при заполнении — чистка записей старше минуты
+		// (им и так положено новое предупреждение).
+		if full := undeclaredStores.Load() >= undeclaredMaxPeers; full && now.Sub(undeclaredOverflowAt) < time.Minute {
+			return
+		} else if full || undeclaredSeen.Add(1)%64 == 0 {
+			n := uint64(0)
+			undeclaredWarned.Range(func(k, v any) bool {
+				if now.Sub(v.(time.Time)) >= time.Minute {
+					undeclaredWarned.Delete(k)
+				} else {
+					n++
+				}
+				return true
+			})
+			undeclaredStores.Store(n)
+			if n >= undeclaredMaxPeers {
+				undeclaredOverflowAt = now
+				slog.Warn("необъявленный формат у многих отправителей: строки похожи на CEF/LEEF/WAF, разобраны как syslog — объявите SYSLOG_PEER_FORMAT, files[].format или [argus format=…]",
+					"peers_over", undeclaredMaxPeers, "total", undeclaredFormatTotal.Load())
+				return
+			}
+		}
+		undeclaredStores.Add(1)
+	}
+	undeclaredWarned.Store(peer.Addr, now)
+	slog.Warn("необъявленный формат: строка похожа на CEF/LEEF/WAF, разобрана как syslog — объявите SYSLOG_PEER_FORMAT, files[].format или [argus format=…]",
+		"peer", peer.Addr, "transport", peer.Transport)
+}
+
+// unrecognizedRecord — формат cef/leef объявлен, но строка не в форме записи
+// (appRecord): разобрана как syslog. Счётчик в /metrics и предупреждение не чаще
+// раза в минуту на отправителя (та же таблица, что у undeclaredFormat).
+var unrecognizedRecordTotal atomic.Uint64
+
+func unrecognizedRecord(peer listen.Peer, format string) {
+	unrecognizedRecordTotal.Add(1)
+	now := time.Now()
+	key := "declared|" + peer.Addr
+	if last, ok := undeclaredWarned.Load(key); ok && now.Sub(last.(time.Time)) < time.Minute {
+		return
+	}
+	if undeclaredStores.Load() >= undeclaredMaxPeers {
+		return // таблица полна: предупреждение о необъявленном формате важнее
+	}
+	if _, known := undeclaredWarned.Swap(key, now); !known {
+		undeclaredStores.Add(1)
+	}
+	slog.Warn("объявлен "+format+", запись не распознана: строка разобрана как syslog", "peer", peer.Addr, "transport", peer.Transport)
+}
+
+// appRecord — запись CEF/LEEF ровно в трёх формах, всё остальное — не запись:
+//  1. RFC 5424: MSG (после SD, её выделил парсер) начинается с маркера; BOM и
+//     пробелы перед ним допустимы;
+//  2. строка или строка после PRI начинается прямо с маркера (допустим BOM);
+//  3. строгий заголовок RFC 3164: PRI, дата «Mmm dd hh:mm:ss» (обязательна), HOSTNAME
+//     из ограниченного алфавита (без «{», кавычек и пробелов), необязательный TAG
+//     «имя[pid]: » — и сразу маркер. Так пишут FortiGate и Check Point.
+//
+// Ни «первого вхождения», ни места TAG сверх этого: по RFC 3164 §4.3.2 после PRI
+// без даты идёт CONTENT, и JSON-префикс не становится HOSTNAME, а маркер в нём — TAG.
+func appRecord(line string, sl parse.Syslog, marker string) (string, bool) {
+	line = strings.TrimRight(line, "\r\n")
+	if sl.Format == "rfc5424" {
+		if msg := strings.TrimLeft(sl.Message, "\ufeff "); strings.HasPrefix(msg, marker) {
+			return msg, true
+		}
+		return "", false
+	}
+	for _, re := range recordForms {
+		if m := re.FindStringSubmatchIndex(line); m != nil && line[m[2]:m[3]]+":" == marker {
+			return line[m[2]:], true
+		}
+	}
+	return "", false
+}
+
+// recordForms — формы 2 и 3 appRecord; первая группа — маркер без двоеточия.
+var recordForms = []*regexp.Regexp{
+	regexp.MustCompile(`^(?:<\d{1,3}>)?\x{FEFF}?(CEF|LEEF):`),
+	regexp.MustCompile(`^<\d{1,3}>[A-Z][a-z]{2} [ 0-3]\d \d\d:\d\d:\d\d [A-Za-z0-9._:-]{1,255} (?:[A-Za-z0-9._/-]{1,48}(?:\[\d+\])?: )?(CEF|LEEF):`),
+}
+
+// recordMarker — строка в одной из форм записи CEF/LEEF (appRecord): «CEF:»,
+// «LEEF:» или "" — не запись.
+func recordMarker(line string, sl parse.Syslog) string {
+	for _, m := range []string{"CEF:", "LEEF:"} {
+		if _, ok := appRecord(line, sl, m); ok {
+			return m
+		}
+	}
+	return ""
+}
+
+// isWAFText — строка error-лога WAF: маркер в строке (в том числе TAG «ModSecurity:»)
+// или в декодированном msg JSON Caddy в сообщении приложения (маркер может прийти
+// экранированным, «Coraza:\u0020»).
+func isWAFText(line, payload string) bool {
+	return parse.IsWAFErrorLine(line) || parse.IsWAFErrorLine(payload)
+}
+
 func hasCEF(s string) bool  { return strings.Contains(s, "CEF:") }
 func hasLEEF(s string) bool { return strings.Contains(s, "LEEF:") }
 
