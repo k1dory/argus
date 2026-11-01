@@ -220,8 +220,21 @@ var (
 )
 
 // IsWAFErrorLine — строка error-лога ModSecurity/Coraza (в т.ч. внутри JSON-лога Caddy).
+// У JSON-лога Caddy проверяется декодированный msg: маркер в нём может прийти
+// экранированным («Coraza:\u0020»).
 func IsWAFErrorLine(line string) bool {
-	return strings.Contains(line, "ModSecurity: ") || strings.Contains(line, "Coraza: ")
+	if strings.Contains(line, "ModSecurity: ") || strings.Contains(line, "Coraza: ") {
+		return true
+	}
+	if t := strings.TrimSpace(line); strings.HasPrefix(t, "{") {
+		var j struct {
+			Msg string `json:"msg"`
+		}
+		if json.Unmarshal([]byte(t), &j) == nil {
+			return strings.Contains(j.Msg, "ModSecurity: ") || strings.Contains(j.Msg, "Coraza: ")
+		}
+	}
+	return false
 }
 
 // ParseWAFErrorLine разбирает строку error-лога. Если строка — JSON Caddy
@@ -300,67 +313,38 @@ func parseRuleMeta(meta string, w *WAF, coraza bool) (WAFRule, bool) {
 }
 
 // scanRuleMeta — пары [key "value"] метаданных правила, начиная с [file "…"].
-// ModSecurity пишет msg и uri без экранирования: данные запроса могут закрыть кавычку
-// и добавить свои [id]/[tag]/[severity]. Порядок полей фиксирован (file, line, id, rev,
-// msg, data, severity, ver, maturity, accuracy, tag…, hostname, uri, unique_id), поэтому:
-// у уникального ключа учитывается первое вхождение (настоящий [id] идёт до [msg]); теги —
-// только после последнего [severity]/[maturity]/[accuracy] перед первым [hostname] и до
-// него (подделки из msg стоят раньше, из uri — позже). Штатный повтор хвоста строки
-// (ModSecurity дописывает его ещё раз) ничего не меняет.
+// Для ModSecurity метаданные error-лога неоднозначны: msg и uri пишутся без экранирования,
+// и данные запроса могут дописать свои [id]/[tag]/[severity]. Строковыми эвристиками это не
+// решается (см. ревью #16), поэтому разбор прежний; надёжный источник для ModSecurity —
+// JSON-аудит. У Coraza метаданные экранированы (%q), и parseRuleMeta берёт последний [file].
 func scanRuleMeta(meta string, w *WAF) WAFRule {
-	kvs := kvRe.FindAllStringSubmatch(meta, -1)
-	tagFrom, tagTo := 0, len(kvs)
-	for i, kv := range kvs {
-		if kv[1] == "hostname" {
-			tagTo = i
-			break
-		}
-	}
-	for i := 0; i < tagTo; i++ {
-		switch kvs[i][1] {
-		case "severity", "maturity", "accuracy", "ver":
-			tagFrom = i + 1
-		}
-	}
-	seen := map[string]bool{}
 	r := WAFRule{Severity: -1}
-	for i, kv := range kvs {
-		if kv[1] == "tag" {
-			if i >= tagFrom && i < tagTo {
-				r.Tags = append(r.Tags, strings.ReplaceAll(kv[2], `\"`, `"`))
+	for _, kv := range kvRe.FindAllStringSubmatch(meta, -1) {
+		v := strings.ReplaceAll(kv[2], `\"`, `"`)
+		switch kv[1] {
+		case "id":
+			r.ID = v
+		case "msg":
+			r.Msg = v
+		case "data":
+			r.Data = v
+		case "severity":
+			if n, err := strconv.Atoi(v); err == nil {
+				r.Severity = n
+			} else {
+				r.Severity = severityWord(v)
 			}
-			continue
+		case "tag":
+			r.Tags = append(r.Tags, v)
+		case "hostname":
+			w.ServerName = v
+		case "uri":
+			w.URI = v
+		case "unique_id":
+			w.UniqueID = v
 		}
-		if seen[kv[1]] {
-			continue
-		}
-		seen[kv[1]] = true
-		applyRuleMeta(&r, w, kv[1], strings.ReplaceAll(kv[2], `\"`, `"`))
 	}
 	return r
-}
-
-func applyRuleMeta(r *WAFRule, w *WAF, key, v string) {
-	switch key {
-	case "id":
-		r.ID = v
-	case "msg":
-		r.Msg = v
-	case "data":
-		r.Data = v
-	case "severity":
-		if n, err := strconv.Atoi(v); err == nil {
-			r.Severity = n
-		} else {
-			r.Severity = severityWord(v)
-		}
-	case "hostname":
-		w.ServerName = v
-	case "uri":
-		w.URI = v
-	case "unique_id":
-		w.UniqueID = v
-	}
 }
 
 // auditHeaders — заголовки запроса из аудита: объект строк (ModSecurity) или массивов (Coraza 3.8).

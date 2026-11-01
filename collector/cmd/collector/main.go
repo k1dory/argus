@@ -821,24 +821,28 @@ func logLevel() slog.Level {
 	return slog.LevelInfo
 }
 
-// hasCEF/hasLEEF — запись в формате CEF/LEEF. Заголовок syslog бывает любым (RFC 3164
-// без тега, без PRI, RFC 5424 с BOM), поэтому маркер ищется по строке. Но если раньше
-// маркера стоит маркер WAF («ModSecurity: »/«Coraza: »), то «CEF:» — это данные запроса
-// (URI, logdata) внутри строки WAF: иначе атакующий выбирал бы разборщик.
-func hasCEF(line, _ string) bool  { return formatBeforeWAF(line, "CEF:") }
-func hasLEEF(line, _ string) bool { return formatBeforeWAF(line, "LEEF:") }
+// hasCEF/hasLEEF — запись в формате CEF/LEEF по структуре syslog, а не поиском
+// подстроки: заголовок CEF/LEEF стоит в начале строки, в начале сообщения syslog
+// (в т.ч. RFC 5424 с BOM) или забран разборщиком RFC 3164 как тег приложения
+// («host CEF:0|…»). «CEF:» внутри данных (URI WAF, поле JSON Caddy) формата не задаёт.
+func hasCEF(line, msg string) bool  { return hasFormat(line, msg, "CEF") }
+func hasLEEF(line, msg string) bool { return hasFormat(line, msg, "LEEF") }
 
-func formatBeforeWAF(line, marker string) bool {
-	i := strings.Index(line, marker)
-	if i < 0 {
-		return false
+func hasFormat(line, msg, name string) bool {
+	marker := name + ":"
+	clean := func(s string) string { return strings.TrimLeft(strings.TrimSpace(s), "\ufeff") }
+	if strings.HasPrefix(clean(line), marker) || strings.HasPrefix(clean(msg), marker) {
+		return true
 	}
-	for _, w := range []string{"ModSecurity: ", "Coraza: "} {
-		if j := strings.Index(line, w); j >= 0 && j < i {
-			return false
+	sl, _ := parse.ParseSyslog(line)
+	if sl.Format == "raw" && !strings.HasPrefix(line, "<") {
+		// строка файла без PRI («Oct 29 17:39:38 host CEF:0|…»): тот же разбор заголовка
+		sl, _ = parse.ParseSyslog("<13>" + line)
+		if sl.Format != "raw" && strings.HasPrefix(clean(sl.Message), marker) {
+			return true
 		}
 	}
-	return true
+	return sl.Format == "rfc3164" && strings.EqualFold(sl.AppName, name)
 }
 
 // replayPcap: collector replay-pcap file.pcap [--to http://host:8088] [--token T]
