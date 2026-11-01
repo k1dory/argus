@@ -67,7 +67,7 @@ beforeEach(async (c) => {
 
 test("субъекты: period=30d задаёт 30 дней активности, как range=30d", async () => {
   await actors.default(props({ period: "30d" }));
-  const activity = sent.find((q) => q.sql.includes("ARRAY JOIN ps AS p"));
+  const activity = sent.find((q) => q.sql.includes("FROM events") && q.sql.includes("GROUP BY hits"));
   assert.ok(activity, "должен выполняться реальный запрос активности списка");
   const from = activity.params.get("param_from");
   const to = activity.params.get("param_to");

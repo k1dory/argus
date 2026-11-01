@@ -32,7 +32,7 @@ test("listPersons: 200+ алиасов и 100 персон — один прох
     const url = new URL(input instanceof Request ? input.url : String(input));
     url.searchParams.set("database", database);
     const sql = String(init?.body ?? "");
-    if (/FROM events/.test(sql) && /ARRAY JOIN ps/.test(sql)) {
+    if (/FROM events/.test(sql) && /GROUP BY hits/.test(sql)) {
       captured.push({ sql, params: Object.fromEntries([...url.searchParams].filter(([k]) => k.startsWith("param_")).map(([k, v]) => [k.slice(6), v])) });
     }
     return nativeFetch(url, init);

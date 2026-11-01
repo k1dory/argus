@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import {
-  ACTOR_KEYS_EXPR, activityPlan, actorMarkdown, aliasEventsQuery, aliasPrefilter, PREFILTER_INDEX_MAX, aliasInterval, canonicalIp, canonicalPhone, aliasPredicate, ambiguousAliases, bucketEvents, classifyEvent, clampWindow, holdPolicy, isHeld, isIp, isPhone, normalizeAliasValue, parseActorsParams, parseAliasInput, parseDateInput, parseIdentitiesDoc,
+  ACTOR_KEYS_EXPR, activityPlan, actorMarkdown, ARRAY_PARAM_CHUNK, arrayParam, utf8Bytes, aliasEventsQuery, aliasPrefilter, PREFILTER_INDEX_MAX, aliasInterval, canonicalIp, canonicalPhone, aliasPredicate, ambiguousAliases, bucketEvents, classifyEvent, clampWindow, holdPolicy, isHeld, isIp, isPhone, normalizeAliasValue, parseActorsParams, parseAliasInput, parseDateInput, parseIdentitiesDoc,
   primaryAlias, rangeWindow, resolveStatus, aliasKey, aliasMatches, activeAliases, ACTOR_KINDS, type ActorReport, type Alias,
 } from "../src/lib/shared/actors";
 import { toLogItem } from "../src/lib/shared/log-query";
@@ -282,7 +282,7 @@ test("aliasPrefilter: до PREFILTER_INDEX_MAX значений — hasAny по 
   assert.equal(aliasPrefilter([mk("login", "x", 0.1)]).sql, "0");
 });
 
-test("activityPlan: группы по ключу, номера персон, интервалы в окне, удержанные и вне окна — без плана", () => {
+test("activityPlan: классы по слоту, значению и интервалу, владельцы, удержанные и вне окна — без плана", () => {
   const w = { fromMs: Date.UTC(2026, 9, 20), toMs: Date.UTC(2026, 9, 27) };
   const mk = (person: string, kind: Alias["kind"], value: string, from = "2026-10-01 00:00:00.000", to: string | null = null, confidence = 1): Alias =>
     ({ person_id: person, kind, value, valid_from: from, valid_to: to, source: "t", confidence, note: "" });
@@ -293,10 +293,41 @@ test("activityPlan: группы по ключу, номера персон, и�
     { id: "old", aliases: [mk("old", "login", "o", "2026-09-01 00:00:00.000", "2026-10-01 00:00:00.000")] },
   ], w);
   assert.deepEqual(plan.persons, ["a", "b"], "без алиасов в окне — не в плане");
-  assert.equal(plan.params.ap_k1, "['','shared']", "одно значение login — одна группа");
-  assert.equal(plan.params.ap_g1, "[0,1]");
-  assert.equal(plan.params.ap_ga, "[[],[1,4],[2],[3]]", "группа 1: login shared у a и b");
-  assert.equal(plan.params.ap_pi, "[1,1,2,2]");
-  assert.equal(plan.params.ap_vf, `[${w.fromMs},${Date.UTC(2026, 9, 22)},${w.fromMs},${w.fromMs}]`, "интервал — внутри окна");
-  assert.ok(!/ OR /.test(plan.sql) && plan.sql.includes("arrayDistinct"));
+  // Классы подряд по слотам и значениям: 1 — uid shared (actor_name, b), 2 — login shared
+  // [окно] (lowerUTF8(actor_name), a и b), 3 — ip 192.0.2.1 c 22.10 (src_ip, a).
+  assert.deepEqual(plan.owners, [[2], [1, 2], [1]], "одно значение и интервал у двух персон — один класс");
+  const sp = (start: number, n: number) => String(start * 4294967296 + n);
+  assert.equal(plan.params.ap_k0, "['shared']");
+  assert.equal(plan.params.ap_r0, `[${sp(1, 1)}]`, "значение → отрезок классов [1, 2)");
+  assert.equal(plan.params.ap_k1, "['shared']");
+  assert.equal(plan.params.ap_r1, `[${sp(2, 1)}]`);
+  assert.equal(plan.params.ap_r2, `[${sp(3, 1)}]`);
+  assert.equal(plan.params.ap_vf, `[${w.fromMs},${w.fromMs},${Date.UTC(2026, 9, 22)}]`, "интервал — внутри окна");
+  assert.equal(plan.params.ap_ow, "[2,1,2,1]", "владельцы классов — плоско");
+  assert.equal(plan.params.ap_os, `[${sp(1, 1)},${sp(2, 2)},${sp(4, 1)}]`, "класс → отрезок владельцев");
+  assert.ok(!/Array\(Array/.test(Object.keys(plan.params).join() + plan.hits + plan.who), "без вложенных массивов-параметров");
+  assert.ok(!/ OR /.test(plan.hits) && plan.hits.startsWith("arraySort("));
+  assert.ok(plan.who.startsWith("arrayDistinct(") && plan.who.includes("hits"));
+});
+
+test("arrayParam: короткий массив — один параметр, длинный — частями и arrayConcat", () => {
+  const params: Record<string, string | number> = {};
+  assert.equal(arrayParam(params, "x", "Array(String)", ["'a'", "'b'"]), "{x:Array(String)}");
+  assert.equal(params.x, "['a','b']");
+  const long = Array.from({ length: 3000 }, (_, i) => `'${String(i).padStart(40, "0")}'`);
+  const sql = arrayParam(params, "y", "Array(String)", long);
+  const parts = Object.keys(params).filter((k) => k.startsWith("y_"));
+  assert.ok(parts.length > 1 && sql === `arrayConcat(${parts.map((k) => `{${k}:Array(String)}`).join(", ")})`, sql);
+  assert.ok(parts.every((k) => String(params[k]).length <= ARRAY_PARAM_CHUNK + 2));
+  assert.deepEqual(parts.flatMap((k) => String(params[k]).slice(1, -1).split(",")), long, "порядок и состав сохранены");
+});
+
+test("arrayParam: предел части — в байтах UTF-8, а не в символах", () => {
+  const params: Record<string, string | number> = {};
+  const wide = Array.from({ length: 300 }, (_, i) => `'${"漢".repeat(250)}${i}'`);
+  arrayParam(params, "u", "Array(String)", wide);
+  const parts = Object.keys(params).filter((k) => k.startsWith("u_"));
+  assert.ok(parts.length > 1);
+  assert.ok(parts.every((k) => utf8Bytes(String(params[k])) <= ARRAY_PARAM_CHUNK + 2), "каждая часть ≤ предела в байтах");
+  assert.equal(utf8Bytes("a漢é😀"), 1 + 3 + 2 + 4);
 });

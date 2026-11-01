@@ -274,76 +274,145 @@ export function aliasPredicate(aliases: Alias[], window: Window, prefix = "", ts
 const KEY_SLOTS = ["actor_name", "lowerUTF8(actor_name)", "src_ip", "lowerUTF8(node)"] as const;
 
 export type ActivityPlan = {
-  /** Персоны с хотя бы одним алиасом в окне — по номеру (1-based) в результате запроса. */
+  /** Персоны с хотя бы одним алиасом в окне. */
   persons: string[];
-  /** Выражение: массив номеров персон, которым принадлежит строка (без повторов). */
-  sql: string;
+  /** Класс алиасов (1-based) → номера персон (1-based в persons). */
+  owners: number[][];
+  /** Выражение: отсортированный массив классов, совпавших со строкой в момент ts. */
+  hits: string;
+  /** Выражение над колонкой hits: номера персон (1-based в persons) без повторов. */
+  who: string;
   params: Record<string, string | number>;
 };
 
-const chIntArray = (values: number[]): string => `[${values.join(",")}]`;
+/** Часть массива-параметра не больше стольких байт UTF-8: длинный параметр уходит телом
+ *  multipart (clickhouse.ts), а у поля формы есть предел значения (Poco HTMLForm,
+ *  http_max_field_value_size — 128 КиБ на 24.8, в байтах; из URL не поднимается). */
+export const ARRAY_PARAM_CHUNK = 60_000;
+
+/** Длина строки в байтах UTF-8 (без Buffer: модуль общий с клиентом). */
+export function utf8Bytes(s: string): number {
+  let n = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0x80) n += 1;
+    else if (c < 0x800) n += 2;
+    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length) { n += 4; i++; } // суррогатная пара
+    else n += 3;
+  }
+  return n;
+}
 
 /**
- * Активность многих персон за один проход по окну — без OR по алиасам. Каждый из
- * четырёх ключей строки (ACTOR_KEYS_EXPR) ищется хеш-поиском transform в таблице
- * «значение → группа алиасов»; из найденных алиасов остаются действующие в момент
- * ts (их интервал внутри окна — как у aliasPredicate), от них — номера персон без
- * повторов. Строка, совпавшая с двумя алиасами одной персоны, засчитывается ей один
- * раз; два события в одну мс — два события (как count() паспорта, без хеша).
- * Сотни веток OR × сотня персон считались на каждой строке и на живом потоке
- * упирались в таймаут; поиск по ключу от числа алиасов почти не зависит.
+ * Массив-параметр из готовых литералов элементов: одним параметром {name:Type}, а если
+ * длиннее ARRAY_PARAM_CHUNK байт — частями name_0, name_1… и arrayConcat в SQL. Делится
+ * только между элементами, поэтому элементы — скаляры (вложенные массивы не годятся:
+ * один элемент мог бы сам превысить предел поля). Склейка констант — константа: её
+ * принимают transform и IN.
+ */
+export function arrayParam(params: Record<string, string | number>, name: string, type: string, elements: string[]): string {
+  const chunks: string[][] = [[]];
+  let len = 0;
+  for (const el of elements) {
+    const bytes = utf8Bytes(el) + 1;
+    if (len + bytes > ARRAY_PARAM_CHUNK && chunks[chunks.length - 1].length) {
+      chunks.push([]);
+      len = 0;
+    }
+    chunks[chunks.length - 1].push(el);
+    len += bytes;
+  }
+  if (chunks.length === 1) {
+    params[name] = `[${chunks[0].join(",")}]`;
+    return `{${name}:${type}}`;
+  }
+  return `arrayConcat(${chunks.map((c, i) => {
+    params[`${name}_${i}`] = `[${c.join(",")}]`;
+    return `{${name}_${i}:${type}}`;
+  }).join(", ")})`;
+}
+
+const chStringLiteral = (v: string): string => `'${v.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`;
+
+/** Отрезок [start, start + n) одним UInt64: start в старших 32 битах. */
+const SPAN = 4294967296;
+const span = (start: number, n: number): string => String(start * SPAN + n);
+const spanRange = (x: string): string => `range(toUInt32(intDiv(${x}, ${SPAN})), toUInt32(intDiv(${x}, ${SPAN}) + modulo(${x}, ${SPAN})))`;
+
+/**
+ * Активность многих персон за один проход по окну — без OR по алиасам. Алиасы с
+ * одинаковыми слотом (колонкой сравнения), значением и интервалом внутри окна — один
+ * класс; у класса — список персон-владельцев (одно значение бывает у нескольких).
+ * Классы одного значения пронумерованы подряд, поэтому каждый из четырёх ключей строки
+ * (ACTOR_KEYS_EXPR) хеш-поиском transform даёт отрезок номеров классов, а не вложенный
+ * массив; остаются классы, действующие в момент ts. Так же — владельцы класса: отрезок
+ * плоского массива персон. Вызывающий группирует строки по набору совпавших классов
+ * (count, max(ts)) и затем раскрывает наборы в персоны выражением who в самом
+ * ClickHouse: строка засчитывается персоне один раз, даже если совпала с несколькими
+ * её алиасами, общие значения сотни персон не размножают строки событий, а в ответе
+ * не больше строк, чем персон. Два события в одну мс — два события (как count()
+ * паспорта, без хеша). Строки отбирает aliasPrefilter (hasAny или IN).
  */
 export function activityPlan(byPerson: { id: string; aliases: Alias[] }[], window: Window, prefix = "ap_"): ActivityPlan {
   const w = clampWindow(window);
   const persons: string[] = [];
-  const keyGroups = KEY_SLOTS.map(() => new Map<string, number>());
-  const groups: number[][] = [[]]; // группа 0 — «нет алиасов» (transform по умолчанию)
-  const from: number[] = [], to: number[] = [], owner: number[] = [];
+  // слот → значение → интервал → номера владельцев
+  const slotValues = KEY_SLOTS.map(() => new Map<string, Map<string, { fromMs: number; toMs: number; owners: number[] }>>());
   for (const { id, aliases } of byPerson) {
     let personNo = 0;
     for (const a of aliases) {
       if (isHeld(a)) continue;
       const iv = aliasInterval(a, w);
       if (!iv) continue;
+      const slot = KEY_SLOTS.indexOf(aliasColumnExpr(a.kind) as (typeof KEY_SLOTS)[number]);
+      if (slot < 0) continue;
       if (!personNo) {
         persons.push(id);
         personNo = persons.length;
       }
-      const slot = KEY_SLOTS.indexOf(aliasColumnExpr(a.kind) as (typeof KEY_SLOTS)[number]);
-      if (slot < 0) continue;
-      from.push(iv.fromMs);
-      to.push(iv.toMs);
-      owner.push(personNo);
-      const aliasNo = owner.length;
-      let g = keyGroups[slot].get(a.value);
-      if (g === undefined) {
-        g = groups.length;
-        groups.push([]);
-        keyGroups[slot].set(a.value, g);
-      }
-      groups[g].push(aliasNo);
+      const byInterval = slotValues[slot].get(a.value) ?? new Map();
+      slotValues[slot].set(a.value, byInterval);
+      const key = `${iv.fromMs}\u0000${iv.toMs}`;
+      const cls = byInterval.get(key) ?? { fromMs: iv.fromMs, toMs: iv.toMs, owners: [] };
+      byInterval.set(key, cls);
+      if (!cls.owners.includes(personNo)) cls.owners.push(personNo);
     }
   }
-  const params: Record<string, string | number> = {
-    [`${prefix}ga`]: `[${groups.map(chIntArray).join(",")}]`,
-    [`${prefix}vf`]: chIntArray(from), [`${prefix}vt`]: chIntArray(to), [`${prefix}pi`]: chIntArray(owner),
-  };
-  const lookups = KEY_SLOTS.map((expr, s) => {
-    // Пустое значение — всегда группа 0: transform не принимает пустые массивы.
-    const keys = ["", ...keyGroups[s].keys()];
-    const ids = [0, ...keyGroups[s].values()];
-    params[`${prefix}k${s}`] = chStringArray(keys);
-    params[`${prefix}g${s}`] = chIntArray(ids);
-    return `{${prefix}ga:Array(Array(UInt32))}[transform(${expr}, {${prefix}k${s}:Array(String)}, {${prefix}g${s}:Array(UInt32)}, toUInt32(0)) + 1]`;
+  const params: Record<string, string | number> = {};
+  const owners: number[][] = [];
+  const from: string[] = [], to: string[] = [], ownerSpan: string[] = [], ownerFlat: string[] = [];
+  const lookups: string[] = [];
+  KEY_SLOTS.forEach((expr, s) => {
+    if (!slotValues[s].size) return;
+    const keys: string[] = [], spans: string[] = [];
+    for (const [value, byInterval] of slotValues[s]) {
+      keys.push(chStringLiteral(value));
+      spans.push(span(owners.length + 1, byInterval.size));
+      for (const cls of byInterval.values()) {
+        owners.push(cls.owners);
+        from.push(String(cls.fromMs));
+        to.push(String(cls.toMs));
+        ownerSpan.push(span(ownerFlat.length + 1, cls.owners.length));
+        ownerFlat.push(...cls.owners.map(String));
+      }
+    }
+    const k = arrayParam(params, `${prefix}k${s}`, "Array(String)", keys);
+    const r = arrayParam(params, `${prefix}r${s}`, "Array(UInt64)", spans);
+    lookups.push(spanRange(`transform(${expr}, ${k}, ${r}, toUInt64(0))`));
   });
+  if (!lookups.length) return { persons, owners, hits: "[]", who: "[]", params };
+  const vf = arrayParam(params, `${prefix}vf`, "Array(Int64)", from);
+  const vt = arrayParam(params, `${prefix}vt`, "Array(Int64)", to);
+  const os = arrayParam(params, `${prefix}os`, "Array(UInt64)", ownerSpan);
+  const ow = arrayParam(params, `${prefix}ow`, "Array(UInt32)", ownerFlat);
   const ms = "toUnixTimestamp64Milli(ts)";
-  const sql = `arrayDistinct(arrayMap(i -> {${prefix}pi:Array(UInt32)}[i], arrayFilter(i -> ${ms} >= {${prefix}vf:Array(Int64)}[i] AND ${ms} < {${prefix}vt:Array(Int64)}[i], arrayConcat(${lookups.join(", ")}))))`;
-  return { persons, sql, params };
+  const hits = `arraySort(arrayFilter(c -> ${ms} >= ${vf}[c] AND ${ms} < ${vt}[c], arrayConcat(${lookups.join(", ")})))`;
+  const who = `arrayDistinct(arrayFlatten(arrayMap(c -> arrayMap(i -> ${ow}[i], ${spanRange(`${os}[c]`)}), hits)))`;
+  return { persons, owners, hits, who, params };
 }
 
 /** Строка ClickHouse Array(String) для параметра запроса. */
-export const chStringArray = (values: string[]): string =>
-  `[${values.map((v) => `'${v.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`).join(",")}]`;
+export const chStringArray = (values: string[]): string => `[${values.map(chStringLiteral).join(",")}]`;
 
 /** Выражение skip-индекса idx_actor_keys (миграция 0032): все колонки, с которыми
  *  сравниваются алиасы, в том виде, в каком их сравнивает aliasColumnExpr. Текст должен
@@ -374,8 +443,9 @@ export function aliasPrefilter(aliases: Alias[], prefix = "pf_"): Predicate {
   const values = new Set(live.map(compareValue));
   if (!values.size) return { sql: "0", params: {} };
   if (values.size <= PREFILTER_INDEX_MAX) {
-    const name = `${prefix}keys`;
-    return { sql: `hasAny(${ACTOR_KEYS_EXPR}, {${name}:Array(String)})`, params: { [name]: chStringArray([...values].sort()) } };
+    const params: Record<string, string> = {};
+    const keys = arrayParam(params, `${prefix}keys`, "Array(String)", [...values].sort().map(chStringLiteral));
+    return { sql: `hasAny(${ACTOR_KEYS_EXPR}, ${keys})`, params };
   }
   const bySlot = new Map<string, Set<string>>();
   for (const a of live) {
@@ -383,11 +453,8 @@ export function aliasPrefilter(aliases: Alias[], prefix = "pf_"): Predicate {
     bySlot.set(expr, (bySlot.get(expr) ?? new Set()).add(a.value));
   }
   const params: Record<string, string> = {};
-  const parts = [...bySlot].sort(([x], [y]) => x.localeCompare(y)).map(([expr, vals], i) => {
-    const name = `${prefix}in${i}`;
-    params[name] = chStringArray([...vals].sort());
-    return `${expr} IN {${name}:Array(String)}`;
-  });
+  const parts = [...bySlot].sort(([x], [y]) => x.localeCompare(y)).map(([expr, vals], i) =>
+    `${expr} IN ${arrayParam(params, `${prefix}in${i}`, "Array(String)", [...vals].sort().map(chStringLiteral))}`);
   return { sql: `(${parts.join(" OR ")})`, params };
 }
 
