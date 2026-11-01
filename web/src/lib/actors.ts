@@ -10,6 +10,7 @@ import { SEARCH_SETTINGS } from "./search";
 import { chTs, LOG_COLUMNS, toLogItem, type LogItem } from "./shared/log-query";
 import type { TriageBinding } from "./shared/triage";
 import {
+  activityPlan,
   ACTOR_KEYS_EXPR, ACTOR_KINDS, activeAliases, aliasColumnExpr, aliasPredicate, aliasPrefilter, aliasActiveAt, aliasMatches, aliasKey, ambiguousAliases, bucketEvents, canonicalIp, canonicalPhone, chStringArray, clampWindow, SECTION_LABELS, SECTION_SQL, SECTIONS, CONFIRMED_NOTE_PREFIX, HOLD_CONFIDENCE, HOLD_NOTE_PREFIX, isAliasKind, isHeld, LOWERCASE_KINDS, normalizeAliasValue, rangeWindow, resolveStatus,
   type ActorIncident, type ActorRange, type ActorReport, type Alias, type AliasInput, type ClassCount, type IpStat, type NodeStat, type Person, type PersonInput, type ResolveMatch, type ResolveStatus, type SourceCoverage, type Window,
 } from "./shared/actors";
@@ -74,15 +75,16 @@ export async function allAliases(): Promise<Alias[]> {
 
 export type PersonSummary = Person & { aliases: number; events: number; incidents: number; last_ts: string | null };
 
-/** Персон в одном запросе активности: на каждую — countIf/maxIf по её предикату. */
+/** Персон в одном запросе инцидентов: на каждую — countIf по её предикату. */
 const PERSONS_PER_QUERY = 100;
 
 /**
- * Список персон с активностью за период. Каждый человек считается одним
- * OR-предикатом по своим алиасам (тот же aliasPredicate, что у паспорта —
- * счётчики совпадают с count() паспорта, без дедупликации по хешу), партиями
- * по PERSONS_PER_QUERY персон на один проход по окну. Инциденты — по
- * субъектным алиасам, действовавшим на first_ts инцидента.
+ * Список персон с активностью за период. События — один проход по окну на всех
+ * персон (activityPlan: поиск по ключам строки, без OR по алиасам), с предфильтром
+ * idx_actor_keys по значениям всех алиасов; строка считается персоне один раз,
+ * события не дедуплицируются по хешу — счётчики совпадают с count() паспорта.
+ * Инциденты — по субъектным алиасам, действовавшим на first_ts инцидента,
+ * партиями по PERSONS_PER_QUERY персон (incidents_current невелик).
  */
 export async function listPersons(range: ActorRange, now = Date.now()): Promise<PersonSummary[]> {
   const w = clampWindow(rangeWindow(range, now));
@@ -94,42 +96,41 @@ export async function listPersons(range: ActorRange, now = Date.now()): Promise<
   for (const a of aliases) byPerson.set(a.person_id, [...(byPerson.get(a.person_id) ?? []), a]);
   const events = new Map<string, { events: number; last_ts: string | null }>();
   const incidents = new Map<string, number>();
+  const plan = activityPlan(persons.map((p) => ({ id: p.person_id, aliases: byPerson.get(p.person_id) ?? [] })), w);
+  const eventsQuery = plan.persons.length ? (async () => {
+    const pf = aliasPrefilter(persons.flatMap((p) => byPerson.get(p.person_id) ?? []));
+    const rows = await chQuery<{ p: string | number; events: string | number; last_ts: string }>(
+      `SELECT p, count() AS events, toString(max(ts)) AS last_ts
+       FROM (SELECT ts, ${plan.sql} AS ps FROM events
+             WHERE ts >= parseDateTime64BestEffort({from:String}, 3, 'UTC') AND ts < parseDateTime64BestEffort({to:String}, 3, 'UTC') AND ${pf.sql})
+       ARRAY JOIN ps AS p GROUP BY p`,
+      { from: chTs(w.fromMs), to: chTs(w.toMs), ...pf.params, ...plan.params },
+    );
+    for (const r of rows) {
+      const id = plan.persons[Number(r.p) - 1];
+      const n = Number(r.events);
+      if (id) events.set(id, { events: n, last_ts: n > 0 ? String(r.last_ts) : null });
+    }
+  })() : Promise.resolve();
+  const incidentQueries: Promise<void>[] = [];
   for (let i = 0; i < persons.length; i += PERSONS_PER_QUERY) {
     const chunk = persons.slice(i, i + PERSONS_PER_QUERY).filter((p) => (byPerson.get(p.person_id) ?? []).length > 0);
     if (!chunk.length) continue;
-    const evParams: Record<string, string | number> = { from: chTs(w.fromMs), to: chTs(w.toMs) };
     const incParams: Record<string, string | number> = { from: chTs(w.fromMs), to: chTs(w.toMs) };
-    const evCols: string[] = [];
     const incCols: string[] = [];
-    // Предфильтр по всем алиасам партии: точные countIf считаются только по совпавшим строкам.
-    const pf = aliasPrefilter(chunk.flatMap((p) => byPerson.get(p.person_id) ?? []));
-    Object.assign(evParams, pf.params);
     chunk.forEach((p, j) => {
-      const own = byPerson.get(p.person_id) ?? [];
-      const pe = aliasPredicate(own, w, `p${j}_`);
-      Object.assign(evParams, pe.params);
-      evCols.push(`countIf(${pe.sql}) AS e${j}, toString(maxIf(ts, ${pe.sql})) AS l${j}`);
-      const pi = aliasPredicate(own.filter((a) => ACTOR_KINDS.includes(a.kind)), w, `p${j}_`, "first_ts");
+      const pi = aliasPredicate((byPerson.get(p.person_id) ?? []).filter((a) => ACTOR_KINDS.includes(a.kind)), w, `p${j}_`, "first_ts");
       Object.assign(incParams, pi.params);
       incCols.push(`countIf(${pi.sql}) AS i${j}`);
     });
-    const [ev, inc] = await Promise.all([
-      chQuery<Record<string, string | number>>(
-        `SELECT ${evCols.join(", ")} FROM events WHERE ts >= parseDateTime64BestEffort({from:String}, 3, 'UTC') AND ts < parseDateTime64BestEffort({to:String}, 3, 'UTC') AND ${pf.sql}`,
-        evParams,
-      ),
-      chQuery<Record<string, string | number>>(
-        `SELECT ${incCols.join(", ")} FROM incidents_current WHERE created_at >= parseDateTimeBestEffort({from:String}) AND created_at < parseDateTimeBestEffort({to:String})`,
-        incParams,
-      ),
-    ]);
-    chunk.forEach((p, j) => {
-      const n = Number(ev[0]?.[`e${j}`] ?? 0);
-      const last = String(ev[0]?.[`l${j}`] ?? "");
-      events.set(p.person_id, { events: n, last_ts: n > 0 && !last.startsWith("1970") ? last : null });
-      incidents.set(p.person_id, Number(inc[0]?.[`i${j}`] ?? 0));
-    });
+    incidentQueries.push(chQuery<Record<string, string | number>>(
+      `SELECT ${incCols.join(", ")} FROM incidents_current WHERE created_at >= parseDateTimeBestEffort({from:String}) AND created_at < parseDateTimeBestEffort({to:String})`,
+      incParams,
+    ).then((inc) => {
+      chunk.forEach((p, j) => incidents.set(p.person_id, Number(inc[0]?.[`i${j}`] ?? 0)));
+    }));
   }
+  await Promise.all([eventsQuery, ...incidentQueries]);
   return persons.map((p) => ({
     ...toPerson(p),
     aliases: (byPerson.get(p.person_id) ?? []).length,
