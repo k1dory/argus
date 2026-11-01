@@ -22,6 +22,7 @@ import { INCIDENT_STATUSES, incidentClosuresFor, incidentStats, incidentsList, v
 import { isIncidentStatus } from "@/lib/shared/incidents";
 import { reactionDeadline, reactionOverdue } from "@/lib/shared/incident-sla";
 import { verdictState, type VerdictState } from "@/lib/shared/incidents";
+import { hideVerdicts } from "@/lib/blind";
 import { INCIDENT_LEVEL_LABELS } from "@/lib/shared/labels";
 import { clampPage } from "@/lib/shared/limits";
 import { fmtNum, formatAgo, formatTs } from "@/lib/shared/time";
@@ -35,7 +36,8 @@ const VERDICT_CELL: Record<VerdictState, (v: VerdictRow | undefined) => React.Re
   hidden: (v) => <span className="font-mono text-xs">уверенность {fmtNum(v?.confidence, 2)} ниже порога — разбор скрыт</span>,
   shown: (v) => <span className="line-clamp-3" title={v?.summary_ru}>{v?.summary_ru}</span>,
 };
-function VerdictCell({ v, unavailable = false }: { v: VerdictRow | undefined; unavailable?: boolean }) {
+function VerdictCell({ v, unavailable = false, blind = false }: { v: VerdictRow | undefined; unavailable?: boolean; blind?: boolean }) {
+  if (blind) return <span className="font-mono text-xs">разбор вслепую — скрыт до завершения</span>;
   if (unavailable) return <span className="font-mono text-xs text-destructive">разбор временно недоступен</span>;
   return <>{VERDICT_CELL[verdictState(v)](v)}</>;
 }
@@ -157,7 +159,9 @@ export default async function IncidentsPage({ searchParams }: PageProps<"/incide
                     </TableRow>
                   )}
                   {r.data.list.rows.map((row) => {
-                    const v = verdicts?.ok ? verdicts.data[row.incident_id] : undefined;
+                    // Слепая выборка: разбор модели не попадает и в ленту, пока инцидент открыт.
+                    const blind = hideVerdicts(row);
+                    const v = verdicts?.ok && !blind ? verdicts.data[row.incident_id] : undefined;
                     const closure = closures?.ok ? closures.data[row.incident_id] : undefined;
                     return (
                       <TableRow key={row.incident_id} className="border-border/40">
@@ -179,7 +183,7 @@ export default async function IncidentsPage({ searchParams }: PageProps<"/incide
                         </TableCell>
                         <TableCell><LevelBadge level={row.level} /></TableCell>
                         <TableCell className="text-sm whitespace-normal break-words text-muted-foreground">
-                          <VerdictCell v={v} unavailable={verdicts !== null && !verdicts.ok} />
+                          <VerdictCell v={v} blind={blind} unavailable={verdicts !== null && !verdicts.ok} />
                         </TableCell>
                         <TableCell className="whitespace-normal break-words">
                           <StatusBadge status={row.status} />
