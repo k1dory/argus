@@ -1,0 +1,27 @@
+# Массовое удаление или переименование файлов на NAS одним пользователем —
+# почерк шифровальщика: Qlocker, DeadBolt и их родня либо шифруют файлы прямо
+# на QNAP, либо заражённая рабочая станция переписывает общую папку по SMB.
+# EDR на NAS не поставить, поэтому журнал доступа QuLog — единственный датчик.
+# Порог 200 действий за 5 минут: ручная уборка папки столько не даёт, а
+# шифровальщик проходит тысячи файлов в минуту. Плановые задания (бэкап с
+# зеркалированием, очистка корзины) заводятся отдельной учёткой — её стоит
+# занести в filter, а не поднимать порог. Учётки QNAP локальные: admin двух NAS —
+# разные люди, поэтому группировка по субъекту и узлу.
+title: "NAS: mass file delete/rename by one user"
+id: a41c-imp-090
+level: high
+tags: [attack.impact, attack.t1486, attack.t1485]
+
+detection:
+  selection:
+    source: nas.qnap
+    action: [file.delete, file.rename, file.move]
+  threshold:
+    kind: count
+    count: 200
+    window: 5m
+    group_by: actor.name, node
+  condition: selection and threshold
+
+analyst:
+  profile: on-prem-strict
