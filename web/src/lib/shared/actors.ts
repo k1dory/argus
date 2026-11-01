@@ -342,7 +342,7 @@ export function utf8Bytes(s: string): number {
     const c = s.charCodeAt(i);
     if (c < 0x80) n += 1;
     else if (c < 0x800) n += 2;
-    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length) { n += 4; i++; } // суррогатная пара
+    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length && s.charCodeAt(i + 1) >= 0xdc00 && s.charCodeAt(i + 1) <= 0xdfff) { n += 4; i++; } // суррогатная пара
     else n += 3;
   }
   return n;
@@ -357,8 +357,8 @@ export function formEncodedBytes(s: string): number {
     if ((c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || c === 0x2a || c === 0x2d || c === 0x2e || c === 0x5f || c === 0x20) n += 1;
     else if (c < 0x80) n += 3;
     else if (c < 0x800) n += 6;
-    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length) { n += 12; i++; }
-    else n += 9;
+    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length && s.charCodeAt(i + 1) >= 0xdc00 && s.charCodeAt(i + 1) <= 0xdfff) { n += 12; i++; }
+    else n += 9; // в том числе непарный суррогат: URLSearchParams отправляет U+FFFD (3 байта)
   }
   return n;
 }
@@ -371,16 +371,20 @@ export function formEncodedBytes(s: string): number {
  * принимают transform и IN.
  */
 export function arrayParam(params: Record<string, string | number>, name: string, type: string, elements: string[]): string {
+  // Бюджет части: скобки «[» «]» (%5B %5D — 6 байт), элементы и «,» (%2C) между ними.
+  const BRACKETS = 6, COMMA = 3;
   const chunks: string[][] = [[]];
-  let len = 0;
+  let len = BRACKETS;
   for (const el of elements) {
-    const bytes = formEncodedBytes(el) + 3; // «,» — %2C
-    if (len + bytes > ARRAY_PARAM_CHUNK && chunks[chunks.length - 1].length) {
-      chunks.push([]);
-      len = 0;
+    const bytes = formEncodedBytes(el);
+    const cur = chunks[chunks.length - 1];
+    if (cur.length && len + COMMA + bytes > ARRAY_PARAM_CHUNK) {
+      chunks.push([el]);
+      len = BRACKETS + bytes;
+      continue;
     }
-    chunks[chunks.length - 1].push(el);
-    len += bytes;
+    cur.push(el);
+    len += (cur.length > 1 ? COMMA : 0) + bytes;
   }
   if (chunks.length === 1) {
     params[name] = `[${chunks[0].join(",")}]`;

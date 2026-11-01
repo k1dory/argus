@@ -10,7 +10,7 @@ import { SEARCH_SETTINGS } from "./search";
 import { chTs, LOG_COLUMNS, toLogItem, type LogItem } from "./shared/log-query";
 import type { TriageBinding } from "./shared/triage";
 import {
-  activityPlan,
+  activityPlan, formEncodedBytes,
   ACTOR_KEYS_EXPR, ACTOR_KINDS, activeAliases, aliasColumnExpr, aliasPredicate, aliasPrefilter, aliasActiveAt, aliasMatches, aliasKey, ambiguousAliases, bucketEvents, canonicalIp, canonicalPhone, chStringArray, clampWindow, SECTION_LABELS, SECTION_SQL, SECTIONS, CONFIRMED_NOTE_PREFIX, HOLD_CONFIDENCE, HOLD_NOTE_PREFIX, isAliasKind, isHeld, LOWERCASE_KINDS, normalizeAliasValue, rangeWindow, resolveStatus,
   type ActorIncident, type ActorRange, type ActorReport, type Alias, type AliasInput, type ClassCount, type IpStat, type NodeStat, type Person, type PersonInput, type ResolveMatch, type ResolveStatus, type SourceCoverage, type Window,
 } from "./shared/actors";
@@ -454,12 +454,36 @@ export async function actorReport(person: Person, aliases: Alias[], range: Actor
 /* ===== Запись: upsert персон и алиасов, закрытие алиаса ===== */
 
 const CHUNK = 200;
+/** Параметров одной партии импорта не больше стольких байт в URL: у INSERT они всегда в
+ *  URL (в теле — данные), а URI ClickHouse не длиннее 1 MiB. 200 алиасов с длинными
+ *  Unicode-значениями и примечаниями иначе давали больше. */
+const INSERT_PARAMS_MAX = 512 * 1024;
+
+/** Длина значений параметров строки в URL (с запасом на имя и экранирование). */
+const fieldBytes = (...values: string[]): number => values.reduce((n, v) => n + 2 * formEncodedBytes(v) + 16, 0);
+
+/** Партии подряд: не больше CHUNK строк и INSERT_PARAMS_MAX байт параметров. Строка
+ *  больше бюджета идёт отдельной партией — её размер ограничивает разбор импорта. */
+function byteBatches<T>(items: T[], size: (item: T) => number): T[][] {
+  const out: T[][] = [];
+  let cur: T[] = [], bytes = 0;
+  for (const item of items) {
+    const n = size(item);
+    if (cur.length && (cur.length >= CHUNK || bytes + n > INSERT_PARAMS_MAX)) {
+      out.push(cur);
+      cur = []; bytes = 0;
+    }
+    cur.push(item);
+    bytes += n;
+  }
+  if (cur.length) out.push(cur);
+  return out;
+}
 
 /** Upsert персон и их алиасов (новая версия строки; ReplacingMergeTree схлопнет). */
 export async function upsertIdentities(persons: PersonInput[], source: string): Promise<{ persons: number; aliases: number }> {
   let aliasCount = 0;
-  for (let i = 0; i < persons.length; i += CHUNK) {
-    const chunk = persons.slice(i, i + CHUNK);
+  for (const chunk of byteBatches(persons, (p) => fieldBytes(p.person_id, p.display, p.kind, p.team, p.note))) {
     const params: Record<string, string | number> = {};
     const rows = chunk.map((p, j) => {
       params[`p${j}`] = p.person_id; params[`d${j}`] = p.display; params[`k${j}`] = p.kind; params[`t${j}`] = p.team; params[`n${j}`] = p.note;
@@ -468,9 +492,9 @@ export async function upsertIdentities(persons: PersonInput[], source: string): 
     await chCommand(`INSERT INTO identities (person_id, display, kind, team, note, updated_at, deleted) VALUES ${rows.join(", ")}`, params);
   }
   const flat = persons.flatMap((p) => p.aliases.map((a) => ({ person_id: p.person_id, a })));
-  for (let i = 0; i < flat.length; i += CHUNK) {
-    await insertAliases(flat.slice(i, i + CHUNK), source);
-    aliasCount += Math.min(CHUNK, flat.length - i);
+  for (const chunk of byteBatches(flat, ({ person_id, a }) => fieldBytes(person_id, a.kind, a.value, a.valid_from ?? "", a.valid_to ?? "", String(a.confidence), a.note))) {
+    await insertAliases(chunk, source);
+    aliasCount += chunk.length;
   }
   return { persons: persons.length, aliases: aliasCount };
 }

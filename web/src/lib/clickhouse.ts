@@ -218,17 +218,22 @@ async function chFetchWithSlot(sql: string, params: Record<string, string | numb
   const withParams = new URL(url);
   for (const [key, value] of encoded) withParams.searchParams.set(key, value);
   const fitsUrl = urlFits(withParams);
-  const fitsForm = Buffer.byteLength(sql, "utf8") <= FORM_FIELD_MAX
+  // В multipart уходят только query и param_*: настройки и поля CLICKHOUSE_URL остаются в
+  // URL, и он сам должен помещаться (log_comment из 15 000 иероглифов — 135 КБ в URL).
+  const fitsForm = urlFits(url) && Buffer.byteLength(sql, "utf8") <= FORM_FIELD_MAX
     && encoded.every(([, v]) => Buffer.byteLength(v, "utf8") <= FORM_FIELD_MAX);
   const short = Buffer.byteLength(withParams.search, "utf8") - Buffer.byteLength(url.search, "utf8") <= PARAMS_IN_URL_MAX;
-  if (!isInsert && !(short && fitsUrl) && !fitsForm && !fitsUrl) {
+  // INSERT: данные в теле, параметры — всегда в URL, и он проверяется так же.
+  const transport = isInsert ? (fitsUrl ? "url" : null)
+    : short && fitsUrl ? "url" : fitsForm ? "form" : fitsUrl ? "url" : null;
+  if (transport === null) {
     // Ни так, ни так ClickHouse запрос не примет (414 или «Field value too long») — ошибка
     // здесь, с размерами, а не непонятный ответ сервера. В журнал — только размеры и SQL без данных.
-    const message = `запрос не помещается в HTTP ClickHouse: SQL ${Buffer.byteLength(sql, "utf8")} байт, параметров ${encoded.length}`;
+    const message = `запрос не помещается в HTTP ClickHouse: SQL ${Buffer.byteLength(sql, "utf8")} байт, параметров ${encoded.length}, URL ${Buffer.byteLength(withParams.pathname + withParams.search, "utf8")} байт`;
     console.error(`clickhouse: ${message}`, "\nSQL:", sqlForLog(sql));
     throw new ClickHouseError(message, null, null);
   }
-  if (!isInsert && !(short && fitsUrl) && fitsForm) {
+  if (transport === "form") {
     const boundary = multipartBoundary([sql, ...encoded.map(([, v]) => v)]);
     contentType = `multipart/form-data; boundary=${boundary}`;
     body = [["query", sql] as const, ...encoded].map(([name, value]) =>
