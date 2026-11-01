@@ -21,6 +21,7 @@ import {
   triageVerdictClaim,
 } from "./argus-queries";
 import { isIncidentStatus } from "./shared/incidents";
+import { closureLabelText, isOpsIncident, parseClosureLabel, type ClosureLabel } from "./shared/closure-label";
 
 const INCIDENT_ID_RE = /^INC-\d{1,9}$/;
 const FINAL_STATUSES = new Set(["closed", "false_positive"]);
@@ -57,6 +58,14 @@ export async function setIncidentStatusAction(
     }
     if (FINAL_STATUSES.has(inc.status)) return { error: "Инцидент уже завершён" };
     if (FINAL_STATUSES.has(status) && (reason.length < 10 || reason.length > 2000)) return { error: "Для завершения укажите причину от 10 до 2000 символов" };
+    // Метка ответа обязательна при завершении: по свободной причине не обучить и
+    // не посчитать долю ложных срабатываний. Набор полей — по типу правила.
+    let label: ClosureLabel | undefined;
+    if (FINAL_STATUSES.has(status)) {
+      const parsed = parseClosureLabel((name) => String(formData.get(name) ?? ""), { ops: isOpsIncident(inc.tags), status });
+      if (typeof parsed === "string") return { error: parsed };
+      label = parsed;
+    }
     // Сначала исключения, потом статус: если статус записался, а исключения
     // нет, движок заведёт тот же инцидент снова. Обратный порядок безопасен —
     // исключение без статуса лишь подавит правило, а статус можно поставить ещё раз.
@@ -70,8 +79,9 @@ export async function setIncidentStatusAction(
         await audit(s.user, "rule.exception", inc.rule_id, `${field} = ${value} (из ${id})`);
       }
     }
-    await incidentTransition({ id, kind: "status", status, reason, actor: s.user, role: s.role });
-    await audit(s.user, "incident.status", id, `${inc.status} → ${status} · ${s.user}${reason ? ` · ${reason}` : ""}`);
+    await incidentTransition({ id, kind: "status", status, reason, actor: s.user, role: s.role, label });
+    const labelText = label ? closureLabelText(label) : "";
+    await audit(s.user, "incident.status", id, `${inc.status} → ${status} · ${s.user}${labelText ? ` · ${labelText}` : ""}${reason ? ` · ${reason}` : ""}`);
   } catch (err) {
 	if (err instanceof IncidentWorkflowError) return { error: err.message };
     return { error: shortError("incident.status", err) };

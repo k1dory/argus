@@ -109,6 +109,24 @@ mkuser argus_ro "${CLICKHOUSE_RO_PASSWORD:-}" \
     "readonly = 1 READONLY, allow_ddl = 0 READONLY, allow_introspection_functions = 0 READONLY, max_execution_time = 20 READONLY, max_memory_usage = 2000000000 READONLY, max_rows_to_read = 500000000 READONLY, max_result_rows = 5000 READONLY, result_overflow_mode = 'break' READONLY, output_format_json_quote_64bit_integers = 0 READONLY, max_concurrent_queries_for_user = 4 READONLY" \
     "SELECT ON argus.*"
 
+# Слепая выборка (web/src/lib/blind.ts, engine labels.go): панели и предпросмотр SQL
+# пишут любой SELECT от argus_ro — вердикт агента и анализ модели по слепому
+# незавершённому инциденту скрываются политиками строк. Хэш тот же: первые два байта
+# SHA-256 от incident_id (big-endian) по модулю 100 < 25; «завершён» — статус closed /
+# false_positive в incidents_current. Остальные пользователи политик не имеют и видят
+# всё (users_without_row_policies_can_read_rows), консоль скрывает сама.
+if [ -n "${CLICKHOUSE_RO_PASSWORD:-}" ]; then
+    disclosed() {
+        echo "reinterpretAsUInt16(reverse(substring(SHA256($1), 1, 2))) % 100 >= 25
+          OR $1 IN (SELECT incident_id FROM argus.incidents_current WHERE status IN ('closed', 'false_positive'))"
+    }
+    ch --query "CREATE ROW POLICY OR REPLACE argus_ro_blind ON argus.incident_verdicts FOR SELECT USING $(disclosed incident_id) TO argus_ro"
+    ch --query "CREATE ROW POLICY OR REPLACE argus_ro_blind ON argus.agent_verdicts FOR SELECT USING $(disclosed incident_id) TO argus_ro"
+    ch --query "CREATE ROW POLICY OR REPLACE argus_ro_blind ON argus.incident_comments FOR SELECT USING NOT startsWith(author, 'agent:') OR $(disclosed incident_id) TO argus_ro"
+    ch --query "CREATE ROW POLICY OR REPLACE argus_ro_blind ON argus.console_audit FOR SELECT USING NOT startsWith(action, 'triage.verdict') OR $(disclosed target) TO argus_ro"
+    echo "migrate: argus_ro blind row policies ok"
+fi
+
 # argus_console — консоль: чтение argus + INSERT в таблицы, которые ведёт оператор.
 # Без readonly (нужны INSERT), DDL закрыт, лимиты с потолком (поиск ставит свои).
 # system.parts (пять колонок) — проверка, что проекция p_source_last есть во всех

@@ -58,6 +58,7 @@ export type QueryMocks = {
   responseLog: (opts?: { incidentId?: string; limit?: number }) => Promise<Record<string, unknown>[]>;
   verdictsFor: (ids: string[]) => Promise<Record<string, Record<string, unknown>>>;
   incidentClosuresFor: (ids: string[]) => Promise<Record<string, Record<string, unknown>>>;
+  incidentLabels: (since: string, limit: number, after?: import("../src/lib/label-cursor").LabelCursor) => Promise<unknown[]>;
 };
 
 type WazuhApi = typeof import("../src/lib/wazuh-api");
@@ -166,6 +167,7 @@ export function installNextMocks(): Mocks {
     responseLog: async () => [],
     verdictsFor: async () => ({}),
     incidentClosuresFor: async () => ({}),
+    incidentLabels: async () => [],
   };
   const argusQueries = require.resolve(path.resolve(__dirname, "../src/lib/argus-queries"));
   const delegate = Object.fromEntries(
