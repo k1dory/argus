@@ -27,7 +27,8 @@ import { closingEvent, incidentMarkdown } from "@/lib/shared/incident-wiki";
 import { reactionDeadline, reactionLate, reactionOverdue } from "@/lib/shared/incident-sla";
 import { parseSimilarLine } from "@/lib/shared/incident-lines";
 import { fmtNum, formatTs } from "@/lib/shared/time";
-import { agentVerdictsFor, incidentComments, incidentFirstResponse, incidentGet, incidentStateHistory, blockCandidatesFor, verdictGet, responseLog, respondStatus, triageVerdictClaim, INCIDENT_STATUSES } from "@/lib/argus-queries";
+import { MEMBER_BLOCK_LABEL, type MemberBlockState } from "@/lib/shared/incident-members";
+import { agentVerdictsFor, incidentComments, incidentMembers, incidentFirstResponse, incidentGet, incidentStateHistory, blockCandidatesFor, verdictGet, responseLog, respondStatus, triageVerdictClaim, INCIDENT_STATUSES } from "@/lib/argus-queries";
 import { MarkdownBody } from "@/components/console/markdown-body";
 import { VERDICT_RU } from "@/lib/shared/triage-verdict";
 import { closureLabelText, isOpsIncident } from "@/lib/shared/closure-label";
@@ -64,7 +65,7 @@ export default async function IncidentPage({ params }: PageProps<"/incidents/[id
   // модели — ответ человека должен быть независим от них. Не запрашиваем вовсе,
   // чтобы ничего не утекло в разметку страницы.
   const blind = hideVerdicts(inc);
-  const [vr, ur, rr, cr, hr, fr, tr, ar] = await Promise.all([
+  const [vr, ur, rr, cr, hr, fr, tr, ar, mr] = await Promise.all([
     safeQuery(() => blind ? Promise.resolve(null) : verdictGet(id)),
     safeQuery(() => session.role === "admin" ? listUsers() : Promise.resolve([])),
     safeQuery(() => responseLog({ incidentId: id, limit: 20 })),
@@ -73,7 +74,9 @@ export default async function IncidentPage({ params }: PageProps<"/incidents/[id
     safeQuery(() => incidentFirstResponse(id)),
     safeQuery(() => triageVerdictClaim(id)),
     safeQuery(() => blind ? Promise.resolve([]) : agentVerdictsFor(id)),
+    safeQuery(() => incidentMembers(id)),
   ]);
+  const members = mr.ok ? mr.data : null;
   const triageClaim = tr.ok ? tr.data : null;
   const agentVerdicts = ar.ok ? ar.data : [];
   const verdict = vr.ok ? vr.data : null;
@@ -213,6 +216,40 @@ export default async function IncidentPage({ params }: PageProps<"/incidents/[id
                   </li>
                 ))}
               </ul>
+            </Panel>
+          )}
+
+          {members && members.members.length > 0 && (
+            <Panel label={`Адреса подсети ${inc.actor_name}`} meta={`${fmtNum(members.members.length + members.dropped)} адресов${members.dropped ? ` · в списке ${fmtNum(members.members.length)} самых свежих` : ""}`}>
+              <div className="c-well max-h-80 overflow-auto p-2 font-mono text-xs">
+                <table className="w-full">
+                  <thead>
+                    <tr className="border-b border-border/60 text-left">
+                      <th scope="col" className="c-label py-1 pr-3">адрес</th>
+                      <th scope="col" className="c-label py-1 pr-3">первое</th>
+                      <th scope="col" className="c-label py-1 pr-3">последнее</th>
+                      <th scope="col" className="c-label py-1 pr-3">событий</th>
+                      <th scope="col" className="c-label py-1 pr-3">правила</th>
+                      <th scope="col" className="c-label py-1">блокировка</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {members.members.map((m) => {
+                      const state: MemberBlockState = members.blocks[m.ip] ?? "none";
+                      return (
+                        <tr key={m.ip} className="border-b border-border/40 align-top">
+                          <td className="py-1 pr-3"><Copyable value={m.ip} href={searchHref.srcip(m.ip)} label="IP" /></td>
+                          <td className="whitespace-nowrap py-1 pr-3 text-muted-foreground">{formatTs(m.first)}</td>
+                          <td className="whitespace-nowrap py-1 pr-3 text-muted-foreground">{formatTs(m.last)}</td>
+                          <td className="py-1 pr-3">{fmtNum(m.events)}</td>
+                          <td className="py-1 pr-3 text-muted-foreground">{m.rules.join(", ")}</td>
+                          <td className={state === "blocked" ? "py-1 text-[var(--status-err)]" : state === "capped" || state === "failed" ? "py-1 text-[var(--status-warn)]" : "py-1 text-muted-foreground"}>{MEMBER_BLOCK_LABEL[state]}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
             </Panel>
           )}
 

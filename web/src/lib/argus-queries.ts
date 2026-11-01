@@ -23,6 +23,7 @@ function engineError(scope: string, err: unknown): string {
 export { INCIDENT_STATUSES, EXCEPTION_FIELDS, isIncidentStatus, type IncidentStatus } from "./shared/incidents";
 import { isIncidentStatus, type IncidentStatus } from "./shared/incidents";
 import type { ClosureLabel } from "./shared/closure-label";
+import { memberBlockState, parseMembers, type IncidentMember, type MemberBlockRow, type MemberBlockState } from "./shared/incident-members";
 
 
 export type IncidentRow = {
@@ -981,6 +982,34 @@ export async function setRespondMode(mode: RespondMode | "", user: string): Prom
     `INSERT INTO console_settings (key, value, updated_at, updated_by) VALUES ('respond_mode', {mode:String}, now(), {user:String})`,
     { mode, user },
   );
+}
+
+/**
+ * Адреса склеенного по подсети инцидента со статусом блокировки по каждому:
+ * members — из incidents (в incidents_current колонки нет), статус — последняя
+ * запись response_log этого инцидента по адресу.
+ */
+export async function incidentMembers(id: string): Promise<{ members: IncidentMember[]; dropped: number; blocks: Record<string, MemberBlockState> }> {
+  const rows = await chQuery<{ members: string; members_dropped: number | string }>(
+    `SELECT argMax(members, (updated_at, event_count, last_ts)) AS members,
+            argMax(members_dropped, (updated_at, event_count, last_ts)) AS members_dropped
+     FROM incidents WHERE incident_id = {id:String}`,
+    { id },
+  );
+  const members = parseMembers(rows[0]?.members);
+  const dropped = Number(rows[0]?.members_dropped ?? 0) || 0;
+  if (members.length === 0) return { members, dropped, blocks: {} };
+  const last = await chQuery<MemberBlockRow>(
+    `SELECT ip, argMax(executor, ts) AS executor, argMax(mode, ts) AS mode, argMax(dry_run, ts) AS dry_run,
+            argMax(ok, ts) AS ok, argMax(detail, ts) AS detail
+     FROM response_log WHERE incident_id = {id:String} AND ip IN {ips:Array(String)} GROUP BY ip`,
+    // Array(String) параметром — литерал массива (как names в sourcesHealth).
+    { id, ips: `[${members.map((m) => `'${m.ip.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`).join(",")}]` },
+  );
+  const byIp = new Map(last.map((r) => [r.ip, { ...r, dry_run: Number(r.dry_run), ok: Number(r.ok) }]));
+  const blocks: Record<string, MemberBlockState> = {};
+  for (const m of members) blocks[m.ip] = memberBlockState(byIp.get(m.ip));
+  return { members, dropped, blocks };
 }
 
 export type ResponseLogRow = {
