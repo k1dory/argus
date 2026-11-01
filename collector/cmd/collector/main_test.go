@@ -248,7 +248,7 @@ func strs(n int, c string) string { return strings.Repeat(c, n) }
 func TestParseSyslogLineSDCannotForgeProvenance(t *testing.T) {
 	n := &normalize.Normalizer{}
 	line := `<134>1 2026-10-29T08:40:44Z host1 app - - [argus peer_cn="trusted-agent" scope="internal" transport="tls" peer="10.9.9.9" container="caddy"] hello`
-	e, ok := parseSyslogLine(n, line, listen.Peer{Addr: "203.0.113.7", Transport: "udp"})
+	e, ok := parseSyslogLine(n, nil, line, listen.Peer{Addr: "203.0.113.7", Transport: "udp"})
 	if !ok {
 		t.Fatal("строка не принята")
 	}
@@ -258,7 +258,7 @@ func TestParseSyslogLineSDCannotForgeProvenance(t *testing.T) {
 	if e.Attrs["scope"] != "" || e.Attrs["transport"] != "" || e.Attrs["peer"] != "203.0.113.7" || e.Attrs["container"] != "caddy" {
 		t.Fatalf("происхождение от отправителя: %+v", e.Attrs)
 	}
-	e, _ = parseSyslogLine(n, line, listen.Peer{Addr: "203.0.113.7", Transport: "tls", CN: "agent-01"})
+	e, _ = parseSyslogLine(n, nil, line, listen.Peer{Addr: "203.0.113.7", Transport: "tls", CN: "agent-01"})
 	if e.Attrs["peer_cn"] != "agent-01" {
 		t.Fatalf("peer_cn из сертификата: %+v", e.Attrs)
 	}
@@ -270,7 +270,7 @@ func TestParseSyslogLineSanitizesLateWrites(t *testing.T) {
 	n := &normalize.Normalizer{}
 	evil := "\x1b]8;;http://x\x07" + strs(9000, "a")
 	line := `<134>1 2026-10-29T08:40:44Z host1 app - - [argus container="` + evil + `"] hello`
-	e, _ := parseSyslogLine(n, line, listen.Peer{Addr: "203.0.113.7", Transport: "udp"})
+	e, _ := parseSyslogLine(n, nil, line, listen.Peer{Addr: "203.0.113.7", Transport: "udp"})
 	c := e.Attrs["container"]
 	if strings.ContainsAny(c, "\x1b\x07") || len(c) > sdAttrMax || e.Attrs["truncated"] != "1" {
 		t.Fatalf("container не очищен: len=%d truncated=%q %q", len(c), e.Attrs["truncated"], c[:min(len(c), 40)])
@@ -278,7 +278,7 @@ func TestParseSyslogLineSanitizesLateWrites(t *testing.T) {
 	// WAF-строка в обёртке syslog: узел — hostname заголовка, тоже после Ensure.
 	host := "waf\x1b[31m" + strs(9000, "h")
 	waf := `<134>1 2026-10-29T08:40:44Z ` + host + ` caddy - - - {"level":"error","logger":"http.handlers.waf","msg":"[client \"93.123.109.247\"] Coraza: Access denied with code 403 (phase 2). [file \"x\"] [id \"949110\"] [msg \"Inbound Anomaly Score Exceeded (Total Score: 5)\"] [severity \"emergency\"] [hostname \"172.19.0.4\"] [uri \"/.env\"]"}`
-	e, ok := parseSyslogLine(n, waf, listen.Peer{Addr: "203.0.113.7", Transport: "udp"})
+	e, ok := parseSyslogLine(n, nil, waf, listen.Peer{Addr: "203.0.113.7", Transport: "udp"})
 	if !ok || e.SourceClass != "waf" {
 		t.Fatalf("WAF-строка: ok=%v %+v", ok, e)
 	}
@@ -305,7 +305,7 @@ func TestWAFNodeOrder(t *testing.T) {
 		{"атакующий Host: dc01.corp, WAF_NODE перебивает", nginx, listen.Peer{Addr: "nginx.error", Transport: "file", Node: "nginx-01"}, "nginx-01"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			e, ok := parseSyslogLine(n, tc.line, tc.peer)
+			e, ok := parseSyslogLine(n, nil, tc.line, tc.peer)
 			if !ok || e.SourceClass != "waf" {
 				t.Fatalf("не WAF: ok=%v %+v", ok, e)
 			}

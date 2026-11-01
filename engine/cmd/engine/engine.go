@@ -664,6 +664,7 @@ func (e *engine) writeIncidents(ctx context.Context, toWrite []*incidents.Incide
 		slog.Warn("incidents insert", "err", err)
 		return
 	}
+	e.reg.Persisted(toWrite)
 	for _, inc := range toWrite {
 		if engineClosed[inc.IncidentID] && (inc.Status == incidents.StatusClosed || inc.Status == incidents.StatusFalsePositive) {
 			if _, err := e.ch.AppendIncidentState(ctx, inc.IncidentID, "argus-engine", "auto_close", inc.Status, inc.Owner, "Закрыто автоматикой по правилу "+inc.RuleID, store.ClosureLabel{}); err != nil {

@@ -1,0 +1,5 @@
+rule: a41c-auth-033
+fixture: fixtures/events/nas-qnap.ndjson
+expect_incidents: 1
+expect_actor: 203.0.113.50
+min_events: 8

@@ -1,0 +1,3 @@
+rule: a41c-ops-065
+fixture: fixtures/events/nas-qnap.ndjson
+expect_incidents: 1
