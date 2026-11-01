@@ -23,6 +23,7 @@ import {
 } from "./argus-queries";
 import { GROUP_ACTION_MAX, isSubnetKey, parseIncidentIds } from "./shared/scan-groups";
 import { isIncidentStatus } from "./shared/incidents";
+import { parseIncidentRanges } from "./shared/page-filters";
 import { closureLabelText, isOpsIncident, parseClosureLabel, type ClosureLabel } from "./shared/closure-label";
 
 const INCIDENT_ID_RE = /^INC-\d{1,9}$/;
@@ -302,6 +303,8 @@ export async function scanGroupAction(_prev: FormState, formData: FormData): Pro
   const filter = {
     status: String(formData.get("f_status") ?? "") || undefined,
     level: String(formData.get("f_level") ?? "") || undefined,
+    // Диапазоны очереди (from, level_min, …) — тем же парсером, что страница.
+    ranges: parseIncidentRanges(new URLSearchParams(String(formData.get("f_ranges") ?? "").slice(0, 2000))),
     q: String(formData.get("f_q") ?? "").trim().slice(0, 200) || undefined,
     queue: fq === "open" || fq === "mine" || fq === "unassigned" || fq === "overdue" ? fq : undefined,
     user: s.user,

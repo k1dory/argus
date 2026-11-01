@@ -1,5 +1,19 @@
 import { chCommand, chQuery, RANGES, type RangeKey } from "./clickhouse";
 import { clampInt, clampLevel, clampPage } from "./shared/limits";
+import { hasRange, numConditions, ordinalConditions, timeCondition, VULN_SEVERITIES, type NumRange, type OrdinalRange, type TimeFilter } from "./shared/filters";
+
+/** Окно витрины: точный интервал/пресет (TimeFilter) или ключ пресета, как раньше. */
+type Window = RangeKey | TimeFilter;
+const asTime = (w: Window): TimeFilter => (typeof w === "string" ? { range: w } : w);
+/** Условие окна по timestamp (ключ сортировки и партиция wazuh_alerts). */
+function alertTime(w: Window, params: Record<string, string | number>): string {
+  const conds = timeCondition("timestamp", asTime(w), params, "t");
+  return conds.length ? conds.join(" AND ") : "1";
+}
+/** Пороги уровня правила: rule_level >= / <=. */
+function levelConds(r: NumRange | undefined, params: Record<string, string | number>): string[] {
+  return r ? numConditions("rule_level", r, params, "lvl", "UInt8") : [];
+}
 
 // Заглушённые правила исключаются из всех витрин алертов (борьба с шумом);
 // витрина CVE намеренно не фильтруется — уязвимость не «шум».
@@ -87,14 +101,15 @@ export async function topRules(range: RangeKey, limit = 8): Promise<TopRule[]> {
 
 export type TacticCount = { tactic: string; count: number };
 
-export async function topTactics(range: RangeKey, limit = 8): Promise<TacticCount[]> {
-  const { hours } = RANGES[range];
+export async function topTactics(range: Window, limit = 8, level?: NumRange): Promise<TacticCount[]> {
+  const params: Record<string, string | number> = { limit: clampInt(limit, 1, 100, 8) };
+  const where = [alertTime(range, params), ...levelConds(level, params), NOT_MUTED].join(" AND ");
   const rows = await chQuery<{ tactic: string; cnt: string }>(
     `SELECT tactic, count() AS cnt
      FROM wazuh_alerts ARRAY JOIN mitre_tactics AS tactic
-     WHERE timestamp >= now() - INTERVAL {hours:UInt32} HOUR AND ${NOT_MUTED}
+     WHERE ${where}
      GROUP BY tactic ORDER BY cnt DESC LIMIT {limit:UInt32}`,
-    { hours, limit: clampInt(limit, 1, 100, 8) },
+    params,
   );
   return rows.map((r) => ({ tactic: r.tactic, count: Number(r.cnt) }));
 }
@@ -114,7 +129,10 @@ export type AlertDir = "asc" | "desc";
 
 export type AlertFilters = {
   range: RangeKey;
+  /** Точный интервал или пресет; главнее range. */
+  time?: TimeFilter;
   minLevel?: number;
+  maxLevel?: number;
   agent?: string;
   search?: string;
   showMuted?: boolean;
@@ -132,15 +150,12 @@ export const parseAlertSort = (v: unknown): AlertSort => (v === "level" ? "level
 export const parseAlertDir = (v: unknown): AlertDir => (v === "asc" ? "asc" : "desc");
 
 function alertsWhere(filters: AlertFilters): { where: string; params: Record<string, string | number> } {
-  const { hours } = RANGES[filters.range];
-  const conditions = ["timestamp >= now() - INTERVAL {hours:UInt32} HOUR"];
+  const params: Record<string, string | number> = {};
+  const conditions = [alertTime(filters.time ?? filters.range, params)];
   if (!filters.showMuted) conditions.push(NOT_MUTED);
-  const params: Record<string, string | number> = { hours };
   const minLevel = clampLevel(filters.minLevel ?? 0);
-  if (minLevel > 0) {
-    conditions.push("rule_level >= {minLevel:UInt8}");
-    params.minLevel = minLevel;
-  }
+  const maxLevel = filters.maxLevel === undefined ? 15 : clampLevel(filters.maxLevel);
+  conditions.push(...levelConds({ min: minLevel > 0 ? minLevel : undefined, max: maxLevel < 15 ? maxLevel : undefined }, params));
   if (filters.agent) {
     conditions.push("agent_name = {agent:String}");
     params.agent = filters.agent.slice(0, 128);
@@ -175,13 +190,13 @@ export async function alertsList(filters: AlertFilters): Promise<AlertsPage> {
   return { rows, total, page, pageSize: ALERTS_PAGE_SIZE, pages: Math.max(1, Math.min(ALERTS_MAX_PAGE, Math.ceil(total / ALERTS_PAGE_SIZE))) };
 }
 
-export async function agentNames(range: RangeKey): Promise<string[]> {
-  const { hours } = RANGES[range];
+export async function agentNames(range: Window): Promise<string[]> {
+  const params: Record<string, string | number> = { limit: MAX_LIST_ROWS };
   const rows = await chQuery<{ agent_name: string }>(
     `SELECT DISTINCT agent_name FROM wazuh_alerts
-     WHERE timestamp >= now() - INTERVAL {hours:UInt32} HOUR AND agent_name != ''
+     WHERE ${alertTime(range, params)} AND agent_name != ''
      ORDER BY agent_name LIMIT {limit:UInt32}`,
-    { hours, limit: MAX_LIST_ROWS },
+    params,
   );
   return rows.map((r) => r.agent_name);
 }
@@ -258,8 +273,16 @@ export type AgentSummary = {
   last_alert: string;
 };
 
-export async function agentsSummary(range: RangeKey): Promise<AgentSummary[]> {
-  const { hours } = RANGES[range];
+/** Фильтры витрины агентов: уровень — какие алерты считаются; alerts/critical — пороги итогов (HAVING). */
+export type AgentFilters = { level?: NumRange; alerts?: NumRange; critical?: NumRange };
+
+export async function agentsSummary(range: Window, f: AgentFilters = {}): Promise<AgentSummary[]> {
+  const params: Record<string, string | number> = { limit: MAX_LIST_ROWS };
+  const where = [alertTime(range, params), "agent_name != ''", ...levelConds(f.level, params)].join(" AND ");
+  const having = [
+    ...(f.alerts ? numConditions("alerts", f.alerts, params, "al", "UInt64") : []),
+    ...(f.critical ? numConditions("critical", f.critical, params, "cr", "UInt64") : []),
+  ];
   const rows = await chQuery<{
     agent_name: string;
     alerts: string;
@@ -273,10 +296,11 @@ export async function agentsSummary(range: RangeKey): Promise<AgentSummary[]> {
             uniqExact(rule_id) AS rules,
             max(timestamp) AS last_alert
      FROM wazuh_alerts
-     WHERE timestamp >= now() - INTERVAL {hours:UInt32} HOUR AND agent_name != ''
+     WHERE ${where}
        AND ${NOT_MUTED}
-     GROUP BY agent_name ORDER BY alerts DESC LIMIT {limit:UInt32}`,
-    { hours, limit: MAX_LIST_ROWS },
+     GROUP BY agent_name ${having.length ? `HAVING ${having.join(" AND ")}` : ""}
+     ORDER BY alerts DESC LIMIT {limit:UInt32}`,
+    params,
   );
   return rows.map((r) => ({
     agent_name: r.agent_name,
@@ -335,7 +359,17 @@ export type VulnRow = {
 
 export const VULN_LIMIT = 300;
 
-export async function vulnList(): Promise<VulnRow[]> {
+/** Фильтры витрины CVE: окно по timestamp (не шире 30 дней), серьёзность и CVSS последней записи (HAVING). */
+export type VulnFilters = { time?: TimeFilter; severity?: OrdinalRange; cvss?: NumRange };
+
+export async function vulnList(f: VulnFilters = {}): Promise<VulnRow[]> {
+  const params: Record<string, string | number> = { limit: VULN_LIMIT };
+  const where = ["vuln_cve != ''", alertTime(f.time ?? "30d", params)].join(" AND ");
+  const having = [
+    ...(f.severity ? ordinalConditions("severity", f.severity, VULN_SEVERITIES, params, "sev") : []),
+    // CVSS 0 — «нет оценки»: порог снизу её отсекает, как и должен.
+    ...(f.cvss && hasRange(f.cvss) ? numConditions("toFloat64(score)", f.cvss, params, "cvss", "Float64") : []),
+  ];
   const rows = await chQuery<VulnRow>(
     `SELECT vuln_cve AS cve,
             argMax(vuln_severity, timestamp) AS severity,
@@ -346,11 +380,12 @@ export async function vulnList(): Promise<VulnRow[]> {
             argMax(vuln_status, timestamp) AS status,
             max(timestamp) AS last_seen
      FROM wazuh_alerts
-     WHERE vuln_cve != '' AND timestamp >= now() - INTERVAL 30 DAY
+     WHERE ${where}
      GROUP BY cve, pkg, agent_name
+     ${having.length ? `HAVING ${having.join(" AND ")}` : ""}
      ORDER BY score DESC, cve
      LIMIT {limit:UInt32}`,
-    { limit: VULN_LIMIT },
+    params,
   );
   return rows.map((r) => ({ ...r, score: Number(r.score) }));
 }
@@ -359,18 +394,19 @@ export async function vulnList(): Promise<VulnRow[]> {
 
 export type TechniqueCount = { id: string; technique: string; count: number };
 
-export async function topTechniques(range: RangeKey, limit = 20): Promise<TechniqueCount[]> {
-  const { hours } = RANGES[range];
+export async function topTechniques(range: Window, limit = 20, level?: NumRange): Promise<TechniqueCount[]> {
+  const params: Record<string, string | number> = { limit: clampInt(limit, 1, 200, 20) };
+  const where = [alertTime(range, params), ...levelConds(level, params)].join(" AND ");
   // Массивы id и technique у Wazuh параллельны; arrayResize страхует
   // от рассинхрона длин (arrayZip падает на неравных массивах).
   const rows = await chQuery<{ id: string; technique: string; cnt: string }>(
     `SELECT t.1 AS id, t.2 AS technique, count() AS cnt
      FROM wazuh_alerts
      ARRAY JOIN arrayZip(mitre_ids, arrayResize(mitre_techniques, length(mitre_ids), '')) AS t
-     WHERE timestamp >= now() - INTERVAL {hours:UInt32} HOUR
+     WHERE ${where}
        AND length(mitre_ids) > 0 AND ${NOT_MUTED}
      GROUP BY id, technique ORDER BY cnt DESC LIMIT {limit:UInt32}`,
-    { hours, limit: clampInt(limit, 1, 200, 20) },
+    params,
   );
   return rows.map((r) => ({ id: r.id, technique: r.technique, count: Number(r.cnt) }));
 }

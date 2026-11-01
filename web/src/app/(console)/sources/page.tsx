@@ -19,6 +19,10 @@ import { eventsRecent, sourcesHealthReport, STALE_SOURCES_LIMIT } from "@/lib/ar
 import { SOURCE_ALIVE_LABELS } from "@/lib/shared/labels";
 import { describeThreshold, formatRhythm, RHYTHM_WINDOW_DAYS } from "@/lib/shared/source-health";
 import { fmtNum, formatAgo, formatTs } from "@/lib/shared/time";
+import { RangeFilters } from "@/components/console/range-filters";
+import { RangePicker } from "@/components/console/range-picker";
+import { describeChips, inRange, inTime } from "@/lib/shared/filters";
+import { parseSourceRanges, SOURCE_FEED_FIELDS, SOURCE_HEALTH_FIELDS, sourceFeedChips, sourceHealthChips, type SourceRanges } from "@/lib/shared/page-filters";
 
 export const dynamic = "force-dynamic";
 export const metadata: Metadata = { title: "Источники" };
@@ -28,23 +32,29 @@ export default async function SourcesPage({ searchParams }: PageProps<"/sources"
   const ingestBase = (process.env.INGEST_PUBLIC_URL || `https://${process.env.CONSOLE_HOST || "localhost"}:8089`).replace(/\/$/, "");
   const params = await searchParams;
   const source = typeof params.source === "string" ? params.source.slice(0, 200) : undefined;
-  const r = await safeQuery(() => Promise.all([sourcesHealthReport(), eventsRecent(source)]));
+  // Таблица коллекторов — фильтр в памяти по последнему приёму, событиям за час и EPS;
+  // лента — окно по received_at и серьёзность в запросе.
+  const ranges = parseSourceRanges(params);
+  const r = await safeQuery(() => Promise.all([sourcesHealthReport(), eventsRecent(source, 60, { time: ranges.time, severity: ranges.severity })]));
 
   return (
     <>
       <PageHeader title="Источники">
         <span className="c-label">коллектор · syslog 5514 · netflow 2055 · webhooks HTTPS</span>
       </PageHeader>
-      {!r.ok ? <StorageUnavailable reason={r.error} /> : <SourcesBody health={r.data[0].sources} omitted={r.data[0].omitted} events={r.data[1]} source={source} ingestBase={ingestBase} />}
+      {!r.ok ? <StorageUnavailable reason={r.error} /> : <SourcesBody health={r.data[0].sources} omitted={r.data[0].omitted} events={r.data[1]} source={source} ingestBase={ingestBase} ranges={ranges} />}
     </>
   );
 }
 
-function SourcesBody({ health, omitted, events, source, ingestBase }: { health: Awaited<ReturnType<typeof sourcesHealthReport>>["sources"]; omitted: number; events: Awaited<ReturnType<typeof eventsRecent>>; source?: string; ingestBase: string }) {
+function SourcesBody({ health, omitted, events, source, ingestBase, ranges }: { health: Awaited<ReturnType<typeof sourcesHealthReport>>["sources"]; omitted: number; events: Awaited<ReturnType<typeof eventsRecent>>; source?: string; ingestBase: string; ranges: SourceRanges }) {
   const alive = health.filter((h) => h.alive === 1).length;
   const eps = health.reduce((a, h) => a + h.eps_60s, 0);
   const classes = new Set(health.map((h) => h.source_class));
   const now = new Date();
+  const healthText = describeChips(sourceHealthChips(ranges));
+  const feedText = describeChips(sourceFeedChips(ranges));
+  const shown = health.filter((h) => inTime(h.last_ts, ranges.seen, now.getTime()) && inRange(h.events_1h, ranges.events) && inRange(h.eps_60s, ranges.eps));
 
   return (
     <>
@@ -61,7 +71,10 @@ function SourcesBody({ health, omitted, events, source, ingestBase }: { health: 
             Замолчавших источников больше {fmtNum(STALE_SOURCES_LIMIT)}: ещё {fmtNum(omitted)} давно молчащих не показаны.
           </p>
         )}
-        {health.length === 0 ? (
+        <div className="mb-4"><RangeFilters fields={SOURCE_HEALTH_FIELDS} idPrefix="src-health" /></div>
+        {health.length > 0 && shown.length === 0 ? (
+          <p className="text-sm text-muted-foreground">Нет источников по фильтрам: {healthText} — ослабьте пороги.</p>
+        ) : health.length === 0 ? (
           <div className="space-y-2">
             <p className="text-sm text-muted-foreground">За последние {RHYTHM_WINDOW_DAYS} суток событий нет.</p>
             <p className="text-sm text-muted-foreground">
@@ -84,7 +97,7 @@ function SourcesBody({ health, omitted, events, source, ingestBase }: { health: 
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {health.map((h) => {
+                {shown.map((h) => {
                   const active = h.source === source;
                   return (
                     <TableRow key={h.source} className={active ? "border-border/40 bg-[var(--muted)]" : "border-border/40"} aria-current={active ? "true" : undefined}>
@@ -125,9 +138,15 @@ function SourcesBody({ health, omitted, events, source, ingestBase }: { health: 
           )
         }
       >
+        <div className="mb-4 space-y-3">
+          <RangePicker value={ranges.time.range} keys={["1h", "24h", "7d", "30d"]} />
+          <RangeFilters time timeLabel="Поступило, точный интервал UTC" fields={SOURCE_FEED_FIELDS} idPrefix="src-feed" />
+        </div>
         {events.length === 0 ? (
           <p className="text-sm text-muted-foreground">
-            {source ? `За 24 часа новых поступлений от «${source}» нет.` : "За 24 часа новых поступлений нет."}
+            {feedText
+              ? `Поступлений${source ? ` от «${source}»` : ""} по фильтрам нет: ${feedText}.`
+              : source ? `За 24 часа новых поступлений от «${source}» нет.` : "За 24 часа новых поступлений нет."}
           </p>
         ) : (
           <div className="c-well overflow-x-auto p-2">

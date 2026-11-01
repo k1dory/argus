@@ -15,36 +15,44 @@ import { parseRange, safeQuery } from "@/lib/clickhouse";
 import { topTactics, topTechniques } from "@/lib/queries";
 import { fmtNum } from "@/lib/shared/time";
 import { requirePageSession } from "@/lib/auth";
+import { RangeFilters } from "@/components/console/range-filters";
+import { describeChips } from "@/lib/shared/filters";
+import { ALERT_LEVEL_FIELD, alertRangeChips, parseAlertRanges } from "@/lib/shared/page-filters";
 
 export const dynamic = "force-dynamic";
 export const metadata: Metadata = { title: "MITRE ATT&CK" };
 
 export default async function MitrePage({ searchParams }: PageProps<"/wazuh/mitre">) {
   await requirePageSession();
-  const range = parseRange((await searchParams).range as string | undefined);
-  const r = await safeQuery(() => Promise.all([topTactics(range, 14), topTechniques(range, 20)]));
+  const sp = await searchParams;
+  const range = parseRange(sp.range as string | undefined);
+  // Окно (пресет или from/to) и уровень правила: техники считаются только по алертам в пороге.
+  const ranges = parseAlertRanges(sp);
+  const filtersText = describeChips(alertRangeChips(ranges));
+  const r = await safeQuery(() => Promise.all([topTactics(ranges.time, 14, ranges.level), topTechniques(ranges.time, 20, ranges.level)]));
 
   return (
     <>
       <PageHeader title="MITRE ATT&CK">
         <RangePicker value={range} />
       </PageHeader>
-      {!r.ok ? <StorageUnavailable reason={r.error} /> : <MitreBody tactics={r.data[0]} techniques={r.data[1]} />}
+      <RangeFilters time fields={[ALERT_LEVEL_FIELD]} idPrefix="mitre" />
+      {!r.ok ? <StorageUnavailable reason={r.error} /> : <MitreBody tactics={r.data[0]} techniques={r.data[1]} empty={filtersText ? `Нет данных по фильтрам: ${filtersText}` : "Нет данных за период"} />}
     </>
   );
 }
 
-function MitreBody({ tactics, techniques }: { tactics: Awaited<ReturnType<typeof topTactics>>; techniques: Awaited<ReturnType<typeof topTechniques>> }) {
+function MitreBody({ tactics, techniques, empty }: { tactics: Awaited<ReturnType<typeof topTactics>>; techniques: Awaited<ReturnType<typeof topTechniques>>; empty: string }) {
   const maxCount = techniques[0]?.count ?? 0;
   return (
     <>
       <Panel label="Тактики · покрытие алертами">
-        {tactics.length > 0 ? <TacticsChart tactics={tactics} /> : <Empty>Нет данных за период</Empty>}
+        {tactics.length > 0 ? <TacticsChart tactics={tactics} /> : <Empty>{empty}</Empty>}
       </Panel>
 
       <Panel label={`Техники · топ ${fmtNum(techniques.length)}`} meta="attack.mitre.org">
         {techniques.length === 0 ? (
-          <Empty>Нет данных за период</Empty>
+          <Empty>{empty}</Empty>
         ) : (
           <div className="c-well overflow-x-auto p-2">
             <Table>
