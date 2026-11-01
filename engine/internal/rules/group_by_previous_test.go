@@ -55,3 +55,20 @@ func TestGroupByPreviousBeforeValidation(t *testing.T) {
 		}
 	}
 }
+
+// Неизвестное поле правила — ошибка загрузки: движок, который поля не знает (rc33 и
+// group_by_previous), не применяет новый набор частично. Живой случай argus1
+// 2026-11-01: rc33 перечитал правило с новым group_by и пропущенным group_by_previous
+// и завёл INC-5370 рядом с открытым INC-5312.
+func TestLoadRejectsUnknownFields(t *testing.T) {
+	for _, extra := range []string{"  group_by_next: attrs.peer\n", "unknown_top: 1\n"} {
+		yml := "title: t\nid: t-strict\nlevel: low\ndetection:\n  selection: {action: x}\n  condition: selection\n" + extra
+		path := filepath.Join(t.TempDir(), "r.yml")
+		if err := os.WriteFile(path, []byte(yml), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadFile(path); err == nil || !strings.Contains(err.Error(), "not found") {
+			t.Fatalf("%q: неизвестное поле принято: %v", extra, err)
+		}
+	}
+}

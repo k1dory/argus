@@ -3,7 +3,10 @@
 package rules
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/netip"
 	"os"
@@ -414,8 +417,14 @@ func LoadFile(path string) (*Rule, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Неизвестное поле — ошибка, а не молчаливый пропуск: движок старой версии,
+	// получивший правило с полем новее себя (group_by_previous до своего релиза),
+	// отвергнет набор и оставит прежний при перечитывании, а не применит его
+	// частично (новый group_by без миграции — второй открытый инцидент).
 	var r Rule
-	if err := yaml.Unmarshal(raw, &r); err != nil {
+	dec := yaml.NewDecoder(bytes.NewReader(raw))
+	dec.KnownFields(true)
+	if err := dec.Decode(&r); err != nil && !errors.Is(err, io.EOF) {
 		return nil, err
 	}
 	if r.Respond != nil {
