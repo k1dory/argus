@@ -71,7 +71,10 @@ func TestStallWatchEmitsOncePerEpisode(t *testing.T) {
 
 func TestStallWatchDisabled(t *testing.T) {
 	w := &stallWatch{after: 0, stuck: func(time.Time) time.Duration { return time.Hour },
-		insert: func(context.Context, []any) error { t.Fatal("выключенный стоп-сигнал пишет события"); return nil }}
+		insert: func(context.Context, []any) error {
+			t.Fatal("выключенный стоп-сигнал пишет события")
+			return nil
+		}}
 	w.tick(context.Background(), time.Now())
 	t.Setenv("SINK_STALL_AFTER", "0")
 	if stallAfter() != 0 {
