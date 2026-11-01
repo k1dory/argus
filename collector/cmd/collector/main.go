@@ -406,8 +406,13 @@ func main() {
 	norm := &normalize.Normalizer{Rules: cfg.Sources, PIIFields: cfg.PIIFields}
 	st := &stats{perMin: map[string]uint32{}, listener: map[string]string{}, bySource: map[string]uint64{}}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	sigCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	// Отмена изнутри (приёмник не открыл порт) — отдельно от сигналов: обработчики
+	// SIGINT/SIGTERM снимаются только при выходе из main, после дренажа. Иначе SIGTERM
+	// от compose stop посреди дозаписи батча убивал бы процесс и терял батч.
+	ctx, cancel := context.WithCancel(sigCtx)
+	defer cancel()
 
 	queue := make(chan queuedEvent, cfg.Batch.PendingRows)
 	// emit всегда сам проставляет attrs.transport: значение из тела события
@@ -640,7 +645,7 @@ func main() {
 			err := f()
 			if err != nil && !errors.Is(err, http.ErrServerClosed) && ctx.Err() == nil {
 				listenerFailed.Store(true)
-				stop()
+				cancel()
 			}
 			return err
 		})
