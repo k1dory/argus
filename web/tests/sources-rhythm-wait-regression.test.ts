@@ -153,6 +153,8 @@ async function runFixture(t: TestContext, options: Options) {
   // VM изолирует регистрацию node:test, а не обеспечивает безопасность исполнения.
   const context = createContext({
     Date,
+    // Монотонные часы фикстуры — то же виртуальное время, что и Date.now.
+    performance: { now: () => now * 1000 },
     // expected = Array.from(...) в callback и массивы реального report должны
     // иметь один prototype, иначе assert/strict отвергнет их из-за разных VM.
     Array,

@@ -97,10 +97,11 @@ test("больше 2000 молчащих: порядок при равном в�
   const fmt = (x: number) => new Date(x * 1000).toISOString().slice(0, 19).replace("T", " ");
   const nowSQL = "SELECT toString(now() - toIntervalSecond({s:UInt32})) AS ts";
   // «Сейчас» для расстановки — одно чтение now() ClickHouse на итерацию, после отчёта.
-  // Бюджет — длительность (часы процесса): ожидания и сами отчёты; проверяется и
-  // перед ожиданием, и после последнего отчёта — отчёт может оказаться медленнее прошлого.
-  const startMs = Date.now();
-  const elapsed = () => (Date.now() - startMs) / 1000;
+  // Бюджет — длительность по монотонным часам (performance.now: сдвиг системного
+  // времени его не меняет): ожидания и сами отчёты; проверяется и перед ожиданием, и
+  // после последнего отчёта — отчёт может оказаться медленнее прошлого.
+  const startMs = performance.now();
+  const elapsed = () => (performance.now() - startMs) / 1000;
   let startCh: number | undefined;
   let beforeTotal: number;
   let capSec: number;
