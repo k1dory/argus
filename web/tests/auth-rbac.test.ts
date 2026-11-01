@@ -49,6 +49,8 @@ test("матрица manage-actions × роли: viewer — отказ, analyst 
     { name: "agentGroup", min: "analyst", run: () => manage.agentGroupAction(formData({ agent_id: "001", group_id: "web", op: "add" })) },
     { name: "createGroup", min: "analyst", run: () => manage.createGroupAction({ error: null }, formData({ name: "web" })) },
     { name: "respondMode", min: "admin", run: () => respond.setRespondModeAction({ error: null }, formData({ mode: "ids" })) },
+    { name: "excludeIp", min: "admin", run: () => respond.excludeIpAction(formData({ ip: "203.0.113.7", ttl: "24h", reason: "тест" })) },
+    { name: "revokeExclusion", min: "admin", run: () => respond.revokeExclusionAction(formData({ ip: "203.0.113.7", reason: "тест" })) },
     { name: "createUser", min: "admin", run: () => users.createUserAction({ error: null }, formData({ name: "zz", role: "viewer" })) },
   ];
   for (const user of ["viewer1", "analyst1", "admin"]) {

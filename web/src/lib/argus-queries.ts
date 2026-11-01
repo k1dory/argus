@@ -1014,8 +1014,9 @@ async function engineRespond(url: string, body: unknown, scope: string): Promise
     }
     if (!r.ok) {
       console.error(`${scope}: ${r.status} ${text.slice(0, 300)}`);
-      // 422 — движок объясняет отказ (адрес в allowlist, нет активной блокировки): это пользователю
-      return { error: r.status === 422 && parsed.error ? parsed.error : `движок ответил ${r.status}` };
+      // 422 — движок объясняет отказ (адрес в allowlist, нет активной блокировки), 503 — журнал
+      // реагирования недоступен и решение не применено: оба текста движка — это пользователю
+      return { error: (r.status === 422 || r.status === 503) && parsed.error ? parsed.error : `движок ответил ${r.status}` };
     }
     return parsed;
   } catch (err) {
@@ -1030,6 +1031,16 @@ export async function requestBlockIp(id: string, ip: string, reason: string, use
 /** POST /respond/unblock {ip, user, reason} → 200 {results:[…]} | 422 {error}. */
 export async function requestUnblockIp(ip: string, user: string, reason: string): Promise<RespondResult> {
   return engineRespond(`${engineBase()}/respond/unblock`, { ip, user, reason }, "engine.unblock_ip");
+}
+
+/** POST /respond/exclude {ip, ttl, user, reason} → 200 {ip, until} | 503 {error}: исключить адрес из автоблокировки на срок. */
+export async function requestExcludeIp(ip: string, ttl: string, user: string, reason: string): Promise<RespondResult> {
+  return engineRespond(`${engineBase()}/respond/exclude`, { ip, ttl, user, reason }, "engine.exclude_ip");
+}
+
+/** POST /respond/exclude/revoke {ip, user, reason} → 200 | 422 {error} (адрес не исключён). */
+export async function requestRevokeExclusion(ip: string, user: string, reason: string): Promise<RespondResult> {
+  return engineRespond(`${engineBase()}/respond/exclude/revoke`, { ip, user, reason }, "engine.exclude_revoke");
 }
 
 export { blockCandidates, publicIpsFromChain } from "./shared/respond";
@@ -1057,6 +1068,8 @@ export type RespondStatus = {
   ttl: string;
   allowlist: string[];
   active: { ip: string; incident: string; until: string; manual?: boolean; executors?: string[] }[];
+  /** адреса, исключённые оператором из автоблокировки до until */
+  excluded: { ip: string; since: string; until: string; actor: string; reason: string }[];
   config_errors: string[];
   pending: number;
   /** что записано из консоли (console_settings), даже если движок ещё не применил */
@@ -1069,7 +1082,7 @@ export async function respondStatus(): Promise<RespondStatus> {
   const requested = await chQuery<{ value: string }>(
     `SELECT argMax(value, updated_at) AS requested_value FROM console_settings WHERE key = 'respond_mode' GROUP BY key`,
   ).then((r) => (r[0] ? ((r[0] as unknown as { requested_value: string }).requested_value as RespondMode | "") : null)).catch(() => null);
-  const empty: RespondStatus = { mode: "simulate", mode_from: "config", enabled: false, ttl: "", allowlist: [], active: [], config_errors: [], pending: 0, requested };
+  const empty: RespondStatus = { mode: "simulate", mode_from: "config", enabled: false, ttl: "", allowlist: [], active: [], excluded: [], config_errors: [], pending: 0, requested };
   try {
     const r = await fetch(`${base}/respond/status`, { cache: "no-store", headers: engineAuth(), signal: AbortSignal.timeout(3000) });
     if (!r.ok) throw new Error(`engine ${r.status}`);
@@ -1083,6 +1096,7 @@ export async function respondStatus(): Promise<RespondStatus> {
       ttl: j.ttl ?? "",
       allowlist: j.allowlist ?? [],
       active: j.active ?? [],
+      excluded: j.excluded ?? [],
       config_errors: j.config_errors ?? [],
       pending: Number(j.pending ?? 0),
       requested,

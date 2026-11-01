@@ -20,6 +20,8 @@ export type QueryMocks = {
   blockCandidatesFor: (inc: { actor_name: string; chain: string[] }) => string[];
   requestUnblockIp: (...args: unknown[]) => Promise<{ error?: string; results?: { executor: string; ok: boolean; detail: string }[] }>;
   requestReanalyze: (id: string) => Promise<string | null>;
+  requestExcludeIp: (...args: unknown[]) => Promise<{ error?: string; until?: string }>;
+  requestRevokeExclusion: (...args: unknown[]) => Promise<{ error?: string }>;
   addException: (...args: unknown[]) => Promise<void>;
   addIncidentComment: (...args: unknown[]) => Promise<void>;
   incidentCommentExists: (id: string, commentId: string) => Promise<boolean>;
@@ -135,6 +137,8 @@ export function installNextMocks(): Mocks {
     blockCandidatesFor: (inc) => blockCandidates(inc.actor_name, inc.chain),
     requestUnblockIp: async () => ({ error: "движок недоступен" }),
     requestReanalyze: async () => "движок недоступен",
+    requestExcludeIp: async () => ({ error: "движок недоступен" }),
+    requestRevokeExclusion: async () => ({ error: "движок недоступен" }),
     addException: async () => undefined,
     addIncidentComment: async () => undefined,
     incidentCommentExists: async () => false,
