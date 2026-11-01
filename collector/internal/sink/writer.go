@@ -47,6 +47,7 @@ type Batch struct {
 	diskSize int64
 	loadErr  error
 	stall    *stallMark // батч возвращается без прогресса (stall.go)
+	restored bool       // поднят из spool при старте и ещё без прогресса (stall.go)
 }
 
 // Queue — ограниченная очередь батчей между батчером и писателями. При
@@ -66,6 +67,10 @@ type Queue struct {
 	stats    *Stats
 	spool    *diskSpool
 	stalls   map[*stallMark]bool // отметки застрявших батчей (stall.go)
+	// restoredPending — батчи, поднятые из spool при старте, у которых ещё не было
+	// прогресса; startedAt — момент старта (stall.go: отсчёт их застревания).
+	restoredPending int
+	startedAt       time.Time
 }
 
 func NewQueue(maxRows int, st *Stats) *Queue {
