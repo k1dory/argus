@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -333,19 +334,20 @@ func Action(s string) string {
 // Поставляемое правило (registry) — id, заголовок из файла правила и теги из
 // реестра; пользовательское — «[rule]» и только теги ATT&CK: его заголовок,
 // id и теги пишет оператор, и в них бывают имена и узлы.
+//
+// Теги ATT&CK — только тактики и техники из справочника, в каноническом виде
+// (registry.NormalizeAttackTag): тот же список идёт и в состояние, и в запись, и
+// в подбор кандидатов техники (dataset.Questions), чтобы варианты в обучающей
+// записи и в запросе модели совпадали.
 func Rule(inc *incidents.Incident) (id, title string, tags []string) {
-	if r, ok := registry.LookupRule(inc.RuleID); ok {
-		for _, t := range inc.Tags {
-			if registry.Tag(t) {
-				tags = append(tags, t)
-			}
-		}
-		return inc.RuleID, r.Title, tags
-	}
+	r, shipped := registry.LookupRule(inc.RuleID)
 	for _, t := range inc.Tags {
-		if registry.AttackTag(t) {
-			tags = append(tags, t)
+		if c := registry.CleanTag(t, shipped); c != "" && !slices.Contains(tags, c) {
+			tags = append(tags, c)
 		}
+	}
+	if shipped {
+		return inc.RuleID, r.Title, tags
 	}
 	return "[rule]", "[rule]", tags
 }

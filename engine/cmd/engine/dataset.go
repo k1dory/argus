@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -132,6 +133,11 @@ func askModel(ctx context.Context, c *systemone.Client, r *dataset.Record) (data
 	resp2, err := c.Decide(ctx, r.State, map[string]systemone.Question{"attack_technique": tq})
 	if err != nil {
 		return dataset.ModelAnswers{}, fmt.Errorf("attack_technique: %w", err)
+	}
+	// У записи одна версия модели на все ответы: если за псевдонимом модели
+	// между запросами выкатили другую ревизию, пару не смешиваем.
+	if resp2.Model != resp.Model {
+		return dataset.ModelAnswers{}, errors.New("systemone " + c.Name + ": model revision changed between requests")
 	}
 	ma.Answers = maps.Clone(ma.Answers)
 	ma.Answers["attack_technique"] = resp2.Answers["attack_technique"]
