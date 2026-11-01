@@ -49,6 +49,13 @@ argus_identities_src: ""
 argus_cmdb_src: ""
 argus_etc_dir: /etc/argus
 
+# Снимки правил для движка: каталог rules-<хеш содержимого> на каждую версию rules/.
+# Движок монтирует снимок (ARGUS_RULES_HOST_DIR в .env), а не ./rules checkout:
+# обновление кода не меняет правила под ещё работающим старым движком. Хранятся
+# текущий и argus_rules_keep последних.
+argus_rules_releases_dir: /var/lib/argus/rules
+argus_rules_keep: 2
+
 # ASN публичных адресов в событиях коллектора (attrs.src_asn и т.д.): таблица iptoasn.com
 # скачивается на хост в argus_asn_dir (scripts/asn-update.sh — проверка и атомарная замена)
 # и обновляется по cron; коллектор перечитывает её без рестарта.

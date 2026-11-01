@@ -103,6 +103,31 @@
     - scripts/gen-sample.sh
     - scripts/bench-ingest.sh
 
+# Правила для движка — неизменяемый снимок по хешу содержимого, а не живой ./rules
+# checkout. Обновление кода меняет ./rules сразу, а запущенный движок перечитывает
+# каталог правил на лету: до пересоздания на новом образе старый движок применил бы
+# правила новой версии — частично, если в них есть неизвестные ему поля (rc34:
+# новый group_by без group_by_previous, дубль INC-5312). Снимок монтируется по пути из
+# .env; compose пересоздаёт движок, только когда путь меняется, — вместе с образом.
+- name: "Правила: снимок для движка"
+  ansible.builtin.shell:
+    cmd: |
+      set -eu
+      cd {{ argus_dir | quote }}
+      if command -v sha256sum >/dev/null 2>&1; then sum=sha256sum; else sum="shasum -a 256"; fi
+      h=$(find rules -type f | LC_ALL=C sort | while IFS= read -r f; do printf '%s\n' "$f"; $sum < "$f"; done | $sum | cut -c1-16)
+      base={{ argus_rules_releases_dir | quote }}
+      d="$base/rules-$h"
+      if [ -d "$d" ]; then echo "exists $d"; exit 0; fi
+      mkdir -p "$base"
+      rm -rf "$d.tmp"
+      cp -R rules "$d.tmp"
+      mv "$d.tmp" "$d"
+      echo "created $d"
+    executable: /bin/bash
+  register: argus_rules_snapshot
+  changed_when: argus_rules_snapshot.stdout.startswith('created')
+
 # Боевые карты идентичностей и CMDB живут вне checkout: git reset по тегу их не трогает,
 # а compose подхватывает docker-compose.override.yml сам. Запись in-place (unsafe_writes):
 # файлы примонтированы в движок как файлы, новый inode контейнер бы не увидел; содержимое
@@ -169,6 +194,13 @@
   loop_control:
     label: "{{ item.key }}"
   no_log: true
+
+- name: ".env: снимок правил движка"
+  ansible.builtin.lineinfile:
+    path: "{{ argus_dir }}/.env"
+    regexp: "^#?ARGUS_RULES_HOST_DIR="
+    line: "ARGUS_RULES_HOST_DIR={{ argus_rules_snapshot.stdout.split()[-1] }}"
+    mode: "0600"
 
 - name: ".env: профиль compose mcp"
   ansible.builtin.lineinfile:
@@ -360,6 +392,19 @@
   retries: 12
   delay: 5
   until: argus_collector_ready.status == 200
+
+# Выкатка прошла: движок на новом снимке. Старые снимки — кроме текущего и
+# argus_rules_keep последних — удаляются (откат на прошлую версию их воссоздаст).
+- name: "Правила: старые снимки"
+  ansible.builtin.shell:
+    cmd: |
+      set -eu
+      cd {{ argus_rules_releases_dir | quote }}
+      cur=$(basename {{ argus_rules_snapshot.stdout.split()[-1] | quote }})
+      ls -1dt rules-* 2>/dev/null | grep -vxF "$cur" | grep -v '\.tmp$' | tail -n +{{ argus_rules_keep | int + 1 }} | while IFS= read -r d; do rm -rf -- "$d"; echo "removed $d"; done
+    executable: /bin/bash
+  register: argus_rules_prune
+  changed_when: "'removed' in argus_rules_prune.stdout"
 
 - name: ASN — скачать таблицу, если её ещё нет
   ansible.builtin.command:
