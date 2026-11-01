@@ -10,7 +10,7 @@ import { SEARCH_SETTINGS } from "./search";
 import { chTs, LOG_COLUMNS, toLogItem, type LogItem } from "./shared/log-query";
 import type { TriageBinding } from "./shared/triage";
 import {
-  ACTOR_KINDS, activeAliases, aliasColumnExpr, aliasPredicate, aliasPrefilter, aliasActiveAt, aliasMatches, aliasKey, ambiguousAliases, bucketEvents, canonicalIp, canonicalPhone, clampWindow, CONFIRMED_NOTE_PREFIX, HOLD_NOTE_PREFIX, isAliasKind, isHeld, LOWERCASE_KINDS, normalizeAliasValue, rangeWindow, resolveStatus,
+  ACTOR_KINDS, activeAliases, aliasColumnExpr, aliasPredicate, aliasPrefilter, aliasActiveAt, aliasMatches, aliasKey, ambiguousAliases, bucketEvents, canonicalIp, canonicalPhone, clampWindow, CONFIRMED_NOTE_PREFIX, HOLD_CONFIDENCE, HOLD_NOTE_PREFIX, isAliasKind, isHeld, LOWERCASE_KINDS, normalizeAliasValue, rangeWindow, resolveStatus,
   type ActorIncident, type ActorRange, type ActorReport, type Alias, type AliasInput, type ClassCount, type IpStat, type NodeStat, type Person, type PersonInput, type ResolveMatch, type ResolveStatus, type SourceCoverage, type Window,
 } from "./shared/actors";
 
@@ -238,44 +238,34 @@ export async function aliasSightings(value: string, range: ActorRange, now = Dat
   }
   // Те же правила значения, что у алиасов (aliasColumn/compareValue): uid/sid/peer —
   // actor_name точно, phone — в E.164, host — node без учёта регистра. Без учёта
-  // регистра actor_name сравнивается, только если значение — login/email, который
-  // действует на ts события и не на удержании, — с той же политикой, что в резолве.
-  // Из этой ветки исключаются подтверждённые uid/sid/peer других персон, действующие
-  // на ts события: login casekey персоны A не берёт события uid CaseKey персоны B.
-  // Оба справочных запроса идут по первичному ключу (alias_kind, alias_value);
-  // второй сравнивает lowerUTF8(alias_value) и читает только uid/sid/peer.
+  // регистра actor_name сравнивается, только если на ts события действует
+  // подтверждённый (не на удержании) login/email с этим значением — та же политика,
+  // что в резолве. Из этой ветки исключаются подтверждённые uid/sid/peer, действующие
+  // на ts события, если у их владельца в тот же момент нет такого login/email:
+  // login casekey персоны A не берёт события uid CaseKey персоны B.
+  // Интервалы собираются в массивы в самом ClickHouse (скалярные подзапросы, только
+  // пересекающие окно): длина запроса не зависит от истории алиасов. Справочник
+  // читается по первичному ключу (alias_kind, alias_value); uid/sid/peer — диапазон
+  // alias_kind с lowerUTF8(alias_value).
   const v = value.trim();
   const lv = v.toLowerCase();
-  const [folding, exact] = await Promise.all([
-    chQuery<AliasRow>(`SELECT * FROM (${aliasesLatestWhere(`alias_kind IN (${CASE_INSENSITIVE_ACTOR_SQL}) AND alias_value = {lv:String}`)})`, { lv }),
-    chQuery<AliasRow>(`SELECT * FROM (${aliasesLatestWhere(`alias_kind IN (${CASE_SENSITIVE_ACTOR_SQL}) AND lowerUTF8(alias_value) = {lv:String}`)})`, { lv }),
-  ]);
-  const ci = aliasesOf(folding).filter((a) => !isHeld(a));
-  const owners = new Set(ci.map((a) => a.person_id));
-  const foreign = aliasesOf(exact).filter((a) => !isHeld(a) && !owners.has(a.person_id));
-  const params: Record<string, string> = { ...win, v, pv: canonicalPhone(v) ?? v, lv };
-  const at = (name: string) => `parseDateTime64BestEffort({${name}:String}, 3, 'UTC')`;
-  const interval = (a: Alias, p: string) => {
-    params[`${p}f`] = a.valid_from;
-    if (a.valid_to === null) return `ts >= ${at(`${p}f`)}`;
-    params[`${p}t`] = a.valid_to;
-    return `(ts >= ${at(`${p}f`)} AND ts < ${at(`${p}t`)})`;
-  };
-  let folded = "";
-  if (ci.length > 0) {
-    const active = ci.map((a, i) => interval(a, `ci${i}_`)).join(" OR ");
-    const excluded = foreign.map((a, i) => {
-      params[`fx${i}_v`] = a.value;
-      return `(actor_name = {fx${i}_v:String} AND ${interval(a, `fx${i}_`)})`;
-    });
-    folded = `OR (lowerUTF8(actor_name) = {lv:String} AND (${active})${excluded.length ? ` AND NOT (${excluded.join(" OR ")})` : ""})`;
-  }
+  const live = `confidence >= {hold:Float32} AND valid_from < parseDateTime64BestEffort({to:String}, 3, 'UTC')
+    AND (valid_to_raw IS NULL OR valid_to_raw > parseDateTime64BestEffort({from:String}, 3, 'UTC'))`;
+  const activeAt = (t: string, from: string, to: string) => `ts >= ${t}.${from} AND (isNull(${t}.${to}) OR ts < ${t}.${to})`;
   const rows = await chQuery<Row>(
-    `SELECT source, action, actor_name AS who, node AS at_node, groupUniqArray(5)(src_ip) AS ips, count() AS events, toString(min(ts)) AS first_ts, toString(max(ts)) AS last_ts
+    `WITH
+       (SELECT groupArray((person_id, valid_from, valid_to_raw)) FROM (${aliasesLatestWhere(`alias_kind IN (${CASE_INSENSITIVE_ACTOR_SQL}) AND alias_value = {lv:String}`)}) WHERE ${live}) AS ci,
+       (SELECT groupArray((alias_value, person_id, valid_from, valid_to_raw)) FROM (${aliasesLatestWhere(`alias_kind IN (${CASE_SENSITIVE_ACTOR_SQL}) AND lowerUTF8(alias_value) = {lv:String}`)}) WHERE ${live}) AS fx
+     SELECT source, action, actor_name AS who, node AS at_node, groupUniqArray(5)(src_ip) AS ips, count() AS events, toString(min(ts)) AS first_ts, toString(max(ts)) AS last_ts
      FROM events WHERE ${ts}
-       AND (actor_name IN ({v:String}, {pv:String}) ${folded} OR lowerUTF8(node) = {lv:String})
+       AND (actor_name IN ({v:String}, {pv:String})
+         OR (lowerUTF8(actor_name) = {lv:String}
+             AND arrayExists(c -> ${activeAt("c", "2", "3")}, ci)
+             AND NOT arrayExists(x -> actor_name = x.1 AND ${activeAt("x", "3", "4")}
+                   AND NOT arrayExists(c -> c.1 = x.2 AND ${activeAt("c", "2", "3")}, ci), fx))
+         OR lowerUTF8(node) = {lv:String})
      GROUP BY source, action, actor_name, node ORDER BY last_ts DESC LIMIT 100`,
-    params,
+    { ...win, v, pv: canonicalPhone(v) ?? v, lv, hold: HOLD_CONFIDENCE },
   );
   return { kind: "actor", rows: rows.map(toSighting), vpn: [] };
 }
