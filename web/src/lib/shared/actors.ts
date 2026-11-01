@@ -263,23 +263,42 @@ export function aliasPredicate(aliases: Alias[], window: Window, prefix = "", ts
     return iv ? [{ a, iv }] : [];
   });
   if (form === "arrays" || (form === "auto" && live.length > PREDICATE_OR_MAX)) {
-    // Компактная форма: по колонке сравнения — массивы значений и интервалов параметрами
-    // (arrayParam делит их на части), текст SQL не растёт с числом алиасов. Ветки OR
-    // позволяют индексу отсекать гранулы, но строки и так отбирает aliasPrefilter, а
-    // тысяча веток делала SQL одной персоны длиннее поля формы ClickHouse (128 КиБ).
-    const byColumn = new Map<string, { v: string[]; f: string[]; t: string[] }>();
+    // Компактная форма, как activityPlan: интервалы одного значения пронумерованы подряд,
+    // transform по колонке сравнения даёт отрезок их номеров (хеш-поиск), лямбда проходит
+    // только по нему. Массивы — параметрами (arrayParam делит их на части), текст SQL не
+    // растёт с числом алиасов. Ветки OR позволяют индексу отсекать гранулы, но строки и
+    // так отбирает aliasPrefilter, а тысячи веток не помещались в max_query_size
+    // (256 КиБ) и в поле формы ClickHouse. Массивы значений — не аргументами
+    // arrayExists: те ClickHouse разворачивает на каждую строку (тысячи значений ×
+    // строки — гигабайты).
+    const byColumn = new Map<string, Map<string, { fromMs: number; toMs: number }[]>>();
     for (const { a, iv } of live) {
       const col = aliasColumnExpr(a.kind);
-      const g = byColumn.get(col) ?? { v: [], f: [], t: [] };
-      byColumn.set(col, g);
-      g.v.push(chStringLiteral(a.value));
-      g.f.push(String(iv.fromMs));
-      g.t.push(String(iv.toMs));
+      const byValue = byColumn.get(col) ?? new Map<string, { fromMs: number; toMs: number }[]>();
+      byColumn.set(col, byValue);
+      byValue.set(a.value, [...(byValue.get(a.value) ?? []), iv]);
     }
+    const from: string[] = [], to: string[] = [];
+    const lookups: string[] = [];
+    [...byColumn].forEach(([col, byValue], j) => {
+      const keys: string[] = [], spans: string[] = [];
+      for (const [value, ivs] of byValue) {
+        keys.push(chStringLiteral(value));
+        spans.push(span(from.length + 1, ivs.length));
+        for (const iv of ivs) {
+          from.push(String(iv.fromMs));
+          to.push(String(iv.toMs));
+        }
+      }
+      const k = arrayParam(params, `${prefix}ck${j}`, "Array(String)", keys);
+      const r = arrayParam(params, `${prefix}cr${j}`, "Array(UInt64)", spans);
+      lookups.push(spanRange(`transform(${col}, ${k}, ${r}, toUInt64(0))`));
+    });
+    if (!lookups.length) return { sql: "0", params };
+    const f = arrayParam(params, `${prefix}cf`, "Array(Int64)", from);
+    const t = arrayParam(params, `${prefix}ct`, "Array(Int64)", to);
     const ms = `toUnixTimestamp64Milli(${tsColumn})`;
-    const parts = [...byColumn].map(([col, g], j) =>
-      `arrayExists((v, f, t) -> ${col} = v AND ${ms} >= f AND ${ms} < t, ${arrayParam(params, `${prefix}cv${j}`, "Array(String)", g.v)}, ${arrayParam(params, `${prefix}cf${j}`, "Array(Int64)", g.f)}, ${arrayParam(params, `${prefix}ct${j}`, "Array(Int64)", g.t)})`);
-    return { sql: parts.length ? `(${parts.join(" OR ")})` : "0", params };
+    return { sql: `arrayExists(c -> ${ms} >= ${f}[c] AND ${ms} < ${t}[c], arrayConcat(${lookups.join(", ")}))`, params };
   }
   const parts: string[] = [];
   let i = 0;

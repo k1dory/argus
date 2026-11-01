@@ -45,3 +45,19 @@ test("aliasPredicate: arrays и or считают одно и то же — ви
   const auto = aliasPredicate(many, W);
   assert.ok(many.length > PREDICATE_OR_MAX && /arrayExists/.test(auto.sql) && auto.sql.length < 2000, auto.sql.slice(0, 200));
 });
+
+test("aliasPredicate: 4097 алиасов одной персоны — SQL не растёт, память не зависит от числа значений", { skip, timeout: 60_000 }, async () => {
+  // Как снимки адресов VPN каждые 5 минут: тысячи интервалов у одной персоны.
+  const many = Array.from({ length: 4097 }, (_, i) => mk(i % 2 ? "login" : "uid", `user-${i % 900}`, W.fromMs + i * 60_000, W.fromMs + i * 60_000 + 300_000));
+  const p = aliasPredicate(many, W, "", "ts");
+  assert.ok(p.sql.length < 2000, `SQL ${p.sql.length} байт`);
+  const rows = `SELECT parseDateTime64BestEffort({start:String}, 3, 'UTC') + toIntervalSecond(number * 15) AS ts,
+      concat('user-', toString(number % 1000)) AS actor_name, '' AS src_ip, '' AS node FROM numbers(20000)`;
+  const or = aliasPredicate(many.slice(0, 300), W, "o_", "ts", "or");
+  const arr = aliasPredicate(many.slice(0, 300), W, "a_", "ts", "arrays");
+  const r = await ch().chQuery<{ n: string | number; o: string | number; a: string | number }>(
+    `SELECT countIf(${p.sql}) AS n, countIf(${or.sql}) AS o, countIf(${arr.sql}) AS a FROM (${rows})`,
+    { ...p.params, ...or.params, ...arr.params, start: chTs(W.fromMs) }, { max_memory_usage: 128 * 1024 * 1024, max_threads: 1 });
+  assert.ok(Number(r[0].n) > 0);
+  assert.equal(Number(r[0].a), Number(r[0].o), "на 300 алиасах формы совпадают");
+});
