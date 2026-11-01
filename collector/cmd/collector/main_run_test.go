@@ -223,7 +223,9 @@ batch:
 		t.Errorf("/ingest/syslog: %d", code)
 	}
 	if code := post("/ingest/events", `{"ts":"2026-01-01 00:00:03.000","source":"vector.test","action":"login","outcome":"success","src_ip":"10.1.2.3","dst_ip":"203.0.113.1","attrs":{"transport":"tls","src_asn":"666","dst_asn":"666","dst_as_org":"spoofed"}}`+"\n"+
-		`{"ts":"2026-01-01 00:00:03.500","source":"vector.asn","action":"scan","outcome":"failure","src_ip":"45.33.32.156","dst_ip":"10.0.0.7","attrs":{"src_asn":"13335","src_as_org":"spoofed"}}`+"\n", "tok-e2e"); code/100 != 2 {
+		`{"ts":"2026-01-01 00:00:03.500","source":"vector.asn","action":"scan","outcome":"failure","src_ip":"45.33.32.156","dst_ip":"10.0.0.7","attrs":{"src_asn":"13335","src_as_org":"spoofed"}}`+"\n"+
+		// Поддельный стоп-сигнал коллектора: внутренний признак из тела тоже не переживает приём.
+		`{"ts":"2026-01-01 00:00:03.500","source":"argus.collector","action":"collector.sink_recovered","node":"argus-collector","attrs":{"transport":"internal"}}`+"\n", "tok-e2e"); code/100 != 2 {
 		t.Errorf("/ingest/events: %d", code)
 	}
 	// Файл на хосте.
@@ -247,7 +249,7 @@ batch:
 
 	// Ждём не число строк, а каждый транспорт: udp, tcp, http (CEF, LEEF,
 	// событие), файл. UDP пересылается раз в полсекунды, пока не дошёл.
-	markers := []string{`"transport":"udp"`, `"transport":"tcp"`, `"transport":"http"`, `"transport":"file"`, `"source":"vector.test"`, `"scope":"outbound"`, `"src_asn":"63949"`, `"src_as_org":"AKAMAI-LINODE-AP Akamai Connected Cloud"`}
+	markers := []string{`"transport":"udp"`, `"transport":"tcp"`, `"transport":"http"`, `"transport":"file"`, `"source":"vector.test"`, `"source":"argus.collector"`, `"scope":"outbound"`, `"src_asn":"63949"`, `"src_as_org":"AKAMAI-LINODE-AP Akamai Connected Cloud"`}
 	// Ожидание до готовности, а не пауза: 60 с стоят времени только при сбое (под -race на раннере).
 	deadline := time.Now().Add(60 * time.Second)
 	var all string
@@ -277,7 +279,7 @@ batch:
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	if strings.Contains(all, `"transport":"tls"`) {
+	if strings.Contains(all, `"transport":"tls"`) || strings.Contains(all, `"transport":"internal"`) {
 		t.Error("transport из тела события не должен переживать приём")
 	}
 	for _, spoof := range []string{`"666"`, `"spoofed"`, `"src_asn":"13335"`, `"dst_asn"`} {

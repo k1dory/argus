@@ -818,7 +818,8 @@ func main() {
 				"queue": len(queue), "pending_rows": pq.Rows(), "pending_bytes": pq.Bytes(), "spool_bytes": pq.SpoolBytes(), "spool_capacity_bytes": pq.SpoolCapacityBytes(), "dead_letter": ws.DeadLetter.Load(), "panics": listen.Metrics.Panics.Load()}
 		},
 		Metrics: func(full bool) string {
-			return st.prometheus(len(queue), pq.Rows(), pq.Bytes(), ws, full) + fmt.Sprintf("argus_collector_spool_bytes %d\nargus_collector_spool_capacity_bytes %d\nargus_collector_undeclared_format_total %d\nargus_collector_unrecognized_record_total %d\n", pq.SpoolBytes(), pq.SpoolCapacityBytes(), undeclaredFormatTotal.Load(), unrecognizedRecordTotal.Load())
+			return st.prometheus(len(queue), pq.Rows(), pq.Bytes(), ws, full) + fmt.Sprintf("argus_collector_spool_bytes %d\nargus_collector_spool_capacity_bytes %d\nargus_collector_spool_head_stuck_seconds %d\nargus_collector_sink_stalled_passes_total %d\nargus_collector_undeclared_format_total %d\nargus_collector_unrecognized_record_total %d\n",
+				pq.SpoolBytes(), pq.SpoolCapacityBytes(), int64(pq.StuckFor(time.Now()).Seconds()), ws.StalledPasses.Load(), undeclaredFormatTotal.Load(), unrecognizedRecordTotal.Load())
 		},
 	}
 
@@ -901,6 +902,9 @@ func main() {
 		writers.Wait()
 		return nil
 	})
+	stall := &stallWatch{after: stallAfter(), stuck: pq.StuckFor, pending: pq.Rows,
+		passes: ws.StalledPasses.Load, insert: ch.InsertEvents}
+	run("sink-stall", func() error { listen.Guard("sink-stall", func() { stall.run(ctx) }); return nil })
 	// Heartbeat раз в минуту — источник виден живым даже без событий.
 	run("heartbeat", func() error {
 		t := time.NewTicker(time.Minute)
