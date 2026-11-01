@@ -126,6 +126,9 @@ func (c *ClickHouse) insert(ctx context.Context, table string, rows []any) error
 	// меньше частей MergeTree при тысячах EPS; ждём записи в буфер, не merge.
 	q.Set("async_insert", "1")
 	q.Set("wait_for_async_insert", "1")
+	// С async_insert+wait_for_async_insert ответ приходит после записи в буфер вставок;
+	// wait_end_of_query дополнительно буферизует ответ, и ошибка — HTTP-статусом.
+	q.Set("wait_end_of_query", "1")
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"/?"+q.Encode(), &body)
 	if err != nil {
 		return err
@@ -137,17 +140,16 @@ func (c *ClickHouse) insert(ctx context.Context, table string, rows []any) error
 	}
 	defer resp.Body.Close()
 	msg, readErr := io.ReadAll(io.LimitReader(resp.Body, (4<<10)+1))
-	if resp.StatusCode != http.StatusOK {
-		return parseError(table, resp.StatusCode, resp.Header.Get("X-ClickHouse-Exception-Code"), string(msg))
+	// Ошибка ClickHouse распознаётся до проверки размера: длинное исключение (27, 241)
+	// иначе теряло код и уходило в транспортные повторы вместо деления батча/отказа.
+	if code := resp.Header.Get("X-ClickHouse-Exception-Code"); resp.StatusCode != http.StatusOK || (code != "" && code != "0") || codeRe.Match(msg) {
+		return parseError(table, resp.StatusCode, code, string(msg[:min(len(msg), 4<<10)]))
 	}
 	if readErr != nil {
 		return fmt.Errorf("clickhouse %s response: %w", table, readErr)
 	}
 	if len(msg) > 4<<10 {
 		return fmt.Errorf("clickhouse %s: oversized insert response", table)
-	}
-	if code := resp.Header.Get("X-ClickHouse-Exception-Code"); (code != "" && code != "0") || codeRe.Match(msg) {
-		return parseError(table, resp.StatusCode, code, string(msg))
 	}
 	return nil
 }

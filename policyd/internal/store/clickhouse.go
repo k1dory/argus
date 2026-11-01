@@ -62,6 +62,7 @@ func New(base, db, user, pass string) *ClickHouse {
 func (c *ClickHouse) HasStatusColumn(ctx context.Context) (bool, error) {
 	q := url.Values{}
 	q.Set("query", fmt.Sprintf("DESCRIBE TABLE %s.policy_verdicts FORMAT TSV", c.db))
+	q.Set("wait_end_of_query", "1")
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/?"+q.Encode(), nil)
 	if err != nil {
 		return false, err
@@ -76,7 +77,7 @@ func (c *ClickHouse) HasStatusColumn(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if resp.StatusCode != http.StatusOK {
+	if failed(resp, body) {
 		return false, chError("describe", resp, body)
 	}
 	for _, line := range strings.Split(string(body), "\n") {
@@ -103,6 +104,7 @@ func (c *ClickHouse) InsertVerdicts(ctx context.Context, rows []VerdictRow) erro
 	q.Set("query", fmt.Sprintf("INSERT INTO %s.policy_verdicts FORMAT JSONEachRow", c.db))
 	q.Set("date_time_input_format", "best_effort")
 	q.Set("input_format_skip_unknown_fields", "1")
+	q.Set("wait_end_of_query", "1")
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"/?"+q.Encode(), &body)
 	if err != nil {
@@ -114,11 +116,29 @@ func (c *ClickHouse) InsertVerdicts(ctx context.Context, rows []VerdictRow) erro
 		return fmt.Errorf("clickhouse insert: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+	// Тело читается и при 200: ClickHouse может сообщить ошибку заголовком
+	// X-ClickHouse-Exception-Code или строкой исключения в теле.
+	msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+	if failed(resp, msg) {
 		return chError("insert", resp, msg)
 	}
 	return nil
+}
+
+// Исключение в теле ответа 200 — формы сервера: «Code: N. DB::Exception»,
+// «Poco::Exception. Code: N,», «std::exception. Code: N,», {"exception": "Code: …"}.
+var responseException = regexp.MustCompile(`(?m)^(?:\{"exception":\s*"|Poco::Exception\. |std::exception\. )?Code:\s*\d+[.,]`)
+
+// failed — ответ ClickHouse с ошибкой: статус не 200, код исключения в заголовке
+// или строка исключения в теле (до wait_end_of_query сервер мог прислать её после 200).
+func failed(resp *http.Response, body []byte) bool {
+	if resp.StatusCode != http.StatusOK {
+		return true
+	}
+	if code := strings.TrimSpace(resp.Header.Get("X-ClickHouse-Exception-Code")); code != "" && code != "0" {
+		return true
+	}
+	return responseException.Match(body)
 }
 
 var exceptionCode = regexp.MustCompile(`Code:\s*(\d+)`)
