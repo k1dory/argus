@@ -121,6 +121,64 @@ jobs:
           version: latest
       - run: opa test policies -v
 
+  changelog:
+    # Фрагменты changelog (changes/unreleased/README.md): PR кладёт свой файл
+    # changes/unreleased/<ветка>.md, а CHANGELOG.md правит только релиз (вместе с VERSION,
+    # scripts/changelog-release.sh). Иначе параллельные PR конфликтуют в «Не выпущено».
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          # Пути — через -z и сравнение строк (имена файлов не регулярки и не команды);
+          # переименование и удаление CHANGELOG.md тоже правка (--no-renames). Релиз —
+          # это новая версия по содержимому VERSION, а не любое касание файла.
+          git cat-file -e "$BASE^{commit}" || { echo "база PR $BASE недоступна"; exit 1; }
+          # В pull_request HEAD — merge-коммит refs/pull/N/merge поверх текущего main, а
+          # base.sha события мог устареть: тогда чужие слияния в main попали бы в diff PR.
+          # База — первый родитель merge-коммита; для обычного коммита — merge-base.
+          if git rev-parse -q --verify "HEAD^2" >/dev/null; then mb="$(git rev-parse "HEAD^1")"; else mb="$(git merge-base "$BASE" HEAD)"; fi
+          paths="$(mktemp)"
+          git diff --no-renames --name-only -z "$mb" HEAD > "$paths"
+          touched=0
+          while IFS= read -r -d '' path; do
+            if [ "$path" = CHANGELOG.md ]; then touched=1; fi
+          done < "$paths"
+          # Версия — содержимое обычного файла VERSION в коммите (mode 100644/100755).
+          # Симлинк хранит в blob путь цели, а не версию: такой VERSION не считается.
+          version_at() {
+            case "$(git ls-tree "$1" -- VERSION | cut -f1 | cut -d' ' -f1)" in
+              100644|100755) git cat-file blob "$1:VERSION" | tr -d '[:space:]' ;;
+            esac
+          }
+          if [ "$touched" = 1 ]; then
+            old="$(version_at "$mb")"
+            new="$(version_at HEAD)"
+            if [ -z "$new" ] || [ "$new" = "$old" ]; then
+              echo "::error file=CHANGELOG.md::CHANGELOG.md правится только в релизе вместе с новой версией в VERSION. Запись PR — отдельный файл в changes/unreleased/ (формат в changes/unreleased/README.md)."
+              exit 1
+            fi
+          fi
+
+  scripts:
+    # Регрессии скриптов репозитория и run-блоков workflow (Go вне модулей, только std):
+    # scripts/changelog-release.sh и проверки changelog в ci.yml / release.yml исполняются
+    # на временных git-репозиториях.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - run: |
+          go test -count=1 ./scripts/changelog_release_test.go
+          go test -count=1 ./.github/workflows/changelog_test.go
+
   ansible:
     # Регрессии роли argus (deploy/ansible/roles/argus/tests): настоящие задачи выкатки
     # с заглушками make/docker — block/rescue migrator, маскирование секретов в логе,
