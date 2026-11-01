@@ -821,14 +821,24 @@ func logLevel() slog.Level {
 	return slog.LevelInfo
 }
 
-// hasCEF/hasLEEF — запись целиком в формате CEF/LEEF: заголовок в начале строки
-// или в начале сообщения syslog. «CEF:» где-то внутри (URI, logdata WAF) — данные
-// запроса, а не формат записи: иначе атакующий выбирал бы разборщик.
-func hasCEF(line, msg string) bool  { return startsWithFormat(line, msg, "CEF:") }
-func hasLEEF(line, msg string) bool { return startsWithFormat(line, msg, "LEEF:") }
+// hasCEF/hasLEEF — запись в формате CEF/LEEF. Заголовок syslog бывает любым (RFC 3164
+// без тега, без PRI, RFC 5424 с BOM), поэтому маркер ищется по строке. Но если раньше
+// маркера стоит маркер WAF («ModSecurity: »/«Coraza: »), то «CEF:» — это данные запроса
+// (URI, logdata) внутри строки WAF: иначе атакующий выбирал бы разборщик.
+func hasCEF(line, _ string) bool  { return formatBeforeWAF(line, "CEF:") }
+func hasLEEF(line, _ string) bool { return formatBeforeWAF(line, "LEEF:") }
 
-func startsWithFormat(line, msg, marker string) bool {
-	return strings.HasPrefix(strings.TrimSpace(line), marker) || strings.HasPrefix(strings.TrimSpace(msg), marker)
+func formatBeforeWAF(line, marker string) bool {
+	i := strings.Index(line, marker)
+	if i < 0 {
+		return false
+	}
+	for _, w := range []string{"ModSecurity: ", "Coraza: "} {
+		if j := strings.Index(line, w); j >= 0 && j < i {
+			return false
+		}
+	}
+	return true
 }
 
 // replayPcap: collector replay-pcap file.pcap [--to http://host:8088] [--token T]
