@@ -73,12 +73,19 @@ func (c *ClickHouse) HasStatusColumn(ctx context.Context) (bool, error) {
 		return false, fmt.Errorf("clickhouse describe: %w", err)
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-	if err != nil {
-		return false, err
-	}
-	if failed(resp, body) {
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if headerFailed(resp) {
 		return false, chError("describe", resp, body)
+	}
+	if readErr != nil {
+		return false, fmt.Errorf("clickhouse describe: response: %w", readErr)
+	}
+	// Ответ DESCRIBE — TSV: у каждой строки есть табуляция, и имя столбца вида
+	// «Code: 27.» — данные. Строка исключения после 200 табуляции не содержит.
+	for _, line := range strings.Split(string(body), "\n") {
+		if !strings.Contains(line, "\t") && responseException.MatchString(line) {
+			return false, chError("describe", resp, []byte(line))
+		}
 	}
 	for _, line := range strings.Split(string(body), "\n") {
 		name, _, _ := strings.Cut(line, "\t")
@@ -118,8 +125,15 @@ func (c *ClickHouse) InsertVerdicts(ctx context.Context, rows []VerdictRow) erro
 	defer resp.Body.Close()
 	// Тело читается и при 200: ClickHouse может сообщить ошибку заголовком
 	// X-ClickHouse-Exception-Code или строкой исключения в теле.
-	msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
-	if failed(resp, msg) {
+	msg, readErr := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+	if headerFailed(resp) {
+		return chError("insert", resp, msg)
+	}
+	// Ответ 200, тело не дочитано (обрыв, таймаут): итог вставки неизвестен — ошибка.
+	if readErr != nil {
+		return fmt.Errorf("clickhouse insert: response: %w", readErr)
+	}
+	if responseException.Match(msg) {
 		return chError("insert", resp, msg)
 	}
 	return nil
@@ -129,16 +143,14 @@ func (c *ClickHouse) InsertVerdicts(ctx context.Context, rows []VerdictRow) erro
 // «Poco::Exception. Code: N,», «std::exception. Code: N,», {"exception": "Code: …"}.
 var responseException = regexp.MustCompile(`(?m)^(?:\{"exception":\s*"|Poco::Exception\. |std::exception\. )?Code:\s*\d+[.,]`)
 
-// failed — ответ ClickHouse с ошибкой: статус не 200, код исключения в заголовке
-// или строка исключения в теле (до wait_end_of_query сервер мог прислать её после 200).
-func failed(resp *http.Response, body []byte) bool {
+// headerFailed — ошибка по статусу или коду исключения в заголовке (с wait_end_of_query
+// это основной признак); строка исключения в теле проверяется отдельно, по форме ответа.
+func headerFailed(resp *http.Response) bool {
 	if resp.StatusCode != http.StatusOK {
 		return true
 	}
-	if code := strings.TrimSpace(resp.Header.Get("X-ClickHouse-Exception-Code")); code != "" && code != "0" {
-		return true
-	}
-	return responseException.Match(body)
+	code := strings.TrimSpace(resp.Header.Get("X-ClickHouse-Exception-Code"))
+	return code != "" && code != "0"
 }
 
 var exceptionCode = regexp.MustCompile(`Code:\s*(\d+)`)

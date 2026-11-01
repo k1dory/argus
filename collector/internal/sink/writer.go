@@ -387,10 +387,12 @@ func (w *Writer) sleep(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// bisect: обе половины пробуются по одному разу. Обе отвергнуты как данные —
-// весь батч одним INSERT в ingest_rejects (без деления до строк: стоимость
-// бисекции ограничена O(log n) вызовов на батч). Иначе прошедшая половина
-// учтена, отвергнутая делится дальше, транспортная — в обычный цикл повторов.
+// bisect: обе половины пробуются; прошедшая учтена, отвергнутая как данные делится
+// дальше, транспортная — в обычный цикл повторов. Ошибка, зависящая от размера
+// вставки (IsDivisible: 241 MEMORY_LIMIT_EXCEEDED и т.п.), делится до одной строки
+// даже когда отвергнуты обе половины: части поменьше могут пройти. Обе половины
+// отвергнуты как ядовитые данные (IsPermanent: 27, 6, 53, 117) — потолок: весь батч
+// одним INSERT в ingest_rejects, стоимость бисекции O(log n) вставок на батч.
 func (w *Writer) bisect(ctx context.Context, rows []any, err error) {
 	if len(rows) == 1 {
 		w.deadLetter(rows, err)
@@ -400,7 +402,7 @@ func (w *Writer) bisect(ctx context.Context, rows []any, err error) {
 	mid := len(rows) / 2
 	left, right := rows[:mid], rows[mid:]
 	errL, errR := w.insert(left), w.insert(right)
-	if isData(errL) && isData(errR) {
+	if IsPermanent(errL) && IsPermanent(errR) {
 		slog.Warn("insert: обе половины отвергнуты, батч целиком в ingest_rejects", "rows", len(rows))
 		w.deadLetter(rows, err)
 		return
