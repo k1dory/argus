@@ -157,24 +157,25 @@ type pending struct {
 }
 
 type Responder struct {
-	cfg        Config
-	allow      []*net.IPNet
-	never      []*net.IPNet
-	trusted    []*net.IPNet
-	ttl        time.Duration
-	manualTTL  time.Duration
-	mu         sync.Mutex
-	operations [64]sync.Mutex // bounded locks serialize network operations for the same IP
-	mode       string
-	modeFrom   string // config | console
-	active     map[string]Block
-	retry      map[string]*pending
-	secure     *http.Client
-	insecure   *http.Client
-	nowFn      func() time.Time
-	cfgErrors  []string
-	wzTok      string
-	wzTokExp   time.Time
+	beforeRetry func(ctx context.Context, ip, incident string) error // SetBeforeRetry, под mu
+	cfg         Config
+	allow       []*net.IPNet
+	never       []*net.IPNet
+	trusted     []*net.IPNet
+	ttl         time.Duration
+	manualTTL   time.Duration
+	mu          sync.Mutex
+	operations  [64]sync.Mutex // bounded locks serialize network operations for the same IP
+	mode        string
+	modeFrom    string // config | console
+	active      map[string]Block
+	retry       map[string]*pending
+	secure      *http.Client
+	insecure    *http.Client
+	nowFn       func() time.Time
+	cfgErrors   []string
+	wzTok       string
+	wzTokExp    time.Time
 }
 
 // csvList — список через запятую (INTERNAL_NETS), пустые элементы отбрасываются.
@@ -480,6 +481,23 @@ func (r *Responder) Pending() int {
 	return len(r.retry)
 }
 
+// PendingIP — адрес стоит в очереди повторов.
+func (r *Responder) PendingIP(ip string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, ok := r.retry[canonicalIP(ip)]
+	return ok
+}
+
+// SetBeforeRetry — проверка перед каждым повтором из очереди: ошибка — повтор
+// откладывается (не вызывает исполнителей). Через неё движок пишет запись-резерв
+// в журнал до повторного блока, как и до первого.
+func (r *Responder) SetBeforeRetry(f func(ctx context.Context, ip, incident string) error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.beforeRetry = f
+}
+
 // BlockIP — ручная блокировка оператором: выполняется в любом режиме, кроме
 // адресов из allowlist/never_block. Срок — manual_ttl (по умолчанию 24h,
 // 0 — бессрочно); автоматика её не перекрывает своим TTL, снимает — по сроку
@@ -620,6 +638,21 @@ func (r *Responder) Retry(ctx context.Context) []Result {
 		if !stillDue {
 			unlock()
 			continue
+		}
+		r.mu.Lock()
+		before := r.beforeRetry
+		r.mu.Unlock()
+		if before != nil {
+			if herr := before(ctx, p.ip, p.incident); herr != nil {
+				r.mu.Lock()
+				if r.retry[p.ip] == p {
+					p.next = r.nowFn().Add(retryBackoff[0])
+				}
+				r.mu.Unlock()
+				unlock()
+				out = append(out, Result{Executor: "argus", IP: p.ip, Incident: p.incident, Detail: "повтор отложен: " + herr.Error()})
+				continue
+			}
 		}
 		res, _, err := r.auto(ctx, p.ip, p.incident, p.reason, p.ttl)
 		unlock()

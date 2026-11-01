@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -254,110 +253,8 @@ func (e *engine) restoreRespState(open []incidents.Incident, now time.Time) int 
 	if len(collapsed) == 0 {
 		return n
 	}
-	ids := make([]string, len(collapsed))
-	for i, inc := range collapsed {
-		ids[i] = inc.IncidentID
-	}
-	rows, err := e.ch.ResponsesFor(context.Background(), ids, now.Add(-respStateTTL))
-	if err != nil {
-		slog.Warn("ips: решения склеенных инцидентов не восстановлены — адреса считаются решёнными, потолок исчерпанным", "err", err)
-		for _, inc := range collapsed {
-			for _, ip := range inc.MemberIPs() {
-				e.setRespStatus(inc.IncidentID+"|"+ip, "done", now)
-			}
-			limit, _ := e.collapseCap(inc)
-			e.respMu.Lock()
-			e.respCap[inc.IncidentID] = slices.Repeat([]time.Time{now}, limit)
-			e.respMu.Unlock()
-		}
-		return n
-	}
-	type addr struct {
-		reserved, blocked, failed bool
-		decision                  string
-		slotAt                    time.Time
-	}
-	byKey := map[string]*addr{}
-	var order []string
-	for _, row := range rows {
-		key := row.IncidentID + "|" + row.IP
-		a := byKey[key]
-		if a == nil {
-			a = &addr{}
-			byKey[key] = a
-			order = append(order, key)
-		}
-		at, perr := time.ParseInLocation("2006-01-02 15:04:05", row.TS, time.UTC)
-		if perr != nil {
-			at = now
-		}
-		st := restoredState(row)
-		switch st {
-		case "reserved", "blocked", "failed":
-			if a.slotAt.IsZero() || at.Before(a.slotAt) {
-				a.slotAt = at
-			}
-		}
-		switch st {
-		case "reserved":
-			a.reserved = true
-		case "blocked":
-			a.blocked = true
-		case "failed":
-			a.failed = true
-		case "":
-		default:
-			a.decision = st
-		}
-	}
-	doubtful := 0
-	for _, key := range order {
-		a := byKey[key]
-		id, ip, _ := strings.Cut(key, "|")
-		switch {
-		case a.blocked:
-			e.setRespStatus(key, "done", now)
-		case a.failed:
-			// сбой исполнителей: место держится, новая сработка блокирует снова
-		case a.reserved:
-			// Резерв без итога: исполнитель мог заблокировать, а итог не записался.
-			// Место держится, повторной попытки нет — проверить NGFW.
-			e.setRespStatus(key, "done", now)
-			doubtful++
-		case a.decision != "":
-			e.setRespStatus(key, a.decision, now)
-		}
-		if a.reserved || a.blocked || a.failed {
-			e.capRestoreIP(id, ip, a.slotAt)
-		}
-	}
-	if doubtful > 0 {
-		slog.Warn("ips: резерв блока без итога в response_log — адрес считается заблокированным, место занято; проверьте NGFW", "addresses", doubtful)
-	}
+	e.restoreCollapsed(collapsed, now)
 	return n
-}
-
-// collapseGroupOf — группа из ключа «collapse:группа:подсеть» (в группе двоеточий
-// нет, в подсети IPv6 — есть).
-func collapseGroupOf(inc *incidents.Incident) string {
-	group, _, _ := strings.Cut(strings.TrimPrefix(inc.GroupKey, "collapse:"), ":")
-	return group
-}
-
-// collapseCap — потолок блоков склеенного инцидента: по его правилу, а если его
-// убрали — по любому правилу той же группы склейки (потолок в группе один), иначе
-// по умолчанию.
-func (e *engine) collapseCap(inc *incidents.Incident) (int, time.Duration) {
-	if r := e.ruleFor(inc.RuleID); r != nil && r.Collapsed() {
-		return r.IncidentCap()
-	}
-	group := collapseGroupOf(inc)
-	for _, r := range e.current() {
-		if r.Collapsed() && r.CollapseGroup() == group {
-			return r.IncidentCap()
-		}
-	}
-	return rules.DefaultIncidentCap, rules.DefaultIncidentCapWindow
 }
 
 // restoredState — что значила запись response_log для решения по адресу:
@@ -376,6 +273,8 @@ func restoredState(row store.ResponseRow) string {
 		return "failed"
 	case strings.HasPrefix(row.Detail, reservePrefix):
 		return "reserved"
+	case strings.HasPrefix(row.Detail, "повтор отложен"):
+		return ""
 	case strings.HasPrefix(row.Detail, "потолок блокировок"):
 		return "capped"
 	case strings.HasPrefix(row.Detail, "ожидание:"), strings.HasPrefix(row.Detail, "предупреждение:"), strings.HasPrefix(row.Detail, "адресов больше"),
@@ -481,9 +380,13 @@ func (e *engine) autoRespond(ctx context.Context, incs []*incidents.Incident, no
 	mode, _ := e.resp.Mode()
 	for _, inc := range incs {
 		for _, u := range e.respUnits(inc) {
+			if u.ip != "" {
+				rows = append(rows, e.respondCollapsed(ctx, inc, u, mode, now)...)
+				continue
+			}
 			r := u.rule
-			state, at := e.respEntry(u.key)
-			if state == "done" || state == "capped" || (state == "reserve_failed" && now.Sub(at) < reserveRetry) {
+			state := e.respStatus(u.key)
+			if state == "done" {
 				continue
 			}
 			reason := r.Title + " (" + r.ID + ")"
@@ -499,40 +402,13 @@ func (e *engine) autoRespond(ctx context.Context, incs []*incidents.Incident, no
 					} else if u.trusted == 0 {
 						detail += "; в инциденте нет событий с транспортом (восстановлен из базы?)"
 					}
-					rows = append(rows, respRow(ts, mode, "argus-engine", respond.Result{Executor: "argus", OK: u.untrusted == 0, IP: u.ip, Incident: inc.IncidentID, Detail: detail}, r.ID, reason))
+					rows = append(rows, respRow(ts, mode, "argus-engine", respond.Result{Executor: "argus", OK: u.untrusted == 0, Incident: inc.IncidentID, Detail: detail}, r.ID, reason))
 				}
 				continue
 			}
-			fresh := false
-			if u.ip != "" && mode != respond.ModeIDS {
-				limit, window := r.IncidentCap()
-				ok, f := e.capReserveIP(inc.IncidentID, u.ip, now, window, limit)
-				if !ok {
-					e.setRespStatus(u.key, "capped", now)
-					rows = append(rows, respRow(ts, mode, "argus-engine", respond.Result{Executor: "argus", OK: true, IP: u.ip, Incident: inc.IncidentID,
-						Detail: fmt.Sprintf("потолок блокировок инцидента: %d новых адресов за %s (collapse.block_cap) — адрес не заблокирован, решение за аналитиком", limit, window)}, r.ID, reason))
-					slog.Warn("ips: потолок блокировок склеенного инцидента", "incident", inc.IncidentID, "rule", r.ID, "ip", u.ip, "limit", limit)
-					continue
-				}
-				fresh = f
-				// Запись вперёд: каждый блок на NGFW должен остаться в аудите. Резерв
-				// пишется в response_log до вызова исполнителя; не записался — блока
-				// нет, адрес ждёт следующей попытки (не раньше reserveRetry).
-				if mode != respond.ModeIDS {
-					if err := e.ch.InsertResponses(ctx, []store.ResponseRow{respRow(ts, mode, "argus-engine", respond.Result{Executor: "argus", OK: true, IP: u.ip, Incident: inc.IncidentID,
-						Detail: reservePrefix + " блок адреса перед вызовом исполнителей"}, r.ID, reason)}); err != nil {
-						if fresh {
-							e.capReleaseIP(inc.IncidentID, u.ip)
-						}
-						e.setRespStatus(u.key, "reserve_failed", now)
-						slog.Warn("ips: резерв в response_log не записан — адрес не блокируется до следующей попытки", "incident", inc.IncidentID, "ip", u.ip, "err", err)
-						continue
-					}
-				}
-			}
 			e.setRespStatus(u.key, "done", now)
 			if u.untrusted > 0 {
-				rows = append(rows, respRow(ts, mode, "argus-engine", respond.Result{Executor: "argus", OK: true, IP: u.ip, Incident: inc.IncidentID,
+				rows = append(rows, respRow(ts, mode, "argus-engine", respond.Result{Executor: "argus", OK: true, Incident: inc.IncidentID,
 					Detail: fmt.Sprintf("предупреждение: %d недоверенных событий не учтены (адреса и порог — только по %d доверенным) — %s", u.untrusted, u.trusted, strings.Join(u.why, "; "))}, r.ID, reason))
 			}
 			ttl, _ := time.ParseDuration(r.Respond.TTL)
@@ -545,7 +421,6 @@ func (e *engine) autoRespond(ctx context.Context, incs []*incidents.Incident, no
 				rows = append(rows, respRow(ts, mode, "argus-engine", respond.Result{Executor: "argus", OK: true, Incident: inc.IncidentID,
 					Detail: fmt.Sprintf("адресов больше max_targets: %d отброшено", u.truncated)}, r.ID, reason))
 			}
-			keep := false // место адреса потрачено
 			for _, ip := range u.targets {
 				results, applied, err := e.resp.Auto(ctx, ip, inc.IncidentID, reason, ttl)
 				if err != nil {
@@ -560,13 +435,6 @@ func (e *engine) autoRespond(ctx context.Context, incs []*incidents.Incident, no
 				for _, res := range results {
 					rows = append(rows, respRow(ts, mode, "argus-engine", res, r.ID, reason))
 				}
-				// Место потрачено блоком или симуляцией. Сбой всех исполнителей тоже держит
-				// место: responder повторит блок сам (Retry), и повтор должен уложиться в
-				// то же место. Возвращается оно только без блока: отказ по
-				// allowlist/never_block, IDS, адрес уже заблокирован.
-				if applied || mode == respond.ModeSimulate || (!respond.Noop(results) && len(results) > 0) {
-					keep = true
-				}
 				switch {
 				case applied:
 					e.m.autoBlocks.Add(1)
@@ -580,9 +448,6 @@ func (e *engine) autoRespond(ctx context.Context, incs []*incidents.Incident, no
 					e.m.blockFailures.Add(1)
 					slog.Error("ips: блокировка не выполнена", "ip", ip, "incident", inc.IncidentID, "rule", r.ID)
 				}
-			}
-			if fresh && !keep {
-				e.capReleaseIP(inc.IncidentID, u.ip)
 			}
 		}
 	}
@@ -600,7 +465,9 @@ func (e *engine) expireBlocks(ctx context.Context, now time.Time) {
 	for _, res := range e.resp.Expire(ctx) {
 		rows = append(rows, respRow(ts, "ips", "argus-engine", res, "", "TTL истёк"))
 	}
-	for _, res := range e.resp.Retry(ctx) {
+	retried := e.resp.Retry(ctx)
+	e.afterRetry(retried, now)
+	for _, res := range retried {
 		rows = append(rows, respRow(ts, "ips", "argus-engine", res, "", "повтор автоблокировки"))
 		if res.OK && res.Executor != "argus" {
 			e.m.autoBlocks.Add(1)
