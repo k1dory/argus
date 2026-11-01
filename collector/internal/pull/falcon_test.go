@@ -338,8 +338,15 @@ func TestFalconRunReconnectsWithFreshToken(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { f.Run(ctx); close(done) }()
+	// Ждём третье событие, а не третий поток: поток открывается раньше, чем его
+	// событие доходит до emit, и отмена сразу после подключения теряла его (флейк CI).
+	events := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(*got)
+	}
 	deadline := time.Now().Add(5 * time.Second)
-	for api.streams.Load() < 3 && time.Now().Before(deadline) {
+	for (api.streams.Load() < 3 || events() < 3) && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	cancel()
