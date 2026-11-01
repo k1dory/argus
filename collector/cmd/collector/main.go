@@ -173,10 +173,10 @@ func parseSyslogLine(norm *normalize.Normalizer, line string, peer listen.Peer) 
 	sl, _ := parse.ParseSyslog(line)
 	var e model.Event
 	switch {
-	case hasCEF(line):
+	case hasCEF(line, sl.Message):
 		c, _ := parse.ParseCEF(line)
 		e = norm.FromCEF(c, sl, line)
-	case hasLEEF(line):
+	case hasLEEF(line, sl.Message):
 		l, _ := parse.ParseLEEF(line)
 		e = norm.FromLEEF(l, sl, line)
 	case parse.IsWAFErrorLine(line):
@@ -821,8 +821,15 @@ func logLevel() slog.Level {
 	return slog.LevelInfo
 }
 
-func hasCEF(s string) bool  { return strings.Contains(s, "CEF:") }
-func hasLEEF(s string) bool { return strings.Contains(s, "LEEF:") }
+// hasCEF/hasLEEF — запись целиком в формате CEF/LEEF: заголовок в начале строки
+// или в начале сообщения syslog. «CEF:» где-то внутри (URI, logdata WAF) — данные
+// запроса, а не формат записи: иначе атакующий выбирал бы разборщик.
+func hasCEF(line, msg string) bool  { return startsWithFormat(line, msg, "CEF:") }
+func hasLEEF(line, msg string) bool { return startsWithFormat(line, msg, "LEEF:") }
+
+func startsWithFormat(line, msg, marker string) bool {
+	return strings.HasPrefix(strings.TrimSpace(line), marker) || strings.HasPrefix(strings.TrimSpace(msg), marker)
+}
 
 // replayPcap: collector replay-pcap file.pcap [--to http://host:8088] [--token T]
 // Достаёт UDP/TCP-полезную нагрузку из записи tcpdump и шлёт построчно в /ingest/syslog.

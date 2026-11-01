@@ -550,11 +550,19 @@ func wafServerID(w parse.WAF) string {
 	return w.ServerID
 }
 
-// hostOnly — имя без порта: «a.example:8443» → «a.example».
+// hostOnly — имя без порта и скобок, в нижнем регистре: «[a.example:8443]:443» → «a.example».
+// Порт снимается до упора: Caddy снимает один уровень, и server_id может сохранить второй.
 func hostOnly(s string) string {
-	s = strings.TrimSpace(s)
-	if h, _, err := net.SplitHostPort(s); err == nil {
-		return h
+	s = strings.ToLower(strings.TrimSpace(s))
+	for i := 0; i < 4; i++ {
+		prev := s
+		if h, _, err := net.SplitHostPort(s); err == nil {
+			s = h
+		}
+		s = strings.Trim(s, "[]")
+		if s == prev {
+			break
+		}
 	}
 	return s
 }

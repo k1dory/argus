@@ -131,7 +131,10 @@ func ParseWAFAudit(b []byte) (WAF, bool) {
 		}
 		w.UnixNano = n
 	}
-	if strings.Contains(strings.ToLower(t.Producer.Connector+t.Producer.Server+t.Producer.ModSecurity), "coraza") || t.Producer.RuleEngine != "" {
+	// producer пишется только с частью H аудита; без неё Coraza узнаётся по своим полям
+	// (timestamp/unix_timestamp вместо time_stamp ModSecurity) или по тексту сообщений.
+	if strings.Contains(strings.ToLower(t.Producer.Connector+t.Producer.Server+t.Producer.ModSecurity), "coraza") ||
+		t.Producer.RuleEngine != "" || (t.Time == "" && (t.Timestamp != "" || t.UnixTS != "")) || corazaMessages(a) {
 		w.Product = "coraza"
 	}
 	for k, v := range auditHeaders(t.Request.Headers) {
@@ -179,6 +182,18 @@ func ParseWAFAudit(b []byte) (WAF, bool) {
 	w.Blocked = !strings.EqualFold(w.EngineMode, "DetectionOnly") &&
 		(t.IsInterrupted || denied || ((w.Status == 403 || w.Status == 406) && w.hasFinalRule()))
 	return w, true
+}
+
+// corazaMessages — в сообщениях аудита есть строка error-лога Coraza.
+func corazaMessages(a modsecAudit) bool {
+	for _, ms := range [][]modsecMessage{a.Messages, a.Transaction.Messages} {
+		for _, m := range ms {
+			if strings.Contains(m.ErrorMessage, "Coraza: ") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // hasFinalRule — сработало правило оценки anomaly score (CRS 949110/980130) — признак решения WAF, а не приложения.
@@ -236,9 +251,11 @@ func ParseWAFErrorLine(line string) (WAF, bool) {
 	if c := clientRe.FindStringSubmatch(text[:loc[0]]); c != nil {
 		w.ClientIP = c[1]
 	}
-	// denied/dropped/redirected — движок прервал запрос. «Access allowed» итогом не считается:
-	// allow:phase и allow:request пропускают только часть фаз, дальше возможен deny.
+	// denied/dropped/redirected — движок прервал запрос. «Access allowed» итогом не считается
+	// даже у 949110 (SecRuleUpdateActionById … "allow:phase"): allow:phase и allow:request
+	// пропускают только часть фаз, дальше возможен deny.
 	denied := wafBlockAction(m[2])
+	allowed := m[2] == "allowed"
 	if m[3] != "" {
 		w.Status, _ = strconv.Atoi(m[3])
 	}
@@ -251,7 +268,7 @@ func ParseWAFErrorLine(line string) (WAF, bool) {
 	if denied {
 		w.EngineMode, w.Blocked = "On", true
 	}
-	w.Final = denied || w.hasFinalRule()
+	w.Final = denied || (!allowed && w.hasFinalRule())
 	return w, true
 }
 
@@ -283,7 +300,20 @@ func parseRuleMeta(meta string, w *WAF, coraza bool) (WAFRule, bool) {
 }
 
 // scanRuleMeta — пары [key "value"] метаданных правила, начиная с [file "…"].
+// ModSecurity пишет msg без экранирования: данные запроса в msg могут закрыть кавычку
+// и добавить свои [id]/[tag]. Повтор уникального ключа — признак подделки: такие
+// метаданные отбрасываются целиком (правило не учитывается, итогом строка не станет).
 func scanRuleMeta(meta string, w *WAF) WAFRule {
+	seen := map[string]bool{}
+	for _, kv := range kvRe.FindAllStringSubmatch(meta, -1) {
+		switch kv[1] {
+		case "file", "line", "id", "msg", "severity", "hostname", "uri", "unique_id":
+			if seen[kv[1]] {
+				return WAFRule{Severity: -1}
+			}
+			seen[kv[1]] = true
+		}
+	}
 	r := WAFRule{Severity: -1}
 	for _, kv := range kvRe.FindAllStringSubmatch(meta, -1) {
 		v := strings.ReplaceAll(kv[2], `\"`, `"`)
