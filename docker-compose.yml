@@ -58,11 +58,16 @@ services:
       nofile:
         soft: 262144
         hard: 262144
+    # start_period: на общем раннере CI и при первом старте с пустым томом сервер
+    # поднимается дольше; сбои проверки в этот период не засчитываются в retries
+    # (в e2e бывало «unhealthy» через секунды после старта). start_interval не
+    # ставим: он требует Docker Engine 25+, а этот файл — и для argus1.
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
       interval: 5s
       timeout: 3s
       retries: 20
+      start_period: 60s
     deploy:
       resources:
         limits:

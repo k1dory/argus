@@ -22,13 +22,26 @@ trap cleanup EXIT
 # клиентов (caddy/entrypoint.sh добавляет шлюз Docker — иначе localhost получал 403).
 # Образ mcp собирается с именованным контекстом (BuildKit): без плагина buildx —
 # classic builder не умеет additional_contexts — стек поднимается без mcp/caddy, шаг 13 SKIP.
+# Стенд не поднялся (зависимость unhealthy, контейнер упал) — причина в лог CI:
+# состояние сервисов, история проверок здоровья ClickHouse и хвост его журнала.
+up_failed() {
+  echo "error: стенд e2e не поднялся — диагностика:" >&2
+  dc --profile mcp ps -a >&2 || true
+  cid="$(dc ps -aq clickhouse 2>/dev/null | head -1)"
+  if [ -n "$cid" ]; then
+    docker inspect --format '{{json .State}}' "$cid" >&2 || true
+  fi
+  dc logs --no-color --tail 200 clickhouse >&2 || true
+  dc logs --no-color --tail 50 migrator >&2 || true
+  exit 1
+}
 MCP_URL=""
 if docker buildx version >/dev/null 2>&1; then
-  dc --profile mcp up -d --build clickhouse migrator collector engine web mcp caddy
+  dc --profile mcp up -d --build clickhouse migrator collector engine web mcp caddy || up_failed
   MCP_URL="https://127.0.0.1:$MCP_PORT"
 else
   echo "warn: docker buildx не установлен — mcp и caddy не поднимаются, шаг 13 смоука пропускается"
-  dc up -d --build clickhouse migrator collector engine web
+  dc up -d --build clickhouse migrator collector engine web || up_failed
 fi
 # Админ ClickHouse на стенде — из .env.dev; пароль через окружение, не argv.
 CLICKHOUSE_PASSWORD="$(grep -E '^CLICKHOUSE_PASSWORD=' .env.dev | cut -d= -f2-)"; export CLICKHOUSE_PASSWORD
