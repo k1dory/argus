@@ -2,10 +2,19 @@
 // email сравниваются без учёта регистра; добавление IP-алиаса через OR не
 // должно превращать каждый запрос паспорта в чтение всего временного окна.
 // Никаких SLA по времени: проверяем результат и гранулы в EXPLAIN indexes=1.
+//
+// План детерминирован. Фикстура лежит в отдельной базе одним партом, без чужих
+// строк в окне: в общей argus соседний парт добавлял гранулы к базе сравнения,
+// и «меньше окна» проходило даже без отсечения. Значения алиасов постоянные:
+// у bloom_filter(0.01) около 1 % случайных login ложно совпадали с фоновой
+// группой гранул, и тест падал через раз. Постоянные значения проверены против
+// постоянного фона; если обновление ClickHouse сменит хеш, тест упадёт сразу и
+// всегда, тогда нужно выбрать другие значения.
 import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
-import { applyAllMigrations, ch, liveSkip as skip, serializeLiveFile } from "./_ch-live";
+import { readdirSync } from "node:fs";
+import { MIGRATIONS_DIR, ch, liveSkip as skip, migrationStatements, serializeLiveFile } from "./_ch-live";
 import { chTs } from "../src/lib/shared/log-query";
 import type { Alias, AliasKind, Person } from "../src/lib/shared/actors";
 
@@ -27,16 +36,22 @@ async function granules(query: Query): Promise<{ selected: number; text: string 
 }
 
 test("actorReport: редкий login/email с IP-алиасом сохраняет результат и отсекает гранулы", { skip }, async (t) => {
-  await applyAllMigrations();
-  const run = randomBytes(4).toString("hex");
-  const source = `actor.cost.${run}`;
-  const login = `rare.user.${run}`;
-  const email = `rare.${run}@example.test`;
-  const ip = `2001:db8:${parseInt(run.slice(0, 4), 16).toString(16)}:${parseInt(run.slice(4), 16).toString(16)}::7`;
+  const db = `argus_actors_cost_${randomBytes(6).toString("hex")}`;
+  const source = "actor.cost.fixture";
+  const login = "rare.user.fixture";
+  const email = "rare.fixture@example.test";
+  const ip = "2001:db8:a5::7";
+  let database = "default", created = false;
+  const nativeFetch = globalThis.fetch;
+  t.mock.method(globalThis, "fetch", (input: URL | string | Request, init?: RequestInit) => {
+    const url = new URL(input instanceof Request ? input.url : String(input));
+    url.searchParams.set("database", database);
+    return nativeFetch(url, init);
+  });
   const window = { fromMs: Date.now() - 48 * 3600_000, toMs: 0 };
   window.toMs = window.fromMs + 66_000;
   const params = { source, login, email, ip, from: chTs(window.fromMs), to: chTs(window.toMs) };
-  const person: Person = { person_id: `cost-${run}`, display: "Cost fixture", kind: "person", team: "test", note: "" };
+  const person: Person = { person_id: "cost-fixture", display: "Cost fixture", kind: "person", team: "test", note: "" };
   const alias = (kind: AliasKind, value: string): Alias => ({
     person_id: person.person_id, kind, value, valid_from: params.from, valid_to: null,
     source: "fixture", confidence: 1, note: "",
@@ -49,7 +64,15 @@ test("actorReport: редкий login/email с IP-алиасом сохраня�
   // Во всех гранулах есть все пять разделов, включая фоновые события:
   // фильтр раздела не может выдать отсечение за поиск редкого алиаса.
   // Окно охватывает весь INSERT, так что первичный ключ по ts тоже не помогает.
-  await ch().chCommand(`INSERT INTO events (ts, source, source_class, actor_name, actor_kind, src_ip, node, action, outcome, attrs)
+  try {
+    // Все миграции по порядку, как migrate.sh, но в отдельной базе.
+    await ch().chCommand(`CREATE DATABASE ${db}`);
+    created = true;
+    database = db;
+    for (const file of readdirSync(MIGRATIONS_DIR).filter((f) => f.endsWith(".sql")).sort()) {
+      for (const sql of migrationStatements(file)) await ch().chCommand(sql.replaceAll("argus.", `${db}.`));
+    }
+    await ch().chCommand(`INSERT INTO events (ts, source, source_class, actor_name, actor_kind, src_ip, node, action, outcome, attrs)
     SELECT parseDateTime64BestEffort({from:String}, 3, 'UTC') + toIntervalMillisecond(number),
       {source:String}, 'syslog',
       multiIf(number >= 1230 AND number < 1235, {login:String}, number >= 1235 AND number < 1240, upperUTF8({login:String}),
@@ -58,13 +81,16 @@ test("actorReport: редкий login/email с IP-алиасом сохраня�
       ['auth.login', 'sudo.command', 'net.connection', 'app.open', 'file.modify'][1 + number % 5], 'success',
       map('fixture_row', toString(number))
     FROM numbers(65536)`, params);
-  try {
+    const [parts] = await ch().chQuery<{ parts: string | number; marks: string | number }>(
+      "SELECT count() AS parts, sum(marks) AS marks FROM system.parts WHERE database = currentDatabase() AND table = 'events' AND active");
+    // Один парт: сливать фоновому merge нечего, границы групп индекса постоянны.
+    assert.equal(Number(parts.parts), 1, "фикстура пишется одним партом");
     const baseline = await granules({
       sql: `SELECT actor_name, src_ip FROM events
         WHERE ts >= parseDateTime64BestEffort({from:String}, 3, 'UTC') AND ts < parseDateTime64BestEffort({to:String}, 3, 'UTC')`,
       params,
     });
-    assert.ok(baseline.selected >= 8, `фикстура должна занимать несколько групп skip-индекса:\n${baseline.text}`);
+    assert.equal(baseline.selected, 8, `фикстура занимает две группы skip-индекса по четыре гранулы:\n${baseline.text}`);
 
     const cases: { name: string; aliases: Alias[]; ids: string[] }[] = [
       { name: "login без учёта регистра", aliases: [alias("login", login)], ids: idsFrom(1230, 1235) },
@@ -103,9 +129,10 @@ test("actorReport: редкий login/email с IP-алиасом сохраня�
         const aggregateQueries = captured.filter((q) => /\bGROUP BY\b/i.test(q.sql));
         assert.ok(aggregateQueries.length > 0, "проверяется SQL агрегаций, фактически отправленный actorReport");
         const plans = await Promise.all(aggregateQueries.map(async (query) => ({ query, plan: await granules(query) })));
-        const unpruned = plans.filter(({ plan }) => plan.selected >= baseline.selected);
+        // Редкие строки лежат в первой группе индекса, вторая — только фон: доля, а не «меньше».
+        const unpruned = plans.filter(({ plan }) => plan.selected * 2 > baseline.selected);
         assert.deepEqual(unpruned.map(({ query, plan }) => ({ sql: query.sql, selected: plan.selected })), [],
-          `редкий алиас должен читать меньше гранул, чем одно окно (${baseline.selected}); планы без отсечения:\n${unpruned.map(({ plan }) => plan.text).join("\n\n")}`);
+          `редкий алиас должен читать не больше половины гранул окна (${baseline.selected}); планы без отсечения:\n${unpruned.map(({ plan }) => plan.text).join("\n\n")}`);
 
         const sectionQueries = captured.filter((q) => typeof q.params.section === "string");
         assert.deepEqual(sectionQueries.map((q) => q.params.section).sort(), [...sections].sort(),
@@ -114,10 +141,10 @@ test("actorReport: редкий login/email с IP-алиасом сохраня�
         for (const { query, plan } of sectionPlans) {
           const bloom = plan.text.match(/Name:\s+idx_actor_keys\b[\s\S]*?Granules:\s*(\d+)\s*\/\s*(\d+)/);
           assert.ok(bloom, `${query.params.section}: применяется bloom-индекс ключей алиасов:\n${plan.text}`);
-          assert.ok(Number(bloom[1]) < Number(bloom[2]),
+          assert.ok(Number(bloom[1]) * 2 <= Number(bloom[2]),
             `${query.params.section}: bloom-индекс должен отсечь фоновые гранулы:\n${plan.text}`);
-          assert.ok(plan.selected < baseline.selected,
-            `${query.params.section}: выборка раздела читает меньше гранул, чем одно окно (${baseline.selected}):\n${plan.text}`);
+          assert.ok(plan.selected * 2 <= baseline.selected,
+            `${query.params.section}: выборка раздела читает не больше половины гранул окна (${baseline.selected}):\n${plan.text}`);
         }
       });
     }
@@ -142,10 +169,10 @@ test("actorReport: редкий login/email с IP-алиасом сохраня�
       const plan = await granules(captured[0]);
       const bloom = plan.text.match(/Name:\s+idx_actor_keys\b[\s\S]*?Granules:\s*(\d+)\s*\/\s*(\d+)/);
       assert.ok(bloom, `aliasSightings: применяется bloom-индекс ключей алиасов:\n${plan.text}`);
-      assert.ok(Number(bloom[1]) < Number(bloom[2]), `aliasSightings: bloom-индекс должен отсечь фоновые гранулы:\n${plan.text}`);
+      assert.ok(Number(bloom[1]) * 2 <= Number(bloom[2]), `aliasSightings: bloom-индекс должен отсечь фоновые гранулы:\n${plan.text}`);
     });
   } finally {
-    // Общая БД защищена _ch-live lock; удаляется только собственная фикстура.
-    await ch().chCommand("ALTER TABLE events DELETE WHERE source = {source:String} SETTINGS mutations_sync = 1", { source });
+    database = "default";
+    if (created) await ch().chCommand(`DROP DATABASE ${db} SYNC`);
   }
 });
