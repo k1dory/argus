@@ -12,6 +12,7 @@ import ts from "typescript";
 import { MIGRATIONS_DIR, migrationStatements } from "./_ch-live";
 import { chTs } from "../src/lib/shared/log-query";
 import { CH_ERROR_NAMES } from "../src/lib/clickhouse-error-names";
+import * as ranges from "../src/lib/shared/ranges";
 
 const fixtureFile = path.join(__dirname, "actors-query-cost-ch.test.ts");
 const clientFile = path.resolve(__dirname, "../src/lib/clickhouse.ts");
@@ -106,6 +107,7 @@ async function runSetup(t: TestContext, options: Options = {}) {
     "node:fs": { readdirSync },
     "../src/lib/shared/log-query": { chTs },
     "./clickhouse-error-names": { CH_ERROR_NAMES },
+    "./shared/ranges": ranges,
     "server-only": {},
     "node:test": {
       before: () => undefined,
@@ -125,14 +127,14 @@ async function runSetup(t: TestContext, options: Options = {}) {
       } }).outputText;
       compiled.set(file, js);
     }
-    const module = { exports: {} };
+    const mod = { exports: {} };
     const evaluate = new Script(`(function(require, module, exports, __dirname, __filename) {\n${js}\n})`, { filename: file })
       .runInContext(context, { timeout: 1000 });
     evaluate((name: string) => {
       assert.ok(Object.hasOwn(dependencies, name), `неожиданный импорт ${name}`);
       return dependencies[name];
-    }, module, module.exports, path.dirname(file), file);
-    return module.exports;
+    }, mod, mod.exports, path.dirname(file), file);
+    return mod.exports;
   }
   const client = load(clientFile) as typeof import("../src/lib/clickhouse");
   dependencies["./_ch-live"] = {
