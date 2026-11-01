@@ -418,6 +418,54 @@ paths:
         "429": { $ref: "#/components/responses/TooManyRequests" }
         "503": { $ref: "#/components/responses/StorageUnavailable" }
 
+  /api/incidents/agreement:
+    get:
+      tags: [incidents]
+      summary: Согласие человека с вердиктом агента по правилам
+      description: |
+        Метрики слепой выборки. Только завершённые инциденты (статус closed / false_positive)
+        с ответом человека (`labeled_by_human`), последняя закрывающая метка которых попала
+        в окно. Вердикт агента — последний записанный не позже этой метки; сопоставление:
+        `true_positive` — `malicious`, `benign_true_positive` — `benign_authorized`,
+        `false_positive` — `false_positive`; `undetermined` и отсутствие вердикта не
+        сравниваются. Слепой (`blind`) и неслепой (`sighted`) разбор — отдельно: при
+        неслепом человек видел подсказку агента. `false_positive` — доля ответов
+        «ложное срабатывание» по правилу, кандидаты на тюнинг. Интервал — Уилсона, 95 %;
+        `low_data` — n < `low_data_n`. Метки DevOps (правила `ops.*`) не учитываются.
+        Сессия консоли от аналитика или токен API; сессии разбора закрыт.
+      operationId: getIncidentAgreement
+      security:
+        - cookieSession: []
+        - apiToken: []
+      parameters:
+        - name: window
+          in: query
+          schema: { type: string, enum: ["7d", "30d"], default: "30d" }
+          description: Окно по времени завершения инцидента.
+      responses:
+        "200":
+          description: Метрики по правилам и итог.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [window, from, to, low_data_n, rules, total]
+                properties:
+                  window: { type: string, enum: ["7d", "30d"] }
+                  from: { $ref: "#/components/schemas/ChTimestamp" }
+                  to: { $ref: "#/components/schemas/ChTimestamp" }
+                  low_data_n: { type: integer, description: "Порог «мало данных»." }
+                  rules:
+                    type: array
+                    description: Сверху — правила с наибольшей долей ложных (без пометки «мало данных»).
+                    items: { $ref: "#/components/schemas/AgreementRule" }
+                  total: { $ref: "#/components/schemas/AgreementRule" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "503": { $ref: "#/components/responses/StorageUnavailable" }
+
   /api/incidents/{id}:
     get:
       tags: [incidents]
@@ -1603,6 +1651,39 @@ components:
         ops_action: { type: string }
         blind: { type: boolean }
         labeled_by_human: { type: boolean }
+    AgreementShare:
+      type: object
+      required: [k, n, share, ci, low_data]
+      properties:
+        k: { type: integer, description: "Совпало (или ложных)." }
+        n: { type: integer, description: "Знаменатель." }
+        share: { type: [number, "null"], description: "k / n; null при n = 0." }
+        ci:
+          type: [object, "null"]
+          description: Интервал Уилсона, 95 %; null при n = 0.
+          required: [low, high]
+          properties:
+            low: { type: number }
+            high: { type: number }
+        low_data: { type: boolean, description: "n меньше low_data_n." }
+    AgreementSide:
+      type: object
+      required: [labeled, agreement, undetermined, no_verdict]
+      properties:
+        labeled: { type: integer, description: "Завершено с ответом человека." }
+        agreement: { $ref: "#/components/schemas/AgreementShare" }
+        undetermined: { type: integer, description: "Агент ответил undetermined." }
+        no_verdict: { type: integer, description: "Вердикта агента до завершения не было." }
+    AgreementRule:
+      type: object
+      required: [rule_id, rule_title, labeled, false_positive, blind, sighted]
+      properties:
+        rule_id: { type: string, description: "Пусто в итоге (total)." }
+        rule_title: { type: string }
+        labeled: { type: integer }
+        false_positive: { $ref: "#/components/schemas/AgreementShare" }
+        blind: { $ref: "#/components/schemas/AgreementSide" }
+        sighted: { $ref: "#/components/schemas/AgreementSide" }
     IncidentLabel:
       type: object
       required: [event_id, incident_id, changed_at, actor, status, disposition, escalate, severity_correct, ops_cause, ops_action, blind, reason, rule_id, rule_title, level, tags]
