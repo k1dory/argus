@@ -31,7 +31,12 @@ API. Wazuh подключается как модуль, а не как цент
   на диск. При заполнении очереди HTTP возвращает `503` с `Retry-After`, а
   TCP/TLS-источники получают обратное давление. UDP не подтверждает доставку.
   После аварии возможен повтор последнего батча, поэтому при анализе сырых
-  событий учитывайте семантику «как минимум один раз».
+  событий учитывайте семантику «как минимум один раз». Если батч проход за проходом
+  возвращается в очередь без прогресса (ClickHouse отвечает, но не принимает),
+  коллектор считает это застреванием: `argus_collector_spool_head_stuck_seconds`,
+  `argus_collector_sink_stalled_passes_total`, а дольше `SINK_STALL_AFTER` (10m; `0` —
+  выключено) — ERROR в журнал и событие `argus.collector` / `collector.sink_stalled`,
+  инцидент `a41c-ops-066` (закрывается событием `collector.sink_recovered`).
 - `engine/` — Go. Ядро корреляции: Sigma-подобные правила из `rules/*.yml`
   (selection / filter / threshold с окнами и distinct), инциденты со статусами
   отработки, LLM-аналитик по строгой JSON-схеме за интерфейсом `analyst.Backend`
@@ -934,6 +939,7 @@ Wazuh — популярный open-source HIDS, поэтому его подд�
 |---|---|---|
 | Событий нет, источники «молчат» на `/sources` | `docker compose logs collector`, `curl -s localhost:8088/metrics \| grep spool` | переполнен spool → место на диске `collector-state`; источник не доходит → файрвол, `INGEST_BIND`, токен `X-Argus-Token` |
 | Инциденты не появляются при живом потоке | `docker compose logs engine`, `GET :8090/rules` (ошибки загрузки правил) | `./scripts/argus rules test`; `POST :8090/reload` с `ENGINE_TOKEN` после правки правил |
+| Инцидент `a41c-ops-066` (коллектор не пишет) | `curl -s localhost:8088/metrics \| grep stuck`, `docker compose logs collector \| grep "запись в ClickHouse стоит"`, `system.errors` и `system.query_log` ClickHouse | данные ждут в spool; чинить ClickHouse (память, диск, `max_*` профиля `argus_collector`), коллектор допишет сам |
 | Инцидент `a41c-ops-062` (диск ClickHouse) | `df -h` на томе `clickhouse-data`, `SELECT * FROM system.disks` | расширить раздел или снизить TTL в миграции; ClickHouse при нехватке места отклоняет вставки, не затирает старое |
 | Консоль отвечает 503 «хранилище недоступно» | `docker compose ps clickhouse`, `docker compose logs migrator` | `migrator` отказывает на слабых паролях; после восстановления ClickHouse консоль поднимается сама |
 | Паспорт не открывается, «журнал действий недоступен» | таблица `argus.console_audit` и права `argus_console` | без записи в журнал ПДн не отдаются намеренно; восстановить ClickHouse, затем повторить |

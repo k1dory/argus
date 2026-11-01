@@ -21,6 +21,7 @@ type Stats struct {
 	Requeued       atomic.Uint64 // батчей возвращено в pending после N неудач
 	PendingDropped atomic.Uint64 // строк выброшено из pending при переполнении
 	RejectsFailed  atomic.Uint64 // строк, которые не удалось записать в ingest_rejects
+	StalledPasses  atomic.Uint64 // проходов, после которых батч вернулся в очередь без прогресса (stall.go)
 }
 
 // MaxRequeues — сколько раз подряд батч может вернуться в pending по
@@ -45,6 +46,7 @@ type Batch struct {
 	file     string
 	diskSize int64
 	loadErr  error
+	stall    *stallMark // батч возвращается без прогресса (stall.go)
 }
 
 // Queue — ограниченная очередь батчей между батчером и писателями. При
@@ -63,6 +65,7 @@ type Queue struct {
 	closed   bool
 	stats    *Stats
 	spool    *diskSpool
+	stalls   map[*stallMark]bool // отметки застрявших батчей (stall.go)
 }
 
 func NewQueue(maxRows int, st *Stats) *Queue {
@@ -169,6 +172,7 @@ func (q *Queue) evict() {
 		old := q.items[0]
 		q.items = q.items[1:]
 		q.add(old, -1)
+		delete(q.stalls, old.stall)
 		q.stats.PendingDropped.Add(uint64(len(old.Rows)))
 		slog.Error("pending переполнен, старый батч выброшен", "rows", len(old.Rows), "bytes", old.Bytes,
 			"pending_rows", q.rows, "pending_bytes", q.bytes)
@@ -229,6 +233,14 @@ type Writer struct {
 	Backoff    time.Duration // первый интервал (1s), удваивается
 	MaxBackoff time.Duration // потолок (30s)
 	Sleep      func(ctx context.Context, d time.Duration) bool
+	Now        func() time.Time // часы отметки застревания (тесты); nil — time.Now
+}
+
+func (w *Writer) now() time.Time {
+	if w.Now != nil {
+		return w.Now()
+	}
+	return time.Now()
 }
 
 func NewWriter(ins Inserter, q *Queue, st *Stats) *Writer {
@@ -272,11 +284,13 @@ func (w *Writer) WriteBatch(ctx context.Context, b Batch) {
 		return
 	}
 	rows := b.Rows
+	start := len(rows)
 	delay := w.Backoff
 	budget := bisectBudget // один на весь WriteBatch, повторы его не пополняют
 	for attempt := 1; ; attempt++ {
 		err := w.insert(rows)
 		if err == nil {
+			w.Queue.clearStall(&b)
 			return
 		}
 		if isData(err) {
@@ -284,6 +298,7 @@ func (w *Writer) WriteBatch(ctx context.Context, b Batch) {
 			// повторяется этим же циклом — с общим счётчиком попыток и паузой.
 			rest, terr := w.resolve(ctx, rows, err, false, &budget)
 			if len(rest) == 0 {
+				w.Queue.clearStall(&b)
 				return
 			}
 			if len(rest) < len(rows) {
@@ -302,6 +317,11 @@ func (w *Writer) WriteBatch(ctx context.Context, b Batch) {
 			return
 		}
 		if attempt >= w.Attempts {
+			if len(rows) < start {
+				w.Queue.clearStall(&b)
+			} else {
+				w.Queue.noteStall(&b, w.now())
+			}
 			w.requeue(ctx, b, delay, err)
 			return
 		}
@@ -323,6 +343,7 @@ func (w *Writer) WriteBatch(ctx context.Context, b Batch) {
 // (транспорт, остановка, ingest_rejects недоступна), spool-файл атомарно заменяется
 // только этими строками: вставленные при повторе не задвоятся.
 func (w *Writer) writeDurable(ctx context.Context, b Batch) {
+	progressed := false // часть строк решена за проход (shrink обнуляет b.Rows — считать по нему нельзя)
 	delay := w.Backoff
 	budget := bisectBudget
 	for attempt := 1; ; attempt++ {
@@ -331,6 +352,7 @@ func (w *Writer) writeDurable(ctx context.Context, b Batch) {
 			if err := w.Queue.ack(b); err != nil {
 				slog.Error("spool ack", "err", err, "file", b.file)
 			}
+			w.Queue.clearStall(&b)
 			return
 		}
 		if isData(err) {
@@ -339,9 +361,11 @@ func (w *Writer) writeDurable(ctx context.Context, b Batch) {
 				if err := w.Queue.ack(b); err != nil {
 					slog.Error("spool ack", "err", err, "file", b.file)
 				}
+				w.Queue.clearStall(&b)
 				return
 			}
 			if len(rest) < len(b.Rows) {
+				progressed = true
 				nb, serr := w.Queue.shrink(b, rest)
 				if serr != nil {
 					// Файл остаётся целиком: при повторе вставленные строки задвоятся,
@@ -364,6 +388,11 @@ func (w *Writer) writeDurable(ctx context.Context, b Batch) {
 			delay *= 2
 		}
 	}
+	if progressed {
+		w.Queue.clearStall(&b)
+	} else {
+		w.Queue.noteStall(&b, w.now())
+	}
 	b.Rows = nil
 	w.Stats.Requeued.Add(1)
 	w.Queue.Requeue(b)
@@ -382,6 +411,7 @@ func (w *Writer) requeue(ctx context.Context, b Batch, delay time.Duration, err 
 		slog.Error("insert: батч отвергнут транспортом при живом ClickHouse, целиком в ingest_rejects",
 			"rows", len(b.Rows), "requeues", b.Attempts, "err", short(err.Error()))
 		w.deadLetter(b.Rows, err)
+		w.Queue.clearStall(&b)
 		return
 	}
 	w.Stats.Requeued.Add(1)
