@@ -75,6 +75,12 @@ const chLimit = createLimiter(CH_MAX_INFLIGHT);
 export const CH_TIMEOUT_MS = 30_000;
 const DEFAULT_SETTINGS: Record<string, string | number> = { max_execution_time: 30 };
 
+/** Настройки запроса; null — не передавать (и умолчание консоли тоже): значение
+ *  задаёт профиль пользователя. Нужно для SQL, исполнимого и от argus_ro, у которого
+ *  readonly = 1 отклоняет любую настройку, отличную от профиля. null убирает и параметр
+ *  из CLICKHOUSE_URL. */
+export type ChSettings = Record<string, string | number | null>;
+
 /**
  * Ошибка хранилища для пользователя: короткая причина без SQL и без внутренностей
  * сервера. Полный текст — только в console.error на сервере.
@@ -160,13 +166,17 @@ export function encodeParam(value: string | number, type: string | undefined): s
   return type !== undefined && STRING_PARAM_TYPE.test(type.trim()) ? escapeChString(text) : text;
 }
 
-function chFetch(sql: string, params: Record<string, string | number>, settings: Record<string, string | number>, format: string | null): Promise<string> {
+function chFetch(sql: string, params: Record<string, string | number>, settings: ChSettings, format: string | null): Promise<string> {
   return chLimit(() => chFetchWithSlot(sql, params, settings, format));
 }
 
-async function chFetchWithSlot(sql: string, params: Record<string, string | number>, settings: Record<string, string | number>, format: string | null): Promise<string> {
+async function chFetchWithSlot(sql: string, params: Record<string, string | number>, settings: ChSettings, format: string | null): Promise<string> {
   const url = new URL(CH_URL);
-  for (const [key, value] of Object.entries({ ...DEFAULT_SETTINGS, ...settings })) url.searchParams.set(key, String(value));
+  // null убирает настройку совсем, в том числе заданную в самом CLICKHOUSE_URL.
+  for (const [key, value] of Object.entries({ ...DEFAULT_SETTINGS, ...settings })) {
+    if (value === null) url.searchParams.delete(key);
+    else url.searchParams.set(key, String(value));
+  }
   url.searchParams.set("database", CH_DB);
   if (format) url.searchParams.set("default_format", format);
   // Ответ буферизуется на сервере до конца запроса: ошибка посреди выдачи приходит HTTP-
@@ -223,7 +233,7 @@ export function sqlForLog(sql: string): string {
 }
 
 /** settings — серверные настройки ClickHouse на запрос (max_execution_time и т.п.). */
-export async function chQuery<T>(sql: string, params: Record<string, string | number> = {}, settings: Record<string, string | number> = {}): Promise<T[]> {
+export async function chQuery<T>(sql: string, params: Record<string, string | number> = {}, settings: ChSettings = {}): Promise<T[]> {
   const text = await chFetch(sql, params, settings, "JSONEachRow");
   try {
     return text
@@ -241,7 +251,7 @@ export async function chQuery<T>(sql: string, params: Record<string, string | nu
 }
 
 /** Запрос без результата (INSERT/DDL); параметры — тем же server-side binding. */
-export async function chCommand(sql: string, params: Record<string, string | number> = {}, settings: Record<string, string | number> = {}): Promise<void> {
+export async function chCommand(sql: string, params: Record<string, string | number> = {}, settings: ChSettings = {}): Promise<void> {
   await chFetch(sql, params, settings, null);
 }
 

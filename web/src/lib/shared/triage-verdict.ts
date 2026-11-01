@@ -6,6 +6,11 @@ import schemaJson from "./triage-verdict.schema.json";
 import type { TriageScope } from "./triage";
 
 export const VERDICT_SCHEMA_ID = "argus-triage/v3";
+
+/** Одна сессия разбора — один вердикт: самая ранняя строка agent_verdicts сессии, при
+ *  равном времени — по документу. Ключ argMin для карточки (agentVerdictsFor) и метрик
+ *  согласия: поздний дубль старой сессии не становится новым вердиктом. */
+export const AGENT_VERDICT_SESSION_ORDER = "(created_at, verdict_json)";
 /** Потолок тела запроса с вердиктом, байт. */
 export const VERDICT_MAX_BYTES = 64 * 1024;
 /** Имя агента в комментарии (author = agent:<имя>). */

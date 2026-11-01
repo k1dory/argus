@@ -24,6 +24,7 @@ export { INCIDENT_STATUSES, EXCEPTION_FIELDS, isIncidentStatus, type IncidentSta
 import { isIncidentStatus, type IncidentStatus } from "./shared/incidents";
 import type { ClosureLabel } from "./shared/closure-label";
 import { memberBlockState, parseMembers, type IncidentMember, type MemberBlockRow, type MemberBlockState } from "./shared/incident-members";
+import { AGENT_VERDICT_SESSION_ORDER } from "./shared/triage-verdict";
 
 
 export type IncidentRow = {
@@ -783,9 +784,9 @@ export async function saveAgentVerdict(row: Omit<AgentVerdictRow, "created_at">)
 // `argMin(verdict_json, (created_at, verdict_json)) AS verdict_json` превращается в агрегат
 // внутри агрегата (ILLEGAL_AGGREGATION, замечено на стенде). Поэтому запросы идут с
 // prefer_column_name_to_alias = 1, а агрегат по created_at назван first_created.
-const AGENT_VERDICT_COLS = `incident_id, session_id, argMin(agent, (created_at, verdict_json)) AS agent, toString(min(created_at)) AS first_created,
-  argMin(verdict, (created_at, verdict_json)) AS verdict, argMin(confidence, (created_at, verdict_json)) AS confidence, argMin(human_needed, (created_at, verdict_json)) AS human_needed,
-  argMin(verdict_json, (created_at, verdict_json)) AS verdict_json, argMin(markdown, (created_at, verdict_json)) AS markdown`;
+const AGENT_VERDICT_COLS = `incident_id, session_id, argMin(agent, ${AGENT_VERDICT_SESSION_ORDER}) AS agent, toString(min(created_at)) AS first_created,
+  argMin(verdict, ${AGENT_VERDICT_SESSION_ORDER}) AS verdict, argMin(confidence, ${AGENT_VERDICT_SESSION_ORDER}) AS confidence, argMin(human_needed, ${AGENT_VERDICT_SESSION_ORDER}) AS human_needed,
+  argMin(verdict_json, ${AGENT_VERDICT_SESSION_ORDER}) AS verdict_json, argMin(markdown, ${AGENT_VERDICT_SESSION_ORDER}) AS markdown`;
 
 const AGENT_VERDICT_SETTINGS = { prefer_column_name_to_alias: 1 };
 

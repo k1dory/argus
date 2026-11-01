@@ -57,6 +57,7 @@ export function StatTile({
   unit,
   led,
   hint,
+  note,
   href,
 }: {
   label: string;
@@ -65,6 +66,8 @@ export function StatTile({
   led?: string;
   /** Подсказка при наведении (например, полная дата) */
   hint?: string;
+  /** Видимая пометка под значением (например, «мало данных») — не только при наведении. */
+  note?: string;
   /** Если метрика ведёт к списку, вся плитка становится доступной ссылкой. */
   href?: string;
 }) {
@@ -79,6 +82,7 @@ export function StatTile({
         {value}
         {unit && <span className="ml-1 text-sm font-normal text-[var(--text-tertiary)]">{unit}</span>}
       </div>
+      {note && <div className="mt-1 text-xs text-[var(--status-warn)]">{note}</div>}
     </>
   );
   const className = cn("win p-5", href && "block transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--surface-elevated)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--ring)]");

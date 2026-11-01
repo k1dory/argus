@@ -246,9 +246,9 @@ make replay                                   # залить записанны�
 
 | Источник | Как | Куда |
 |---|---|---|
-| NGFW / прокси: Check Point (Log Exporter), PAN-OS, UserGate, Ideco, Fortinet | syslog CEF / LEEF | `:5514` UDP/TCP, `:6514` TLS |
+| NGFW / прокси: Check Point (Log Exporter), PAN-OS, UserGate, Ideco, Fortinet | syslog CEF / LEEF, формат объявить в `SYSLOG_PEER_FORMAT` | `:5514` UDP/TCP, `:6514` TLS |
 | Squid | native access.log через syslog | `:5514` |
-| EDR: Kaspersky, Cortex XDR | syslog CEF | `:5514` |
+| EDR: Kaspersky, Cortex XDR | syslog CEF, `SYSLOG_PEER_FORMAT=<адрес>=cef` | `:5514` |
 | CrowdStrike Falcon | Streaming API (OAuth2) | `collector.yml → falcon`, `FALCON_*` |
 | Sysmon, FIM, SCA, rootcheck | агент Wazuh → менеджер (модуль Wazuh) | `WAZUH_ALERTS_DIR` |
 | телеметрия хостов: диск, load, очереди | NDJSON с `value`/`unit` (`scripts/telemetry-sample.sh`) | `POST …:8089/ingest/events` |
@@ -484,20 +484,49 @@ collapse: { by: src.net, group: inbound-scan, block_cap: 32, block_cap_window: 1
 
 ## WAF: ModSecurity и Coraza
 
-Коллектор читает **audit-лог в JSON** (`SecAuditLogFormat JSON`; ModSecurity v3 под nginx/Apache и
-Coraza под Caddy/nginx) и **error-лог** (`ModSecurity: …` в nginx/Apache, `Coraza: …` в JSON-логе Caddy):
-файлы с хоста монтируются каталогом `WAF_LOG_DIR` → `/logs/waf`, пути задаются `WAF_AUDIT_LOG` и
+Источники WAF:
+
+| WAF | Источник событий WAF | Как подключить |
+|---|---|---|
+| ModSecurity v3 (nginx/Apache) | **только audit-лог JSON** (`SecAuditLogFormat JSON`) | файл `WAF_AUDIT_LOG` (`files[].format: waf-audit`) или `POST /ingest/modsecurity` |
+| Coraza (Caddy/nginx) | audit-лог JSON, **или** строки `Coraza: …` JSON-лога Caddy | audit — как у ModSecurity; JSON-лог Caddy — файл `WAF_ERROR_LOG` (`files[].format: waf-coraza`) или агент с `[argus format="waf-coraza"]` в заголовке RFC 5424 |
+
+**Error-лог ModSecurity (`ModSecurity: …` в nginx/Apache) событием WAF не является**: `msg` и
+`uri` в нём не экранированы, и данные запроса подделывают метаданные правила и решение. Такие
+строки принимаются как обычный syslog с `attrs.waf_unparsed=1` — по ним есть поиск, но правила WAF
+они не кормят. Включите `SecAuditLogFormat JSON` и отправляйте audit-лог.
+
+Формат строк определяет **объявление источника**, а не содержимое строки: `SYSLOG_PEER_FORMAT`
+(«адрес|CIDR=`cef`|`leef`|`waf-coraza`» через запятую), `files[].format` или SD-параметр агента
+`[argus format="…"]`. Конфигурация главнее: SD учитывается, только если для отправителя формат не
+задан и отправитель доверенный — агент через HTTP-приём с токеном или по TLS с проверенным
+клиентским сертификатом; от UDP/TCP/TLS без сертификата SD-параметр — просто данные.
+Объявленный формат — только его разборщик, без проверок маркеров в тексте. `cef`/`leef`
+принимается ровно в трёх формах строки: RFC 5424, у которой MSG начинается с `CEF:`/`LEEF:`
+(BOM и пробелы допустимы); строка или строка после PRI, начинающаяся прямо с маркера; строгий
+заголовок RFC 3164 — `<PRI>Mmm dd hh:mm:ss host [tag[pid]: ]CEF:…` (дата обязательна, имя
+хоста без пробелов, кавычек и `{`; так пишут FortiGate и Check Point). Остальное — syslog
+(`waf_unparsed=1` у строки WAF) и предупреждение «объявлен cef, запись не распознана»,
+счётчик `argus_collector_unrecognized_record_total`. ISO-дата в заголовке 3164 и строки файла
+без PRI под формы не подходят. `waf-coraza` — только JSON-объект лога Caddy
+(`logger: http.handlers.waf`). Без объявления строки в тех же трёх формах CEF/LEEF и строки
+WAF разбираются как syslog раньше вендорных разборщиков; на переходный релиз коллектор пишет
+предупреждение «необъявленный формат» (раз в минуту на отправителя, не больше 1024
+отправителей — сверх того одно сводное в минуту) и считает их в
+`argus_collector_undeclared_format_total`.
+
+Файлы с хоста монтируются каталогом `WAF_LOG_DIR` → `/logs/waf`, пути задаются `WAF_AUDIT_LOG` и
 `WAF_ERROR_LOG`; для агентов без файлового доступа — `POST /ingest/modsecurity` (JSON, NDJSON или
 массив). В единой схеме: `source_class=waf`, `action=http.attack`, `outcome=deny|allow` (заблокировано
 или только замечено: DetectionOnly, либо score не набран), атрибуты `category` (sqli, xss, rce, lfi…),
 `rule_ids`, `anomaly_score`, `status`, `engine_mode`, `host` (заголовок Host из audit-лога), `http_host`
-(`[hostname]` error-лога ModSecurity в любом виде, у Coraza — если там имя), `server_addr`, `method`,
+(`[hostname]` строки Coraza, если там имя), `server_addr`, `method`,
 `user_agent`. `host` и `http_host` присылает клиент: это справка, не узел, не адрес сервера и не
 основание для автоблокировки.
 Правила `rules/waf-*.yml`: серия атак с адреса, сканер по нескольким хостам, критичный RCE/LFI
 с высоким score — эти три с `respond`; «атака дошла до приложения» (детект + 5xx) — без автоответа,
-её разбирает человек. Из error-лога событием считается итоговая строка транзакции (Access denied
-или оценка anomaly score 949110/980130), промежуточные Warning по отдельным правилам не считаются.
+её разбирает человек. Из JSON-лога Caddy (Coraza) событием считается итоговая строка транзакции
+(Access denied или оценка anomaly score 949110/980130), промежуточные Warning не считаются.
 Витрина — дашборд «WAF · ModSecurity / Coraza». Coraza для Caddy: модуль `coraza-caddy`,
 директива `SecAuditLogFormat JSON` и `SecAuditLog /var/log/caddy/coraza_audit.log`.
 

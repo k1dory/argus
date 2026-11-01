@@ -12,7 +12,7 @@ import socket, sys, time
 n, host = int(sys.argv[1]), sys.argv[2]
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 << 20)
-line = ('<134>1 2026-09-06T10:00:00Z fw-01 CheckPoint - - - CEF:0|Check Point|VPN-1 & FireWall-1|R81.20|Accept|Firewall|0|'
+line = ('<134>1 2026-09-06T10:00:00Z fw-01 CheckPoint - - [argus format="cef"] CEF:0|Check Point|VPN-1 & FireWall-1|R81.20|Accept|Firewall|0|'
         'rt=1757066138000 src=10.20.4.%d spt=%d dst=10.20.5.7 dpt=445 proto=TCP suser=svc-backup act=Accept externalId=%d dvchost=fw-01')
 for i in range(n):
     s.sendto((line % (i % 250 + 1, 40000 + i % 20000, i)).encode(), (host, 5514))

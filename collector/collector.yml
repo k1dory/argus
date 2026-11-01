@@ -19,8 +19,13 @@ listeners:
     addr: ":8088"
     token: "${ARGUS_INGEST_TOKEN}"     # пусто — без проверки (только для стенда)
   # Файлы на хосте (смонтировать в контейнер): WAF ModSecurity/Coraza.
-  #   waf-audit — SecAuditLogFormat JSON (ModSecurity v3, Coraza); lines — error-лог
-  #   nginx/Apache с «ModSecurity: …» или JSON-лог Caddy с «Coraza: …».
+  #   waf-audit — SecAuditLogFormat JSON (ModSecurity v3, Coraza) — единственный источник
+  #   ModSecurity; waf-coraza — JSON-лог Caddy с «Coraza: …»; lines — обычные строки.
+  #   Error-лог nginx/Apache с «ModSecurity: …» событием WAF не становится (msg/uri не
+  #   экранированы, запрос подделывает метаданные) — строки идут как syslog, waf_unparsed=1.
+  # Формат строк syslog объявляет источник: SYSLOG_PEER_FORMAT («адрес|CIDR=cef|leef|
+  # waf-coraza») или агент — [argus format="…"] в заголовке RFC 5424. Без объявления
+  # CEF/LEEF/Coraza не разбираются (счётчик argus_collector_undeclared_format_total).
   files:
   #   node — имя хоста WAF (WAF_NODE): узел событий файла, если отправитель его
   #   не назвал; [hostname] error-лога узлом не бывает — у ModSecurity это Host
@@ -33,8 +38,8 @@ listeners:
       node: "${WAF_NODE:-}"
       attrs:
         container: "${WAF_CONTAINER:-}"
-    - path: "${WAF_ERROR_LOG:-}"        # напр. /logs/waf/error.log (nginx) или caddy.log (Coraza)
-      format: lines
+    - path: "${WAF_ERROR_LOG:-}"        # JSON-лог Caddy с Coraza, напр. /logs/waf/caddy.log
+      format: waf-coraza
       source: waf.error
       from_start: ${WAF_FROM_START:-false}
       node: "${WAF_NODE:-}"

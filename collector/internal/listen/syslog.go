@@ -16,6 +16,7 @@ type Peer struct {
 	Transport string // udp | tcp | tls | http | file
 	CN        string // CommonName клиентского сертификата при mTLS
 	Node      string // узел по умолчанию для событий без узла (node: файлового источника)
+	Format    string // объявленный формат источника (parse.Format*): files[].format, SYSLOG_PEER_FORMAT
 }
 
 // LineHandler получает одну строку syslog и сведения об отправителе.

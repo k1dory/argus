@@ -5,11 +5,9 @@
 // (Первая версия codex подменяла fetch: защиту на стороне ClickHouse так не проверить.)
 import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { readFileSync } from "node:fs";
-import path from "node:path";
-import { applyAllMigrations, ch, liveSkip as skip, root, serializeLiveFile } from "./_ch-live";
+import { applyAllMigrations, ch, liveSkip as skip, serializeLiveFile } from "./_ch-live";
+import { createBlindRo } from "./_ro-blind";
 import { formData, installNextMocks, loadAuth } from "./_next-mock";
 import { hideVerdicts, isBlindIncident } from "../src/lib/blind";
 
@@ -28,29 +26,6 @@ const auth = loadAuth();
 const { previewPanelAction } = require("../src/lib/dashboard-actions") as typeof import("../src/lib/dashboard-actions");
 /* eslint-enable @typescript-eslint/no-require-imports */
 
-const script = readFileSync(path.join(root, "scripts/migrate.sh"), "utf8");
-
-/** Профиль argus_ro: настройки и гранты вызова mkuser. */
-function roProfile(): { settings: string; grants: string[] } {
-  const call = script.match(/^mkuser argus_ro\b(?:.*\\\n)*.*$/m);
-  assert.ok(call, "production профиль argus_ro найден");
-  const quoted = [...call[0].matchAll(/"((?:\\.|[^"\\])*)"/g)].map((m) => m[1]);
-  const [, settings, ...grants] = quoted;
-  return { settings, grants };
-}
-
-/** SQL блока политик: bash исполняет блок с ch(), который только печатает запрос. */
-function policyStatements(): string[] {
-  const block = script.match(/^if \[ -n "\$\{CLICKHOUSE_RO_PASSWORD:-\}" \]; then\n[\s\S]*?\nfi$/m);
-  assert.ok(block && block[0].includes("ROW POLICY"), "блок политик argus_ro найден в migrate.sh");
-  const out = execFileSync("bash", ["-c", `ch() { printf '%s\\0' "$2"; }\n${block[0]}`], {
-    env: { ...process.env, CLICKHOUSE_RO_PASSWORD: "x" }, encoding: "utf8",
-  });
-  const stmts = out.split("\0").filter((s) => s.includes("ROW POLICY"));
-  assert.equal(stmts.length, 4);
-  return stmts.map((s) => s.replaceAll("argus_ro_blind", policy).replace(/\bTO argus_ro$/, `TO ${user}`));
-}
-
 const pick = (blind: boolean, from = 870_000_000): number => {
   for (let i = from; ; i++) if (isBlindIncident(`INC-${i}`) === blind) return i;
 };
@@ -65,16 +40,8 @@ const marker = `BlindRo${suffix}`;
 
 test("blind: argus_ro не читает вердикт и его копии по слепому открытому инциденту", { skip }, async () => {
   await applyAllMigrations();
-  const { settings, grants } = roProfile();
-  const policies = policyStatements();
-  const tables = ["incident_verdicts", "agent_verdicts", "incident_comments", "console_audit"];
-  let created = false;
+  const cleanup = await createBlindRo(user, policy, process.env.CLICKHOUSE_RO_PASSWORD!);
   try {
-    await ch().chCommand(`CREATE USER ${user} IDENTIFIED WITH plaintext_password BY '${process.env.CLICKHOUSE_RO_PASSWORD}'`);
-    created = true;
-    await ch().chCommand(`ALTER USER ${user} SETTINGS ${settings}`);
-    for (const grant of grants) await ch().chCommand(`GRANT ${grant} TO ${user}`);
-    for (const sql of policies) await ch().chCommand(sql);
 
     const statuses: [string, string][] = [[blindOpen, "in_progress"], [blindClosed, "closed"], [plainOpen, "new"]];
     for (const [id, status] of statuses) {
@@ -176,7 +143,6 @@ test("blind: argus_ro не читает вердикт и его копии по
     // Агрегаты встроенного дашборда argus-siem по-прежнему считаются.
     assert.match(await preview(`SELECT count() AS n FROM incident_verdicts WHERE position(summary_ru, '${marker}') > 0`), /"n":2\b/);
   } finally {
-    for (const table of tables) await ch().chCommand(`DROP ROW POLICY IF EXISTS ${policy} ON argus.${table}`);
-    if (created) await ch().chCommand(`DROP USER IF EXISTS ${user}`);
+    await cleanup();
   }
 });

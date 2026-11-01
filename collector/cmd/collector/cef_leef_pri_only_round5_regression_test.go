@@ -26,7 +26,7 @@ func TestPR16Round5CEFLEEFWithPRIOnlyRetainSecurityFields(t *testing.T) {
 			{"pri_only", "<134>"},
 		} {
 			t.Run(format.name+"/"+envelope.name, func(t *testing.T) {
-				events := wafHTTPBatch(t, "/ingest/syslog", envelope.prefix+format.payload, "192.0.2.20:31000")
+				events := wafHTTPBatchAs(t, "/ingest/syslog", envelope.prefix+format.payload, "192.0.2.20:31000", formatOf(envelope.prefix+format.payload))
 				if len(events) != 1 {
 					t.Fatalf("accepted=%d, want one vendor event", len(events))
 				}
