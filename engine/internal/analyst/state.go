@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/devitex-soft/argus/engine/internal/incidents"
+	"github.com/devitex-soft/argus/engine/internal/registry"
 )
 
 // Состояние инцидента для моделей решений (System One: Laya, Jev) и записи
@@ -50,8 +51,13 @@ func NewPseudonyms(salt []byte) *Pseudonyms {
 	return &Pseudonyms{salt: salt}
 }
 
-// processPseudonyms — соль процесса: одна выгрузка = один запуск engine dataset export.
+// processPseudonyms — соль процесса. engine dataset export задаёт её из
+// ARGUS_DATASET_SECRET (SetDatasetSecret): тогда псевдонимы и разбиение
+// train/holdout одинаковы во всех выгрузках, а без секрета не связываются.
 var processPseudonyms = NewPseudonyms(nil)
+
+// SetDatasetSecret — секрет выгрузки (до первого DecisionState).
+func SetDatasetSecret(secret []byte) { processPseudonyms = NewPseudonyms(secret) }
 
 // Process — псевдонимы процесса (соль выгрузки).
 func Process() *Pseudonyms { return processPseudonyms }
@@ -269,8 +275,8 @@ func (p *Pseudonyms) chainLine(line string) (string, bool) {
 	if !ok {
 		return "", false
 	}
-	return fmt.Sprintf("%s  %s  %s  %s  %s", string(r[:8]), token(f[0], "[source]"), p.Host(strings.TrimSuffix(f[1], "…")),
-		token(f[2], "[action]"), p.Detail(f[3])), true
+	return fmt.Sprintf("%s  %s  %s  %s  %s", string(r[:8]), Source(f[0]), p.Host(strings.TrimSuffix(f[1], "…")),
+		Action(f[2]), p.Detail(f[3])), true
 }
 
 var (
@@ -303,7 +309,45 @@ func (p *Pseudonyms) enrichLine(line string) (string, bool) {
 	if !ok {
 		return "", false
 	}
-	return fmt.Sprintf("  %s  %s  %s  %s", string(r[2:10]), token(f[0], "[source]"), token(f[1], "[action]"), p.Detail(f[2])), true
+	return fmt.Sprintf("  %s  %s  %s  %s", string(r[2:10]), Source(f[0]), Action(f[1]), p.Detail(f[2])), true
+}
+
+// Source, Action — значение из постоянного реестра поставляемого набора
+// (registry), иначе «[source]» / «[action]»: пользовательские источники и
+// действия из свободного текста (CEF cat=…) могут называть людей и узлы.
+func Source(s string) string {
+	if s = strings.TrimSpace(s); registry.Source(s) {
+		return s
+	}
+	return "[source]"
+}
+
+func Action(s string) string {
+	if s = strings.TrimSpace(s); registry.Action(s) {
+		return s
+	}
+	return "[action]"
+}
+
+// Rule — id, заголовок и теги правила для состояния и записи датасета.
+// Поставляемое правило (registry) — id, заголовок из файла правила и теги из
+// реестра; пользовательское — «[rule]» и только теги ATT&CK: его заголовок,
+// id и теги пишет оператор, и в них бывают имена и узлы.
+func Rule(inc *incidents.Incident) (id, title string, tags []string) {
+	if r, ok := registry.LookupRule(inc.RuleID); ok {
+		for _, t := range inc.Tags {
+			if registry.Tag(t) {
+				tags = append(tags, t)
+			}
+		}
+		return inc.RuleID, r.Title, tags
+	}
+	for _, t := range inc.Tags {
+		if registry.AttackTag(t) {
+			tags = append(tags, t)
+		}
+	}
+	return "[rule]", "[rule]", tags
 }
 
 // redactPII — шаблоны ПДн (email, телефон, паспорт, ИНН, карта).
@@ -320,14 +364,15 @@ func DecisionState(inc *incidents.Incident) string { return DecisionStateWith(in
 // DecisionStateWith — пакет инцидента по белому списку полей (см. начало файла).
 func DecisionStateWith(inc *incidents.Incident, p *Pseudonyms) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "Rule: %s (%s), level %s\n", redactPII(inc.RuleTitle), token(inc.RuleID, "[rule]"), token(inc.Level, "?"))
-	tags := make([]string, 0, len(inc.Tags))
-	for _, t := range inc.Tags {
-		tags = append(tags, token(t, "[tag]"))
+	id, title, tags := Rule(inc)
+	level := inc.Level
+	if !criticality[level] {
+		level = "?"
 	}
+	fmt.Fprintf(&b, "Rule: %s (%s), level %s\n", title, id, level)
 	sources := make([]string, 0, len(inc.Sources))
 	for _, s := range inc.Sources {
-		sources = append(sources, token(s, "[source]"))
+		sources = append(sources, Source(s))
 	}
 	fmt.Fprintf(&b, "Tags: %s\nSubject: %s\nNode: %s\nSources: %s\nEvents: %d\n\nEvent chain:\n",
 		strings.Join(tags, ", "), p.User(inc.ActorName), p.Host(inc.Node), strings.Join(sources, ", "), inc.EventCount)

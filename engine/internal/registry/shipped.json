@@ -1,0 +1,311 @@
+{
+ "rules": {
+  "a41c-agent-080": {
+   "title": "Agent sandbox: repeated egress denials from one agent",
+   "tags": [
+    "attack.exfiltration",
+    "attack.t1041"
+   ]
+  },
+  "a41c-agent-081": {
+   "title": "Agent sandbox: burst of API authorization failures",
+   "tags": [
+    "attack.credential_access",
+    "attack.t1110"
+   ]
+  },
+  "a41c-auth-030": {
+   "title": "SSH brute force against a host",
+   "tags": [
+    "attack.credential_access",
+    "attack.t1110"
+   ]
+  },
+  "a41c-auth-031": {
+   "title": "Host: SSH brute force from one address",
+   "tags": [
+    "attack.credential_access",
+    "attack.t1110.001"
+   ]
+  },
+  "a41c-auth-032": {
+   "title": "Host: login brute force against a management interface",
+   "tags": [
+    "attack.credential_access",
+    "attack.t1110.001"
+   ]
+  },
+  "a41c-auth-033": {
+   "title": "NAS: login brute force",
+   "tags": [
+    "attack.credential_access",
+    "attack.t1110.001"
+   ]
+  },
+  "a41c-c2-015": {
+   "title": "Possible DNS tunnel",
+   "tags": [
+    "attack.command_and_control",
+    "attack.t1071.004"
+   ]
+  },
+  "a41c-c2-016": {
+   "title": "Periodic beacon to external host",
+   "tags": [
+    "attack.command_and_control",
+    "attack.t1071.001"
+   ]
+  },
+  "a41c-c2-017": {
+   "title": "Network: non-DNS traffic on port 53",
+   "tags": [
+    "attack.command_and_control",
+    "attack.t1572",
+    "attack.t1571"
+   ]
+  },
+  "a41c-cicd-007": {
+   "title": "CI job echoed a secret",
+   "tags": [
+    "attack.credential_access",
+    "attack.t1552.004"
+   ]
+  },
+  "a41c-cred-004": {
+   "title": "LSASS memory access from user temp",
+   "tags": [
+    "attack.credential_access",
+    "attack.t1003.001"
+   ]
+  },
+  "a41c-fim-021": {
+   "title": "sudoers changed on many hosts",
+   "tags": [
+    "attack.privilege_escalation",
+    "attack.t1548.003"
+   ]
+  },
+  "a41c-imp-090": {
+   "title": "NAS: mass file delete/rename by one user",
+   "tags": [
+    "attack.impact",
+    "attack.t1486",
+    "attack.t1485"
+   ]
+  },
+  "a41c-k8s-011": {
+   "title": "Kubernetes RBAC escalation to cluster-admin",
+   "tags": [
+    "attack.privilege_escalation",
+    "attack.t1078.004"
+   ]
+  },
+  "a41c-lateral-002": {
+   "title": "Service account SMB fan-out",
+   "tags": [
+    "attack.lateral_movement",
+    "attack.t1021.002"
+   ]
+  },
+  "a41c-net-070": {
+   "title": "Network: inbound port scan",
+   "tags": [
+    "attack.reconnaissance",
+    "attack.t1046"
+   ]
+  },
+  "a41c-net-071": {
+   "title": "Network: inbound host sweep",
+   "tags": [
+    "attack.reconnaissance",
+    "attack.t1595.001"
+   ]
+  },
+  "a41c-net-072": {
+   "title": "Network: inbound hammering of admin/database ports",
+   "tags": [
+    "attack.credential_access",
+    "attack.t1110"
+   ]
+  },
+  "a41c-net-073": {
+   "title": "Firewall: inbound deny burst across ports",
+   "tags": [
+    "attack.reconnaissance",
+    "attack.t1046"
+   ]
+  },
+  "a41c-net-074": {
+   "title": "Proxy: login brute force against a published service",
+   "tags": [
+    "attack.credential_access",
+    "attack.t1110.001"
+   ]
+  },
+  "a41c-net-075": {
+   "title": "Proxy: path scanning of a published service",
+   "tags": [
+    "attack.reconnaissance",
+    "attack.t1595.003"
+   ]
+  },
+  "a41c-net-076": {
+   "title": "Proxy: access to a published service from outside the expected country",
+   "tags": [
+    "attack.reconnaissance"
+   ]
+  },
+  "a41c-ops-040": {
+   "title": "Wazuh agent went silent",
+   "tags": [
+    "attack.defense_evasion",
+    "attack.t1489"
+   ]
+  },
+  "a41c-ops-060": {
+   "title": "Ops: disk usage above 90%",
+   "tags": [
+    "ops.storage",
+    "ops.capacity"
+   ]
+  },
+  "a41c-ops-061": {
+   "title": "Ops: host stopped sending telemetry",
+   "tags": [
+    "ops.availability"
+   ]
+  },
+  "a41c-ops-062": {
+   "title": "ARGUS: ClickHouse disk is almost full",
+   "tags": [
+    "argus.system",
+    "ops.storage"
+   ]
+  },
+  "a41c-ops-063": {
+   "title": "Ops: identity alias churn above policy",
+   "tags": [
+    "argus.identity",
+    "ops.identity"
+   ]
+  },
+  "a41c-ops-064": {
+   "title": "Ops: identity alias from untrusted source",
+   "tags": [
+    "argus.identity",
+    "ops.identity"
+   ]
+  },
+  "a41c-ops-065": {
+   "title": "Ops: NAS storage failure",
+   "tags": [
+    "ops.storage",
+    "ops.hardware"
+   ]
+  },
+  "a41c-ops-066": {
+   "title": "ARGUS: collector cannot write to ClickHouse",
+   "tags": [
+    "argus.system",
+    "ops.ingest"
+   ]
+  },
+  "a41c-waf-050": {
+   "title": "WAF: burst of web attacks from one address",
+   "tags": [
+    "attack.initial_access",
+    "attack.t1190"
+   ]
+  },
+  "a41c-waf-051": {
+   "title": "WAF: scanner across multiple hosts",
+   "tags": [
+    "attack.reconnaissance",
+    "attack.t1595.002"
+   ]
+  },
+  "a41c-waf-052": {
+   "title": "WAF: attack reached the application (detect-only, 5xx)",
+   "tags": [
+    "attack.initial_access",
+    "attack.t1190"
+   ]
+  },
+  "a41c-waf-053": {
+   "title": "WAF: critical RCE/LFI attempt with high anomaly score",
+   "tags": [
+    "attack.execution",
+    "attack.t1190",
+    "attack.t1059"
+   ]
+  }
+ },
+ "sources": [
+  "argus.collector",
+  "argus.identity",
+  "argus.system",
+  "edr.kaspersky",
+  "gitlab.audit",
+  "gitlab.ci",
+  "host.caddy",
+  "host.nftables",
+  "host.pvedaemon",
+  "host.sandboxd",
+  "host.sshd",
+  "idp.example",
+  "k8s.audit",
+  "nas.qnap",
+  "netflow.core",
+  "netflow.example",
+  "netflow.lan",
+  "ngfw.checkpoint",
+  "ngfw.usergate",
+  "otp.example",
+  "proxy.netbird",
+  "syslog.fw-01",
+  "syslog.sshd",
+  "syslog.sudo",
+  "syslog.web-01",
+  "telemetry.node",
+  "telemetry.node-exporter",
+  "vpn.example",
+  "waf.modsecurity",
+  "wazuh.agents"
+ ],
+ "actions": [
+  "app.authorize",
+  "auth.login",
+  "auth.otp",
+  "auth.ssh",
+  "collector.sink_recovered",
+  "collector.sink_stalled",
+  "config.update",
+  "disk.usage",
+  "event.dns",
+  "file.delete",
+  "file.move",
+  "file.read",
+  "file.rename",
+  "flow",
+  "gitlab.build.success",
+  "gitlab.project_access_token_created",
+  "gitlab.project_access_token_revoked",
+  "gitlab.project_access_token_rotated",
+  "http.attack",
+  "identity.alias",
+  "identity.alias.revoke",
+  "identity.policy.violation",
+  "k8s.create.clusterrolebindings",
+  "net.firewall",
+  "priv.sudo",
+  "proxy.access",
+  "rule.550",
+  "rule.5763",
+  "sandbox.api",
+  "sandbox.egress",
+  "sandbox.status",
+  "session.allow",
+  "storage.event",
+  "threat.detect"
+ ]
+}

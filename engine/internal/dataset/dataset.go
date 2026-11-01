@@ -161,14 +161,15 @@ func Build(l store.LabeledIncident, source string) *Record {
 	}
 	group := GroupID(inc)
 	split := "train"
-	// Разбиение — по ключу случая без соли: одна и та же группа по одну сторону
-	// во всех выгрузках. В JSONL пишется только group_id с солью выгрузки.
-	if bucket(groupKey(inc)) < HoldoutPercent {
+	// Разбиение — HMAC ключа случая с секретом выгрузки (ARGUS_DATASET_SECRET):
+	// одна группа по одну сторону во всех выгрузках с тем же секретом, а без
+	// секрета биты split не сопоставить со словарём адресов и учёток.
+	if splitBucket(groupKey(inc)) < HoldoutPercent {
 		split = "holdout"
 	}
 	return &Record{
 		Schema: Schema, IncidentID: inc.IncidentID, GroupID: group, Split: split,
-		Scenario: scenario, Source: source, RuleID: inc.RuleID, Level: inc.Level, Tags: inc.Tags,
+		Scenario: scenario, Source: source, RuleID: recordRuleID(inc), Level: inc.Level, Tags: ruleTags(inc),
 		PII: inc.PII != 0, Blind: l.Label.Blind, LabeledAt: l.ChangedAt,
 		State: analyst.DecisionState(inc), Questions: Questions(scenario), Labels: labels,
 	}
@@ -208,9 +209,27 @@ func groupKey(inc *incidents.Incident) string {
 	return inc.RuleID + "|" + subject
 }
 
-func bucket(s string) int {
-	sum := sha256.Sum256([]byte("split|" + s))
-	return int(binary.BigEndian.Uint16(sum[:2])) % 100
+// splitBucket — корзина 0–99 разбиения train/holdout с секретом выгрузки.
+func splitBucket(key string) int {
+	h := analyst.Process().Key("split", key)
+	n, _ := strconv.ParseUint(h[:8], 16, 32)
+	return int(n % 100)
+}
+
+// recordRuleID — id поставляемого правила как есть, пользовательского —
+// псевдоним (в id оператор пишет что угодно, в том числе имена).
+func recordRuleID(inc *incidents.Incident) string {
+	if id, _, _ := analyst.Rule(inc); id != "[rule]" {
+		return id
+	}
+	return "rule-" + analyst.Process().Key("rule", inc.RuleID)
+}
+
+// ruleTags — теги, как в состоянии: поставляемого правила — из реестра,
+// пользовательского — только ATT&CK. Сырые теги в запись не попадают.
+func ruleTags(inc *incidents.Incident) []string {
+	_, _, tags := analyst.Rule(inc)
+	return tags
 }
 
 // MaxPerRule — потолок записей одного правила: без него тысячи сканов

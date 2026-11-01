@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/devitex-soft/argus/engine/internal/analyst"
 	"github.com/devitex-soft/argus/engine/internal/dataset"
 	"github.com/devitex-soft/argus/engine/internal/store"
 	"github.com/devitex-soft/argus/engine/internal/systemone"
@@ -117,6 +118,15 @@ func datasetCmd(args []string) int {
 	outPath := fs.String("out", "-", "файл JSONL, - — stdout")
 	_ = fs.Parse(args[1:])
 
+	// Секрет выгрузки: псевдонимы, group_id и разбиение train/holdout — HMAC с
+	// ним. Один секрет на все выгрузки (vault_argus_dataset_secret), иначе
+	// группы перемешаются между train и holdout разных выгрузок. В JSONL не пишется.
+	secret := os.Getenv("ARGUS_DATASET_SECRET")
+	if len(secret) < 32 {
+		fmt.Fprintln(os.Stderr, "нужен ARGUS_DATASET_SECRET (не короче 32 символов): один и тот же для всех выгрузок")
+		return 2
+	}
+	analyst.SetDatasetSecret([]byte(secret))
 	laya, jev := systemone.FromEnv(os.Getenv)
 	var list []string
 	if *models != "" {

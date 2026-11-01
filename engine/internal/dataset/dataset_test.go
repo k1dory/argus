@@ -19,8 +19,8 @@ func secIncident(id, actor string) incidents.Incident {
 		Owner: "ivan.petrov", Note: "это пентест Ивана, закрыто", ActorName: actor, Node: "db-prod-01.corp.local",
 		Sources: []string{"journald"}, EventCount: 12,
 		Chain: []string{
-			fmt.Sprintf("%s  %-16s %-14s %-24s %s", "10:00:01", "journald", "db-prod-01.co…", "auth.ssh.failure", "192.168.0.44:22"),
-			fmt.Sprintf("%s  %-16s %-14s %-24s %s", "10:00:02", "journald", "db-prod-01.co…", "auth.ssh.failure", "ivan.petrov"),
+			fmt.Sprintf("%s  %-16s %-14s %-24s %s", "10:00:01", "host.sshd", "db-prod-01.co…", "auth.ssh", "192.168.0.44:22"),
+			fmt.Sprintf("%s  %-16s %-14s %-24s %s", "10:00:02", "host.sshd", "db-prod-01.co…", "auth.ssh", "ivan.petrov"),
 			"10:00 free text ivan.petrov@corp.local phone +7 912 345-67-89",
 		},
 	}
@@ -59,7 +59,7 @@ func TestBuildSecurityRecord(t *testing.T) {
 			t.Fatalf("в состоянии %q:\n%s", leak, r.State)
 		}
 	}
-	if !strings.Contains(r.State, "a41c-auth-031") || !strings.Contains(r.State, "auth.ssh.failure") ||
+	if !strings.Contains(r.State, "a41c-auth-031") || !strings.Contains(r.State, "auth.ssh") ||
 		!strings.Contains(r.State, "ip-private-") || !strings.Contains(r.State, ":22") || !strings.Contains(r.State, "user-") ||
 		!strings.Contains(r.State, "1 lines omitted") {
 		t.Fatalf("состояние без правила или сети:\n%s", r.State)
@@ -133,7 +133,7 @@ func TestGroupIDCollapsesSubnetAndSplitIsStable(t *testing.T) {
 	// Доля отложенных групп близка к HoldoutPercent.
 	hold := 0
 	for i := 0; i < 2000; i++ {
-		if bucket(fmt.Sprintf("g-%d", i)) < HoldoutPercent {
+		if splitBucket(fmt.Sprintf("g-%d", i)) < HoldoutPercent {
 			hold++
 		}
 	}

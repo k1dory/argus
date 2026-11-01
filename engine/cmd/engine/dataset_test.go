@@ -217,3 +217,13 @@ func TestReadDatasetRejectsOtherSchema(t *testing.T) {
 		t.Fatalf("чужая схема: %v", err)
 	}
 }
+
+// Без секрета выгрузки export отказывает до обращения к ClickHouse и моделям:
+// иначе псевдонимы и разбиение не совпали бы между выгрузками.
+func TestDatasetExportRequiresSecret(t *testing.T) {
+	t.Setenv("ARGUS_DATASET_SECRET", "short")
+	t.Setenv("CLICKHOUSE_URL", "http://127.0.0.1:1")
+	if code := datasetCmd([]string{"export", "--out", filepath.Join(t.TempDir(), "x.jsonl")}); code != 2 {
+		t.Fatalf("код %d", code)
+	}
+}
