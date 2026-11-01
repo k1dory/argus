@@ -71,3 +71,12 @@ test("sources: heartbeat-only младше границы входит в спи
   assert.equal(report.sources[0].last_ts, stale("unused", 90 * 60).last_ts);
   assert.equal(report.omitted, 2);
 });
+
+test("sources: молчание прямого writer считается по часам ClickHouse, а не Node", async (t) => {
+  // Часы базы на сутки позади Node: last_sec и now_sec — из ClickHouse, разница 2 ч.
+  const chNow = now - 86400;
+  const row = { ...stale("argus.system"), last_sec: chNow - 7200, now_sec: chNow };
+  database(t, [row as Stale], []);
+  const [s] = (await sourcesHealthReport()).sources;
+  assert.equal(s.silent_for_sec, 7200, "рассинхрон часов Node и ClickHouse не попадает в silent_for_sec");
+});
