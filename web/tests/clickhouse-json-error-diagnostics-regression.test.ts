@@ -1,4 +1,4 @@
-// PR #27: JSON-обёртка является транспортом, а не секретным значением.
+// PR #27: JSON-обёртка — транспорт: код и имя исключения сохраняются (текст не выводится).
 // Формат ClickHouse 24.8: JSONEachRowRowOutputFormat::writeSuffix вызывает
 // JSONUtils::writeException, записывающий {"exception": "Code: ..."}.
 // Подменён HTTP-ответ; это проверка клиента, не живого ClickHouse.
@@ -13,7 +13,7 @@ const body = `{"exception": ${JSON.stringify(plain)}}\n`;
 test("shortChError: JSON сохраняет код и безопасную причину так же, как текстовый ответ", () => {
   const control = shortChError(plain, 404);
   assert.equal(control.code, 60);
-  assert.match(control.message, /Table argus\.fixture_missing does not exist/);
+  assert.equal(control.message, "код 60 (UNKNOWN_TABLE)");
   assert.deepEqual(shortChError(body, 404), control, "маскировать нужно содержание exception после разбора JSON");
 });
 
@@ -42,11 +42,11 @@ for (const withHeader of [true, false]) {
     const error = caught;
     await t.test("короткое сообщение", () => {
       assert.equal(error.code, 60);
-      assert.match(error.message, /Table argus\.fixture_missing does not exist/);
+      assert.equal(error.message, "код 60 (UNKNOWN_TABLE)");
     });
     await t.test("серверный журнал", () => {
-      assert.match(logs.join("\n"), /Code:\s*60/);
-      assert.match(logs.join("\n"), /Table argus\.fixture_missing does not exist/);
+      assert.match(logs.join("\n"), /код 60 \(UNKNOWN_TABLE\)/);
+      assert.ok(!logs.join("\n").includes("fixture_missing does not exist"), "текст исключения не логируется: полный — в system.query_log");
     });
   });
 }

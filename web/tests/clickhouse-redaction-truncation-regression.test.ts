@@ -5,7 +5,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { format } from "node:util";
-import { chCommand, ClickHouseError, redactChText, sqlForLog } from "../src/lib/clickhouse";
+import { chCommand, ClickHouseError, sqlForLog } from "../src/lib/clickhouse";
 
 const marker = "PrivateTruncatedExceptionFixture";
 const value = `1${marker}${"x".repeat(2200)}`;
@@ -24,8 +24,6 @@ for (const [shape, body, status] of [
     const logs: string[] = [];
     const sql = "INSERT INTO console_audit (detail) SELECT {detail:String}";
     let calls = 0;
-    // Полное исключение маскируется: проверяется именно порядок slice/redact.
-    assert.ok(!redactChText(body).includes(marker));
     assert.ok(body.slice(0, 2000).includes(marker), "маркер лежит внутри журнального префикса");
     assert.ok(!sqlForLog(sql).includes(marker), "данные передаются параметром, не текстом SQL");
     t.mock.method(console, "error", (...args: unknown[]) => { logs.push(format(...args)); });

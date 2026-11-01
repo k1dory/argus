@@ -12,29 +12,22 @@ const AUTH = `Code: 516. DB::Exception: default: Authentication failed: password
 
 If you use ClickHouse Cloud, the password can be reset at https://clickhouse.cloud/ ... (AUTHENTICATION_FAILED) (version 24.8.4.13 (official build))`;
 
-test("shortChError: код и короткая причина без хвоста «while processing»/версии", () => {
-  const t = shortChError(TIMEOUT, 500);
-  assert.equal(t.code, 159);
-  assert.match(t.message, /^код 159: Timeout exceeded: elapsed 20.001 seconds, maximum: 20/);
-  assert.ok(!/version|official build/.test(t.message));
-
-  const m = shortChError(MEMORY, 500);
-  assert.equal(m.code, 241);
-  assert.match(m.message, /^код 241: Memory limit \(for query\) exceeded/);
-
-  const n = shortChError(NO_TABLE, 404);
-  assert.equal(n.code, 60);
-  assert.match(n.message, /^код 60: Table argus.events_v2 does not exist/);
-
-  const s = shortChError(SYNTAX, 400);
-  assert.equal(s.code, 62);
-  assert.match(s.message, /^код 62: Syntax error: failed at position 8/);
-  assert.ok(s.message.length <= 170, "причина обрезана");
-
-  const a = shortChError(AUTH, 403);
-  assert.equal(a.code, 516);
-  assert.match(a.message, /^код 516: default: Authentication failed/);
-  assert.ok(!a.message.includes("clickhouse.cloud"), "многострочный хвост не попадает");
+test("shortChError: только код и имя исключения из списка ClickHouse — без текста исключения", () => {
+  const cases: [string, number, number, string, string][] = [
+    [TIMEOUT, 500, 159, "TIMEOUT_EXCEEDED", "Timeout exceeded"],
+    [MEMORY, 500, 241, "MEMORY_LIMIT_EXCEEDED", "Memory limit"],
+    [NO_TABLE, 404, 60, "UNKNOWN_TABLE", "events_v2"],
+    [SYNTAX, 400, 62, "SYNTAX_ERROR", "FORM"],
+    [AUTH, 403, 516, "AUTHENTICATION_FAILED", "clickhouse.cloud"],
+  ];
+  for (const [text, status, code, name, hidden] of cases) {
+    const e = shortChError(text, status);
+    assert.equal(e.code, code);
+    assert.equal(e.message, `код ${code} (${name})`);
+    assert.ok(!e.message.includes(hidden), "текст исключения цитирует данные запроса и не выводится");
+  }
+  assert.deepEqual(shortChError("Code: 99999. DB::Exception: x", 500), { message: "код 99999", code: 99999 }, "неизвестный код — без имени");
+  assert.deepEqual(shortChError("", 500, 60), { message: "код 60 (UNKNOWN_TABLE)", code: 60 }, "код из заголовка X-ClickHouse-Exception-Code");
 });
 
 test("shortChError: без кода — по HTTP-статусу; пусто — «запрос не выполнен»", () => {
@@ -42,7 +35,7 @@ test("shortChError: без кода — по HTTP-статусу; пусто —
   assert.deepEqual(shortChError("", 401), { message: "доступ к ClickHouse отклонён (учётные данные консоли)", code: null });
   assert.deepEqual(shortChError("Bad Gateway", 502), { message: "ClickHouse ответил HTTP 502", code: null });
   assert.deepEqual(shortChError("", null), { message: "запрос не выполнен", code: null });
-  assert.deepEqual(shortChError("DB::Exception: something odd", null), { message: "something odd", code: null });
+  assert.deepEqual(shortChError("DB::Exception: something odd", null), { message: "запрос не выполнен", code: null }, "текст без кода не выводится");
 });
 
 test("searchErrorMessage: классификация по коду ClickHouseError, не по тексту", () => {
