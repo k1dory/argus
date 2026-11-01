@@ -2,12 +2,14 @@ package pull
 
 import (
 	"bufio"
+	"compress/gzip"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -16,6 +18,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/devitex-soft/argus/collector/internal/model"
@@ -40,6 +43,26 @@ type S3 struct {
 	cfg  S3Config
 	http *http.Client
 	Emit func(model.Event)
+	// Объект, чтение которого оборвалось: сколько строк уже выдано и сколько было
+	// попыток. Повтор пропускает выданные строки — событие не дублируется.
+	retryKey   string
+	retryDone  int
+	retryCount int
+	// Skipped — объектов, брошенных из-за битого содержимого (gzip, CRC, строка
+	// длиннее 32 МиБ) или после s3MaxAttempts неудачных чтений.
+	Skipped atomic.Int64
+}
+
+// s3MaxAttempts — сколько раз читать объект, тело которого обрывается посреди:
+// дальше он считается битым, курсор идёт дальше. Иначе один испорченный объект
+// навсегда останавливал бы чтение бакета. Отказ хранилища на сам GET (403, 5xx,
+// сеть) попыткой не считается: это не объект битый, а доступ — повтор без предела,
+// как раньше; 404 (объект удалён после листинга) — пропуск.
+const s3MaxAttempts = 3
+
+// s3ContentError — ошибка самого содержимого: повтор не поможет.
+func s3ContentError(err error) bool {
+	return errors.Is(err, gzip.ErrHeader) || errors.Is(err, gzip.ErrChecksum) || errors.Is(err, bufio.ErrTooLong)
 }
 
 func NewS3(cfg S3Config, emit func(model.Event)) *S3 {
@@ -119,10 +142,23 @@ func (s *S3) get(ctx context.Context, path string, query url.Values) (*http.Resp
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 400))
 		resp.Body.Close()
-		return nil, fmt.Errorf("s3 %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		return nil, &s3StatusError{code: resp.StatusCode, msg: fmt.Sprintf("s3 %s: %s", resp.Status, strings.TrimSpace(string(body)))}
 	}
 	return resp, nil
 }
+
+// s3StatusError — GET объекта не дал тела: ответ хранилища не 200 (нет прав, сбой,
+// объекта нет; code — статус) или сетевая ошибка (code 0, err — причина).
+type s3StatusError struct {
+	code int
+	msg  string
+	err  error
+}
+
+func (e *s3StatusError) Error() string { return e.msg }
+func (e *s3StatusError) Unwrap() error { return e.err }
+
+func (e *s3StatusError) isNotFound() bool { return e != nil && e.code == http.StatusNotFound }
 
 type listResult struct {
 	Contents []struct {
@@ -170,12 +206,37 @@ func (s *S3) Run(ctx context.Context) {
 					last = obj.Key
 					continue
 				}
-				n, err := s.fetch(ctx, obj.Key)
-				if err != nil {
+				skip := 0
+				if obj.Key == s.retryKey {
+					skip = s.retryDone
+				}
+				done, n, err := s.fetchFrom(ctx, obj.Key, skip)
+				var st *s3StatusError
+				if errors.As(err, &st) && st.code != http.StatusNotFound {
+					// Тела нет — доступ или сеть: повтор на следующем цикле без счёта попыток.
 					slog.Warn("s3 fetch", "key", obj.Key, "err", err)
 					break
 				}
-				slog.Info("s3 object", "name", s.cfg.Name, "key", obj.Key, "events", n)
+				if err != nil && !st.isNotFound() && ctx.Err() == nil && !s3ContentError(err) {
+					if obj.Key != s.retryKey {
+						s.retryKey, s.retryCount = obj.Key, 0
+					}
+					s.retryDone, s.retryCount = done, s.retryCount+1
+					if s.retryCount < s3MaxAttempts {
+						slog.Warn("s3 fetch: повтор на следующем цикле", "key", obj.Key, "events", n, "attempt", s.retryCount, "err", err)
+						break
+					}
+				}
+				if err != nil && ctx.Err() != nil {
+					return // остановка посреди объекта — дочитаем после рестарта, курсор не двигаем
+				}
+				if err != nil {
+					s.Skipped.Add(1)
+					slog.Error("s3: объект прочитан не целиком и пропущен — выданные события остаются, курсор идёт дальше", "name", s.cfg.Name, "key", obj.Key, "events", n, "err", err)
+				} else {
+					slog.Info("s3 object", "name", s.cfg.Name, "key", obj.Key, "events", n)
+				}
+				s.retryKey, s.retryDone, s.retryCount = "", 0, 0
 				last = obj.Key
 				s.saveState(last)
 			}
@@ -188,18 +249,48 @@ func (s *S3) Run(ctx context.Context) {
 	}
 }
 
+// fetch — все события объекта (без пропуска уже выданных).
 func (s *S3) fetch(ctx context.Context, key string) (int, error) {
+	_, n, err := s.fetchFrom(ctx, key, 0)
+	return n, err
+}
+
+// fetchFrom выдаёт события объекта, пропуская первые skip непустых строк (уже
+// выданные прошлой попыткой). done — сколько непустых строк пройдено всего (для
+// следующей попытки), n — сколько событий выдано в этот раз.
+func (s *S3) fetchFrom(ctx context.Context, key string, skip int) (done, n int, err error) {
 	resp, err := s.get(ctx, "/"+strings.TrimLeft(key, "/"), nil)
 	if err != nil {
-		return 0, err
+		var st *s3StatusError
+		if !errors.As(err, &st) {
+			err = &s3StatusError{msg: err.Error(), err: err}
+		}
+		return skip, 0, err
 	}
 	defer resp.Body.Close()
-	n := 0
-	sc := bufio.NewScanner(resp.Body)
+	// Экспорт в бакет бывает сжатым (*.json.gz): распознаём по магическим байтам,
+	// а не по имени ключа — иначе такой объект молча давал бы 0 событий.
+	br := bufio.NewReader(resp.Body)
+	var body io.Reader = br
+	if magic, err := br.Peek(2); err == nil && magic[0] == 0x1f && magic[1] == 0x8b {
+		gz, err := gzip.NewReader(br)
+		if err != nil {
+			return skip, 0, fmt.Errorf("gzip %s: %w", key, err)
+		}
+		defer gz.Close()
+		body = gz
+	}
+	sc := bufio.NewScanner(body)
 	sc.Buffer(make([]byte, 1<<20), 32<<20)
+	lastEmitted := false
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" {
+			continue
+		}
+		done++
+		lastEmitted = false
+		if done <= skip {
 			continue
 		}
 		var e model.Event
@@ -219,8 +310,17 @@ func (s *S3) fetch(ctx context.Context, key string) (int, error) {
 		e.Ensure()
 		s.Emit(e)
 		n++
+		lastEmitted = true
 	}
-	return n, sc.Err()
+	if err := sc.Err(); err != nil {
+		// При ошибке чтения Scanner отдаёт обрывок последней строки отдельным токеном:
+		// если он не стал событием, следующая попытка должна прочитать эту строку целиком.
+		if !lastEmitted && done > skip {
+			done--
+		}
+		return max(done, skip), n, err
+	}
+	return max(done, skip), n, nil
 }
 
 func (s *S3) loadState() string {

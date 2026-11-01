@@ -450,13 +450,37 @@ Coraza под Caddy/nginx) и **error-лог** (`ModSecurity: …` в nginx/Apac
 `WAF_ERROR_LOG`; для агентов без файлового доступа — `POST /ingest/modsecurity` (JSON, NDJSON или
 массив). В единой схеме: `source_class=waf`, `action=http.attack`, `outcome=deny|allow` (заблокировано
 или только замечено: DetectionOnly, либо score не набран), атрибуты `category` (sqli, xss, rce, lfi…),
-`rule_ids`, `anomaly_score`, `status`, `engine_mode`, `host`, `method`, `user_agent`.
+`rule_ids`, `anomaly_score`, `status`, `engine_mode`, `host` (заголовок Host из audit-лога), `http_host`
+(`[hostname]` error-лога ModSecurity в любом виде, у Coraza — если там имя), `server_addr`, `method`,
+`user_agent`. `host` и `http_host` присылает клиент: это справка, не узел, не адрес сервера и не
+основание для автоблокировки.
 Правила `rules/waf-*.yml`: серия атак с адреса, сканер по нескольким хостам, критичный RCE/LFI
 с высоким score — эти три с `respond`; «атака дошла до приложения» (детект + 5xx) — без автоответа,
 её разбирает человек. Из error-лога событием считается итоговая строка транзакции (Access denied
 или оценка anomaly score 949110/980130), промежуточные Warning по отдельным правилам не считаются.
 Витрина — дашборд «WAF · ModSecurity / Coraza». Coraza для Caddy: модуль `coraza-caddy`,
 директива `SecAuditLogFormat JSON` и `SecAuditLog /var/log/caddy/coraza_audit.log`.
+
+Узел события WAF коллектор выбирает одинаково для error-лога, файла audit и
+`POST /ingest/modsecurity`: имя хоста из заголовка syslog (агент на хосте WAF) → `node:` источника
+(`WAF_NODE`) → `server_id` audit-лога → адрес сервера (`host_ip` audit-лога или, только у Coraza,
+IP из `[hostname]`) → адрес отправителя. Происхождение `[hostname "…"]` у двух WAF разное:
+
+- у ModSecurity под Apache/nginx это заголовок Host запроса, его подставляет клиент. Он
+  недоверенный в любом виде, даже как IP, IPv6 или IP с портом: только `attrs.http_host`, ни
+  узлом, ни `dst_ip`/`attrs.server_addr` не становится — иначе атакующий тремя разными Host
+  «создал бы» три сервера для правила «сканер по нескольким хостам»;
+- Coraza пишет туда сама локальный адрес сокета (внутри Docker — адрес контейнера): IP уходит
+  в `dst_ip` и `attrs.server_addr`, узлом напрямую не бывает.
+
+Разные серверы без `server_id` дают разные узлы по доверенному адресу (`host_ip` audit-лога,
+адрес отправителя) — на этом держится правило «сканер по нескольким хостам».
+
+Имени контейнера в логе нет: для файла — `attrs: {container: …}` (`WAF_CONTAINER`), для агента на
+хосте — SD-элемент RFC 5424 `[argus container="caddy"]` в заголовке строки. Из SD-элемента `argus`
+принимаются только `container`, `pod`, `namespace`, `service` (не длиннее 253 байт, с очисткой
+управляющих символов); происхождение — `peer`, `peer_cn`, `transport`, `scope`, `server_addr` —
+ставит только коллектор, `peer_cn` — только из проверенного клиентского сертификата.
 
 ## Вебхуки и подключение агента разбора
 
@@ -558,6 +582,29 @@ desc:"brute force" srcip:10.0.*`; для событий — `source:k8s.audit ac
 То же через API: `GET /api/search?index=events&q=...&range=24h[&format=csv|export&limit=N]`
 (`index=alerts` — только с модулем Wazuh); простые выборки без языка запросов — `GET /api/v1/log`.
 
+Свободный текст (слово или фраза без поля) — подстрока без учёта регистра в любом поле
+записи: `raw`, субъект, объект, узел, адреса, действие, атрибуты (вместе с ключами). Слова
+от 4 байт ускоряет n-граммный индекс `idx_text` (миграция 0030): гранулы, где такой
+подстроки заведомо нет, не читаются, поэтому редкое слово или адрес находится за доли
+секунды на любом окне. Частое слово (`sshd`) и слова короче 4 байт индекс не сужает —
+нужное время задают поля (`source:`, `node:`) и интервал. Страница результатов
+показывается сразу; распределение с итогом и поля догружаются отдельно, у каждого свой
+бюджет (15 и 10 с): не уложились — страница остаётся, вместо блока причина, пейджер
+предлагает следующую страницу, только когда она подтверждена: страница читает на одну
+строку больше (51-я строка — `has_more`), а `total` считает лишь доказанные строки. Ссылка
+на предыдущую страницу остаётся и на пустой дальней странице. Поля (фасеты) считаются по
+последним 10 000 совпадениям. В API то же: `total_exact`, `incomplete`, `notice`,
+`facets_sample` в ответе `GET /api/search`.
+
+Индекс получают новые куски таблицы; старые читаются как раньше, пока для них индекс не
+построен вручную (тяжёлая мутация, запускать в спокойное время; ~6,5 байт на событие,
+~800 МиБ на 120 млн событий):
+
+```sh
+docker compose exec clickhouse clickhouse-client --query "ALTER TABLE argus.events MATERIALIZE INDEX idx_text"
+docker compose exec clickhouse clickhouse-client --query "ALTER TABLE argus.wazuh_alerts MATERIALIZE INDEX idx_text"
+```
+
 «Журнал» (`/events`) — лента событий всех источников с фильтрами по источнику, хосту,
 серьёзности и правилу, гистограммой, раскрытием до сырого события, связью с инцидентом
 и live-tail (`GET /api/events/tail`, курсор `received_at|id`, только закрытые секунды
@@ -584,6 +631,13 @@ docker compose --profile mcp up -d mcp     # Streamable HTTP на 127.0.0.1:1809
 и отклоняет запросы с браузерным `Origin`, кроме перечисленных в `ARGUS_MCP_ALLOWED_ORIGINS`.
 Лимит — `ARGUS_MCP_RATE_PER_MIN` (300) запросов в минуту на сессию (`Mcp-Session-Id`) или токен,
 считается после проверки bearer. Инструменты с `limit` отдают до 500 строк без `raw`.
+
+Наружу MCP публикует Caddy на `:8445` (TLS как у консоли): `MCP_BIND=0.0.0.0` открывает порт,
+`MCP_ALLOWED_NETS` — сети клиентов (остальным 403). Клиенты с самого хоста приходят в
+контейнер с адреса шлюза Docker; шлюз разрешает `MCP_ALLOW_HOST=1`, по умолчанию — только при
+`MCP_BIND` на loopback. В rootless Docker, при userland-proxy и на Docker Desktop с адреса
+шлюза приходят все клиенты: там при `MCP_BIND=0.0.0.0` включённый `MCP_ALLOW_HOST` пустил бы
+всех, и остался бы только bearer.
 
 Значения из событий (субъект, узел, IP, домен, хеш) передаются точными фильтрами
 инструментов поиска (`actor`, `node`, `src_ip`, `dst_ip`, `action`, `source`, `domain`,
@@ -918,15 +972,15 @@ make deploy                                # cosign verify + pull образов
 
 ## Тесты
 
-Пять слоёв, от быстрых к медленным:
+Пять слоёв, от быстрых к медленным. Цифры — число тестов на момент rc28.
 
-| Слой | Что проверяет | Как запустить |
-|---|---|---|
-| юнит | Go-модули (`collector`, `engine`, `policyd`, `mcp`, `triage`), шиппер на Rust, Rego-политики через встроенный OPA, чистые модули консоли `web/src/lib/shared/*` и маршруты `web/src/app/api/*` с подменённым ClickHouse | `make test`; `cd web && npm test` |
-| правила | правила корреляции на записанном трафике `fixtures/events/*.ndjson`, ожидания в `rules/tests/` | `./scripts/argus rules test` |
-| интеграция | живой ClickHouse: конкурентный claim вердикта агента (`web/tests/triage-claim-ch.test.ts`); без `ARGUS_TEST_CLICKHOUSE_URL` тест пропускается | `ARGUS_TEST_CLICKHOUSE_URL=http://localhost:8123 ARGUS_TEST_CLICKHOUSE_PASSWORD=… npm test` |
-| API-смоук | живой стенд: `GET /api/version`, приём NDJSON коллектором (`value`/`unit`, `identity.alias`), событие в `GET /api/v1/log`, сессия разбора по демо-инциденту, карточка, граница области, вердикт `argus-triage/v3` и его идемпотентный повтор, резолв алиаса и паспорт субъекта, запрет экспорта токену сессии | `make up-dev && make demo && ./scripts/api-smoke.sh` (параметры `ARGUS_URL`, `ARGUS_API_TOKEN`, `ARGUS_TRIAGE_ISSUER_TOKEN`, `ARGUS_INGEST_URL`, `ARGUS_INGEST_TOKEN`; по умолчанию — `.env.dev`) |
-| e2e | стек с нуля в compose (`argus-e2e`): replay → ≥ 7 инцидентов и вердиктов движка, `argus_ro` только читает, затем API-смоук; в CI — на push в `main` | `./scripts/e2e.sh` (`E2E_TIMEOUT`, сек) |
+| Слой | Сколько | Что проверяет | Как запустить |
+|---|---|---|---|
+| юнит | Go 531, консоль 354, шиппер 26, OPA 20 | Go-модули (`collector`, `engine`, `policyd`, `mcp`, `triage`): парсеры и нормализация, приёмники на реальных сокетах, правила корреляции (каждый оператор и ветка валидации), жизненный цикл инцидентов, реагирование, уведомления и шторм через httptest и мини-SMTP, pull-коллекторы Falcon/S3 на имитации API, обогащение; `main()` коллектора и policyd запускаются в процессе целиком (конфиг с `${ENV}`, приёмники, spool, `/healthz`, `/metrics`, SIGTERM), раунд policyd — на имитации Wazuh API с настоящим Rego; шиппер на Rust; Rego-политики; консоль — чистые модули `web/src/lib/shared/*`, все маршруты `web/src/app/api/*` с подменённым ClickHouse по схемам OpenAPI, OIDC-вход с проверкой `id_token` по JWKS, аутентификация и RBAC на реальном файле `auth.json`, каждая страница и компонент консоли с ролями, пустыми состояниями, 404 и недоступным хранилищем | `make test`; `cd web && npm test` |
+| правила | 31 сценарий | правила корреляции на записанном трафике `fixtures/events/*.ndjson`, ожидания (число инцидентов, субъект, в том числе отрицательные) в `rules/tests/` | `./scripts/argus rules test` |
+| интеграция | 3 файла | живой ClickHouse: все миграции с нуля по порядку и повторно (идемпотентность), затем каждый SQL консоли (`web/tests/queries-ch.test.ts`) и каждый запрос хранилища движка — события и курсор, инциденты и журнал состояний, ответы, исключения, отчёт о рисках, паспорт, доставки вебхуков (`engine/internal/store/live_test.go`); конкурентный claim вердикта агента (`web/tests/triage-claim-ch.test.ts`). Без `ARGUS_TEST_CLICKHOUSE_URL` пропускаются; в CI сервис `clickhouse` у job `go` и `web` | `docker run -d -p 8123:8123 -e CLICKHOUSE_DB=argus -e CLICKHOUSE_PASSWORD=x clickhouse/clickhouse-server:24.8`, затем `ARGUS_TEST_CLICKHOUSE_URL=http://localhost:8123 ARGUS_TEST_CLICKHOUSE_PASSWORD=x npm test` (консоль) и то же окружение для `go test ./internal/store/` в `engine` |
+| API-смоук | 13 шагов | живой стенд: `GET /api/version`, приём NDJSON коллектором (`value`/`unit`, `identity.alias`), событие в `GET /api/v1/log`, сессия разбора по демо-инциденту, карточка, граница области, вердикт `argus-triage/v3` и его идемпотентный повтор, резолв алиаса и паспорт субъекта, запрет экспорта токену сессии, живость источников `GET /api/sources` (статус по ритму), MCP за Caddy `:8445` (при `ARGUS_MCP_URL`) | `make up-dev && make demo && ./scripts/api-smoke.sh` (параметры `ARGUS_URL`, `ARGUS_API_TOKEN`, `ARGUS_TRIAGE_ISSUER_TOKEN`, `ARGUS_INGEST_URL`, `ARGUS_INGEST_TOKEN`, `ARGUS_MCP_URL`; по умолчанию — `.env.dev`) |
+| e2e | 1 сценарий | стек с нуля в compose (`argus-e2e`): replay → ≥ 7 инцидентов и вердиктов движка, `argus_ro` только читает, затем API-смоук; с плагином buildx поднимаются и `mcp` + `caddy` (шаг 13 — MCP за TLS); в CI — на push в `main` | `./scripts/e2e.sh` (`E2E_TIMEOUT`, сек) |
 
 ```sh
 make test          # cargo test + go vet/test (Rego-политики гоняются через встроенный OPA)
@@ -936,8 +990,18 @@ cd web && npm test && npm run lint && npm run typecheck   # консоль
 ./scripts/api-smoke.sh                                    # API консоли на живом стенде
 ```
 
-Спецификация REST API консоли — OpenAPI в `api/openapi.yaml`; консоль отдаёт её же как
-`/openapi.yaml`. Смоук и тесты маршрутов проверяют поведение, описанное в ней.
+Покрытие на rc28: движок — `rules` 99,7 %, `incidents` 99 %, `store` 89 %, `cmd/engine` 74 %
+(без покрытия только циклы `run`/`loop`/`pollEvents` — их проверяет e2e); коллектор — `pull` 98 %,
+`listen` 94 %, `sink` 91 %, `cmd/collector` 79 %; policyd — 84–98 %; `mcp` 90 %; консоль —
+88 % операторов, страницы 88–100 %, компоненты 87 %. Слабее прочих: обработчики кликов в
+клиентских компонентах (`event-feed.tsx`, `download-button.tsx` — их чистая логика вынесена в
+`lib/shared/tail-poll.ts` и `download.ts` и покрыта), корневой `app/layout.tsx` (`next/font`),
+`main()` движка. Посмотреть: `go test -cover ./...` в модуле, `cd web && npx c8 --include 'src/**' npm test`.
+
+Спецификация REST API консоли — OpenAPI 3.1 в `api/openapi.yaml` (валидна по официальной
+схеме: swagger-parser, Redocly); консоль отдаёт её же как `/openapi.yaml`. Тест
+`web/tests/openapi.test.ts` следит, что каждый маршрут описан и копия совпадает с источником;
+смоук и тесты маршрутов проверяют описанное в ней поведение.
 
 ## Участие и безопасность
 

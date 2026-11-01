@@ -4,6 +4,7 @@ import { useState } from "react";
 import { Download } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import { fetchDownload, saveBlob } from "@/lib/shared/download";
 
 /**
  * Скачивание с состоянием: fetch → blob → a.download. Пока идёт загрузка —
@@ -27,24 +28,7 @@ export function DownloadButton({
   const run = async () => {
     setBusy(true);
     try {
-      const resp = await fetch(href, { credentials: "same-origin" });
-      if (!resp.ok) {
-        let msg = `HTTP ${resp.status}`;
-        try {
-          const j = (await resp.json()) as { error?: string };
-          if (j.error) msg = j.error;
-        } catch {}
-        throw new Error(msg);
-      }
-      const blob = await resp.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 10_000);
+      saveBlob(await fetchDownload(href), filename);
       toast.success("Файл готов", { description: filename });
     } catch (e) {
       toast.error("Экспорт не выполнен", { description: e instanceof Error ? e.message : String(e) });

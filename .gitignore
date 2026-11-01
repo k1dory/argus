@@ -25,3 +25,6 @@ collector/certs/*
 # локальные настройки Claude Code разработчика
 .claude/
 docker-compose.override.yml
+
+# артефакты c8/istanbul (npx c8 в web пишет в корень репозитория)
+coverage/

@@ -10,18 +10,23 @@ import (
 // WAF — разобранная транзакция ModSecurity v3 или Coraza (Caddy/nginx):
 // запрос, ответ, режим движка и сработавшие правила CRS.
 type WAF struct {
-	Product     string // modsecurity | coraza
-	Time        string // как в логе (RFC3339 или "13/Sep/2026:12:00:00 +0000")
-	ClientIP    string
-	ClientPort  int
-	HostIP      string
-	HostPort    int
-	ServerID    string // hostname из producer/server_id
-	Method      string
-	URI         string
-	Host        string // заголовок Host
+	Product    string // modsecurity | coraza
+	Time       string // как в логе (RFC3339 или "13/Sep/2026:12:00:00 +0000")
+	ClientIP   string
+	ClientPort int
+	HostIP     string
+	HostPort   int
+	ServerID   string // hostname из producer/server_id
+	Method     string
+	URI        string
+	Host       string // заголовок Host
+	// ServerName — [hostname "…"] error-лога. Значение не доверенное: у ModSecurity
+	// под Apache/nginx это заголовок Host запроса (r->hostname, headers_in.server),
+	// у Coraza — локальный адрес сокета. Узлом события не бывает никогда.
+	ServerName  string
 	UserAgent   string
 	Status      int
+	UnixNano    int64  // время транзакции из unix_timestamp (Coraza), 0 — нет
 	EngineMode  string // On | DetectionOnly | Off
 	UniqueID    string
 	Rules       []WAFRule
@@ -44,19 +49,24 @@ type WAFRule struct {
 
 type modsecAudit struct {
 	Transaction struct {
-		Time       string `json:"time_stamp"` // ModSecurity
-		Timestamp  string `json:"timestamp"`  // Coraza
-		ClientIP   string `json:"client_ip"`
-		ClientPort int    `json:"client_port"`
-		HostIP     string `json:"host_ip"`
-		HostPort   int    `json:"host_port"`
-		ServerID   string `json:"server_id"`
-		UniqueID   string `json:"unique_id"`
-		ID         string `json:"id"`
-		Request    struct {
-			Method  string            `json:"method"`
-			URI     string            `json:"uri"`
-			Headers map[string]string `json:"headers"`
+		Time       string      `json:"time_stamp"`     // ModSecurity
+		Timestamp  string      `json:"timestamp"`      // Coraza, локальное время без зоны
+		UnixTS     json.Number `json:"unix_timestamp"` // Coraza: наносекунды (time.Unix(0, tx.Timestamp))
+		ClientIP   string      `json:"client_ip"`
+		ClientPort int         `json:"client_port"`
+		HostIP     string      `json:"host_ip"`
+		HostPort   int         `json:"host_port"`
+		ServerID   string      `json:"server_id"`
+		UniqueID   string      `json:"unique_id"`
+		ID         string      `json:"id"`
+		// IsInterrupted — Coraza: движок прервал транзакцию (disruptive action). Код ответа
+		// при этом в аудит не попадает (response.status: null), так что блок виден только здесь.
+		IsInterrupted bool `json:"is_interrupted"`
+		Request       struct {
+			Method string `json:"method"`
+			URI    string `json:"uri"`
+			// ModSecurity — {"Host":"…"}, Coraza 3.8 — {"host":["…"]}
+			Headers json.RawMessage `json:"headers"`
 		} `json:"request"`
 		Response struct {
 			HTTPCode int `json:"http_code"` // ModSecurity
@@ -79,7 +89,10 @@ type modsecAudit struct {
 type modsecMessage struct {
 	Message string        `json:"message"`
 	Details modsecDetails `json:"details"` // ModSecurity
-	Data    modsecDetails `json:"data"`    // Coraza
+	Data    modsecDetails `json:"data"`    // Coraza до 3.8
+	// ErrorMessage — Coraza 3.8: data: null, метаданные правила только строкой
+	// error-лога ("[client …] Coraza: Warning. … [id \"930130\"] …").
+	ErrorMessage string `json:"error_message"`
 }
 
 type modsecDetails struct {
@@ -112,10 +125,16 @@ func ParseWAFAudit(b []byte) (WAF, bool) {
 		Status: firstNonZero(t.Response.HTTPCode, t.Response.Status), UniqueID: firstNonEmpty(t.UniqueID, t.ID),
 		EngineMode: firstNonEmpty(t.Producer.Engine, t.Producer.RuleEngine), MaxSeverity: -1,
 	}
+	if n, err := t.UnixTS.Int64(); err == nil && n > 0 {
+		if n < 1e12 { // старые сборки и чужие генераторы — секунды
+			n *= int64(1e9)
+		}
+		w.UnixNano = n
+	}
 	if strings.Contains(strings.ToLower(t.Producer.Connector+t.Producer.Server+t.Producer.ModSecurity), "coraza") || t.Producer.RuleEngine != "" {
 		w.Product = "coraza"
 	}
-	for k, v := range t.Request.Headers {
+	for k, v := range auditHeaders(t.Request.Headers) {
 		switch strings.ToLower(k) {
 		case "host":
 			w.Host = v
@@ -127,10 +146,23 @@ func ParseWAFAudit(b []byte) (WAF, bool) {
 	if len(msgs) == 0 {
 		msgs = t.Messages
 	}
+	denied := false
 	for _, m := range msgs {
 		d := m.Details
 		if d.RuleID == "" && rawString(d.ID) == "" && d.Msg == "" {
 			d = m.Data
+		}
+		if d.RuleID == "" && rawString(d.ID) == "" && d.Msg == "" && m.ErrorMessage != "" {
+			if loc := wafMarkRe.FindStringSubmatchIndex(m.ErrorMessage); loc != nil {
+				if loc[4] >= 0 {
+					denied = denied || wafBlockAction(m.ErrorMessage[loc[4]:loc[5]])
+				}
+				var mw WAF
+				if r, ok := parseRuleMeta(m.ErrorMessage[loc[1]:], &mw); ok {
+					w.addRule(r)
+				}
+				continue
+			}
 		}
 		r := WAFRule{ID: firstNonEmpty(d.RuleID, rawString(d.ID)), Msg: firstNonEmpty(d.Msg, m.Message), Tags: d.Tags, Data: d.Data, Severity: -1}
 		if sev := rawString(d.Severity); sev != "" {
@@ -143,7 +175,9 @@ func ParseWAFAudit(b []byte) (WAF, bool) {
 		w.addRule(r)
 	}
 	w.Final = true
-	w.Blocked = !strings.EqualFold(w.EngineMode, "DetectionOnly") && (w.Status == 403 || w.Status == 406) && w.hasFinalRule()
+	// Coraza: is_interrupted / «Access denied» в сообщении — решение движка, код ответа не нужен.
+	w.Blocked = !strings.EqualFold(w.EngineMode, "DetectionOnly") &&
+		(t.IsInterrupted || denied || ((w.Status == 403 || w.Status == 406) && w.hasFinalRule()))
 	return w, true
 }
 
@@ -160,9 +194,12 @@ func (w *WAF) hasFinalRule() bool {
 // --- error-log строка: Apache/nginx "ModSecurity: Warning. …" и Caddy "Coraza: Warning. …" ---
 
 var (
-	kvRe      = regexp.MustCompile(`\[([a-z_]+) "((?:[^"\\]|\\.)*)"\]`)
-	clientRe  = regexp.MustCompile(`\[client "?([0-9a-fA-F.:]+)(?::\d+)?"?\]`)
-	wafMarkRe = regexp.MustCompile(`(?:ModSecurity|Coraza): (Warning|Access denied with (?:code (\d+)|redirect|connection close))`)
+	kvRe     = regexp.MustCompile(`\[([a-z_]+) "((?:[^"\\]|\\.)*)"\]`)
+	clientRe = regexp.MustCompile(`\[client "?([0-9a-fA-F.:]+)(?::\d+)?"?\]`)
+	// Coraza пишет «Access denied (phase 2).» без кода — код ответа в строке не указан.
+	// Coraza 3.8 (rule_match.go ErrorLog): «Access denied|dropped|redirected|allowed (phase N).»;
+	// группы: 1 — маркер целиком, 2 — действие, 3 — код ответа (только ModSecurity).
+	wafMarkRe = regexp.MustCompile(`(?:ModSecurity|Coraza): (Warning|Access (denied|dropped|redirected|allowed)(?: with (?:code (\d+)|redirect|connection close)| \(phase \d\))?)`)
 	// метаданные правила начинаются с [file "…"] — всё до него (в т.ч. Value: `…' атакующего) не разбираем
 	fileTagRe = regexp.MustCompile(`\[file "`)
 )
@@ -199,12 +236,34 @@ func ParseWAFErrorLine(line string) (WAF, bool) {
 	if c := clientRe.FindStringSubmatch(text[:loc[0]]); c != nil {
 		w.ClientIP = c[1]
 	}
-	denied := strings.HasPrefix(m[1], "Access denied")
-	if m[2] != "" {
-		w.Status, _ = strconv.Atoi(m[2])
+	// denied/dropped/redirected — движок прервал запрос; allowed — явное разрешение правилом.
+	decision := m[2] != ""
+	denied := wafBlockAction(m[2])
+	if m[3] != "" {
+		w.Status, _ = strconv.Atoi(m[3])
 	}
-	// метаданные правила — от первого [file "…"]; до него — совпадение с данными запроса
-	meta := text[loc[1]:]
+	if r, ok := parseRuleMeta(text[loc[1]:], &w); ok {
+		w.addRule(r)
+	}
+	// «Access denied» = движок заблокировал; Warning — только детект (DetectionOnly или score ещё не набран).
+	// Одна транзакция даёт N строк Warning (по правилу) и одну итоговую: событием считаем итоговую —
+	// Access denied либо оценку anomaly score (949110/980130), иначе счётчики правил завышаются в N раз.
+	if denied {
+		w.EngineMode, w.Blocked = "On", true
+	}
+	w.Final = decision || w.hasFinalRule()
+	return w, true
+}
+
+// wafBlockAction — действие из маркера error-лога прерывает запрос (allow — нет).
+func wafBlockAction(a string) bool {
+	return a == "denied" || a == "dropped" || a == "redirected"
+}
+
+// parseRuleMeta — метаданные правила из хвоста строки error-лога после маркера.
+// Разбор — от первого [file "…"]; до него — совпадение с данными запроса атакующего.
+// hostname/uri/unique_id пишутся в w.
+func parseRuleMeta(meta string, w *WAF) (WAFRule, bool) {
 	if fi := fileTagRe.FindStringIndex(meta); fi != nil {
 		meta = meta[fi[0]:]
 	} else {
@@ -229,24 +288,35 @@ func ParseWAFErrorLine(line string) (WAF, bool) {
 		case "tag":
 			r.Tags = append(r.Tags, v)
 		case "hostname":
-			w.Host = v
+			w.ServerName = v
 		case "uri":
 			w.URI = v
 		case "unique_id":
 			w.UniqueID = v
 		}
 	}
-	if r.ID != "" || r.Msg != "" {
-		w.addRule(r)
+	return r, r.ID != "" || r.Msg != ""
+}
+
+// auditHeaders — заголовки запроса из аудита: объект строк (ModSecurity) или массивов (Coraza 3.8).
+func auditHeaders(raw json.RawMessage) map[string]string {
+	out := map[string]string{}
+	if len(raw) == 0 {
+		return out
 	}
-	// «Access denied» = движок заблокировал; Warning — только детект (DetectionOnly или score ещё не набран).
-	// Одна транзакция даёт N строк Warning (по правилу) и одну итоговую: событием считаем итоговую —
-	// Access denied либо оценку anomaly score (949110/980130), иначе счётчики правил завышаются в N раз.
-	if denied {
-		w.EngineMode, w.Blocked = "On", true
+	var flat map[string]string
+	if json.Unmarshal(raw, &flat) == nil {
+		return flat
 	}
-	w.Final = denied || w.hasFinalRule()
-	return w, true
+	var multi map[string][]string
+	if json.Unmarshal(raw, &multi) == nil {
+		for k, v := range multi {
+			if len(v) > 0 {
+				out[k] = v[0]
+			}
+		}
+	}
+	return out
 }
 
 func (w *WAF) addRule(r WAFRule) {
