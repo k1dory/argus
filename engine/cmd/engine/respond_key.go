@@ -662,6 +662,21 @@ func (e *engine) operatorKeys(ip, actor, reason string, now time.Time) (rows []s
 	return e.operatorKeysWhere(ip, actor, reason, now, nil)
 }
 
+// unsavedKeys — сколько ключей адреса отменено оператором без записи в журнал:
+// повтор решения их дописывает.
+func (e *engine) unsavedKeys(ip string) int {
+	ip, _ = respond.CanonicalIP(ip)
+	e.respMu.Lock()
+	defer e.respMu.Unlock()
+	n := 0
+	for _, k := range e.respKeys {
+		if k.ip == ip && k.state == keyManual && k.unsaved {
+			n++
+		}
+	}
+	return n
+}
+
 // doneKeys — ключи адреса с поставленным блоком (done): второй проход снятия
 // отменяет только их — блок, который снимает этот вызов, а не новые попытки.
 func (e *engine) doneKeys(ip string) map[string]bool {
@@ -803,8 +818,8 @@ func (e *engine) hasExcludedKeys(incident string, now time.Time) bool {
 		if k.incident != incident || k.state != keyExcluded {
 			continue
 		}
-		if x, ok := e.respExcluded[k.ip]; !ok || !x.until.After(now) {
-			return true
+		if x, ok := e.respExcluded[k.ip]; !ok || x.revoked() || !x.until.After(now) {
+			return true // исключения нет, оно кончилось или отозвано (надгробие — не исключение)
 		}
 	}
 	return false

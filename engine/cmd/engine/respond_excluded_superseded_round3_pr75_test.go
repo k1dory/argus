@@ -22,7 +22,9 @@ import (
 // so it cannot accidentally restore a terminal row excluded by ResponsesSince.
 func round3PR75JournalWithReadWindows(t *testing.T, f *fakeCH) *store.ClickHouse {
 	t.Helper()
-	longWindow := regexp.MustCompile(`(?s)OR\s+\((.*?)\s+AND\s+ts\s*>=\s*\{exclude_since:DateTime\}`)
+	// Long window: step=exclude rows and the whole history of keys that were ever
+	// excluded within it (the subquery on (incident_id, ip)).
+	longWindow := regexp.MustCompile(`(?s)ts\s*>=\s*\{exclude_since:DateTime\}\s+AND\s+\(step\s*=\s*'exclude'\s+OR\s+\(incident_id,\s*ip\)\s+IN\s+\(SELECT incident_id, ip FROM response_log WHERE step\s*=\s*'excluded'`)
 	journal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -43,21 +45,29 @@ func round3PR75JournalWithReadWindows(t *testing.T, f *fakeCH) *store.ClickHouse
 				return
 			}
 		}
-		longSteps := longWindow.FindStringSubmatch(string(body))
-		if len(longSteps) != 2 {
+		if !longWindow.MatchString(string(body)) {
 			t.Error("fixture: update the time-window evaluator for the new SQL shape")
 			http.Error(w, "fixture query unsupported", http.StatusBadRequest)
 			return
 		}
+		var all []store.ResponseRow
+		var lines []string
+		excludedKey := map[[2]string]bool{}
 		for _, line := range f.rows("response_log") {
 			var row store.ResponseRow
 			if err := json.Unmarshal([]byte(line), &row); err != nil {
 				t.Errorf("fixture: invalid journal row: %v", err)
 				return
 			}
-			if row.IP != "" && row.Step != "" && (row.TS >= since ||
-				(strings.Contains(longSteps[1], "'"+row.Step+"'") && row.TS >= excludeSince)) {
-				_, _ = io.WriteString(w, line+"\n")
+			all, lines = append(all, row), append(lines, line)
+			if row.Step == "excluded" && row.TS >= excludeSince {
+				excludedKey[[2]string{row.IncidentID, row.IP}] = true
+			}
+		}
+		for i, row := range all {
+			long := row.TS >= excludeSince && (row.Step == "exclude" || excludedKey[[2]string{row.IncidentID, row.IP}])
+			if row.IP != "" && row.Step != "" && (row.TS >= since || long) {
+				_, _ = io.WriteString(w, lines[i]+"\n")
 			}
 		}
 	}))

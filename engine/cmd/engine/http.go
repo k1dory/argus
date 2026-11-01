@@ -266,6 +266,7 @@ func (e *engine) handler() http.Handler {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "журнал реагирования не прочитан — снятие не выполнено, повторите позже"})
 			return
 		}
+		retried, restored := e.unsavedKeys(ip), len(e.doneKeys(ip))
 		override, keys, pending := e.operatorKeys(ip, actor, in.Reason, now)
 		if len(keys) > 0 {
 			if err := e.ch.InsertResponses(ctx, override); err != nil {
@@ -292,10 +293,15 @@ func (e *engine) handler() http.Handler {
 		if errors.Is(err, respond.ErrNotBlocked) && pending > 0 {
 			res, err = []respond.Result{{Executor: "argus", OK: true, IP: ip,
 				Detail: fmt.Sprintf("блокировки ещё не было — ожидающая автоблокировка отменена (%d)", pending)}}, nil
-		} else if errors.Is(err, respond.ErrNotBlocked) && len(keys) > 0 {
-			// Повтор после предупреждения: блок уже снят, недописанное решение записано.
+		} else if errors.Is(err, respond.ErrNotBlocked) && len(keys) > 0 && retried == len(keys) {
+			// Повтор после предупреждения: блок уже снят этим же оператором, недописанное
+			// решение записано. Только для ключей, отменённых без записи, — не для done.
 			res, err = []respond.Result{{Executor: "argus", OK: true, IP: ip,
 				Detail: fmt.Sprintf("блок уже снят — решение оператора записано в журнал (%d)", len(keys))}}, nil
+		} else if errors.Is(err, respond.ErrNotBlocked) && restored > 0 {
+			// Ключ done из журнала, а список активных блокировок рестарт потерял: блок,
+			// скорее всего, ещё стоит на исполнителе — успехом это не назвать.
+			err = fmt.Errorf("%w: движок перезапускался и не знает исполнителей этого блока (по журналу — %d инцидент(ов)); автоблокировка по ним отменена, сам блок снимите на NGFW вручную или дождитесь TTL", err, restored)
 		}
 		rows := make([]store.ResponseRow, 0, len(res)+len(override)+1)
 		for _, x := range res {

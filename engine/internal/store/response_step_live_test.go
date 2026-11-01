@@ -35,8 +35,11 @@ func TestResponsesSinceStepLive(t *testing.T) {
 	rows = append(rows,
 		ResponseRow{TS: ts(-10 * 24 * time.Hour), IP: exclIP, Mode: "manual", Executor: "argus", Step: "exclude", Until: ts(10 * 24 * time.Hour), Actor: id},
 		ResponseRow{TS: ts(-40 * 24 * time.Hour), IP: exclIP, Mode: "manual", Executor: "argus", Step: "exclude", Until: ts(-39 * 24 * time.Hour), Actor: id},
-		// ключ, отложенный исключением 3 суток назад, — тоже за окном исключений
-		ResponseRow{TS: ts(-72 * time.Hour), IncidentID: id + "-X", IP: exclIP, Mode: "manual", Executor: "argus", Step: "excluded", Actor: id},
+		// ключ, отложенный исключением 4 суток назад, и его более поздняя строка manual
+		// (3 суток) — оба за окном исключений; чужой ключ без excluded — нет
+		ResponseRow{TS: ts(-96 * time.Hour), IncidentID: id + "-X", IP: exclIP, Mode: "manual", Executor: "argus", Step: "excluded", Actor: id},
+		ResponseRow{TS: ts(-72 * time.Hour), IncidentID: id + "-X", IP: exclIP, Mode: "manual", Executor: "argus", Step: "manual", Actor: id},
+		ResponseRow{TS: ts(-72 * time.Hour), IncidentID: id + "-Y", IP: exclIP, Mode: "ips", Executor: "argus", Step: "blocked", Actor: id},
 	)
 	if err := c.InsertResponses(ctx, rows); err != nil {
 		t.Fatal(err)
@@ -54,7 +57,8 @@ func TestResponsesSinceStepLive(t *testing.T) {
 			excl = append(excl, r)
 		}
 	}
-	if len(excl) != 2 || excl[0].Step != "exclude" || excl[0].Until != ts(10*24*time.Hour) || excl[0].IncidentID != "" || excl[1].Step != "excluded" {
+	if len(excl) != 3 || excl[0].Step != "exclude" || excl[0].Until != ts(10*24*time.Hour) || excl[0].IncidentID != "" ||
+		excl[1].Step != "excluded" || excl[2].Step != "manual" || excl[2].IncidentID != id+"-X" {
 		t.Fatalf("исключение адреса за 30 дней: %+v", excl)
 	}
 	if len(mine) != 2 || mine[0].TS != ts(0) || mine[0].RuleID != "t-waf" {
