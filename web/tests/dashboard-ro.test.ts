@@ -73,8 +73,8 @@ test("панель: не-200 и X-ClickHouse-Exception-Code — ошибка с 
     status: 500, headers: { "X-ClickHouse-Exception-Code": "241" },
   }));
   const d = await runPanelQuery("SELECT 1 AS n", "24h");
-  assert.match(d.error ?? "", /код 241/);
-  assert.match(d.errorDetail ?? "", /Memory limit/);
+  assert.equal(d.error, "код 241 (MEMORY_LIMIT_EXCEEDED)");
+  assert.equal(d.errorDetail, undefined, "текст исключения не передаётся (цитирует данные); без query_id подробности нет");
 });
 
 test("панель: «Code: …» внутри данных не исключение — смотрим только последнюю строку", async (t) => {
@@ -85,16 +85,17 @@ test("панель: «Code: …» внутри данных не исключе�
   assert.equal(d.rows.length, 2);
 });
 
-test("панель: хвост \"} у исключения отрезан", async (t) => {
+test("панель: исключение {\"exception\": …} после строк — ошибка с кодом и именем, без текста", async (t) => {
   t.mock.method(globalThis, "fetch", async () => new Response('{"n":1}\n{"exception": "Code: 159. DB::Exception: Timeout exceeded"}\n'));
   const d = await runPanelQuery("SELECT 2 AS n", "24h");
-  assert.equal(d.errorDetail, "Code: 159. DB::Exception: Timeout exceeded");
+  assert.equal(d.error, "код 159 (TIMEOUT_EXCEEDED)");
+  assert.deepEqual(d.rows, []);
 });
 
-test("панель: оборванный JSON — «ответ ClickHouse оборван» и truncated", async (t) => {
+test("панель: оборванный JSON — «ответ не JSON» и truncated", async (t) => {
   t.mock.method(globalThis, "fetch", async () => new Response('{"n":1}\n{"n":'));
   const d = await runPanelQuery("SELECT 3 AS n", "24h");
-  assert.equal(d.error, "ответ ClickHouse оборван");
+  assert.equal(d.error, "ответ ClickHouse не JSON (оборван или задан другой FORMAT)");
   assert.equal(d.truncated, true);
 });
 

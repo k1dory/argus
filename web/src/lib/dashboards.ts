@@ -5,7 +5,7 @@
 import "server-only";
 import { promises as fs } from "fs";
 import path from "path";
-import { chCommand, chQuery, createLimiter, LimiterWaitError, shortChError } from "./clickhouse";
+import { chCommand, chExceptionIndex, chQuery, createLimiter, headerChCode, LimiterWaitError, shortChError } from "./clickhouse";
 import { RANGES, type RangeKey } from "./shared/ranges";
 import { normalizeSpec, refreshSeconds, SPEC_LIMITS, SpecError, type DashboardSpec, type Panel, type PanelType } from "./shared/dashboard-spec";
 import { wazuhEnabled } from "./integrations";
@@ -146,8 +146,9 @@ export function expandMacros(sql: string, range: RangeKey): string {
 }
 
 /**
- * error — короткая причина для всех; errorDetail — полный ответ ClickHouse,
- * страница отдаёт его только тем, кто может править дашборд.
+ * error — «код N (ИМЯ)» для всех; errorDetail — query_id запроса (полный текст ошибки
+ * оператор смотрит в system.query_log), страница отдаёт его тем, кто правит дашборд.
+ * Тело ответа ClickHouse не передаётся: текст исключения цитирует данные.
  */
 /** truncated — ответ неполный: обрезан до PANEL_MAX_ROWS строк или оборван посреди JSON. */
 export type PanelData = { columns: string[]; rows: Record<string, unknown>[]; error?: string; errorDetail?: string; ms: number; cached?: boolean; truncated?: boolean };
@@ -200,14 +201,6 @@ export function stripPanelDetail(d: PanelData): PanelData {
   return rest;
 }
 
-/** Исключение после HTTP 200 (таймаут посреди выдачи) — всегда последняя строка ответа:
- *  в JSONEachRow это {"exception": "Code: …"} или голый «Code: …». */
-export function trailingChException(text: string): string | null {
-  const last = text.trimEnd().split("\n").at(-1) ?? "";
-  const m = /^(?:\{"exception":\s*")?(Code:\s*\d+\.\s*DB::Exception:.*?)(?:"\})?$/.exec(last);
-  return m ? m[1] : null;
-}
-
 async function executePanel(sql: string, range: RangeKey, signal?: AbortSignal): Promise<PanelData> {
   const err = validateSql(sql);
   if (err) return { columns: [], rows: [], error: err, ms: 0 };
@@ -231,11 +224,13 @@ async function executePanel(sql: string, range: RangeKey, signal?: AbortSignal):
       signal: signal ? AbortSignal.any([timeout, signal]) : timeout,
     });
     const text = await resp.text();
-    const exception = resp.ok ? trailingChException(text) : null;
-    if (!resp.ok || exception || Number(resp.headers.get("X-ClickHouse-Exception-Code")) > 0) {
-      const detail = exception ?? text;
-      const { message } = shortChError(detail, resp.status);
-      return { columns: [], rows: [], error: message, errorDetail: detail.slice(0, 2000), ms: Date.now() - started };
+    const at = chExceptionIndex(text);
+    const headerCode = headerChCode(resp.headers.get("X-ClickHouse-Exception-Code"));
+    if (!resp.ok || at >= 0 || headerCode != null) {
+      const { message } = shortChError(at >= 0 ? text.slice(at) : resp.ok ? "" : text, resp.status, headerCode);
+      const queryId = resp.headers.get("X-ClickHouse-Query-Id") ?? "";
+      console.error(`panel query ${resp.status}: ${message}${queryId ? ` query_id=${queryId}` : ""}`);
+      return { columns: [], rows: [], error: message, ...(queryId ? { errorDetail: `query_id: ${queryId}` } : {}), ms: Date.now() - started };
     }
     // result_overflow_mode=break режет по блокам, строк бывает больше лимита.
     const lines = text.split("\n").filter(Boolean);
@@ -244,8 +239,9 @@ async function executePanel(sql: string, range: RangeKey, signal?: AbortSignal):
     return { columns, rows, ms: Date.now() - started, ...(lines.length > PANEL_MAX_ROWS ? { truncated: true } : {}) };
   } catch (e) {
     if (e instanceof SyntaxError) {
-      console.error("panel query: оборванный JSON:", e.message);
-      return { columns: [], rows: [], error: "ответ ClickHouse оборван", truncated: true, ms: Date.now() - started };
+      // e.message цитирует фрагмент ответа (данные, например FORMAT TabSeparated).
+      console.error("panel query: ответ не JSONEachRow (оборван или задан другой FORMAT)");
+      return { columns: [], rows: [], error: "ответ ClickHouse не JSON (оборван или задан другой FORMAT)", truncated: true, ms: Date.now() - started };
     }
     const name = e instanceof Error ? e.name : "";
     console.error("panel query:", e instanceof Error ? `${e.name}: ${e.message}` : e);

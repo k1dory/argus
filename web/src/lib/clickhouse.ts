@@ -101,11 +101,27 @@ function maskSqlLiterals(sql: string): string {
  *  не выводится вовсе: он цитирует данные запроса (строку INSERT, параметр, значение
  *  колонки) — замаскировать его регулярками надёжно нельзя (вложенные кавычки, обрезка,
  *  JSON-обёртка). Полный текст — в system.query_log по query_id. */
+/** Строка исключения ClickHouse 24.8 (Exception.cpp, getCurrentExceptionMessageAndPattern):
+ *  «Code: N. DB::Exception: …», «Poco::Exception. Code: 1000, …», «std::exception. Code: 1001, …»,
+ *  отдельной строкой или в JSONEachRow объектом {"exception": "…"} — в том числе после
+ *  HTTP 200 и уже отданных строк результата. */
+const CH_EXCEPTION_RE = /^(?:\{"exception":\s*")?(?:Poco::Exception\. |std::exception\. )?Code:\s*(\d+)[.,]/m;
+
+/** Позиция исключения ClickHouse в теле ответа (или -1). */
+export function chExceptionIndex(text: string): number {
+  return CH_EXCEPTION_RE.exec(text)?.index ?? -1;
+}
+
+/** X-ClickHouse-Exception-Code — только целое число; иначе (мусор, «__proto__») — нет кода. */
+export function headerChCode(value: string | null): number | null {
+  return value && /^\d{1,6}$/.test(value.trim()) && Number(value) > 0 ? Number(value) : null;
+}
+
 export function shortChError(text: string, status: number | null, headerCode: number | null = null): { message: string; code: number | null } {
-  const parsed = Number(/(?:^|\{"exception":\s*")Code:\s*(\d+)\./m.exec(text)?.[1] ?? NaN);
+  const parsed = Number(CH_EXCEPTION_RE.exec(text)?.[1] ?? NaN);
   const code = headerCode && headerCode > 0 ? headerCode : Number.isFinite(parsed) ? parsed : null;
   if (code != null) {
-    const name = CH_ERROR_NAMES[code];
+    const name = Object.hasOwn(CH_ERROR_NAMES, code) ? CH_ERROR_NAMES[code] : undefined;
     return { message: name ? `код ${code} (${name})` : `код ${code}`, code };
   }
   if (status === 401 || status === 403) return { message: "доступ к ClickHouse отклонён (учётные данные консоли)", code: null };
@@ -188,12 +204,12 @@ async function chFetchWithSlot(sql: string, params: Record<string, string | numb
   // ClickHouse может дописать исключение после HTTP 200 — строкой «Code: …» или, в
   // JSONEachRow, объектом {"exception": "Code: …"}. Значения JSON экранируют переводы
   // строк, поэтому в счёт идёт только отдельная строка.
-  const exception = /^(?:\{"exception":\s*")?Code:\s*\d+\.\s*DB::Exception:/m.exec(text);
-  const headerCode = Number(resp.headers.get("X-ClickHouse-Exception-Code"));
-  if (!resp.ok || exception || headerCode > 0) {
+  const exception = CH_EXCEPTION_RE.exec(text);
+  const headerCode = headerChCode(resp.headers.get("X-ClickHouse-Exception-Code"));
+  if (!resp.ok || exception || headerCode != null) {
     // Ни тело ответа, ни текст исключения в журнал не идут (строки результата и
     // цитаты данных) — только код, имя, статус, query_id и SQL без данных.
-    const { message, code } = shortChError(exception ? text.slice(exception.index) : resp.ok ? "" : text, resp.status, headerCode > 0 ? headerCode : null);
+    const { message, code } = shortChError(exception ? text.slice(exception.index) : resp.ok ? "" : text, resp.status, headerCode);
     const queryId = resp.headers.get("X-ClickHouse-Query-Id") ?? "";
     console.error(`clickhouse ${resp.status}: ${message}${queryId ? ` query_id=${queryId}` : ""}`, "\nSQL:", sqlForLog(sql));
     throw new ClickHouseError(message, resp.status, code);
@@ -214,10 +230,19 @@ export function sqlForLog(sql: string): string {
 /** settings — серверные настройки ClickHouse на запрос (max_execution_time и т.п.). */
 export async function chQuery<T>(sql: string, params: Record<string, string | number> = {}, settings: Record<string, string | number> = {}): Promise<T[]> {
   const text = await chFetch(sql, params, settings, "JSONEachRow");
-  return text
-    .split("\n")
-    .filter(Boolean)
-    .map((line) => JSON.parse(line) as T);
+  try {
+    return text
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as T);
+  } catch (e) {
+    // SyntaxError JSON.parse цитирует фрагмент входа (данные) в message и stack.
+    if (e instanceof SyntaxError) {
+      console.error("clickhouse: ответ не JSONEachRow", "\nSQL:", sqlForLog(sql));
+      throw new ClickHouseError("ответ ClickHouse не JSON");
+    }
+    throw e;
+  }
 }
 
 /** Запрос без результата (INSERT/DDL); параметры — тем же server-side binding. */
