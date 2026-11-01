@@ -34,7 +34,7 @@ func TestPR16Round4CEFLEEFIgnoreWAFMarkersInSyslogHeader(t *testing.T) {
 			} {
 				t.Run(format.name+"/"+envelope.name+"/"+extension.name, func(t *testing.T) {
 					line := envelope.prefix + format.payload + extension.value
-					events := wafHTTPBatch(t, "/ingest/syslog", line, "192.0.2.20:31000")
+					events := wafHTTPBatchAs(t, "/ingest/syslog", line, "192.0.2.20:31000", formatOf(line))
 					if len(events) != 1 {
 						t.Fatalf("vendor event discarded as an intermediate WAF warning: accepted=%d, want=1", len(events))
 					}
