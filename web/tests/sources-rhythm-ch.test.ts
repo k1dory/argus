@@ -83,9 +83,14 @@ test("больше 2000 молчащих: порядок при равном в�
   const n = limit + 5;
   const baseline = await q().sourcesHealthReport();
   const beforeQuiet = baseline.sources.filter((s) => s.events_1h === 0);
-  assert.ok(beforeQuiet.every((s) => s.silent_for_sec > 70 * 60), "фикстура cap должна быть новее ранее вставленных молчащих источников");
   const beforeTotal = beforeQuiet.length + baseline.omitted;
-  const [stamp] = await c.chQuery<{ ts: string }>("SELECT toString(now() - INTERVAL 65 MINUTE) AS ts");
+  // Общая живая база хранит молчащие источники прошлых прогонов (других файлов и этого):
+  // фикстура cap ставится на секунду новее самого свежего из них, но не ближе 61 минуты
+  // к «сейчас», чтобы за время теста не попасть в events_1h. Иначе прогон через час
+  // после предыдущего ловил чужие источники среди своих.
+  const freshest = Math.min(70 * 60, ...beforeQuiet.map((s) => s.silent_for_sec)) - 2;
+  assert.ok(freshest > 61 * 60, `молчащий источник прошлого прогона слишком свежий (${freshest + 2} с) — повторите через минуту`);
+  const [stamp] = await c.chQuery<{ ts: string }>("SELECT toString(now() - toIntervalSecond({s:UInt32})) AS ts", { s: freshest });
   await c.chCommand(`INSERT INTO events (ts, received_at, source, source_class, action)
     SELECT toDateTime({ts:String}), toDateTime({ts:String}), concat({prefix:String}, leftPad(toString(number), 5, '0')), 'system', 'x'
     FROM numbers({n:UInt32}) ORDER BY number DESC`, { ts: stamp.ts, prefix, n });
