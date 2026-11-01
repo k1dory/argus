@@ -130,7 +130,7 @@ func TestPR59AckRetryLoopSurvivesConcurrentRetryReturningDebt(t *testing.T) {
 		t.Fatalf("unexpected directory-open error: %v", err)
 	}
 	paused := &pr59AckRetryPauseHandler{
-		Handler: previousLogger.Handler(), dir: dir,
+		Handler: slog.NewTextHandler(os.Stderr, nil), dir: dir,
 		entered: make(chan struct{}), resume: resume,
 	}
 	slog.SetDefault(slog.New(paused))
