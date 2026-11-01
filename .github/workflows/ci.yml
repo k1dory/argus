@@ -209,6 +209,11 @@ jobs:
       - run: APP_VERSION=ci docker compose --env-file .env.dev -f docker-compose.yml -f docker-compose.dev.yml --profile wazuh --profile mcp build
       - name: mcp без compose — как в release.yml (именованный контекст triage)
         run: docker build -q --build-context triage=./triage -t argus-ci/mcp:check ./mcp
+      - name: engine — как в release.yml (поставляемый набор для internal/registry в образе)
+        run: |
+          docker build -q --build-context rules=./rules --build-context fixtures=./fixtures/events -t argus-ci/engine:check ./engine
+          docker run --rm --entrypoint /bin/busybox argus-ci/engine:check test -s /usr/share/argus/shipped/rules/host-ssh-bruteforce.yml
+          docker run --rm --entrypoint /bin/busybox argus-ci/engine:check sh -c 'ls /usr/share/argus/shipped/fixtures/*.ndjson >/dev/null'
 
   e2e:
     # Полный контур в docker compose: replay → инциденты и вердикты, argus_ro только читает,

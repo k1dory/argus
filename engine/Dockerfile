@@ -7,6 +7,12 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -o /engine ./cmd/engine
 
+# Поставляемый набор для реестра (internal/registry) — именованные контексты rules
+# и fixtures (release.yml: build-contexts). Без них — пустые стадии: образ
+# собирается и classic builder'ом, но engine dataset export отказывает без реестра.
+FROM scratch AS rules
+FROM scratch AS fixtures
+
 # Статический busybox — только ради healthcheck (wget --spider) в distroless.
 FROM ${REGISTRY}/library/busybox:1.37-musl@sha256:fc6dddc4c44b1bfe37f41cae8e67d1693828e8f42a91862816d7953e2c9d3f23 AS busybox
 
@@ -14,6 +20,13 @@ FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c
 COPY --from=busybox /bin/busybox /bin/busybox
 COPY --from=build /engine /engine
 COPY argus.analyst.yml /etc/argus/argus.analyst.yml
+# Поставляемый набор этой версии — реестр для состояния моделей решений и
+# датасета (internal/registry): правила и фикстуры событий. Контексты передаёт
+# release.yml; вручную: docker buildx build --build-context rules=./rules
+# --build-context fixtures=./fixtures/events ./engine. RULES_DIR (/rules) может
+# содержать и пользовательские правила — реестр берёт только эту копию, не /rules.
+COPY --from=rules . /usr/share/argus/shipped/rules
+COPY --from=fixtures . /usr/share/argus/shipped/fixtures
 ENV ANALYST_CONFIG=/etc/argus/argus.analyst.yml RULES_DIR=/rules
 EXPOSE 8090
 ENTRYPOINT ["/engine"]
