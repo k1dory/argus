@@ -413,7 +413,9 @@ func (e *engine) restoreKeysLocked(ctx context.Context, now time.Time) bool {
 	if done {
 		return true
 	}
-	rows, err := e.ch.ResponsesSince(ctx, now.Add(-e.respRetention()), now.Add(-excludeMaxTTL))
+	// Исключения и отложенные ими ключи — за весь возможный срок исключения плюс
+	// хранение: ключ, отложенный 72 ч назад, иначе потерялся бы при рестарте.
+	rows, err := e.ch.ResponsesSince(ctx, now.Add(-e.respRetention()), now.Add(-excludeMaxTTL-e.respRetention()))
 	if err != nil {
 		slog.Warn("ips: решения автоответа не восстановлены из response_log — новые блокировки отложены до чтения журнала", "err", err)
 		return false
@@ -475,11 +477,8 @@ func (e *engine) restoreKeysLocked(ctx context.Context, now time.Time) bool {
 		}
 	}
 	for ip, x := range lastExcl {
-		if local, ok := e.respExcluded[ip]; ok && !x.at.After(local.at) {
-			continue
-		}
 		// и истёкшее и отзыв — тоже: срок нужен очистке ключей, отзыв — против старых снимков
-		e.respExcluded[ip] = x
+		e.mergeExclusionLocked(ip, x)
 	}
 	for key, l := range byKey {
 		if _, known := e.respKeys[key]; known {
@@ -628,10 +627,28 @@ func (e *engine) excludedUntil(ip string, now time.Time) (time.Time, bool) {
 	e.respMu.Lock()
 	defer e.respMu.Unlock()
 	x, ok := e.respExcluded[ip]
-	if !ok || !x.until.After(now) {
-		return time.Time{}, false
+	if !ok || x.revoked() || !x.until.After(now) {
+		return time.Time{}, false // надгробие отзыва не исключает даже для цикла, начатого раньше отзыва
 	}
 	return x.until, true
+}
+
+// revoked — запись — отзыв (надгробие): until не позже времени решения.
+func (x exclusion) revoked() bool { return !x.until.After(x.at) }
+
+// newerThan — решение x главнее cur: позже по времени, а при равном времени отзыв
+// главнее исключения (порядок строк одной секунды не гарантирован).
+func (x exclusion) newerThan(cur exclusion) bool {
+	return x.at.After(cur.at) || (x.at.Equal(cur.at) && x.revoked() && !cur.revoked())
+}
+
+// mergeExclusionLocked — единственный путь применения решения по исключению адреса
+// (HTTP после записи, снимок журнала): применяется, только если главнее текущего.
+func (e *engine) mergeExclusionLocked(ip string, x exclusion) {
+	if cur, ok := e.respExcluded[ip]; ok && !x.newerThan(cur) {
+		return
+	}
+	e.respExcluded[ip] = x
 }
 
 // operatorKeys — решение оператора по ключам адреса, которые есть сейчас: в
@@ -752,7 +769,7 @@ func excludeRow(ip, actor, reason string, now, until time.Time) store.ResponseRo
 func (e *engine) setExclusion(ip string, x exclusion) {
 	e.respMu.Lock()
 	defer e.respMu.Unlock()
-	e.respExcluded[ip] = x
+	e.mergeExclusionLocked(ip, x)
 }
 
 // Exclusion — исключённый адрес для /respond/status.
@@ -769,7 +786,7 @@ func (e *engine) exclusions(now time.Time) []Exclusion {
 	defer e.respMu.Unlock()
 	out := []Exclusion{}
 	for ip, x := range e.respExcluded {
-		if x.until.After(now) {
+		if !x.revoked() && x.until.After(now) {
 			out = append(out, Exclusion{IP: ip, Since: model.FormatTS(x.at)[:19], Until: model.FormatTS(x.until)[:19], Actor: x.actor, Reason: x.reason})
 		}
 	}

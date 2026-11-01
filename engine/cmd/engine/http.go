@@ -292,6 +292,10 @@ func (e *engine) handler() http.Handler {
 		if errors.Is(err, respond.ErrNotBlocked) && pending > 0 {
 			res, err = []respond.Result{{Executor: "argus", OK: true, IP: ip,
 				Detail: fmt.Sprintf("блокировки ещё не было — ожидающая автоблокировка отменена (%d)", pending)}}, nil
+		} else if errors.Is(err, respond.ErrNotBlocked) && len(keys) > 0 {
+			// Повтор после предупреждения: блок уже снят, недописанное решение записано.
+			res, err = []respond.Result{{Executor: "argus", OK: true, IP: ip,
+				Detail: fmt.Sprintf("блок уже снят — решение оператора записано в журнал (%d)", len(keys))}}, nil
 		}
 		rows := make([]store.ResponseRow, 0, len(res)+len(override)+1)
 		for _, x := range res {
