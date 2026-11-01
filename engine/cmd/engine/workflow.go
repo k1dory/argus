@@ -18,6 +18,8 @@ type workflowRequest struct {
 	Status string `json:"status"`
 	Owner  string `json:"owner"`
 	Reason string `json:"reason"`
+	// Label — ответ человека, только при завершении (closed, false_positive).
+	Label *closureLabel `json:"label,omitempty"`
 }
 
 var errIncidentMissing = errors.New("инцидент не найден")
@@ -39,6 +41,9 @@ func workflowDecision(inc *incidents.Incident, in workflowRequest) (status, owne
 	}
 	if inc.Status == incidents.StatusClosed || inc.Status == incidents.StatusFalsePositive {
 		return "", "", workflowUserError("инцидент уже завершён")
+	}
+	if in.Kind != "status" && in.Label != nil {
+		return "", "", workflowUserError("метка ставится только при завершении")
 	}
 	switch in.Kind {
 	case "take":
@@ -75,6 +80,9 @@ func workflowDecision(inc *incidents.Incident, in workflowRequest) (status, owne
 			if inc.Status == in.Status {
 				return "", "", workflowUserError("статус не изменился")
 			}
+			if err := validateLabel(inc, in.Status, in.Label); err != nil {
+				return "", "", err
+			}
 			return in.Status, in.Actor, nil
 		default:
 			return "", "", workflowUserError("некорректный статус")
@@ -95,7 +103,7 @@ func (e *engine) transitionIncident(ctx context.Context, id string, in workflowR
 	if err != nil {
 		return store.IncidentStateEvent{}, err
 	}
-	event, err := e.ch.AppendIncidentState(ctx, id, in.Actor, in.Kind, status, owner, strings.TrimSpace(in.Reason))
+	event, err := e.ch.AppendIncidentState(ctx, id, in.Actor, in.Kind, status, owner, strings.TrimSpace(in.Reason), storeLabel(id, in.Label))
 	if err == nil && status == incidents.StatusEscalated && inc.Status != incidents.StatusEscalated {
 		esc := *inc
 		esc.Status, esc.Owner = status, owner

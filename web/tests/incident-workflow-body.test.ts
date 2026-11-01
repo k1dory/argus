@@ -32,3 +32,24 @@ test("тело workflow — только поля, которые принима
   }
   assert.equal(seen[1].body.status, "closed");
 });
+
+test("метка ответа в теле workflow — только поля closureLabel движка", async (t) => {
+  const src = fs.readFileSync(path.resolve(__dirname, "../../engine/cmd/engine/labels.go"), "utf8");
+  const block = src.match(/type closureLabel struct \{([\s\S]*?)\n\}/);
+  assert.ok(block, "closureLabel в движке");
+  const allowed = new Set([...block[1].matchAll(/json:"([a-z_]+)"/g)].map((m) => m[1]));
+  const bodies: Record<string, unknown>[] = [];
+  t.mock.method(globalThis, "fetch", async (_url: unknown, init?: RequestInit) => {
+    bodies.push(JSON.parse(String(init?.body ?? "{}")));
+    return new Response("{}", { status: 200 });
+  });
+  await incidentTransition({ id: "INC-7", kind: "status", status: "closed", reason: "проверено по журналу", actor: "alice", role: "analyst",
+    label: { disposition: "malicious", escalate: true, severity_correct: false } });
+  await incidentTransition({ id: "INC-8", kind: "status", status: "closed", reason: "плановые работы на узле", actor: "alice", role: "analyst",
+    label: { ops_cause: "planned_work", ops_action: "no_action" } });
+  for (const body of bodies) {
+    assert.equal(typeof body.label, "object");
+    for (const k of Object.keys(body.label as object)) assert.ok(allowed.has(k), `поле метки ${k} движок отвергнет`);
+  }
+  assert.deepEqual(bodies[0].label, { disposition: "malicious", escalate: true, severity_correct: false });
+});
