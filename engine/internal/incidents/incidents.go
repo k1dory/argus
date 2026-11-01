@@ -367,6 +367,7 @@ func (r *Registry) Reconcile(toWrite []*Incident, ops map[string]Operator, engin
 				// Оператор закрыл сам — движку нечего добавить; эскалация
 				// тишиной не перебивает статус, который оператор уже поставил.
 				inc.Status, inc.Owner, inc.Note = op.Status, op.Owner, op.Note
+				inc.groupPending = false // строка не пишется: повторять присвоение незачем
 				continue
 			}
 			// Закрытие движком: заметка оператора остаётся, наша дописывается.
@@ -377,7 +378,11 @@ func (r *Registry) Reconcile(toWrite []*Incident, ops map[string]Operator, engin
 		} else {
 			inc.Status, inc.Owner, inc.Note = op.Status, op.Owner, op.Note
 			if isFinal(op.Status) {
-				continue // оператор закрыл — новые события заведут новый инцидент
+				// Оператор закрыл — новые события заведут новый инцидент, а
+				// неподтверждённый group_key больше не повторяется (иначе каждый
+				// цикл сдвигал бы updated_at, и Prune инцидент не убрал бы).
+				inc.groupPending = false
+				continue
 			}
 		}
 		if op.UpdatedAt >= inc.UpdatedAt {
@@ -445,7 +450,14 @@ func (r *Registry) Close(ruleID, key, note string, evTS, now time.Time) *Inciden
 		if last := (&model.Event{TS: inc.LastTS}).Time(); !evTS.IsZero() && !last.IsZero() && !evTS.After(last) {
 			continue
 		}
-		if inc.ActorName == key || inc.Node == key || (inc.GroupKey != "" && inc.GroupKey == key) || strings.HasPrefix(k, ruleID+"|"+key+"|") {
+		// С group_key — только точное совпадение группы: префикс ключа реестра
+		// «правило|admin|…» у составной группы admin|адрес закрывал бы чужой адрес.
+		// Субъект, узел и префикс — для групп без ключа (и инцидентов до 0034).
+		match := inc.GroupKey == key
+		if inc.GroupKey == "" {
+			match = inc.ActorName == key || inc.Node == key || strings.HasPrefix(k, ruleID+"|"+key+"|")
+		}
+		if match {
 			inc.Status = StatusClosed
 			inc.Note = strings.TrimSpace(inc.Note + "\n" + note)
 			inc.UpdatedAt = model.FormatTS(now)[:19]
