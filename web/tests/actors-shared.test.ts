@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import {
-  ACTOR_KEYS_EXPR, actorMarkdown, aliasEventsQuery, aliasPrefilter, aliasInterval, canonicalIp, canonicalPhone, aliasPredicate, ambiguousAliases, bucketEvents, classifyEvent, clampWindow, holdPolicy, isHeld, isIp, isPhone, normalizeAliasValue, parseActorsParams, parseAliasInput, parseDateInput, parseIdentitiesDoc,
+  ACTOR_KEYS_EXPR, activityPlan, actorMarkdown, aliasEventsQuery, aliasPrefilter, PREFILTER_INDEX_MAX, aliasInterval, canonicalIp, canonicalPhone, aliasPredicate, ambiguousAliases, bucketEvents, classifyEvent, clampWindow, holdPolicy, isHeld, isIp, isPhone, normalizeAliasValue, parseActorsParams, parseAliasInput, parseDateInput, parseIdentitiesDoc,
   primaryAlias, rangeWindow, resolveStatus, aliasKey, aliasMatches, activeAliases, ACTOR_KINDS, type ActorReport, type Alias,
 } from "../src/lib/shared/actors";
 import { toLogItem } from "../src/lib/shared/log-query";
@@ -265,4 +265,38 @@ test("aliasPrefilter: hasAny по ключам индекса idx_actor_keys, р
   assert.ok(!all.includes("held"));
   assert.ok(!pf.sql.includes("a@x.org"), "значения только параметрами");
   assert.equal(aliasPrefilter([]).sql, "0");
+});
+
+test("aliasPrefilter: до PREFILTER_INDEX_MAX значений — hasAny по индексу, больше — IN по колонкам видов", () => {
+  const mk = (kind: Alias["kind"], value: string, confidence = 1): Alias => ({ person_id: "p", kind, value, valid_from: "2026-10-01 00:00:00.000", valid_to: null, source: "t", confidence, note: "" });
+  const few = aliasPrefilter([mk("login", "a"), mk("ip", "192.0.2.1"), mk("login", "held", 0.4)]);
+  assert.match(few.sql, /^hasAny\(\[actor_name, lowerUTF8\(actor_name\), src_ip, lowerUTF8\(node\)\], \{pf_keys:Array\(String\)\}\)$/);
+  assert.equal(few.params.pf_keys, "['192.0.2.1','a']", "удержанный алиас не участвует");
+  const many = [...Array(PREFILTER_INDEX_MAX + 1).keys()].map((i) => mk("email", `u${i}@example.test`));
+  many.push(mk("uid", "UID-1"), mk("ip", "192.0.2.7"), mk("host", "web-01"));
+  const big = aliasPrefilter(many);
+  assert.ok(!big.sql.includes("hasAny"), big.sql);
+  assert.equal(big.sql, "(actor_name IN {pf_in0:Array(String)} OR lowerUTF8(actor_name) IN {pf_in1:Array(String)} OR lowerUTF8(node) IN {pf_in2:Array(String)} OR src_ip IN {pf_in3:Array(String)})");
+  assert.equal(big.params.pf_in0, "['UID-1']", "uid — с учётом регистра, как у предиката");
+  assert.equal(big.params.pf_in3, "['192.0.2.7']");
+  assert.equal(aliasPrefilter([mk("login", "x", 0.1)]).sql, "0");
+});
+
+test("activityPlan: группы по ключу, номера персон, интервалы в окне, удержанные и вне окна — без плана", () => {
+  const w = { fromMs: Date.UTC(2026, 9, 20), toMs: Date.UTC(2026, 9, 27) };
+  const mk = (person: string, kind: Alias["kind"], value: string, from = "2026-10-01 00:00:00.000", to: string | null = null, confidence = 1): Alias =>
+    ({ person_id: person, kind, value, valid_from: from, valid_to: to, source: "t", confidence, note: "" });
+  const plan = activityPlan([
+    { id: "a", aliases: [mk("a", "login", "shared"), mk("a", "ip", "192.0.2.1", "2026-10-22 00:00:00.000")] },
+    { id: "b", aliases: [mk("b", "uid", "shared"), mk("b", "login", "shared")] },
+    { id: "held", aliases: [mk("held", "login", "h", undefined, null, 0.2)] },
+    { id: "old", aliases: [mk("old", "login", "o", "2026-09-01 00:00:00.000", "2026-10-01 00:00:00.000")] },
+  ], w);
+  assert.deepEqual(plan.persons, ["a", "b"], "без алиасов в окне — не в плане");
+  assert.equal(plan.params.ap_k1, "['','shared']", "одно значение login — одна группа");
+  assert.equal(plan.params.ap_g1, "[0,1]");
+  assert.equal(plan.params.ap_ga, "[[],[1,4],[2],[3]]", "группа 1: login shared у a и b");
+  assert.equal(plan.params.ap_pi, "[1,1,2,2]");
+  assert.equal(plan.params.ap_vf, `[${w.fromMs},${Date.UTC(2026, 9, 22)},${w.fromMs},${w.fromMs}]`, "интервал — внутри окна");
+  assert.ok(!/ OR /.test(plan.sql) && plan.sql.includes("arrayDistinct"));
 });

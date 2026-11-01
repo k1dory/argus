@@ -248,3 +248,14 @@ func TestDatasetExportRequiresSecret(t *testing.T) {
 		t.Fatalf("код %d", code)
 	}
 }
+
+// Без копии поставляемого набора export отказывает: иначе все правила и
+// действия стали бы «[rule]» / «[action]».
+func TestDatasetExportRequiresShippedRegistry(t *testing.T) {
+	t.Setenv("ARGUS_DATASET_SECRET", strings.Repeat("s", 32))
+	t.Setenv("ARGUS_SHIPPED_DIR", t.TempDir())
+	t.Setenv("CLICKHOUSE_URL", "http://127.0.0.1:1")
+	if code := datasetCmd([]string{"export", "--out", filepath.Join(t.TempDir(), "x.jsonl")}); code != 2 {
+		t.Fatalf("код %d", code)
+	}
+}

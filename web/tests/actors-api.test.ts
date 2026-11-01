@@ -63,6 +63,11 @@ globalThis.fetch = (async (url: URL | string, init?: RequestInit) => {
   const p = u.searchParams;
   calls.push({ sql, params: p });
   if (sql.startsWith("INSERT")) return fail.insert ? new Response("Code: 241. DB::Exception: Memory limit exceeded", { status: 500 }) : new Response("");
+  if (sql.includes("ARRAY JOIN ps AS p") && sql.includes("FROM events")) {
+    // Активность списка персон: по строке на номер персоны из плана (ap_pi).
+    const nos = [...new Set((p.get("param_ap_pi") ?? "[]").slice(1, -1).split(",").filter(Boolean))];
+    return rows(nos.map((n) => ({ p: n, events: "2", last_ts: "2026-10-24 11:00:00.000" })));
+  }
   if (sql.includes("countIf(")) {
     // Список персон: на персону — e<j>/l<j> или i<j>; отвечаем по именам колонок из SQL.
     const out: Record<string, string> = {};
@@ -379,22 +384,22 @@ test("аудит мутаций обязателен: нет журнала — 
   }
 });
 
-test("список персон: каждая считается своим предикатом по алиасам, без дедупликации по хешу", async () => {
+test("список персон: один проход по ключам строки без OR по алиасам, без дедупликации по хешу", async () => {
   const { listPersons } = require("../src/lib/actors") as typeof import("../src/lib/actors"); // eslint-disable-line @typescript-eslint/no-require-imports -- после моков
   const from = since();
   const list = await listPersons("7d");
-  const ev = calls.slice(from).find((c) => c.sql.includes("countIf(") && c.sql.includes("FROM events"))!;
-  assert.ok(ev, "один проход по окну событий на партию персон");
-  assert.ok(!ev.sql.includes("cityHash64") && !ev.sql.includes("uniqExact") && !ev.sql.includes("JOIN"), "два разных события в одну мс — два события: считается countIf по предикату");
-  assert.match(ev.sql, /countIf\(\(\(lowerUTF8\(actor_name\) = \{p0_a0:String\}/, "предикат персоны 0 с её префиксом параметров");
-  assert.ok(ev.sql.includes("AS e1") && ev.sql.includes("AS l1"), "вторая персона — свои колонки");
-  assert.equal(ev.params.get("param_p0_a0"), "project_7_bot");
-  // Предфильтр в WHERE: без него точные countIf шли по всему окну и на живом потоке
-  // (100+ млн строк за 7 суток) упирались в max_execution_time.
-  assert.match(ev.sql, /WHERE ts >= .* AND hasAny\(\[actor_name, lowerUTF8\(actor_name\), src_ip, lowerUTF8\(node\)\], \{pf_keys:Array\(String\)\}\)/, "предфильтр по индексу ключей алиасов");
-  const pfVals = [...ev.params.entries()].filter(([k]) => k.startsWith("param_pf_")).map(([, v]) => v).join(" ");
-  assert.ok(pfVals.includes("'project_7_bot'"), "значения алиасов — массивом-параметром");
-  assert.ok(!pfVals.includes("held_bot"), "удержанный алиас не фильтрует");
+  const evs = calls.slice(from).filter((c) => c.sql.includes("FROM events"));
+  assert.equal(evs.length, 1, "один проход по окну событий на всех персон");
+  const ev = evs[0];
+  assert.ok(!ev.sql.includes("cityHash64") && !ev.sql.includes("uniqExact") && !ev.sql.includes("JOIN events"), "два разных события в одну мс — два события");
+  assert.ok(!/= \{p\d+_a\d+:String\}/.test(ev.sql), "без предиката на каждую персону");
+  assert.match(ev.sql, /transform\(lowerUTF8\(actor_name\), \{ap_k1:Array\(String\)\}/, "поиск по ключу строки");
+  assert.ok((ev.params.get("param_ap_k1") ?? "").includes("'project_7_bot'"), "значения алиасов — массивом-параметром");
+  // Предфильтр в WHERE: без него поиск шёл бы по всему окну (100+ млн строк за 7 суток).
+  assert.match(ev.sql, /WHERE ts >= .* AND hasAny\(\[actor_name, lowerUTF8\(actor_name\), src_ip, lowerUTF8\(node\)\], \{pf_keys:Array\(String\)\}\)/, "мало значений — предфильтр по индексу ключей алиасов");
+  const allVals = [...ev.params.entries()].map(([, v]) => v).join(" ");
+  assert.ok(allVals.includes("'project_7_bot'"));
+  assert.ok(!allVals.includes("held_bot"), "удержанный алиас не фильтрует и не считается");
   const inc = calls.slice(from).find((c) => c.sql.includes("countIf(") && c.sql.includes("FROM incidents_current"))!;
   assert.ok(inc.sql.includes("first_ts >= parseDateTime64BestEffort({p0_f0:String}"), "инциденты — по first_ts алиаса");
   const petrov = list.find((p) => p.person_id === "i.petrov")!;
@@ -402,7 +407,6 @@ test("список персон: каждая считается своим пр
   assert.equal(petrov.incidents, 1);
   assert.equal(petrov.last_ts, "2026-10-24 11:00:00.000");
   assert.equal(petrov.aliases, 4, "удержанный алиас в счётчике алиасов есть");
-  assert.ok(![...ev.params.values()].includes("held_bot"), "но в предикате активности его нет");
 });
 
 test("DELETE алиаса: valid_to = сейчас новой версией, 204; нет действующего — 404; роли", async () => {
