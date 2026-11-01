@@ -138,7 +138,10 @@ jobs:
           # переименование и удаление CHANGELOG.md тоже правка (--no-renames). Релиз —
           # это новая версия по содержимому VERSION, а не любое касание файла.
           git cat-file -e "$BASE^{commit}" || { echo "база PR $BASE недоступна"; exit 1; }
-          mb="$(git merge-base "$BASE" HEAD)"
+          # В pull_request HEAD — merge-коммит refs/pull/N/merge поверх текущего main, а
+          # base.sha события мог устареть: тогда чужие слияния в main попали бы в diff PR.
+          # База — первый родитель merge-коммита; для обычного коммита — merge-base.
+          if git rev-parse -q --verify "HEAD^2" >/dev/null; then mb="$(git rev-parse "HEAD^1")"; else mb="$(git merge-base "$BASE" HEAD)"; fi
           paths="$(mktemp)"
           git diff --no-renames --name-only -z "$mb" HEAD > "$paths"
           touched=0

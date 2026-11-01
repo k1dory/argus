@@ -355,3 +355,23 @@ func TestReleaseGuardDoesNotEmitFilenameAsWorkflowCommand(t *testing.T) {
 		}
 	}
 }
+
+// base.sha события pull_request устаревает, если main ушёл вперёд после события:
+// refs/pull/N/merge собран на новом main, и правка CHANGELOG.md в main (слияние
+// другого PR) не должна приписываться этому PR.
+func TestChangelogCIStaleEventBaseIgnoresNewerMain(t *testing.T) {
+	f := newWorkflowFixture(t)
+	f.gitOK("branch", "-M", "main")
+	staleBase := f.gitOK("rev-parse", "HEAD")
+	f.gitOK("checkout", "-qb", "feature")
+	f.write("changes/unreleased/feature.md", "- PR fragment\n")
+	feature := f.commit()
+	f.gitOK("checkout", "-q", "main")
+	f.editChangelog() // release или ручная правка в main после события PR
+	newMain := f.commit()
+	f.gitOK("checkout", "-q", "--detach", newMain)
+	f.gitOK("merge", "-q", "--no-ff", "-m", "synthetic PR merge", feature)
+	if out, err := f.ci(staleBase, "feature"); err != nil {
+		t.Fatalf("changes merged into main after the event were attributed to the PR: %v\n%s", err, out)
+	}
+}
