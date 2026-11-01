@@ -362,11 +362,26 @@ func TestBisectBudgetBoundsPoisonStorm(t *testing.T) {
 	for i := 0; i < 500; i++ {
 		batch = append(batch, ev("poison"))
 	}
+	// Один WriteBatch: не больше Attempts целых вставок плюс общий бюджет бисекции;
+	// в отказы — только строки, отвергнутые поодиночке, одним INSERT; непроверенный
+	// остаток возвращён в очередь, а не в ingest_rejects.
 	w.Write(context.Background(), batch)
-	if m.calls > 1+bisectBudget {
-		t.Errorf("InsertEvents вызван %d раз, потолок %d", m.calls, 1+bisectBudget)
+	if limit := w.Attempts + bisectBudget; m.calls > limit {
+		t.Errorf("InsertEvents вызван %d раз, потолок %d", m.calls, limit)
 	}
-	if m.rejectCalls != 1 || len(m.rejects) != 500 || st.DeadLetter.Load() != 500 {
-		t.Errorf("rejectCalls=%d rejects=%d dead=%d", m.rejectCalls, len(m.rejects), st.DeadLetter.Load())
+	first := len(m.rejects)
+	if m.rejectCalls != 1 || first == 0 || first >= 500 || st.DeadLetter.Load() != uint64(first) {
+		t.Errorf("rejectCalls=%d rejects=%d dead=%d", m.rejectCalls, first, st.DeadLetter.Load())
+	}
+	if got := w.Queue.Rows(); got != 500-first {
+		t.Errorf("в очереди %d строк, ждали %d", got, 500-first)
+	}
+	// Следующие проходы дорешивают остаток: в итоге все 500 — отказы, ни одна не потеряна.
+	w.Queue.Close()
+	for b, ok := w.Queue.Pop(); ok; b, ok = w.Queue.Pop() {
+		w.WriteBatch(context.Background(), b)
+	}
+	if len(m.rejects) != 500 || st.Inserted.Load() != 0 {
+		t.Errorf("rejects=%d inserted=%d", len(m.rejects), st.Inserted.Load())
 	}
 }
