@@ -1,5 +1,5 @@
 import { INCIDENT_STATUSES, type IncidentStatus } from "./incidents";
-import { closureLabelText } from "./closure-label";
+import { closureLabelText, type ClosureLabelView } from "./closure-label";
 
 export type WikiIncident = {
   incident_id: string; rule_title: string; rule_id: string; level: string;
@@ -13,10 +13,8 @@ export type WikiVerdict = {
 export type WikiChange = {
   changed_at: string; actor: string; kind: string; status: IncidentStatus;
   owner: string; reason: string; revision: number;
-  // Метка ответа (миграция 0033); старые события и автоматика — без неё.
-  disposition?: string; escalate?: boolean | null; severity_correct?: boolean | null;
-  ops_cause?: string; ops_action?: string; blind?: boolean;
-};
+  // Метка ответа (миграции 0033, 0036); старые события и автоматика — без неё.
+} & ClosureLabelView;
 export type WikiComment = { created_at: string; author: string; body: string };
 
 export function closingEvent<T extends WikiChange>(status: IncidentStatus, changes: T[]): T | null {

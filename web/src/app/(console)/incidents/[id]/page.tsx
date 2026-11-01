@@ -31,6 +31,7 @@ import { agentVerdictsFor, incidentComments, incidentFirstResponse, incidentGet,
 import { MarkdownBody } from "@/components/console/markdown-body";
 import { VERDICT_RU } from "@/lib/shared/triage-verdict";
 import { closureLabelText, isOpsIncident } from "@/lib/shared/closure-label";
+import { attackFormOptions } from "@/lib/shared/attack";
 import { blindComments, hideVerdicts } from "@/lib/blind";
 
 export const dynamic = "force-dynamic";
@@ -259,6 +260,7 @@ export default async function IncidentPage({ params }: PageProps<"/incidents/[id
               incidentId={inc.incident_id}
               status={inc.status}
               ops={isOpsIncident(inc.tags)}
+              attack={attackFormOptions(inc.tags)}
               owner={inc.owner}
               currentUser={session.user}
               isAdmin={session.role === "admin"}

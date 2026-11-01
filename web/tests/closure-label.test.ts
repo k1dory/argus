@@ -5,7 +5,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { DISPOSITIONS, OPS_ACTIONS, OPS_CAUSES, closureLabelText, isOpsIncident, parseClosureLabel } from "../src/lib/shared/closure-label";
+import { DISPOSITIONS, OPS_ACTIONS, OPS_CAUSES, SEVERITY_LEVELS, closureLabelText, isOpsIncident, parseClosureLabel, severityCorrect } from "../src/lib/shared/closure-label";
 import { BLIND_PERCENT, hideVerdicts, isBlindIncident } from "../src/lib/blind";
 
 const form = (fields: Record<string, string>) => (name: string) => fields[name] ?? "";
@@ -20,6 +20,7 @@ test("словари меток совпадают с движком", () => {
   assert.deepEqual(list("dispositions"), Object.keys(DISPOSITIONS));
   assert.deepEqual(list("opsCauses"), Object.keys(OPS_CAUSES));
   assert.deepEqual(list("opsActions"), Object.keys(OPS_ACTIONS));
+  assert.deepEqual(list("severityLevels"), Object.values(SEVERITY_LEVELS));
   assert.match(src, new RegExp(`const blindPercent = ${BLIND_PERCENT}\\b`));
 });
 
@@ -34,28 +35,71 @@ test("слепая выборка — те же векторы, что в дви
   assert.equal(hideVerdicts({ incident_id: "INC-1", status: "new" }), false);
 });
 
-test("метка ИБ: все три ответа обязательны, ложное срабатывание согласовано со статусом", () => {
-  const ok = parseClosureLabel(form({ disposition: "malicious", escalate: "yes", severity_correct: "no" }), { ops: false, status: "closed" });
-  assert.deepEqual(ok, { disposition: "malicious", escalate: true, severity_correct: false });
-  assert.equal(typeof parseClosureLabel(form({ disposition: "malicious", escalate: "yes" }), { ops: false, status: "closed" }), "string");
-  assert.equal(typeof parseClosureLabel(form({ disposition: "maybe", escalate: "yes", severity_correct: "yes" }), { ops: false, status: "closed" }), "string");
-  assert.equal(typeof parseClosureLabel(form({ disposition: "false_positive", escalate: "no", severity_correct: "no" }), { ops: false, status: "closed" }), "string");
-  assert.equal(typeof parseClosureLabel(form({ disposition: "malicious", escalate: "no", severity_correct: "no" }), { ops: false, status: "false_positive" }), "string");
-  assert.deepEqual(parseClosureLabel(form({ disposition: "false_positive", escalate: "no", severity_correct: "no" }), { ops: false, status: "false_positive" }),
-    { disposition: "false_positive", escalate: false, severity_correct: false });
-  assert.equal(typeof parseClosureLabel(form({ disposition: "toString", escalate: "no", severity_correct: "no" }), { ops: false, status: "closed" }), "string", "ключи прототипа — не значения словаря");
+const sec = { disposition: "malicious", escalate: "yes", severity_level: "2", attack_tactic: "credential-access", attack_technique: "T1110.001" };
+
+test("метка ИБ: исход, эскалация, правильный уровень, тактика и техника; ложное — согласовано со статусом", () => {
+  assert.deepEqual(parseClosureLabel(form(sec), { ops: false, status: "closed" }),
+    { disposition: "malicious", escalate: true, severity_level: 2, attack_tactic: "credential-access", attack_technique: "T1110.001" });
+  assert.deepEqual(parseClosureLabel(form({ ...sec, attack_tactic: "other", attack_technique: "other" }), { ops: false, status: "closed" }),
+    { disposition: "malicious", escalate: true, severity_level: 2, attack_tactic: "other", attack_technique: "other" });
+  for (const [name, fields] of Object.entries<Record<string, string>>({
+    "без эскалации": { ...sec, escalate: "" },
+    "без уровня": { ...sec, severity_level: "" },
+    "уровень 0": { ...sec, severity_level: "0" },
+    "уровень 5": { ...sec, severity_level: "5" },
+    "уровень дробный": { ...sec, severity_level: "2.5" },
+    "старое поле severity_correct вместо уровня": { disposition: "malicious", escalate: "yes", severity_correct: "yes", attack_tactic: "other", attack_technique: "other" },
+    "неизвестный исход": { ...sec, disposition: "maybe" },
+    "ключ прототипа": { ...sec, disposition: "toString" },
+    "без тактики": { ...sec, attack_tactic: "" },
+    "без техники": { ...sec, attack_technique: "" },
+    "тактика с подчёркиванием": { ...sec, attack_tactic: "credential_access" },
+    "техника не из справочника": { ...sec, attack_technique: "T9999" },
+    "техника в нижнем регистре": { ...sec, attack_technique: "t1110" },
+    "ложное при статусе closed": { ...sec, disposition: "false_positive" },
+  })) assert.equal(typeof parseClosureLabel(form(fields), { ops: false, status: "closed" }), "string", name);
+  assert.equal(typeof parseClosureLabel(form(sec), { ops: false, status: "false_positive" }), "string", "статус ложного без метки ложного");
+  // У ложного срабатывания тактика и техника необязательны.
+  assert.deepEqual(parseClosureLabel(form({ disposition: "false_positive", escalate: "no", severity_level: "1" }), { ops: false, status: "false_positive" }),
+    { disposition: "false_positive", escalate: false, severity_level: 1, attack_tactic: "", attack_technique: "" });
+  assert.equal(typeof parseClosureLabel(form({ disposition: "false_positive", escalate: "no", severity_level: "1", attack_technique: "T1046" }), { ops: false, status: "false_positive" }), "string",
+    "техника без тактики");
 });
 
-test("метка DevOps: причина и действие", () => {
+test("severity_correct вычисляется из ответа и уровня правила", () => {
+  assert.equal(severityCorrect(3, "high"), true);
+  assert.equal(severityCorrect(4, "high"), false);
+  assert.equal(severityCorrect(1, "low"), true);
+  assert.equal(severityCorrect(2, ""), null, "уровень правила вне шкалы — нет ответа, а не «неверно»");
+  assert.equal(severityCorrect(null, "high"), null);
+  assert.deepEqual(Object.values(SEVERITY_LEVELS), ["low", "medium", "high", "critical"]);
+});
+
+test("метка DevOps: причина, действовать сейчас, срочность; «что сделали» — необязательно", () => {
   assert.equal(isOpsIncident(["argus.system", "ops.storage"]), true);
   assert.equal(isOpsIncident(["attack.t1110"]), false);
-  assert.deepEqual(parseClosureLabel(form({ ops_cause: "planned_work", ops_action: "no_action" }), { ops: true, status: "closed" }), { ops_cause: "planned_work", ops_action: "no_action" });
-  assert.equal(typeof parseClosureLabel(form({ ops_cause: "planned_work" }), { ops: true, status: "closed" }), "string");
-  assert.equal(typeof parseClosureLabel(form({ disposition: "malicious", escalate: "no", severity_correct: "yes" }), { ops: true, status: "closed" }), "string");
+  const ops = { ops_cause: "disk", ops_act_now: "yes", ops_urgency: "3" };
+  assert.deepEqual(parseClosureLabel(form(ops), { ops: true, status: "closed" }), { ops_cause: "disk", ops_act_now: true, ops_urgency: 3, ops_action: "" });
+  assert.deepEqual(parseClosureLabel(form({ ...ops, ops_action: "fixed" }), { ops: true, status: "closed" }), { ops_cause: "disk", ops_act_now: true, ops_urgency: 3, ops_action: "fixed" });
+  assert.deepEqual(parseClosureLabel(form({ ...ops, ops_cause: "false_positive" }), { ops: true, status: "false_positive" }),
+    { ops_cause: "false_positive", ops_act_now: true, ops_urgency: 3, ops_action: "" });
+  for (const [name, fields, status] of [
+    ["старая причина", { ...ops, ops_cause: "planned_work" }, "closed"],
+    ["без «сейчас»", { ...ops, ops_act_now: "" }, "closed"],
+    ["без срочности", { ...ops, ops_urgency: "" }, "closed"],
+    ["срочность 5", { ...ops, ops_urgency: "5" }, "closed"],
+    ["неизвестное действие", { ...ops, ops_action: "rebooted" }, "closed"],
+    ["ложное при closed", { ...ops, ops_cause: "false_positive" }, "closed"],
+    ["статус ложного с другой причиной", ops, "false_positive"],
+    ["вопросы ИБ", sec, "closed"],
+  ] as const) assert.equal(typeof parseClosureLabel(form(fields as Record<string, string>), { ops: true, status }), "string", name);
 });
 
 test("метка в истории одной строкой; автоматика и старые события — без неё", () => {
-  assert.equal(closureLabelText({ disposition: "benign_authorized", escalate: false, severity_correct: true, blind: true }), "легитимно, разрешено · без эскалации · уровень верен · вслепую");
-  assert.equal(closureLabelText({ ops_cause: "wrong_threshold", ops_action: "rule_tuned", blind: false }), "неверный порог правила · правило поправлено");
+  assert.equal(closureLabelText({ disposition: "benign_authorized", escalate: false, severity_level: 3, severity_correct: true, attack_tactic: "discovery", attack_technique: "T1046", blind: true }),
+    "легитимно, разрешено · без эскалации · уровень: high · Discovery · T1046 · вслепую");
+  assert.equal(closureLabelText({ disposition: "benign_authorized", escalate: false, severity_correct: true, blind: false }), "легитимно, разрешено · без эскалации · уровень верен",
+    "событие 0033 без severity_level");
+  assert.equal(closureLabelText({ ops_cause: "network", ops_act_now: true, ops_urgency: 4, ops_action: "fixed", blind: false }), "сеть · действовать сейчас: да · срочность 4 · устранено");
   assert.equal(closureLabelText({ disposition: "", escalate: null, severity_correct: null, ops_cause: "", ops_action: "", blind: false }), "");
 });

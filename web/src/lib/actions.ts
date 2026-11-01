@@ -28,7 +28,7 @@ import { otpauthUri } from "./totp";
 import { setRuleMuted } from "./queries";
 import { audit } from "./argus-queries";
 
-export type FormState = { error: string | null; ok?: boolean; requiresTotp?: boolean; totpUser?: string };
+export type FormState = { error: string | null; ok?: boolean; requiresTotp?: boolean; totpUser?: string; message?: string };
 
 export async function loginAction(_prev: FormState, formData: FormData): Promise<FormState> {
   if (formData.get("step") === "totp") {

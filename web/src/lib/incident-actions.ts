@@ -18,8 +18,10 @@ import {
   requestUnblockIp,
   blockCandidatesFor,
   saveTriageVerdict,
+  scanGroupIncidents,
   triageVerdictClaim,
 } from "./argus-queries";
+import { GROUP_ACTION_MAX, isSubnetKey, parseIncidentIds } from "./shared/scan-groups";
 import { isIncidentStatus } from "./shared/incidents";
 import { closureLabelText, isOpsIncident, parseClosureLabel, type ClosureLabel } from "./shared/closure-label";
 
@@ -275,4 +277,87 @@ export async function reopenTriageAction(_prev: FormState, formData: FormData): 
   }
   refreshIncident(id);
   return { error: null, ok: true };
+}
+
+/**
+ * Групповое действие над открытыми инцидентами одной подсети группы сканов:
+ * взять в работу, назначить (администратор) или завершить с меткой. Форма передаёт
+ * показанный состав (список incident_id) и условия очереди, при которых он показан;
+ * сервер пересчитывает группу при тех же условиях и выполняет действие, только если
+ * состав совпал. Иначе — ничего, «группа изменилась». Группа не меньше страницы
+ * раскрытия (500) целиком не сверяется — для неё групповое действие недоступно.
+ * Каждый инцидент проходит те же переходы движка, что и в карточке, с аудитом.
+ */
+export async function scanGroupAction(_prev: FormState, formData: FormData): Promise<FormState> {
+  const op = String(formData.get("op") ?? "");
+  const a = await authorize(op === "assign" ? "admin" : "analyst");
+  if (!a.ok) return { error: a.error };
+  const s = a.session;
+  const subnet = String(formData.get("subnet") ?? "");
+  if (!isSubnetKey(subnet)) return { error: "Некорректная подсеть" };
+  if (formData.get("confirm") !== "yes") return { error: "Подтвердите действие над всей группой" };
+  const shown = parseIncidentIds(String(formData.get("ids") ?? ""));
+  if (!shown) return { error: `Групповое действие — для группы до ${GROUP_ACTION_MAX} инцидентов; обновите страницу` };
+  const fq = String(formData.get("f_queue") ?? "");
+  const filter = {
+    status: String(formData.get("f_status") ?? "") || undefined,
+    level: String(formData.get("f_level") ?? "") || undefined,
+    q: String(formData.get("f_q") ?? "").trim().slice(0, 200) || undefined,
+    queue: fq === "open" || fq === "mine" || fq === "unassigned" || fq === "overdue" ? fq : undefined,
+    user: s.user,
+  } as const;
+  let label: ClosureLabel | undefined;
+  const status = String(formData.get("status") ?? "");
+  const reason = String(formData.get("reason") ?? "").trim();
+  const owner = String(formData.get("owner") ?? "").trim();
+  if (op === "close") {
+    if (status !== "closed" && status !== "false_positive") return { error: "Выберите статус завершения" };
+    if (reason.length < 10 || reason.length > 2000) return { error: "Для завершения укажите причину от 10 до 2000 символов" };
+    const parsed = parseClosureLabel((name) => String(formData.get(name) ?? ""), { ops: false, status });
+    if (typeof parsed === "string") return { error: parsed };
+    label = parsed;
+  } else if (op === "assign") {
+    if (!owner || owner.length > 120) return { error: "Выберите ответственного" };
+  } else if (op !== "take") {
+    return { error: "Неизвестное действие" };
+  }
+  let done = 0, skipped = 0;
+  try {
+    if (op === "assign") {
+      const users = await listUsers();
+      if (!users.some((u) => u.name === owner && (u.role === "analyst" || u.role === "admin"))) return { error: "Выберите аналитика или администратора из списка" };
+    }
+    const incs = await scanGroupIncidents(subnet, { ...filter, page: 1 }, GROUP_ACTION_MAX + 1);
+    const now = [...new Set(incs.map((x) => x.incident_id))].sort();
+    if (incs.length > GROUP_ACTION_MAX || now.join(",") !== shown.join(",")) {
+      return { error: `Группа изменилась (сейчас ${incs.length > GROUP_ACTION_MAX ? `больше ${GROUP_ACTION_MAX}` : incs.length} инцидентов, подтверждено ${shown.length}) — обновите страницу и подтвердите снова` };
+    }
+    for (const inc of incs) {
+      const id = inc.incident_id;
+      if (FINAL_STATUSES.has(inc.status)) { skipped++; continue; }
+      if (op === "take" || op === "close") {
+        if (inc.owner && inc.owner !== s.user) { skipped++; continue; } // чужой инцидент не трогаем
+        if (!inc.owner || inc.status === "new" || inc.status === "waiting_owner") {
+          await incidentTransition({ id, kind: "take", actor: s.user, role: s.role });
+          await audit(s.user, "incident.take", id, `взял в работу (группа ${subnet})`);
+        }
+        if (op === "close") {
+          await incidentTransition({ id, kind: "status", status: status as "closed" | "false_positive", reason, actor: s.user, role: s.role, label });
+          await audit(s.user, "incident.status", id, `${inc.status} → ${status} · ${s.user} · ${closureLabelText(label!)} · группа ${subnet} · ${reason}`);
+        }
+      } else {
+        if (inc.owner === owner) { skipped++; continue; }
+        await incidentTransition({ id, kind: "assign", owner, actor: s.user, role: s.role });
+        await audit(s.user, "incident.assign", id, `${inc.owner || "без ответственного"} → ${owner} (группа ${subnet})`);
+      }
+      done++;
+    }
+    await audit(s.user, "incident.group", subnet, `${op}: выполнено ${done}, пропущено ${skipped}`);
+  } catch (err) {
+    revalidatePath("/incidents");
+    if (err instanceof IncidentWorkflowError) return { error: `${err.message} (выполнено ${done})` };
+    return { error: `${shortError("incident.group", err)} (выполнено ${done})` };
+  }
+  revalidatePath("/incidents");
+  return { error: null, ok: true, message: `выполнено ${done}${skipped ? `, пропущено ${skipped} (чужие или уже назначенные)` : ""}` };
 }

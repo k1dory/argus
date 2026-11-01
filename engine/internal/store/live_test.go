@@ -306,19 +306,21 @@ func TestLiveIncidentsStateAndOperatorViews(t *testing.T) {
 	if _, err := c.AppendIncidentState(ctx, closedID, "ivan", "take", incidents.StatusInProgress, "ivan", "", ClosureLabel{}); err != nil {
 		t.Fatal(err)
 	}
-	// Метка ответа (миграция 0033) пишется и читается теми же колонками; null
+	// Метка ответа (миграции 0033, 0036) пишется и читается теми же колонками; null
 	// у эскалации отличим от false.
-	no := false
+	no, level := false, uint8(2)
 	if _, err := c.AppendIncidentState(ctx, closedID, "ivan", "status", incidents.StatusClosed, "ivan", "проверено, угрозы нет",
-		ClosureLabel{Disposition: "benign_authorized", SeverityCorrect: &no, Blind: true, LabeledByHuman: true}); err != nil {
+		ClosureLabel{Disposition: "benign_authorized", SeverityLevel: &level, SeverityCorrect: &no, AttackTactic: "discovery",
+			AttackTechnique: "T1046", AttackVersion: "20.0", Blind: true, LabeledByHuman: true}); err != nil {
 		t.Fatal(err)
 	}
-	labelRow, err := c.do(ctx, `SELECT disposition, escalate, severity_correct, blind, labeled_by_human FROM incident_state_events
+	labelRow, err := c.do(ctx, `SELECT disposition, escalate, severity_level, severity_correct, attack_tactic, attack_technique, attack_version,
+		ops_act_now, ops_urgency, blind, labeled_by_human FROM incident_state_events
 		WHERE incident_id = {id:String} AND kind = 'status' FORMAT JSONEachRow`, nil, map[string]string{"id": closedID})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.TrimSpace(string(labelRow)); got != `{"disposition":"benign_authorized","escalate":null,"severity_correct":false,"blind":true,"labeled_by_human":true}` {
+	if got := strings.TrimSpace(string(labelRow)); got != `{"disposition":"benign_authorized","escalate":null,"severity_level":2,"severity_correct":false,"attack_tactic":"discovery","attack_technique":"T1046","attack_version":"20.0","ops_act_now":null,"ops_urgency":null,"blind":true,"labeled_by_human":true}` {
 		t.Fatalf("метка ответа: %s", got)
 	}
 	if cur, err = c.CurrentIncident(ctx, closedID); err != nil || cur.Status != incidents.StatusClosed {

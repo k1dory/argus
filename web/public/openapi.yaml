@@ -364,8 +364,10 @@ paths:
       summary: Ответы людей при завершении инцидентов
       description: |
         Типизированные метки, поставленные человеком при завершении (миграция 0033):
-        для правил ИБ — `disposition`, `escalate`, `severity_correct`; для эксплуатационных
-        (теги `ops.*`) — `ops_cause`, `ops_action`. `blind` — инцидент разбирался вслепую:
+        для правил ИБ — `disposition`, `escalate`, `severity_level` (и вычисленный `severity_correct`),
+        `attack_tactic`, `attack_technique` с версией справочника `attack_version` (миграция 0036);
+        для эксплуатационных (теги `ops.*`) — `ops_cause`, `ops_act_now`, `ops_urgency` и необязательный
+        `ops_action`. `blind` — инцидент разбирался вслепую:
         до закрытия консоль не показывала вердикт агента и анализ модели. Автозакрытия
         (`kind: auto_close`) не выдаются — их статус `closed` не ответ человека. По времени
         завершения (при равном времени — по `incident_id`, `event_id`), с `since` включительно; продолжение — `cursor=next_cursor`.
@@ -431,7 +433,8 @@ paths:
         сравниваются. Слепой (`blind`) и неслепой (`sighted`) разбор — отдельно: при
         неслепом человек видел подсказку агента. `false_positive` — доля ответов
         «ложное срабатывание» по правилу, кандидаты на тюнинг. Интервал — Уилсона, 95 %;
-        `low_data` — n < `low_data_n`. Метки DevOps (правила `ops.*`) не учитываются.
+        `low_data` — n < `low_data_n`. Ответы DevOps (правила `ops.*`) входят в число ответов и в долю
+        ложных (статус закрытия `false_positive`, в том числе у меток 0033), в согласие с агентом — нет.
         Сессия консоли от аналитика или токен API; сессии разбора закрыт.
       operationId: getIncidentAgreement
       security:
@@ -1646,8 +1649,14 @@ components:
         reason: { type: string }
         disposition: { type: string, description: "malicious | benign_authorized | false_positive; пусто — метки нет" }
         escalate: { type: [boolean, "null"] }
-        severity_correct: { type: [boolean, "null"] }
+        severity_level: { type: [integer, "null"], minimum: 1, maximum: 4, description: "Какой уровень правильный: 1 low … 4 critical (0036)." }
+        severity_correct: { type: [boolean, "null"], description: "Вычисляет движок: severity_level совпал с уровнем правила; у событий 0033 — ответ человека." }
+        attack_tactic: { type: string, description: "shortname тактики ATT&CK Enterprise или other; пусто — нет ответа." }
+        attack_technique: { type: string, description: "ID техники (T1110, T1110.001) или other; пусто — нет ответа." }
+        attack_version: { type: string, description: "Версия справочника ATT&CK, по которому дан ответ." }
         ops_cause: { type: string }
+        ops_act_now: { type: [boolean, "null"] }
+        ops_urgency: { type: [integer, "null"], minimum: 1, maximum: 4 }
         ops_action: { type: string }
         blind: { type: boolean }
         labeled_by_human: { type: boolean }
@@ -1686,7 +1695,7 @@ components:
         sighted: { $ref: "#/components/schemas/AgreementSide" }
     IncidentLabel:
       type: object
-      required: [event_id, incident_id, changed_at, actor, status, disposition, escalate, severity_correct, ops_cause, ops_action, blind, reason, rule_id, rule_title, level, tags]
+      required: [event_id, incident_id, changed_at, actor, status, disposition, escalate, severity_level, severity_correct, attack_tactic, attack_technique, attack_version, ops_cause, ops_act_now, ops_urgency, ops_action, blind, reason, rule_id, rule_title, level, tags]
       properties:
         event_id: { type: string, format: uuid, description: "Запись журнала incident_state_events; вместе с changed_at и incident_id задаёт порядок выдачи." }
         incident_id: { $ref: "#/components/schemas/IncidentIdString" }
@@ -1695,9 +1704,15 @@ components:
         status: { type: string, enum: [closed, false_positive] }
         disposition: { type: string, enum: ["", malicious, benign_authorized, false_positive] }
         escalate: { type: [boolean, "null"] }
-        severity_correct: { type: [boolean, "null"] }
-        ops_cause: { type: string, enum: ["", real_failure, planned_work, monitoring_noise, wrong_threshold] }
-        ops_action: { type: string, enum: ["", fixed, no_action, rule_tuned, handed_over] }
+        severity_level: { type: [integer, "null"], minimum: 1, maximum: 4, description: "Какой уровень правильный: 1 low, 2 medium, 3 high, 4 critical. null — метка до 0036 или DevOps." }
+        severity_correct: { type: [boolean, "null"], description: "С 0036 вычисляет движок: severity_level совпал с уровнем правила (null — уровень правила вне шкалы); у меток 0033 — ответ человека." }
+        attack_tactic: { type: string, description: "Тактика ATT&CK Enterprise (shortname, например credential-access) или other; пусто — нет ответа (DevOps, ложное срабатывание, метка до 0036)." }
+        attack_technique: { type: string, description: "Техника или подтехника ATT&CK (T1110, T1110.001) или other; пусто — нет ответа." }
+        attack_version: { type: string, description: "Версия справочника ATT&CK, по которому дан ответ (engine/internal/attack/enterprise.json); пусто без тактики и техники." }
+        ops_cause: { type: string, enum: ["", disk, memory, network, process_crash, config, deploy, external_dependency, false_positive, real_failure, planned_work, monitoring_noise, wrong_threshold], description: "С 0036 — словарь плана разметки (disk … false_positive); real_failure, planned_work, monitoring_noise, wrong_threshold — метки 0033." }
+        ops_act_now: { type: [boolean, "null"], description: "DevOps: действовать сейчас." }
+        ops_urgency: { type: [integer, "null"], minimum: 1, maximum: 4, description: "DevOps: срочность 1–4." }
+        ops_action: { type: string, enum: ["", fixed, no_action, rule_tuned, handed_over], description: "Что сделали; с 0036 необязательно." }
         blind: { type: boolean }
         reason: { type: string }
         rule_id: { type: string }

@@ -23,6 +23,7 @@ function engineError(scope: string, err: unknown): string {
 export { INCIDENT_STATUSES, EXCEPTION_FIELDS, isIncidentStatus, type IncidentStatus } from "./shared/incidents";
 import { isIncidentStatus, type IncidentStatus } from "./shared/incidents";
 import type { ClosureLabel } from "./shared/closure-label";
+import { addrSQL, blockState, GROUP_ROWS_PAGE, GROUPS_PAGE, isSubnetKey, levelOfRank, SCAN_GROUP_RULES, subnetSQL, type BlockRow, type BlockState } from "./shared/scan-groups";
 import { AGENT_VERDICT_SESSION_ORDER } from "./shared/triage-verdict";
 
 
@@ -52,13 +53,11 @@ export type IncidentRow = {
 
 const LATEST = `SELECT * FROM incidents_current`;
 
-export async function incidentsList(
-  filter: { status?: string; level?: string; q?: string; page?: number; pageSize?: number; queue?: "open" | "mine" | "unassigned" | "overdue"; user?: string } = {},
-): Promise<{ rows: IncidentRow[]; total: number; page: number; pageSize: number }> {
+type IncidentFilter = { status?: string; level?: string; q?: string; page?: number; pageSize?: number; queue?: "open" | "mine" | "unassigned" | "overdue"; user?: string; groupScans?: boolean };
+
+/** Условия очереди (поиск, статус, уровень, очередь) — общие для списка и групп сканов. */
+function incidentConditions(filter: IncidentFilter, params: Record<string, string | number>): string[] {
   const having: string[] = [];
-  const pageSize = clampInt(filter.pageSize, 10, 200, 50);
-  let page = clampPage(filter.page);
-  const params: Record<string, string | number> = { limit: pageSize, offset: (page - 1) * pageSize };
   if (filter.q) {
     having.push(`(positionCaseInsensitiveUTF8(concat(incident_id, ' ', rule_title, ' ', rule_id, ' ', actor_name, ' ', node, ' ', arrayStringConcat(sources, ' ')), {q:String}) > 0)`);
     params.q = filter.q;
@@ -83,6 +82,25 @@ export async function incidentsList(
     // Срок первичной реакции: только ещё не взятые в работу инциденты.
     having.push("status = 'new' AND dateDiff('second', created_at, now()) > multiIf(level = 'critical', 900, level = 'high', 3600, level = 'medium', 14400, 86400)");
   }
+  return having;
+}
+
+/** Открытый инцидент сканов снаружи с адресом источника — попадает в группу подсети. */
+const SCAN_GROUPED = `(rule_id IN {scan_rules:Array(String)} AND status NOT IN ('closed', 'false_positive') AND ${subnetSQL("actor_name")} != '')`;
+const scanRulesParam = (): string => `[${SCAN_GROUP_RULES.map((r) => `'${r}'`).join(",")}]`;
+
+export async function incidentsList(
+  filter: IncidentFilter = {},
+): Promise<{ rows: IncidentRow[]; total: number; page: number; pageSize: number }> {
+  const pageSize = clampInt(filter.pageSize, 10, 200, 50);
+  let page = clampPage(filter.page);
+  const params: Record<string, string | number> = { limit: pageSize, offset: (page - 1) * pageSize };
+  const having = incidentConditions(filter, params);
+  if (filter.groupScans) {
+    // Сканы снаружи показаны группами по подсети (scanGroups) — в очереди их нет.
+    having.push(`NOT ${SCAN_GROUPED}`);
+    params.scan_rules = scanRulesParam();
+  }
   const where = having.length ? "WHERE " + having.join(" AND ") : "";
   const listSQL = `${LATEST} ${where} ORDER BY created_at DESC, incident_id DESC LIMIT {limit:UInt32} OFFSET {offset:UInt32}`;
   const [initialRows, cnt] = await Promise.all([
@@ -100,6 +118,95 @@ export async function incidentsList(
     rows = total > 0 ? await chQuery<IncidentRow>(listSQL, { ...params, offset: (page - 1) * pageSize }) : [];
   }
   return { rows: rows.map(normalizeIncident), total, page, pageSize };
+}
+
+export type ScanGroup = {
+  subnet: string; incidents: number; addresses: number; rules: string[];
+  first_ts: string; last_ts: string; level: string; unassigned: number;
+};
+
+/**
+ * Открытые инциденты сканов снаружи (SCAN_GROUP_RULES) по подсети источника под
+ * теми же условиями очереди: свёрнутая строка «подсеть: N адресов». Подсеть
+ * считается в запросе (subnetSQL) — инциденты и движок не меняются.
+ */
+export async function scanGroups(filter: IncidentFilter = {}, limit: number = GROUPS_PAGE): Promise<ScanGroup[]> {
+  const size = clampInt(limit, 1, 500, GROUPS_PAGE);
+  const params: Record<string, string | number> = { scan_rules: scanRulesParam(), limit: size, offset: (clampPage(filter.page) - 1) * size };
+  const having = [SCAN_GROUPED, ...incidentConditions(filter, params)];
+  const rows = await chQuery<ScanGroup & { level_rank: number | string; incidents: number | string; addresses: number | string; unassigned: number | string }>(
+    // Агрегаты под своими именами и переименование снаружи: псевдоним first_ts над
+    // min(first_ts) в том же SELECT перекрыл бы колонку внутри агрегата (184).
+    `SELECT subnet, incidents, addresses, rules, toString(f) AS first_ts, toString(l) AS last_ts, level_rank, unassigned FROM (
+       SELECT ${subnetSQL("actor_name")} AS subnet, count() AS incidents, uniqExact(${addrSQL("actor_name")}) AS addresses,
+              arraySort(groupUniqArray(rule_id)) AS rules, min(first_ts) AS f, max(last_ts) AS l,
+              max(multiIf(level = 'critical', 4, level = 'high', 3, level = 'medium', 2, 1)) AS level_rank,
+              countIf(owner = '') AS unassigned
+       FROM (${LATEST} WHERE ${having.join(" AND ")})
+       GROUP BY subnet)
+     ORDER BY l DESC, subnet LIMIT {limit:UInt32} OFFSET {offset:UInt32}`,
+    params,
+  );
+  return rows.map((r) => ({
+    subnet: r.subnet, incidents: Number(r.incidents), addresses: Number(r.addresses), rules: r.rules,
+    first_ts: r.first_ts, last_ts: r.last_ts, level: levelOfRank(Number(r.level_rank)), unassigned: Number(r.unassigned),
+  }));
+}
+
+function groupConditions(subnet: string, filter: IncidentFilter, params: Record<string, string | number>): string[] {
+  params.scan_rules = scanRulesParam();
+  params.subnet = subnet;
+  return [SCAN_GROUPED, `${subnetSQL("actor_name")} = {subnet:String}`, ...incidentConditions(filter, params)];
+}
+
+/** Инциденты одной подсети группы сканов как есть, свежие сверху, страницами по 500. */
+export async function scanGroupIncidents(subnet: string, filter: IncidentFilter = {}, limit: number = GROUP_ROWS_PAGE): Promise<IncidentRow[]> {
+  if (!isSubnetKey(subnet)) return [];
+  const size = clampInt(limit, 1, GROUP_ROWS_PAGE + 1, GROUP_ROWS_PAGE);
+  const params: Record<string, string | number> = { limit: size, offset: (clampPage(filter.page) - 1) * GROUP_ROWS_PAGE };
+  const having = groupConditions(subnet, filter, params);
+  const rows = await chQuery<IncidentRow>(
+    `${LATEST} WHERE ${having.join(" AND ")} ORDER BY last_ts DESC, incident_id DESC LIMIT {limit:UInt32} OFFSET {offset:UInt32}`,
+    params,
+  );
+  return rows.map(normalizeIncident);
+}
+
+/**
+ * Статус блока каждого инцидента — по его последней записи response_log (при равном
+ * ts запись исполнителя главнее служебной). Ожидание пишется без адреса — тоже в
+ * счёт. Блок по адресу общий для инцидентов (респондер хранит активные блоки по IP):
+ * если после блока или «уже заблокирован» этот адрес успешно сняли из любого
+ * инцидента — блок снят.
+ */
+export async function incidentBlockStates(ids: string[]): Promise<Record<string, BlockState>> {
+  if (ids.length === 0) return {};
+  const lit = (xs: string[]) => `[${xs.map((x) => `'${x.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`).join(",")}]`;
+  const rows = await chQuery<BlockRow & { incident_id: string; ip: string; at: string }>(
+    `SELECT incident_id, argMax(executor, (ts, by_exec)) AS executor, argMax(mode, (ts, by_exec)) AS mode,
+            argMax(dry_run, (ts, by_exec)) AS dry_run, argMax(ok, (ts, by_exec)) AS ok, argMax(detail, (ts, by_exec)) AS detail,
+            argMax(ip, (ts, by_exec)) AS ip, toString(max(ts)) AS at
+     FROM (SELECT incident_id, executor, mode, dry_run, ok, detail, ip, ts, executor != 'argus' AS by_exec
+           FROM response_log WHERE incident_id IN {ids:Array(String)})
+     GROUP BY incident_id`,
+    { ids: lit(ids) },
+  );
+  const out: Record<string, BlockState> = {};
+  for (const r of rows) out[r.incident_id] = blockState({ ...r, dry_run: Number(r.dry_run), ok: Number(r.ok) });
+  const blocked = rows.filter((r) => (out[r.incident_id] === "blocked" || out[r.incident_id] === "unblock_failed") && r.ip !== "");
+  if (blocked.length > 0) {
+    const released = await chQuery<{ ip: string; at: string }>(
+      `SELECT ip, toString(max(ts)) AS at FROM response_log
+       WHERE ip IN {ips:Array(String)} AND endsWith(executor, '.unblock') AND ok = 1 GROUP BY ip`,
+      { ips: lit([...new Set(blocked.map((r) => r.ip))]) },
+    );
+    const at = new Map(released.map((x) => [x.ip, x.at]));
+    for (const r of blocked) {
+      const u = at.get(r.ip);
+      if (u && u > r.at) out[r.incident_id] = "released";
+    }
+  }
+  return out;
 }
 
 export async function incidentGet(id: string): Promise<IncidentRow | null> {
@@ -189,11 +296,17 @@ export type IncidentStateEvent = {
   status: IncidentStatus;
   owner: string;
   reason: string;
-  /** Метка ответа (миграция 0033); у переходов без завершения и у автоматики пустая. */
+  /** Метка ответа (миграции 0033, 0036); у переходов без завершения и у автоматики пустая. */
   disposition: string;
   escalate: boolean | null;
+  severity_level: number | null;
   severity_correct: boolean | null;
+  attack_tactic: string;
+  attack_technique: string;
+  attack_version: string;
   ops_cause: string;
+  ops_act_now: boolean | null;
+  ops_urgency: number | null;
   ops_action: string;
   blind: boolean;
   labeled_by_human: boolean;
@@ -202,7 +315,8 @@ export type IncidentStateEvent = {
 export async function incidentStateHistory(id: string, limit = 200): Promise<IncidentStateEvent[]> {
   const rows = await chQuery<IncidentStateEvent>(
     `SELECT event_id, revision, changed_at, actor, kind, status, owner, reason,
-            disposition, escalate, severity_correct, ops_cause, ops_action, blind, labeled_by_human
+            disposition, escalate, severity_level, severity_correct, attack_tactic, attack_technique, attack_version,
+            ops_cause, ops_act_now, ops_urgency, ops_action, blind, labeled_by_human
      FROM incident_state_events WHERE incident_id = {id:String}
      ORDER BY revision DESC LIMIT {limit:UInt32}`, { id, limit: Math.min(10_000, Math.max(1, Math.floor(limit))) },
   );
@@ -215,8 +329,9 @@ import type { LabelCursor } from "./label-cursor";
 
 export type IncidentLabelRow = {
   event_id: string; incident_id: string; changed_at: string; actor: string; status: IncidentStatus;
-  disposition: string; escalate: boolean | null; severity_correct: boolean | null;
-  ops_cause: string; ops_action: string; blind: boolean; reason: string;
+  disposition: string; escalate: boolean | null; severity_level: number | null; severity_correct: boolean | null;
+  attack_tactic: string; attack_technique: string; attack_version: string;
+  ops_cause: string; ops_act_now: boolean | null; ops_urgency: number | null; ops_action: string; blind: boolean; reason: string;
   rule_id: string; rule_title: string; level: string; tags: string[];
 };
 
@@ -237,7 +352,8 @@ export async function incidentLabels(since: string, limit: number, after?: Label
   return chQuery<IncidentLabelRow>(
     `WITH labels AS (
        SELECT event_id, incident_id, changed_at, actor, status, disposition, escalate,
-              severity_correct, ops_cause, ops_action, blind, reason
+              severity_level, severity_correct, attack_tactic, attack_technique, attack_version,
+              ops_cause, ops_act_now, ops_urgency, ops_action, blind, reason
        FROM incident_state_events
        WHERE labeled_by_human AND kind = 'status' AND status IN ('closed', 'false_positive')
          -- changed_at — DateTime64(3). Доли мельче миллисекунды в since не округляются

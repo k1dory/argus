@@ -22,10 +22,10 @@ test("incidentLabels: только ответы людей, с правилом 
       VALUES ({id:String}, now(), now(), {rule:String}, 'Перебор паролей', 'high', ['attack.t1110'], 'new', now64(3), now64(3))`, { id, rule });
   }
   const state = (id: string, kind: string, status: string, label: string) => ch().chCommand(
-    `INSERT INTO incident_state_events (event_id, incident_id, revision, changed_at, actor, kind, status, owner, reason${label ? ", disposition, escalate, severity_correct, blind, labeled_by_human" : ""})
+    `INSERT INTO incident_state_events (event_id, incident_id, revision, changed_at, actor, kind, status, owner, reason${label ? ", disposition, escalate, severity_correct, blind, labeled_by_human, severity_level, attack_tactic, attack_technique, attack_version, ops_act_now, ops_urgency" : ""})
      VALUES ({e:String}, {id:String}, 1, now64(3), 'anna', {k:String}, {s:String}, 'anna', 'проверено по журналу'${label})`,
     { e: randomUUID(), id, k: kind, s: status });
-  await state(human, "status", "closed", ", 'benign_authorized', false, NULL, true, true");
+  await state(human, "status", "closed", ", 'benign_authorized', false, NULL, true, true, 2, 'discovery', 'T1046', '20.0', NULL, NULL");
   await state(auto, "auto_close", "closed", "");
   await state(open, "take", "in_progress", "");
   const rows = (await q().incidentLabels(since, 1000)).filter((r) => [human, auto, open].includes(r.incident_id));
@@ -34,6 +34,9 @@ test("incidentLabels: только ответы людей, с правилом 
   assert.equal(r.disposition, "benign_authorized");
   assert.equal(r.escalate, false);
   assert.equal(r.severity_correct, null, "null отличим от false");
+  // Поля плана разметки (0036) выгружаются как есть; DevOps-поля у ИБ — null.
+  assert.deepEqual([r.severity_level, r.attack_tactic, r.attack_technique, r.attack_version, r.ops_act_now, r.ops_urgency],
+    [2, "discovery", "T1046", "20.0", null, null]);
   assert.equal(r.blind, true);
   assert.equal(r.rule_id, `r-${run}`);
   assert.deepEqual(r.tags, ["attack.t1110"]);
