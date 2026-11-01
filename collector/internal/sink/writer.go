@@ -343,7 +343,7 @@ func (w *Writer) WriteBatch(ctx context.Context, b Batch) {
 // (транспорт, остановка, ingest_rejects недоступна), spool-файл атомарно заменяется
 // только этими строками: вставленные при повторе не задвоятся.
 func (w *Writer) writeDurable(ctx context.Context, b Batch) {
-	progressed := false // часть строк решена за проход (shrink обнуляет b.Rows — считать по нему нельзя)
+	progressed := false // остаток сохранён в spool меньшим, чем был (shrink обнуляет b.Rows — считать по нему нельзя)
 	delay := w.Backoff
 	budget := bisectBudget
 	for attempt := 1; ; attempt++ {
@@ -365,14 +365,14 @@ func (w *Writer) writeDurable(ctx context.Context, b Batch) {
 				return
 			}
 			if len(rest) < len(b.Rows) {
-				progressed = true
 				nb, serr := w.Queue.shrink(b, rest)
 				if serr != nil {
 					// Файл остаётся целиком: при повторе вставленные строки задвоятся,
-					// но ни одна не потеряется.
+					// но ни одна не потеряется. Прогрессом это не считается — на диске
+					// тот же батч, и отметка застревания остаётся.
 					slog.Error("spool: остаток батча не сохранён, файл повторится целиком", "rows", len(rest), "err", serr)
 				} else {
-					b = nb
+					b, progressed = nb, true
 				}
 			}
 			break
