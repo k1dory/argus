@@ -6,11 +6,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -91,15 +93,38 @@ func (c *ClickHouse) do(ctx context.Context, query string, body io.Reader, param
 		return nil, fmt.Errorf("clickhouse response exceeds %d bytes", maxResponseBytes)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("clickhouse %s: %s", resp.Status, strings.TrimSpace(string(out[:min(len(out), 400)])))
+		return nil, chError(resp, out)
 	}
 	if code := resp.Header.Get("X-ClickHouse-Exception-Code"); code != "" && code != "0" {
-		return nil, fmt.Errorf("clickhouse exception %s: %s", code, strings.TrimSpace(string(out[:min(len(out), 400)])))
+		return nil, chError(resp, out)
 	}
 	if loc := responseException.FindIndex(out); loc != nil {
-		return nil, fmt.Errorf("clickhouse: %s", strings.TrimSpace(string(out[loc[0]:min(len(out), loc[0]+400)])))
+		return nil, chError(resp, out[loc[0]:])
 	}
 	return out, nil
+}
+
+var exceptionCode = regexp.MustCompile(`Code:\s*(\d+)`)
+
+// chError — ошибка ClickHouse без текста исключения: он цитирует данные запроса
+// (вердикт, строку события), а ошибка уходит в журнал движка. Статус, код (из
+// заголовка или тела) и query_id; полный текст — в system.query_log.
+func chError(resp *http.Response, body []byte) error {
+	code := strings.TrimSpace(resp.Header.Get("X-ClickHouse-Exception-Code"))
+	if _, err := strconv.Atoi(code); err != nil || code == "0" {
+		code = ""
+		if m := exceptionCode.FindSubmatch(body); m != nil {
+			code = string(m[1])
+		}
+	}
+	msg := "clickhouse HTTP " + strconv.Itoa(resp.StatusCode)
+	if code != "" {
+		msg += " code " + code
+	}
+	if id := resp.Header.Get("X-ClickHouse-Query-Id"); id != "" && len(id) <= 64 {
+		msg += " query_id " + id
+	}
+	return errors.New(msg)
 }
 
 func (c *ClickHouse) insert(ctx context.Context, table string, rows []any) error {

@@ -42,8 +42,16 @@ type Error struct {
 	Msg    string
 }
 
+// Error — без текста исключения: ClickHouse цитирует в нём данные строки (событие),
+// а Error() попадает в журнал. Полный текст — Detail(), только для ingest_rejects.
 func (e *Error) Error() string {
-	return fmt.Sprintf("clickhouse %s: HTTP %d code %d: %s", e.Table, e.Status, e.Code, e.Msg)
+	return fmt.Sprintf("clickhouse %s: HTTP %d code %d", e.Table, e.Status, e.Code)
+}
+
+// Detail — ошибка вместе с текстом ClickHouse: для таблицы отказов (там же лежит
+// исходная строка), не для журнала.
+func (e *Error) Detail() string {
+	return e.Error() + ": " + e.Msg
 }
 
 var codeRe = regexp.MustCompile(`Code:\s*(\d+)`)

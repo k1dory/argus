@@ -59,8 +59,8 @@ func TestHasStatusColumnReportsError(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 	ch := New(srv.URL, "argus", "argus", "pw")
-	if _, err := ch.HasStatusColumn(context.Background()); err == nil || !strings.Contains(err.Error(), "Table missing") {
-		t.Fatalf("expected ClickHouse error text, got %v", err)
+	if _, err := ch.HasStatusColumn(context.Background()); err == nil || !strings.Contains(err.Error(), "code 60") || strings.Contains(err.Error(), "Table missing") {
+		t.Fatalf("expected ClickHouse code without exception text, got %v", err)
 	}
 }
 
@@ -107,7 +107,8 @@ func TestInsertReportsClickHouseError(t *testing.T) {
 	t.Cleanup(srv.Close)
 	ch := New(srv.URL, "argus", "argus", "pw")
 	err := ch.InsertVerdicts(context.Background(), []VerdictRow{{EntityID: "x", Violations: []string{}}})
-	if err == nil || !strings.Contains(err.Error(), "Table missing") {
-		t.Fatalf("expected ClickHouse error text, got %v", err)
+	// Код и статус — да, текст исключения — нет (цитирует данные; полный — в query_log).
+	if err == nil || !strings.Contains(err.Error(), "code 60") || !strings.Contains(err.Error(), "HTTP 404") || strings.Contains(err.Error(), "Table missing") {
+		t.Fatalf("expected ClickHouse status and code without exception text, got %v", err)
 	}
 }
