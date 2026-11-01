@@ -1,10 +1,10 @@
 // Запросы ARGUS-контура: единая схема событий, инциденты, вердикты аналитика,
 // здоровье коллекторов. ReplacingMergeTree читаем через argMax по updated_at.
 import "server-only";
-import { isAlive, rhythmSec, RHYTHM_WINDOW_DAYS, silenceThresholdSec } from "./shared/source-health";
+import { isAlive, RHYTHM_QUANTILE, RHYTHM_WINDOW_DAYS, silenceThresholdSec } from "./shared/source-health";
 import crypto from "node:crypto";
 import { clampInt, clampPage } from "./shared/limits";
-import { chCommand, chQuery as chQueryRaw } from "./clickhouse";
+import { chCommand, chQuery as chQueryRaw, ClickHouseError } from "./clickhouse";
 
 /** Серверные лимиты на все запросы консоли к ClickHouse: пользователь консоли
  *  без квот, а скан за 30 дней — полный. Тот же набор, что в search.ts. */
@@ -117,9 +117,13 @@ export class IncidentWorkflowError extends Error {}
 export async function incidentTransition(input: {
   id: string; kind: "take" | "assign" | "status"; status?: IncidentStatus; owner?: string; reason?: string; actor: string; role: "viewer" | "analyst" | "admin";
 }): Promise<void> {
-  const r = await fetch(`${engineBase()}/incidents/${encodeURIComponent(input.id)}/workflow`, {
+  // id — в пути, не в теле: движок разбирает тело с DisallowUnknownFields
+  // (workflowRequest: actor, role, kind, status, owner, reason), и лишнее поле
+  // превращало каждое «Взять», «Назначить» и смену статуса в 400.
+  const { id, ...body } = input;
+  const r = await fetch(`${engineBase()}/incidents/${encodeURIComponent(id)}/workflow`, {
     method: "POST", cache: "no-store", headers: engineHeaders(), signal: AbortSignal.timeout(ENGINE_TIMEOUT_MS),
-    body: JSON.stringify(input),
+    body: JSON.stringify(body),
   });
   if (!r.ok) {
     const body = await r.json().catch(() => ({})) as { error?: string };
@@ -294,9 +298,9 @@ export type SourceHealth = {
   last_ts: string;
   pii_share: number;
   alive: number;
-  /** Событий за окно ритма (7 суток). */
+  /** Событий за окно ритма (RHYTHM_WINDOW_DAYS) по heartbeat коллектора; источник мимо коллектора — за час. */
   events_window: number;
-  /** Ритм: секунд на одну активную минуту за окно; null — активная минута одна. */
+  /** Ритм: типичный разрыв между пачками событий, с (взвешенный по длительности квантиль RHYTHM_QUANTILE); null — мало данных. */
   rhythm_sec: number | null;
   /** Порог тишины для этого источника, с (max(5 мин, 3 × ритм)). */
   silence_threshold_sec: number;
@@ -304,36 +308,154 @@ export type SourceHealth = {
   silent_for_sec: number;
 };
 
-export async function sourcesHealth(): Promise<SourceHealth[]> {
-  // Окно — 7 суток: в нём ритм источника (активные минуты) и источники, замолчавшие
-  // больше часа назад, — раньше они просто пропадали из списка. Счётчики «за час»
-  // и доля ПДн — по последнему часу, как и прежде.
-  type Row = { source: string; source_class: string; events_1h: string; eps_60s: string; last_ts: string; pii_share: string; events_window: string; active_minutes: string; first_sec: string; last_sec: string; now_sec: string };
-  const rows = await chQuery<Row>(
-    `SELECT source, any(source_class) AS source_class,
-            countIf(received_at >= now() - INTERVAL 1 HOUR) AS events_1h,
-            countIf(received_at >= now() - INTERVAL 60 SECOND) AS eps_60s,
-            max(received_at) AS last_ts,
-            round(100 * avgIf(pii, received_at >= now() - INTERVAL 1 HOUR), 1) AS pii_share,
-            count() AS events_window,
-            uniqExact(toStartOfMinute(received_at)) AS active_minutes,
-            toUnixTimestamp(min(received_at)) AS first_sec,
-            toUnixTimestamp(max(received_at)) AS last_sec,
-            toUnixTimestamp(now()) AS now_sec
-     FROM events WHERE received_at >= now() - INTERVAL ${RHYTHM_WINDOW_DAYS} DAY
-     GROUP BY source ORDER BY events_1h DESC, events_window DESC`,
-  );
-  return rows.map((r) => {
-    const active = Number(r.active_minutes), first = Number(r.first_sec), last = Number(r.last_sec), now = Number(r.now_sec);
-    const span = last - first;
-    const threshold = silenceThresholdSec(active, span);
+/** Сколько замолчавших источников (тише часа) показывать; остальные — счётчиком omitted. */
+export const STALE_SOURCES_LIMIT = 2000;
+
+export type SourcesReport = {
+  sources: SourceHealth[];
+  /** Замолчавших источников сверх STALE_SOURCES_LIMIT (самые давно молчащие), в sources не вошли. */
+  omitted: number;
+};
+
+/** Условие запросов к p_source_last: все активные парты events уже с проекцией.
+ *  force_optimize_projection этого не гарантирует — пока MATERIALIZE идёт, оптимизатор
+ *  берёт проекцию из новых партов и сырые строки из старых, и запрос сканирует историю.
+ *  Скалярный подзапрос к system.parts (строка на парт) вычисляется до выбора партов: не
+ *  готово — WHERE 0, проекция не применяется, force_optimize_projection даёт
+ *  PROJECTION_NOT_USED без чтения events. */
+const SOURCE_LAST_READY = `(SELECT count() FROM system.parts
+         WHERE database = currentDatabase() AND table = 'events' AND active AND NOT has(projections, 'p_source_last')) = 0`;
+const PROJECTION_NOT_USED = 584;
+
+/** Ритм по журналу heartbeat (collector_health_log) — единственное место расчёта, тесты гоняют его на живом ClickHouse.
+ *  Разрывы между соседними активными минутами (минутами с событиями) за окно; самый длинный разрыв отбрасывается —
+ *  одиночный сбой или простой не растягивает ритм непрерывного источника на месяц; квантиль RHYTHM_QUANTILE
+ *  взвешен длительностью разрыва: это доля времени, а не доля разрывов. Поэтому у пачечного источника (CI 15 минут
+ *  раз в сутки: 14 разрывов по минуте и один суточный) ритм — сутки, а не минута, как у квантиля по числу разрывов.
+ *  Меньше двух разрывов — 0 (мало данных). */
+const RHYTHM_GAPS = `arrayPopBack(arraySort(arrayMap(x -> toUInt64(x), arraySlice(arrayDifference(arraySort(groupArrayIf(toUnixTimestamp(seen_at), events_1m > 0))), 2))))`;
+
+export async function sourcesHealthReport(): Promise<SourcesReport> {
+  // Счётчики «за час», доля ПДн и класс — по таблице событий за последний час
+  // (minmax-индекс по received_at). Ритм — по журналу heartbeat коллектора
+  // collector_health_log (строка на источник в минуту, ORDER BY (source, seen_at)):
+  // квантиль считается в ClickHouse, массивы минут в консоль не едут.
+  // Замолчавшие источники — по агрегатной проекции events p_source_last (миграция
+  // 0031: строка на источник в каждом парте), поэтому в списке остаются и те, кто
+  // пишет в events мимо коллектора и heartbeat не имеет (телеметрия движка
+  // argus.system): упавший движок виден как «молчит», а не пропадает через час.
+  // Скан сырых events за окно здесь недопустим — сотни миллионов строк на каждую
+  // загрузку. Пока проекция есть не во всех партах (миграция идёт), запрос не читает
+  // events (SOURCE_LAST_READY) и список строится по heartbeat, как в rc27. Прочие ошибки
+  // не маскируются пустым результатом: маршрут отвечает 503.
+  type Num = number | string; // ClickHouse JSON: UInt32/Float64 приходят числами, count() — строкой
+  type Hour = { source: string; source_class: string; events_1h: Num; eps_60s: Num; last_ts: string; last_sec: Num; pii_share: Num | null; now_sec: Num };
+  type Rhythm = { source: string; events_window: Num; gap_q: Num | null; last_sec: Num; now_sec: Num };
+  type Stale = { source: string; source_class: string; last_ts: string; last_sec: Num; stale_total: Num };
+  const days = RHYTHM_WINDOW_DAYS;
+  const [hour, rhythm, staleRows] = await Promise.all([
+    chQuery<Hour>(
+      `SELECT source, any(source_class) AS source_class, count() AS events_1h,
+              countIf(received_at >= now() - INTERVAL 60 SECOND) AS eps_60s,
+              max(received_at) AS last_ts, toUnixTimestamp(max(received_at)) AS last_sec,
+              round(100 * avg(pii), 1) AS pii_share, toUnixTimestamp(now()) AS now_sec
+       FROM events WHERE received_at >= now() - INTERVAL 1 HOUR
+       GROUP BY source ORDER BY events_1h DESC`,
+    ),
+    chQuery<Rhythm>(
+      `SELECT source, events_window, arrayReduce('quantileExactWeighted({q:Float64})', gaps, gaps) AS gap_q, last_sec, now_sec
+       FROM (
+         SELECT source, sum(events_1m) AS events_window, ${RHYTHM_GAPS} AS gaps,
+                toUnixTimestamp(maxIf(seen_at, events_1m > 0)) AS last_sec, toUnixTimestamp(now()) AS now_sec
+         FROM collector_health_log WHERE seen_at >= now() - INTERVAL {days:UInt32} DAY
+         GROUP BY source HAVING countIf(events_1m > 0) > 0
+       )`,
+      { q: RHYTHM_QUANTILE, days },
+    ),
+    chQuery<Stale>(
+      `SELECT source, any(source_class) AS source_class, max(received_at) AS last_ts,
+              toUnixTimestamp(max(received_at)) AS last_sec, count() OVER () AS stale_total
+       FROM events WHERE ${SOURCE_LAST_READY} GROUP BY source
+       HAVING last_ts >= now() - INTERVAL {days:UInt32} DAY AND last_ts < now() - INTERVAL 1 HOUR
+       ORDER BY last_ts DESC, source LIMIT {lim:UInt32}
+       SETTINGS force_optimize_projection = 1`,
+      { days, lim: STALE_SOURCES_LIMIT },
+    ).catch((err: unknown) => {
+      if (!(err instanceof ClickHouseError) || err.code !== PROJECTION_NOT_USED) throw err;
+      console.error("sourcesHealth: проекция p_source_last ещё не во всех партах, замолчавшие — по heartbeat");
+      return null;
+    }),
+  ]);
+  const byHour = new Map(hour.map((r) => [r.source, r]));
+  const byRhythm = new Map(rhythm.map((r) => [r.source, r]));
+  // Замолчавшие — объединение двух множеств: проекция (все писатели events) и
+  // источники с heartbeat, у которых нет событий за час. Итог и omitted считаются по
+  // уникальному объединению ДО обрезки выдачи, иначе на пределе:
+  //  - heartbeat-only старше границы списка пропадал из счёта;
+  //  - источник за LIMIT проекции с heartbeat считался дважды (в stale_total и как heartbeat).
+  // Имена за LIMIT проекция не вернула; heartbeat-кандидатов, которых нет среди её строк,
+  // проверяем той же проекцией точечно (source IN — ключ агрегатной проекции, полного
+  // скана нет): найденные уже сосчитаны в stale_total, ненайденные — heartbeat-only.
+  // Без проекции (миграция идёт) — только heartbeat, как в rc27. Отказ этого запроса
+  // пробрасывается: без него неизвестно, кто из кандидатов уже в stale_total, и
+  // omitted был бы выдуман.
+  const proj = (staleRows ?? []).filter((r) => !byHour.has(r.source));
+  const projDropped = (staleRows ?? []).length - proj.length; // замолчали час назад и уже снова пишут
+  const projTotal = staleRows ? Math.max(0, Number(staleRows[0]?.stale_total ?? 0) - projDropped) : 0;
+  const projTruncated = staleRows !== null && Number(staleRows[0]?.stale_total ?? 0) > staleRows.length;
+  const inProj = new Set((staleRows ?? []).map((r) => r.source));
+  const hbStale = rhythm.filter((r) => !byHour.has(r.source) && !inProj.has(r.source));
+  let beyondLimit: Stale[] = [];
+  if (projTruncated && hbStale.length > 0) {
+    type Named = Omit<Stale, "stale_total">;
+    beyondLimit = (await chQuery<Named>(
+      `SELECT source, any(source_class) AS source_class, max(received_at) AS last_ts,
+              toUnixTimestamp(max(received_at)) AS last_sec
+       FROM events WHERE source IN {names:Array(String)} AND ${SOURCE_LAST_READY} GROUP BY source
+       HAVING last_ts >= now() - INTERVAL {days:UInt32} DAY AND last_ts < now() - INTERVAL 1 HOUR
+       SETTINGS force_optimize_projection = 1`,
+      // Array(String) параметром — литерал массива (как ids в actors.ts).
+      { names: `[${hbStale.map((r) => `'${r.source.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`).join(",")}]`, days },
+    )).map((r) => ({ ...r, stale_total: 0 }));
+  }
+  const inBeyond = new Set(beyondLimit.map((r) => r.source));
+  const heartbeatOnly: Stale[] = hbStale
+    .filter((r) => !inBeyond.has(r.source))
+    .map((r) => ({
+      source: r.source, source_class: "", last_sec: r.last_sec, stale_total: 0,
+      last_ts: new Date(Number(r.last_sec) * 1000).toISOString().slice(0, 19).replace("T", " "),
+    }));
+  // Порядок детерминирован: от недавно замолчавших к давним, при равенстве — по имени.
+  const candidates = [...proj, ...beyondLimit, ...heartbeatOnly]
+    .sort((x, y) => Number(y.last_sec) - Number(x.last_sec) || x.source.localeCompare(y.source));
+  const staleShown = candidates.slice(0, STALE_SOURCES_LIMIT);
+  // Объединение: проекция целиком (stale_total, включая имена за LIMIT) + heartbeat-only.
+  const unionTotal = Math.max(projTotal, proj.length + beyondLimit.length) + heartbeatOnly.length;
+  const omitted = Math.max(0, unionTotal - staleShown.length);
+  const byStale = new Map(staleShown.map((r) => [r.source, r]));
+  const sources = [...hour.map((r) => r.source), ...staleShown.map((r) => r.source)].map((source) => {
+    const h = byHour.get(source), rh = byRhythm.get(source), st = byStale.get(source);
+    const now = Number(h?.now_sec ?? rh?.now_sec ?? Math.floor(Date.now() / 1000));
+    // Последнее событие: таблица событий точнее heartbeat (минутная гранулярность).
+    const last = Number(h?.last_sec ?? st?.last_sec ?? rh?.last_sec ?? now);
+    const lastTs = h?.last_ts ?? st?.last_ts ?? "";
+    // Меньше двух разрывов — квантиль пустого массива (0/nan/null): ритм неизвестен.
+    const gapQ = rh?.gap_q == null ? NaN : Number(rh.gap_q);
+    const rhythmSec = Number.isFinite(gapQ) && gapQ > 0 ? Math.max(60, gapQ) : null;
+    const threshold = silenceThresholdSec(rhythmSec);
     return {
-      source: r.source, source_class: r.source_class, last_ts: r.last_ts,
-      events_1h: Number(r.events_1h), eps_60s: Number(r.eps_60s), pii_share: Number(r.pii_share) || 0,
-      events_window: Number(r.events_window), rhythm_sec: rhythmSec(active, span), silence_threshold_sec: threshold,
+      source, source_class: h?.source_class ?? st?.source_class ?? "", last_ts: lastTs,
+      events_1h: Number(h?.events_1h ?? 0), eps_60s: Number(h?.eps_60s ?? 0), pii_share: Number(h?.pii_share) || 0,
+      events_window: Number(rh?.events_window ?? h?.events_1h ?? 0), rhythm_sec: rhythmSec, silence_threshold_sec: threshold,
       silent_for_sec: Math.max(0, now - last), alive: isAlive(now, last, threshold) ? 1 : 0,
     };
   });
+  return { sources, omitted };
+}
+
+/** Только список (страница и тесты, которым не нужен счётчик omitted). */
+export async function sourcesHealth(): Promise<SourceHealth[]> {
+  return (await sourcesHealthReport()).sources;
 }
 
 export type EventRow = {
@@ -726,6 +848,17 @@ export async function requestUnblockIp(ip: string, user: string, reason: string)
 }
 
 export { blockCandidates, publicIpsFromChain } from "./shared/respond";
+import { blockCandidates as blockCandidatesRaw } from "./shared/respond";
+
+/** Свои сети из INTERNAL_NETS (те же, что у коллектора для attrs.scope и у движка в allowlist). */
+export function ownNets(): string[] {
+  return (process.env.INTERNAL_NETS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+/** Кандидаты на блокировку с учётом собственных сетей инсталляции. */
+export function blockCandidatesFor(inc: { actor_name: string; chain: string[] }): string[] {
+  return blockCandidatesRaw(inc.actor_name, inc.chain, ownNets());
+}
 
 /* ===== Реагирование: режим IPS/IDS и журнал ответов ===== */
 

@@ -3,6 +3,7 @@
 package normalize
 
 import (
+	"net"
 	"net/netip"
 	"regexp"
 	"strconv"
@@ -439,15 +440,37 @@ func (n *Normalizer) FromWAF(w parse.WAF, raw string) model.Event {
 		Source: "waf." + firstNonEmpty(w.Product, "modsecurity"), SourceClass: "waf",
 		Vendor: map[string]string{"coraza": "Coraza", "modsecurity": "OWASP"}[w.Product], Product: w.Product,
 		Action: "http.request", Outcome: "allow", ActorName: w.ClientIP, ActorKind: "unknown",
-		// Node — из server_id/host_ip WAF, не из заголовка Host: его пишет клиент
-		Object: strings.TrimSpace(w.Method + " " + w.URI), Node: firstNonEmpty(w.ServerID, w.HostIP, w.Host),
+		// Node — только server_id audit-лога: его задаёт оператор в конфиге WAF.
+		// [hostname] error-лога у ModSecurity (Apache r->hostname, nginx
+		// headers_in.server) — это заголовок Host запроса: его присылает клиент, и
+		// он недоверенный в любом виде, даже как IP или IP:порт — только
+		// attrs.http_host. У Coraza [hostname] пишет сам WAF: локальный адрес
+		// сокета, на который пришёл запрос, — его IP допускается в dst_ip и
+		// attrs.server_addr. Узел окончательно выбирает коллектор (cmd/collector
+		// wafNode): отправитель → node: источника → server_id → адрес сервера →
+		// адрес отправителя.
+		Object: strings.TrimSpace(w.Method + " " + w.URI), Node: w.ServerID,
 		SessionID: w.UniqueID, SrcIP: w.ClientIP, SrcPort: uint16(w.ClientPort), DstIP: w.HostIP, DstPort: uint16(w.HostPort),
 		Proto: "tcp", Raw: raw, Attrs: map[string]string{},
+	}
+	if addr := wafServerAddr(w); addr != "" {
+		e.Attrs["server_addr"] = addr
+		if e.DstIP == "" {
+			e.DstIP = addr
+		}
+	}
+	if host := strings.TrimSpace(w.ServerName); host != "" {
+		if _, isAddr := hostAddr(host); !isAddr || w.Product != "coraza" {
+			e.Attrs["http_host"] = host // от клиента: справочно, не узел и не адрес сервера
+		}
 	}
 	if e.Vendor == "" {
 		e.Vendor = "OWASP"
 	}
-	if t := parseWAFTime(w.Time); !t.IsZero() {
+	// unix_timestamp Coraza однозначен; строка timestamp — локальное время хоста без зоны.
+	if w.UnixNano > 0 {
+		e.SetTS(time.Unix(0, w.UnixNano), w.Time)
+	} else if t := parseWAFTime(w.Time); !t.IsZero() {
 		e.SetTS(t, w.Time)
 	}
 	if len(w.Rules) > 0 {
@@ -510,6 +533,37 @@ func (n *Normalizer) FromWAF(w parse.WAF, raw string) model.Event {
 	}
 	e.Ensure()
 	return e
+}
+
+// wafServerAddr — адрес сервера WAF из доверенных данных: host_ip audit-лога или,
+// только у Coraza, IP из [hostname] (локальный адрес сокета, его пишет сам WAF).
+// [hostname] ModSecurity — заголовок Host клиента: адресом сервера не бывает.
+func wafServerAddr(w parse.WAF) string {
+	if w.HostIP != "" {
+		return w.HostIP
+	}
+	if w.Product == "coraza" {
+		if ip, ok := hostAddr(w.ServerName); ok {
+			return ip
+		}
+	}
+	return ""
+}
+
+// hostAddr — IP из «addr», «addr:port», «[v6]:port»; ok=false для имени и пустой строки.
+func hostAddr(s string) (string, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", false
+	}
+	if h, _, err := net.SplitHostPort(s); err == nil {
+		s = h
+	}
+	s = strings.Trim(s, "[]")
+	if ip := net.ParseIP(s); ip != nil {
+		return ip.String(), true
+	}
+	return "", false
 }
 
 func parseWAFTime(s string) time.Time {

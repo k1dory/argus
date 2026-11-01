@@ -22,14 +22,24 @@ listeners:
   #   waf-audit — SecAuditLogFormat JSON (ModSecurity v3, Coraza); lines — error-лог
   #   nginx/Apache с «ModSecurity: …» или JSON-лог Caddy с «Coraza: …».
   files:
+  #   node — имя хоста WAF (WAF_NODE): узел событий файла, если отправитель его
+  #   не назвал; [hostname] error-лога узлом не бывает — у ModSecurity это Host
+  #   от клиента, у Coraza адрес контейнера (уходит в dst_ip и attrs.server_addr);
+  #   attrs — постоянные атрибуты файла, напр. container: имя контейнера WAF.
     - path: "${WAF_AUDIT_LOG:-}"        # напр. /logs/waf/modsec_audit.log (WAF_LOG_DIR → /logs/waf)
       format: waf-audit
       source: waf.modsecurity
       from_start: ${WAF_FROM_START:-false}   # строго true|false — прочитать файл с начала (демо), иначе только новое
+      node: "${WAF_NODE:-}"
+      attrs:
+        container: "${WAF_CONTAINER:-}"
     - path: "${WAF_ERROR_LOG:-}"        # напр. /logs/waf/error.log (nginx) или caddy.log (Coraza)
       format: lines
       source: waf.error
       from_start: ${WAF_FROM_START:-false}
+      node: "${WAF_NODE:-}"
+      attrs:
+        container: "${WAF_CONTAINER:-}"
 
 # Классификация источников: подстрока в Device Vendor (и Product) → имя и класс.
 # Встроенная таблица уже знает Check Point, PAN-OS, UserGate, Ideco, Fortinet,

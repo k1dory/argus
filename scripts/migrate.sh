@@ -111,6 +111,9 @@ mkuser argus_ro "${CLICKHOUSE_RO_PASSWORD:-}" \
 
 # argus_console — консоль: чтение argus + INSERT в таблицы, которые ведёт оператор.
 # Без readonly (нужны INSERT), DDL закрыт, лимиты с потолком (поиск ставит свои).
+# system.parts (четыре колонки) — проверка, что проекция p_source_last есть во всех
+# партах events, прежде чем /api/sources её читает (web/src/lib/argus-queries.ts,
+# SOURCE_LAST_READY); без права запрос падал с 497 и источники отвечали 503.
 mkuser argus_console "${CLICKHOUSE_CONSOLE_PASSWORD:-}" \
     "allow_ddl = 0 READONLY, max_execution_time = 30 MAX 60, max_memory_usage = 2000000000 MAX 4000000000, max_result_rows = 20000 MAX 100000, max_concurrent_queries_for_user = 16" \
     "SELECT ON argus.*" \
@@ -120,7 +123,8 @@ mkuser argus_console "${CLICKHOUSE_CONSOLE_PASSWORD:-}" \
     "INSERT ON argus.incident_comments" "INSERT ON argus.triage_session_revocations" \
     "INSERT ON argus.triage_verdicts" "INSERT ON argus.triage_verdict_claims" \
     "INSERT ON argus.triage_verdict_claims_v2" "INSERT ON argus.agent_verdicts" \
-    "INSERT ON argus.identities" "INSERT ON argus.identity_aliases"
+    "INSERT ON argus.identities" "INSERT ON argus.identity_aliases" \
+    "SELECT(database, table, active, projections) ON system.parts"
 
 # argus_collector — приём событий, heartbeat, dead-letter. У collector_health есть MV
 # в collector_health_log: ClickHouse требует INSERT на цель MV и SELECT на источник.

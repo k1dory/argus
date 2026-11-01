@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import net from "node:net";
-import { blockCandidates, isNonRoutableIpv4, publicIpsFromChain } from "../src/lib/shared/respond";
+import { blockCandidates, ipv4InCidr, isNonRoutableIpv4, publicIpsFromChain } from "../src/lib/shared/respond";
 import { isIncidentStatus } from "../src/lib/shared/incidents";
 
 test("publicIpsFromChain: публичные адреса из текста цепочки, частные и служебные — нет", () => {
@@ -64,13 +64,40 @@ test("isIncidentStatus: реальные статусы — да; toString/const
   for (const s of ["toString", "constructor", "__proto__", "hasOwnProperty", "valueOf", "", "NEW", undefined, null, 1, {}]) assert.ok(!isIncidentStatus(s), String(s));
 });
 
-test("blockCandidates: субъект-адрес — единственный кандидат; наши цели и экспортёр из цепочки не предлагаются", () => {
+test("blockCandidates: публичный субъект — единственный кандидат; свой субъект — цели в своих сетях не предлагаются", () => {
   const chain = [
     "08:22:27  netflow.core     172.16.0.1     flow                     185.25.9.138:9000",
     "08:23:22  netflow.core     185.25.9.1     flow                     185.25.9.53:9000",
   ];
   assert.deepEqual(blockCandidates("94.154.43.7", chain), ["94.154.43.7"]);
-  assert.deepEqual(blockCandidates("10.0.0.5", chain), [], "частный субъект — блокировать нечего, цели не подставляются");
+  assert.deepEqual(blockCandidates("10.0.0.5", chain, ["185.25.9.0/24"]), [], "скан своих белых адресов изнутри — блокировать нечего");
+  assert.deepEqual(blockCandidates("185.25.9.7", chain, ["185.25.9.0/24"]), [], "свой белый субъект — не кандидат; цели тоже свои");
+});
+
+test("blockCandidates: исходящее правило (маячок, DNS-туннель) — субъект частный, кандидат — внешний адрес назначения из цепочки", () => {
+  const chain = [
+    "08:22:27  netflow.core     172.16.0.1     flow                     203.0.113.44:443",
+    "08:27:27  netflow.core     172.16.0.1     flow                     203.0.113.44:443",
+    "08:32:27  netflow.core     185.25.9.1     flow                     198.51.100.2:443",
+  ];
+  assert.deepEqual(blockCandidates("10.1.2.3", chain), ["203.0.113.44", "198.51.100.2"], "экспортёры из колонки узла не предлагаются");
+  assert.deepEqual(blockCandidates("10.1.2.3", chain, ["198.51.100.0/24"]), ["203.0.113.44"], "свои белые сети исключаются");
+});
+
+test("blockCandidates: колонка узла убирается по фиксированной ширине — источник в 16+ символов не сдвигает колонки", () => {
+  // engine: "%s  %-16s %-14s %-24s %s" — после полного столбца source ровно один пробел.
+  const chain = ["10:00:01  wazuh.alerts.js… 203.0.113.9    auth.ssh                 root from 198.51.100.7"];
+  assert.deepEqual(blockCandidates("root", chain), ["198.51.100.7"]);
+});
+
+test("ipv4InCidr: маска, адрес без маски, мусор", () => {
+  assert.equal(ipv4InCidr("185.25.9.138", "185.25.9.0/24"), true);
+  assert.equal(ipv4InCidr("185.25.10.1", "185.25.9.0/24"), false);
+  assert.equal(ipv4InCidr("10.0.0.1", "10.0.0.1"), true);
+  assert.equal(ipv4InCidr("10.0.0.2", "10.0.0.1"), false);
+  assert.equal(ipv4InCidr("1.2.3.4", "0.0.0.0/0"), true);
+  assert.equal(ipv4InCidr("1.2.3.4", "garbage"), false);
+  assert.equal(ipv4InCidr("1.2.3.4", "1.2.3.0/33"), false);
 });
 
 test("blockCandidates: субъект-логин — публичные адреса цепочки без колонки узла", () => {
