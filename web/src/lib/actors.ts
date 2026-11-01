@@ -244,7 +244,10 @@ export async function aliasSightings(value: string, range: ActorRange, now = Dat
   // на ts события, если у их владельца в тот же момент нет такого login/email:
   // login casekey персоны A не берёт события uid CaseKey персоны B.
   // Интервалы собираются в массивы в самом ClickHouse (скалярные подзапросы, только
-  // пересекающие окно): длина запроса не зависит от истории алиасов. Справочник
+  // пересекающие окно): длина запроса не зависит от истории алиасов. На строку —
+  // два прохода: владельцы действующих login/email (ci_at) и владельцы действующих
+  // точных алиасов этого actor_name; строка остаётся, если вторые ⊆ первых (hasAll).
+  // Без вложенных лямбд: память линейна по событиям × (ci + fx), а не × ci × fx. Справочник
   // читается по первичному ключу (alias_kind, alias_value); uid/sid/peer — диапазон
   // alias_kind с lowerUTF8(alias_value).
   // hasAny по idx_actor_keys (0032) отсекает гранулы: каждое из условий ниже — один из ключей.
@@ -263,9 +266,8 @@ export async function aliasSightings(value: string, range: ActorRange, now = Dat
        AND hasAny(${ACTOR_KEYS_EXPR}, {keys:Array(String)})
        AND (actor_name IN ({v:String}, {pv:String})
          OR (lowerUTF8(actor_name) = {lv:String}
-             AND arrayExists(c -> ${activeAt("c", "2", "3")}, ci)
-             AND NOT arrayExists(x -> actor_name = x.1 AND ${activeAt("x", "3", "4")}
-                   AND NOT arrayExists(c -> c.1 = x.2 AND ${activeAt("c", "2", "3")}, ci), fx))
+             AND notEmpty(arrayMap(c -> c.1, arrayFilter(c -> ${activeAt("c", "2", "3")}, ci)) AS ci_at)
+             AND hasAll(ci_at, arrayMap(x -> x.2, arrayFilter(x -> actor_name = x.1 AND ${activeAt("x", "3", "4")}, fx))))
          OR lowerUTF8(node) = {lv:String})
      GROUP BY source, action, actor_name, node ORDER BY last_ts DESC LIMIT 100`,
     { ...win, v, pv, lv, hold: HOLD_CONFIDENCE, keys: chStringArray([...new Set([v, pv, lv])].sort()) },
