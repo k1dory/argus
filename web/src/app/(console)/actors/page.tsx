@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { Copyable } from "@/components/console/copyable";
 import { ActorRangeLinks } from "@/components/console/actor-forms";
+import { ActorLookupForm } from "@/components/console/actor-lookup-form";
 import { Led, PageHeader, Panel, StatTile } from "@/components/console/panel";
 import { StorageUnavailable } from "@/components/console/storage-error";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -29,6 +30,10 @@ export default async function ActorsPage({ searchParams }: PageProps<"/actors">)
       <PageHeader title="Субъекты" subtitle="Паспорт — срез журнала по человеку или служебной учётке за период с учётом времени действия алиасов. Каждый просмотр паспорта записывается в журнал действий.">
         <ActorRangeLinks current={range} base="/actors" />
       </PageHeader>
+
+      <Panel label="Кому принадлежит" meta="почта, логин, телефон, IP, хост — чей сейчас, чей раньше, где встречался">
+        <ActorLookupForm range={range} />
+      </Panel>
 
       {!pr.ok ? (
         <StorageUnavailable reason={pr.error} />

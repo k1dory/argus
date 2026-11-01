@@ -163,6 +163,80 @@ export async function resolveAlias(value: string, atMs = Date.now()): Promise<Re
   return { status: resolveStatus(matches), matches };
 }
 
+export type AliasHistoryRow = Alias & { display: string; person_kind: string; held: boolean };
+
+/**
+ * История владения значением: все интервалы любого вида алиаса, равного
+ * значению (те же правила сравнения, что у resolveAlias), включая закрытые и
+ * удержанные, — «кому и когда принадлежал этот IP / почта / телефон».
+ * Сортировка по началу интервала, новые сверху.
+ */
+export async function aliasHistory(value: string, limit = 500): Promise<AliasHistoryRow[]> {
+  const rows = await chQuery<AliasRow & { display: string; kind: string }>(
+    `SELECT a.person_id, a.alias_kind, a.alias_value, a.valid_from, a.valid_to_raw, a.source, a.confidence, a.note, p.display AS display, p.kind AS kind
+     FROM (${ALIASES_LATEST}) a LEFT JOIN (${PERSONS_LATEST}) p ON a.person_id = p.person_id
+     WHERE a.alias_value IN ({v:String}, {lv:String}, {cv:String}, {pv:String})
+     ORDER BY a.valid_from DESC, a.person_id LIMIT {limit:UInt32}`,
+    { v: value, lv: value.toLowerCase(), cv: canonicalIp(value) ?? value, pv: canonicalPhone(value) ?? value, limit: Math.min(5000, Math.max(1, Math.floor(limit))) },
+  );
+  const out: AliasHistoryRow[] = [];
+  for (const r of rows) {
+    const a = toAlias(r);
+    if (!a || !aliasMatches(a, value)) continue;
+    out.push({ ...a, display: r.display ?? "", person_kind: r.kind === "service" ? "service" : "person", held: isHeld(a) });
+  }
+  return out;
+}
+
+export type Sighting = { source: string; action: string; who: string; where: string; ips: string[]; events: number; first_ts: string; last_ts: string };
+export type VpnConnection = { actor_name: string; peer_name: string; peer_ip: string; events: number; first_ts: string; last_ts: string };
+export type Sightings = { kind: "ip" | "actor"; rows: Sighting[]; vpn: VpnConnection[] };
+
+/**
+ * Где значение встречалось в журнале за окно (не шире 30 дней). IP — как адрес
+ * источника в событиях не-NetFlow (входы, sshd, прокси, WAF: NetFlow слишком
+ * объёмный и смотрится в журнале) и как внешний адрес клиента VPN
+ * (attrs.connection_ip у событий класса vpn). Остальное — как actor_name.
+ * Индексы: bloom по src_ip и actor_name.
+ */
+export async function aliasSightings(value: string, range: ActorRange, now = Date.now()): Promise<Sightings> {
+  const w = clampWindow(rangeWindow(range, now));
+  const win = { from: chTs(w.fromMs), to: chTs(w.toMs) };
+  const ts = `ts >= parseDateTime64BestEffort({from:String}, 3, 'UTC') AND ts < parseDateTime64BestEffort({to:String}, 3, 'UTC')`;
+  type Row = { source: string; action: string; who: string; at_node: string; ips: string[]; events: string | number; first_ts: string; last_ts: string };
+  const toSighting = (r: Row): Sighting => ({ source: r.source, action: r.action, who: r.who, where: r.at_node, ips: (r.ips ?? []).filter(Boolean), events: Number(r.events), first_ts: r.first_ts, last_ts: r.last_ts });
+  const ip = canonicalIp(value);
+  if (ip) {
+    const [rows, vpn] = await Promise.all([
+      chQuery<Row>(
+        `SELECT source, action, actor_name AS who, any(node) AS at_node, groupUniqArray(5)(dst_ip) AS ips, count() AS events, toString(min(ts)) AS first_ts, toString(max(ts)) AS last_ts
+         FROM events WHERE ${ts} AND src_ip = {ip:String} AND source_class != 'netflow'
+         GROUP BY source, action, actor_name ORDER BY last_ts DESC LIMIT 100`,
+        { ...win, ip },
+      ),
+      chQuery<{ actor_name: string; peer_name: string; peer_ip: string; events: string | number; first_ts: string; last_ts: string }>(
+        `SELECT actor_name, attrs['peer_name'] AS peer_name, any(src_ip) AS peer_ip, count() AS events, toString(min(ts)) AS first_ts, toString(max(ts)) AS last_ts
+         FROM events WHERE ${ts} AND source_class = 'vpn' AND attrs['connection_ip'] = {ip:String}
+         GROUP BY actor_name, peer_name ORDER BY last_ts DESC LIMIT 100`,
+        { ...win, ip },
+      ),
+    ]);
+    return { kind: "ip", rows: rows.map(toSighting), vpn: vpn.map((r) => ({ ...r, events: Number(r.events) })) };
+  }
+  // Те же правила значения, что у алиасов (aliasColumn/compareValue): uid/sid/peer —
+  // actor_name точно, phone — в E.164, login/email — actor_name без учёта регистра,
+  // host — node без учёта регистра. Вид значения заранее неизвестен — проверяются все.
+  const v = value.trim();
+  const rows = await chQuery<Row>(
+    `SELECT source, action, actor_name AS who, node AS at_node, groupUniqArray(5)(src_ip) AS ips, count() AS events, toString(min(ts)) AS first_ts, toString(max(ts)) AS last_ts
+     FROM events WHERE ${ts}
+       AND (actor_name IN ({v:String}, {pv:String}) OR lowerUTF8(actor_name) = {lv:String} OR lowerUTF8(node) = {lv:String})
+     GROUP BY source, action, actor_name, node ORDER BY last_ts DESC LIMIT 100`,
+    { ...win, v, pv: canonicalPhone(v) ?? v, lv: v.toLowerCase() },
+  );
+  return { kind: "actor", rows: rows.map(toSighting), vpn: [] };
+}
+
 export type UnboundSubject = { actor_name: string; count: number; first_ts: string; last_ts: string; sources: string[] };
 
 /** Топ actor_name за период без действующего (на момент последней активности) субъектного алиаса. */
