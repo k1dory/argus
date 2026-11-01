@@ -212,7 +212,7 @@ function ReportBody({ r, range }: { r: ActorReport; range: string }) {
           <li>Содержимого данных внутри приложений: паспорт строится по журналу событий, а не по данным систем.</li>
           <li>Событий вне интервалов действия алиасов: до «действует с» и после «по» они субъекту не приписываются.</li>
           <li>Источников, не подключённых к ARGUS, и событий старше срока хранения.</li>
-          <li>Разделы «Входы» … «Изменения» построены по последним {fmtNum(r.limit)} событиям периода, сводка — по всем.</li>
+          <li>Разделы «Входы» … «Изменения» берут последние {fmtNum(r.limit)} событий каждого раздела за период, на странице — первые {fmtNum(SECTION_SHOWN)}; полностью — в экспорте Markdown и в API. Сводка — по всем событиям.</li>
           {r.ambiguous.length > 0 && <li>Алиасы с пометкой «неоднозначно» делятся с другой персоной — их события могут быть не этого субъекта.</li>}
           {r.aliases.some(isHeld) && <li>Алиасы «на удержании» (нарушение политики идентичности) в сшивку не входят: их события в паспорте не учтены, пока администратор не подтвердит алиас.</li>}
         </ul>
@@ -220,6 +220,9 @@ function ReportBody({ r, range }: { r: ActorReport; range: string }) {
     </>
   );
 }
+
+/** Строк раздела на странице; выборка — до limit (экспорт и API отдают её целиком). */
+const SECTION_SHOWN = 50;
 
 function SectionPanel({ section, items, limit }: { section: Exclude<Section, "other">; items: LogItem[]; limit: number }) {
   const meta: Record<Exclude<Section, "other">, string> = {
@@ -231,8 +234,17 @@ function SectionPanel({ section, items, limit }: { section: Exclude<Section, "ot
   };
   const fail = items.filter((e) => /fail|deny|denied|error/i.test(e.outcome)).length;
   return (
-    <Panel label={`${SECTION_LABELS[section]} · ${fmtNum(items.length)}`} meta={`${meta[section]}${fail ? ` · отказов ${fmtNum(fail)}` : ""} · по последним ${fmtNum(limit)}`} bodyClassName="p-0">
-      {items.length === 0 ? <Empty className="p-4">Нет событий этого раздела среди последних в периоде.</Empty> : <EventTable items={items.slice(0, 50)} />}
+    <Panel label={`${SECTION_LABELS[section]} · ${fmtNum(items.length)}`} meta={`${meta[section]}${fail ? ` · отказов ${fmtNum(fail)}` : ""} · выборка до ${fmtNum(limit)}`} bodyClassName="p-0">
+      {items.length === 0 ? <Empty className="p-4">Нет событий этого раздела в периоде.</Empty> : (
+        <>
+          <EventTable items={items.slice(0, SECTION_SHOWN)} />
+          {items.length > SECTION_SHOWN && (
+            <p className="border-t border-border/60 px-4 py-2 text-xs text-muted-foreground">
+              Показаны последние {fmtNum(SECTION_SHOWN)} из {fmtNum(items.length)}{items.length >= limit ? ` (выборка ограничена ${fmtNum(limit)})` : ""} — полностью в экспорте Markdown и API.
+            </p>
+          )}
+        </>
+      )}
     </Panel>
   );
 }

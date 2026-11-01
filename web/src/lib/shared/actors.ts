@@ -274,30 +274,29 @@ export function aliasPredicate(aliases: Alias[], window: Window, prefix = "", ts
 export const chStringArray = (values: string[]): string =>
   `[${values.map((v) => `'${v.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`).join(",")}]`;
 
+/** Выражение skip-индекса idx_actor_keys (миграция 0032): все колонки, с которыми
+ *  сравниваются алиасы, в том виде, в каком их сравнивает aliasColumnExpr. Текст должен
+ *  совпадать с индексом дословно — иначе ClickHouse индекс не применит. */
+export const ACTOR_KEYS_EXPR = "[actor_name, lowerUTF8(actor_name), src_ip, lowerUTF8(node)]";
+
 /**
- * Грубый фильтр строк по значениям алиасов без интервалов: колонка IN массив
- * значений. Ставится в WHERE рядом с точными countIf(aliasPredicate), чтобы
- * точный подсчёт шёл по тысячам совпавших строк, а не по всему окну
- * (на живом потоке 7 суток — 100+ млн строк, сотни OR в countIf не
- * укладывались в 20 с). Удержанные алиасы, как и в aliasPredicate, не участвуют.
+ * Грубый фильтр строк по значениям алиасов без интервалов: hasAny(ключи строки,
+ * массив значений). Ставится в WHERE рядом с точным aliasPredicate: bloom-индекс
+ * idx_actor_keys отсекает гранулы для любой смеси видов алиасов (login OR ip …),
+ * чего OR по отдельным индексам не умеет, и точный предикат с интервалами идёт по
+ * тысячам совпавших строк, а не по всему окну (на живом потоке 7 суток — 100+ млн
+ * строк). Значения — как их сравнивает aliasPredicate (compareValue), поэтому
+ * фильтр не уже точного предиката. Удержанные алиасы не участвуют.
  */
 export function aliasPrefilter(aliases: Alias[], prefix = "pf_"): Predicate {
-  const byExpr = new Map<string, Set<string>>();
+  const values = new Set<string>();
   for (const a of aliases) {
     if (isHeld(a)) continue;
-    const expr = aliasColumnExpr(a.kind);
-    if (!byExpr.has(expr)) byExpr.set(expr, new Set());
-    byExpr.get(expr)!.add(a.value);
+    values.add(compareValue(a));
   }
-  const params: Record<string, string | number> = {};
-  const parts: string[] = [];
-  let i = 0;
-  for (const [expr, values] of [...byExpr.entries()].sort(([a], [b]) => a.localeCompare(b))) {
-    const name = `${prefix}${i++}`;
-    params[name] = chStringArray([...values].sort());
-    parts.push(`${expr} IN {${name}:Array(String)}`);
-  }
-  return { sql: parts.length ? `(${parts.join(" OR ")})` : "0", params };
+  if (!values.size) return { sql: "0", params: {} };
+  const name = `${prefix}keys`;
+  return { sql: `hasAny(${ACTOR_KEYS_EXPR}, {${name}:Array(String)})`, params: { [name]: chStringArray([...values].sort()) } };
 }
 
 /** Действует ли алиас в момент at. */
@@ -372,6 +371,20 @@ export function classifyEvent(action: string, outcome: string, sourceClass = "")
   if (CHANGE_RE.test(a) && outcome.toLowerCase() === "success") return "change";
   return "other";
 }
+
+/**
+ * classifyEvent на SQL — для выборки последних событий каждого раздела отдельно:
+ * частый раздел (журнал соединений) не вытесняет редкие из общей ленты.
+ * Порядок веток совпадает с classifyEvent; сверка — tests/actors-sections-ch.test.ts.
+ */
+export const SECTION_SQL = `multiIf(
+  startsWith(lowerUTF8(action), 'auth.') OR position(lowerUTF8(action), 'login') > 0 OR position(lowerUTF8(action), 'logon') > 0 OR position(lowerUTF8(action), 'sshd') > 0, 'login',
+  startsWith(lowerUTF8(action), 'identity.'), 'change',
+  lowerUTF8(source_class) IN ('netflow', 'ngfw') OR startsWith(lowerUTF8(action), 'net.'), 'network',
+  startsWith(lowerUTF8(action), 'priv.') OR position(lowerUTF8(action), 'sudo') > 0 OR match(lowerUTF8(action), '(^|[._-])su($|[._-])') OR startsWith(lowerUTF8(action), 'session.'), 'host',
+  startsWith(lowerUTF8(action), 'app.') OR position(lowerUTF8(action), 'authorize') > 0 OR position(lowerUTF8(action), 'oauth') > 0, 'app',
+  match(lowerUTF8(action), 'create|update|delete|change|modify') AND lowerUTF8(outcome) = 'success', 'change',
+  'other')`;
 
 /** Разложить события по разделам (порядок строк сохраняется). */
 export function bucketEvents(items: LogItem[]): Record<Section, LogItem[]> {
@@ -581,7 +594,7 @@ export function actorMarkdown(r: ActorReport): string {
     if (s === "other") continue;
     const items = r.sections[s];
     lines.push("", `## ${SECTION_LABELS[s]}`, "");
-    if (!items.length) lines.push("Нет событий этого раздела среди последних в окне.");
+    if (!items.length) lines.push("Нет событий этого раздела в окне.");
     else lines.push(...items.map(eventLine));
   }
   lines.push("", "## Инциденты", "");
@@ -595,7 +608,7 @@ export function actorMarkdown(r: ActorReport): string {
     "- Содержимое данных внутри приложений: паспорт строится по журналу событий, а не по данным систем.",
     "- События вне интервалов действия алиасов: до valid_from и после valid_to они субъекту не приписываются.",
     "- Источники, не подключённые к ARGUS, и события старше срока хранения.",
-    `- Разделы «Входы» … «Изменения» построены по последним ${r.limit} событиям окна, сводка — по всем.`,
+    `- Разделы «Входы» … «Изменения» — последние ${r.limit} событий каждого раздела в окне, сводка — по всем.`,
   );
   if (r.ambiguous.length) lines.push("- Алиасы с пометкой «неоднозначно» в окне делятся с другой персоной: их события могут быть не этого субъекта.");
   if (r.aliases.some(isHeld)) lines.push("- Алиасы «на удержании» (нарушение политики идентичности) в сшивку не входят: их события в паспорте не учтены, пока администратор не подтвердит алиас.");
