@@ -334,14 +334,16 @@ func (w *Writer) writeDurable(ctx context.Context, b Batch) {
 			return
 		}
 		if isData(err) {
-			rest, _ := w.resolve(ctx, b.Rows, err, true, &budget)
+			rest, terr := w.resolve(ctx, b.Rows, err, true, &budget)
 			if len(rest) == 0 {
 				if err := w.Queue.ack(b); err != nil {
 					slog.Error("spool ack", "err", err, "file", b.file)
 				}
 				return
 			}
-			if len(rest) < len(b.Rows) {
+			// Остаток меньше — или тот же, но переставлен ротацией (бюджет исчерпан):
+			// следующий проход должен начать с непроверенного и после перезапуска.
+			if len(rest) < len(b.Rows) || errors.Is(terr, errBisectBudget) {
 				nb, serr := w.Queue.shrink(b, rest)
 				if serr != nil {
 					// Файл остаётся целиком: при повторе вставленные строки задвоятся,
@@ -429,25 +431,25 @@ var errBisectBudget = errors.New("бюджет бисекции исчерпан
 // resolve — бисекция ошибки данных до отдельных строк: прошедшая часть вставлена,
 // отвергнутая как данные (241 и др. по размеру, 27/6/53/117 по содержимому) делится
 // дальше. Отказ — только строка, отвергнутая одиночным INSERT; отказы копятся и
-// пишутся в ingest_rejects одним INSERT. Возвращает нерешённые строки — части с
-// транспортной ошибкой, непроверенные при исчерпанном budget, остаток при остановке,
-// а при keepUnrejected — и отказы, которые не удалось записать, — и последнюю причину.
+// пишутся в ingest_rejects одним INSERT. Возвращает нерешённые строки и последнюю
+// причину: сначала непроверенные (budget исчерпан, остановка), затем части с
+// транспортной ошибкой, а при keepUnrejected — и отказы, которые не удалось записать.
+// Порядок — ротация: следующий проход начинает с ещё не проверенного, иначе при
+// застрявшем префиксе (241 группой, таймаут поодиночке) бюджет каждый раз уходил бы на
+// него, а корректный хвост не проверялся бы никогда.
 func (w *Writer) resolve(ctx context.Context, rows []any, err error, keepUnrejected bool, budget *int) ([]any, error) {
-	var rejects []any
+	var rejects, unverified, failed []any
 	var terr error
-	var split func(rows []any) []any
-	split = func(rows []any) []any {
+	var split func(rows []any)
+	split = func(rows []any) {
 		if ctx.Err() != nil {
-			return rows
+			unverified = append(unverified, rows...)
+			return
 		}
 		mid := len(rows) / 2
-		var rest []any
 		for _, part := range [][]any{rows[:mid], rows[mid:]} {
 			if *budget <= 0 {
-				if terr == nil {
-					terr = errBisectBudget
-				}
-				rest = append(rest, part...)
+				unverified = append(unverified, part...)
 				continue
 			}
 			*budget--
@@ -456,21 +458,23 @@ func (w *Writer) resolve(ctx context.Context, rows []any, err error, keepUnrejec
 			case isData(perr) && len(part) == 1:
 				rejects = append(rejects, part...)
 			case isData(perr):
-				rest = append(rest, split(part)...)
+				split(part)
 			default:
 				terr = perr
-				rest = append(rest, part...)
+				failed = append(failed, part...)
 			}
 		}
-		return rest
 	}
-	var rest []any
 	if len(rows) == 1 {
 		rejects = rows // одиночный INSERT уже отвергнут как данные
 	} else {
 		slog.Warn("insert: ошибка данных, делю батч", "rows", len(rows), "budget", *budget, "err", short(err.Error()))
-		rest = split(rows)
+		split(rows)
 	}
+	if len(unverified) > 0 && ctx.Err() == nil {
+		terr = errors.Join(errBisectBudget, terr) // Join без nil-ошибок, Is видит обе
+	}
+	rest := append(unverified, failed...)
 	if len(rejects) > 0 && !w.deadLetter(rejects, err) && keepUnrejected {
 		rest = append(rest, rejects...)
 	}
