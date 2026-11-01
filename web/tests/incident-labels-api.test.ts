@@ -10,12 +10,12 @@ process.env.CLICKHOUSE_URL = "http://127.0.0.1:9";
 const realQueries = require("../src/lib/argus-queries") as typeof import("../src/lib/argus-queries");
 const mocks = installNextMocks();
 const auth = loadAuth();
-Object.assign(require("../src/lib/argus-queries"), { incidentLabels: realQueries.incidentLabels });
+mocks.queries.incidentLabels = realQueries.incidentLabels;
 const route = require("../src/app/api/incidents/labels/route") as { GET: (req: Request) => Promise<Response> };
 /* eslint-enable @typescript-eslint/no-require-imports */
 
 const label = {
-  incident_id: "INC-4", changed_at: "2026-11-01 10:00:00.123", actor: "analyst", status: "closed",
+  event_id: "12345678-9abc-4def-8abc-123456789abc", incident_id: "INC-4", changed_at: "2026-11-01 10:00:00.123", actor: "analyst", status: "closed",
   disposition: "benign_authorized", escalate: false, severity_correct: true, ops_cause: "", ops_action: "",
   blind: true, reason: "Проверено по журналу", rule_id: "fixture-rule", rule_title: "Fixture", level: "high", tags: ["attack.t1110"],
 };

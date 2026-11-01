@@ -16,3 +16,14 @@ export function isBlindIncident(id: string): boolean {
 export function hideVerdicts(inc: { incident_id: string; status: string }): boolean {
   return inc.status !== "closed" && inc.status !== "false_positive" && isBlindIncident(inc.incident_id);
 }
+
+/** Копии вердикта агента вне самого вердикта: triage/verdicts кладёт его Markdown
+ *  в комментарий от agent:<имя>, а категорию и уверенность — в аудит triage.verdict*.
+ *  Пока hideVerdicts, их отдавать нельзя ни в JSON, ни в Markdown, ни в props страницы. */
+export function blindComments<T extends { author: string }>(comments: T[]): T[] {
+  return comments.filter((c) => !c.author.startsWith("agent:"));
+}
+
+export function blindActions<T extends { action?: unknown }>(actions: T[]): T[] {
+  return actions.filter((a) => !String(a.action ?? "").startsWith("triage.verdict"));
+}

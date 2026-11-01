@@ -209,27 +209,34 @@ export async function incidentStateHistory(id: string, limit = 200): Promise<Inc
 }
 
 /** Метка ответа человека для выгрузки (обучение, доля ложных срабатываний правила). */
+export type { LabelCursor } from "./label-cursor";
+import type { LabelCursor } from "./label-cursor";
+
 export type IncidentLabelRow = {
-  incident_id: string; changed_at: string; actor: string; status: IncidentStatus;
+  event_id: string; incident_id: string; changed_at: string; actor: string; status: IncidentStatus;
   disposition: string; escalate: boolean | null; severity_correct: boolean | null;
   ops_cause: string; ops_action: string; blind: boolean; reason: string;
   rule_id: string; rule_title: string; level: string; tags: string[];
 };
 
-/** Ответы людей при завершении с `since` (включительно), по времени. Только
+/** Ответы людей при завершении с `since` (включительно), по (changed_at, incident_id, event_id);
+ *  after — строго после этой позиции (продолжение выгрузки). Только
  *  labeled_by_human: автозакрытия (kind auto_close) пишут тот же статус closed и
  *  без этого фильтра выдавались бы за ответ человека. Повторное завершение
  *  одного инцидента — отдельная строка (переоткрытия в консоли нет, но журнал
- *  append-only). Правило, уровень и теги — последняя версия инцидента. */
-export async function incidentLabels(since: string, limit: number): Promise<IncidentLabelRow[]> {
+ *  append-only). Правило, уровень и теги — последняя версия инцидента.
+ *  max_result_rows консоли — 20000 (MAX 100000): порция до limit поднимает его на запрос. */
+export async function incidentLabels(since: string, limit: number, after?: LabelCursor): Promise<IncidentLabelRow[]> {
   return chQuery<IncidentLabelRow>(
     `WITH labels AS (
-       SELECT incident_id, changed_at, actor, status, disposition, escalate, severity_correct,
-              ops_cause, ops_action, blind, reason
+       SELECT event_id, incident_id, changed_at, actor, status, disposition, escalate,
+              severity_correct, ops_cause, ops_action, blind, reason
        FROM incident_state_events
        WHERE labeled_by_human AND kind = 'status' AND status IN ('closed', 'false_positive')
          AND changed_at >= parseDateTime64BestEffort({since:String}, 3, 'UTC')
-       ORDER BY changed_at, incident_id LIMIT {limit:UInt32}
+         AND (changed_at, incident_id, toString(event_id))
+             > (parseDateTime64BestEffort({after_ts:String}, 3, 'UTC'), {after_inc:String}, {after_id:String})
+       ORDER BY changed_at, incident_id, toString(event_id) LIMIT {limit:UInt32}
      )
      SELECT l.*, i.rule_id, i.rule_title, i.level, i.tags
      FROM labels AS l
@@ -238,8 +245,9 @@ export async function incidentLabels(since: string, limit: number): Promise<Inci
               argMax(level, updated_at) AS level, argMax(tags, updated_at) AS tags
        FROM incidents WHERE incident_id IN (SELECT incident_id FROM labels) GROUP BY incident_id
      ) AS i USING incident_id
-     ORDER BY l.changed_at, l.incident_id`,
-    { since, limit },
+     ORDER BY l.changed_at, l.incident_id, toString(l.event_id)`,
+    { since, limit, after_ts: after?.changedAt ?? "1970-01-01 00:00:00.000", after_inc: after?.incidentId ?? "", after_id: after?.eventId ?? "" },
+    { max_result_rows: Math.max(limit, 1) },
   );
 }
 

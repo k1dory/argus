@@ -368,7 +368,8 @@ paths:
         (теги `ops.*`) — `ops_cause`, `ops_action`. `blind` — инцидент разбирался вслепую:
         до закрытия консоль не показывала вердикт агента и анализ модели. Автозакрытия
         (`kind: auto_close`) не выдаются — их статус `closed` не ответ человека. По времени
-        завершения, с `since` включительно. Лимит выгрузок; сессии разбора закрыт.
+        завершения (при равном времени — по `incident_id`, `event_id`), с `since` включительно; продолжение — `cursor=next_cursor`.
+        Лимит выгрузок; сессии разбора закрыт.
       operationId: listIncidentLabels
       security:
         - cookieSession: []
@@ -376,11 +377,24 @@ paths:
       parameters:
         - name: since
           in: query
-          schema: { type: string, example: "2026-11-01" }
-          description: Начало периода, дата или дата-время ISO 8601 в UTC. По умолчанию — всё.
+          schema:
+            type: string
+            pattern: '^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d{1,9})?)?Z?)?$'
+            example: "2026-11-01T10:00:00.123Z"
+          description: |
+            Начало периода (включительно): дата `YYYY-MM-DD` или дата-время
+            `YYYY-MM-DDTHH:MM[:SS[.fff]][Z]` в UTC; смещения не принимаются, несуществующая
+            дата (`2026-02-30`, `25:00`) — 400. По умолчанию — всё.
         - name: limit
           in: query
           schema: { type: integer, minimum: 1, maximum: 50000, default: 10000 }
+        - name: cursor
+          in: query
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{1,128}$' }
+          description: |
+            `next_cursor` предыдущего ответа: выдача продолжается строго после его последней
+            метки по (`changed_at`, `incident_id`, `event_id`) — без повторов и пропусков при равном времени.
+            Применяется вместе с `since`. Повреждённый курсор — 400.
       responses:
         "200":
           description: Метки по времени завершения.
@@ -388,12 +402,15 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [labels, truncated, exported_at]
+                required: [labels, truncated, next_cursor, exported_at]
                 properties:
                   labels:
                     type: array
                     items: { $ref: "#/components/schemas/IncidentLabel" }
-                  truncated: { type: boolean, description: "Выдано ровно limit строк — продолжить с последнего changed_at." }
+                  truncated: { type: boolean, description: "Выдано ровно limit строк — продолжить с `cursor=next_cursor`." }
+                  next_cursor:
+                    type: [string, "null"]
+                    description: Курсор следующей порции при `truncated`, иначе null. Непрозрачен.
                   exported_at: { type: string, format: date-time }
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
@@ -1585,8 +1602,9 @@ components:
         labeled_by_human: { type: boolean }
     IncidentLabel:
       type: object
-      required: [incident_id, changed_at, actor, status, disposition, escalate, severity_correct, ops_cause, ops_action, blind, reason, rule_id, rule_title, level, tags]
+      required: [event_id, incident_id, changed_at, actor, status, disposition, escalate, severity_correct, ops_cause, ops_action, blind, reason, rule_id, rule_title, level, tags]
       properties:
+        event_id: { type: string, format: uuid, description: "Запись журнала incident_state_events; вместе с changed_at и incident_id задаёт порядок выдачи." }
         incident_id: { $ref: "#/components/schemas/IncidentIdString" }
         changed_at: { $ref: "#/components/schemas/ChTimestamp" }
         actor: { type: string }
@@ -1673,7 +1691,10 @@ components:
             - type: "null"
         verdict_hidden:
           type: boolean
-          description: Инцидент разбирается вслепую и ещё не завершён — анализ модели скрыт (verdict = null).
+          description: |
+            Инцидент разбирается вслепую и ещё не завершён — анализ модели скрыт (verdict = null),
+            вместе с копиями вердикта агента: комментарии `agent:*` и записи аудита `triage.verdict*`
+            не выдаются в `comments` и `actions`. После завершения выдаются все.
         actions:
           type: array
           items: { $ref: "#/components/schemas/AuditRow" }

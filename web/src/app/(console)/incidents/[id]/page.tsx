@@ -31,7 +31,7 @@ import { agentVerdictsFor, incidentComments, incidentFirstResponse, incidentGet,
 import { MarkdownBody } from "@/components/console/markdown-body";
 import { VERDICT_RU } from "@/lib/shared/triage-verdict";
 import { closureLabelText, isOpsIncident } from "@/lib/shared/closure-label";
-import { hideVerdicts } from "@/lib/blind";
+import { blindComments, hideVerdicts } from "@/lib/blind";
 
 export const dynamic = "force-dynamic";
 
@@ -79,7 +79,8 @@ export default async function IncidentPage({ params }: PageProps<"/incidents/[id
   const verdict = vr.ok ? vr.data : null;
   const users = ur.ok ? ur.data : [];
   const responses = rr.ok ? rr.data : [];
-  const comments = cr.ok ? cr.data : [];
+  // Комментарий agent:* — копия Markdown вердикта: в слепом разборе не уходит в props.
+  const comments = cr.ok ? (blind ? blindComments(cr.data) : cr.data) : [];
   const changes = hr.ok ? hr.data : [];
   const firstResponse = fr.ok ? fr.data : null;
   const missing = [!vr.ok && "анализ модели", !ur.ok && "список сотрудников", !rr.ok && "журнал реагирования", !cr.ok && "записи команды", !hr.ok && "история изменений", !fr.ok && "время первой реакции", !ar.ok && "вердикты агента"].filter(Boolean);

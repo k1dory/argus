@@ -2,7 +2,7 @@ import { apiGuard, outOfScope } from "@/lib/auth";
 import { chQuery, incidentComments, incidentFirstResponse, incidentGet, incidentStateHistory, verdictGet } from "@/lib/argus-queries-export";
 import { incidentAccess } from "@/lib/shared/triage";
 import { relatedSummaries } from "@/lib/triage-queries";
-import { hideVerdicts } from "@/lib/blind";
+import { blindActions, blindComments, hideVerdicts } from "@/lib/blind";
 
 // GET /api/incidents/INC-12 — полная карточка для отчёта: инцидент (последняя
 // версия), история статусов, вердикт аналитика, действия оператора. Доступ —
@@ -40,13 +40,15 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
       incidentFirstResponse(id),
     ]);
     if (!incident) return Response.json({ error: "не найден" }, { status: 404 });
-    // Слепая выборка: выгрузка — та же консоль, анализ модели скрыт до завершения.
+    // Слепая выборка: выгрузка — та же консоль, анализ модели скрыт до завершения,
+    // вместе с его копиями в комментариях agent:* и аудите triage.verdict*.
     // Сессии разбора (агенту) он и так не нужен для своего вердикта.
     const blind = hideVerdicts(incident);
     return Response.json(
       { incident, first_response_at: firstResponseAt, history, history_truncated: history.length === 10_000,
         verdict: blind ? null : verdict, ...(blind ? { verdict_hidden: true } : {}),
-        actions, comments, comments_truncated: comments.length === 10_000,
+        actions: blind ? blindActions(actions) : actions, comments: blind ? blindComments(comments) : comments,
+        comments_truncated: comments.length === 10_000,
         exported_at: new Date().toISOString() },
       { headers: { "Content-Disposition": `attachment; filename="${id}-${new Date().toISOString().slice(0, 10)}.json"` } },
     );

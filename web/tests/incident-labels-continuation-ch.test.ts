@@ -1,10 +1,11 @@
-// OpenAPI /api/incidents/labels: при truncated продолжить с последнего changed_at.
+// OpenAPI /api/incidents/labels: при truncated продолжить с cursor=next_cursor.
 // Две метки одной миллисекунды не должны делать следующую строку недостижимой.
 // Настоящий incidentLabels в отдельной БД; SQL и ответы ClickHouse не подменены.
 import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { ch, liveSkip as skip, migrationStatements, serializeLiveFile } from "./_ch-live";
+import { decodeLabelCursor, encodeLabelCursor, type LabelCursor } from "../src/lib/label-cursor";
 
 serializeLiveFile({ before, after });
 
@@ -12,7 +13,7 @@ serializeLiveFile({ before, after });
 const queries = () => require("../src/lib/argus-queries") as typeof import("../src/lib/argus-queries");
 /* eslint-enable @typescript-eslint/no-require-imports */
 
-test("incidentLabels: продолжение с last.changed_at достигает следующей метки при равном времени", { skip }, async (t) => {
+test("incidentLabels: продолжение по курсору достигает следующей метки при равном времени", { skip }, async (t) => {
   const db = `argus_labels_page_${randomBytes(6).toString("hex")}`;
   const since = "2099-01-01 00:00:00.123";
   const ids = ["INC-410000001", "INC-410000002"];
@@ -56,22 +57,25 @@ test("incidentLabels: продолжение с last.changed_at достигае
     assert.deepEqual(complete.map((row) => row.incident_id), ids);
     assert.ok(complete.every((row) => row.changed_at === since && row.rule_id === "fixture-labels-page"));
 
-    const pages: { since: string; ids: string[]; changedAt: string[] }[] = [];
-    const seen = new Set<string>();
-    let from = since;
-    // Только документированные since/limit. Передаём changed_at ровно из
-    // предыдущего ответа, напрямую в function: API-regex не маскирует SQL-сбой.
+    const pages: { cursor: string | null; ids: string[]; changedAt: string[] }[] = [];
+    const seen: string[] = [];
+    let after: LabelCursor | undefined;
+    // Документированные since/limit/cursor. Курсор — ровно next_cursor из
+    // предыдущей строки (encode → decode, как в API), напрямую в function:
+    // API-проверки не маскируют SQL-сбой.
     for (let attempt = 0; attempt < 3; attempt++) {
-      const page = await queries().incidentLabels(from, 1);
+      const page = await queries().incidentLabels(since, 1, after);
+      pages.push({ cursor: after ? JSON.stringify(after) : null, ids: page.map((row) => row.incident_id), changedAt: page.map((row) => row.changed_at) });
+      if (!page.length) break;
       assert.equal(page.length, 1, "допустимый limit=1 соблюдается");
-      pages.push({ since: from, ids: page.map((row) => row.incident_id), changedAt: page.map((row) => row.changed_at) });
-      for (const row of page) seen.add(row.incident_id);
-      if (seen.size === ids.length) break;
-      from = page.at(-1)!.changed_at;
+      seen.push(...page.map((row) => row.incident_id));
+      after = decodeLabelCursor(encodeLabelCursor(page.at(-1)!))!;
+      assert.ok(after, "next_cursor последней строки декодируется");
     }
     t.diagnostic(JSON.stringify({ complete: complete.map((row) => row.incident_id), limit: 1, pages }));
-    assert.deepEqual([...seen].sort(), ids,
-      "продолжение с last.changed_at повторяет первую метку; сдвиг времени вперёд потеряет вторую метку той же миллисекунды");
+    assert.deepEqual(seen.slice().sort(), ids, "каждая метка той же миллисекунды выдана");
+    assert.equal(new Set(seen).size, seen.length, "продолжение не повторяет уже выданную метку");
+    assert.deepEqual(seen, complete.map((row) => row.incident_id), "порядок порций совпадает с полной выдачей");
   } finally {
     database = "default";
     if (created) await ch().chCommand(`DROP DATABASE ${db} SYNC`);
