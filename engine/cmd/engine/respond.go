@@ -139,23 +139,28 @@ func (e *engine) capRelease(id string, at time.Time) {
 // restoreRespState — после рестарта: открытые инциденты с правилом respond
 // считаются решёнными (done). Их дописывание иначе вызвало бы исполнителей
 // заново: список активных блокировок в памяти и после рестарта пуст.
-// Склеенный по подсети решается по адресам: решения и потраченный потолок
-// восстанавливаются из response_log (членство в инциденте само по себе не
-// значит, что адрес блокировали). Если журнал недоступен — осторожно: все
-// записанные адреса решены, потолок окна считается исчерпанным.
+//
+// Склеенный по подсети решается по адресам, из response_log:
+//   - блок или симуляция хотя бы одним исполнителем — done и одно место в потолке
+//     на адрес (два исполнителя — всё равно один адрес);
+//   - сбой исполнителей (и уведомление о повторе) — только место: очередь повторов
+//     после рестарта пуста, и новая сработка адреса может блокировать снова;
+//   - потолок — capped; IDS, «уже заблокирован», отказ allowlist — done;
+//   - ожидание доверенных событий — без решения;
+//   - адрес, у которого есть правило с respond, но нет ни одной записи (INSERT
+//     журнала мог не дойти после блоков на NGFW), — осторожно: done и место.
+//
+// Если журнал недоступен — все записанные адреса решены, потолок окна исчерпан.
 func (e *engine) restoreRespState(open []incidents.Incident, now time.Time) int {
 	n := 0
-	var collapsed []string
-	byID := map[string]*incidents.Incident{}
+	var collapsed []*incidents.Incident
 	for i := range open {
-		r := e.ruleFor(open[i].RuleID)
 		if incidents.IsCollapsedKey(open[i].GroupKey) {
-			collapsed = append(collapsed, open[i].IncidentID)
-			byID[open[i].IncidentID] = &open[i]
+			collapsed = append(collapsed, &open[i])
 			n++
 			continue
 		}
-		if r != nil && r.Respond != nil {
+		if r := e.ruleFor(open[i].RuleID); r != nil && r.Respond != nil {
 			e.setRespStatus(open[i].IncidentID, "done", now)
 			n++
 		}
@@ -163,63 +168,134 @@ func (e *engine) restoreRespState(open []incidents.Incident, now time.Time) int 
 	if len(collapsed) == 0 {
 		return n
 	}
-	rows, err := e.ch.ResponsesFor(context.Background(), collapsed, now.Add(-respStateTTL))
+	ids := make([]string, len(collapsed))
+	for i, inc := range collapsed {
+		ids[i] = inc.IncidentID
+	}
+	rows, err := e.ch.ResponsesFor(context.Background(), ids, now.Add(-respStateTTL))
 	if err != nil {
 		slog.Warn("ips: решения склеенных инцидентов не восстановлены — адреса считаются решёнными, потолок исчерпанным", "err", err)
-		for _, id := range collapsed {
-			inc := byID[id]
+		for _, inc := range collapsed {
 			for _, ip := range inc.MemberIPs() {
-				e.setRespStatus(id+"|"+ip, "done", now)
+				e.setRespStatus(inc.IncidentID+"|"+ip, "done", now)
 			}
-			if r := e.ruleFor(inc.RuleID); r != nil {
-				limit, _ := r.IncidentCap()
-				e.respMu.Lock()
-				e.respCap[id] = slices.Repeat([]time.Time{now}, limit)
-				e.respMu.Unlock()
-			}
+			limit, _ := e.collapseCap(inc)
+			e.respMu.Lock()
+			e.respCap[inc.IncidentID] = slices.Repeat([]time.Time{now}, limit)
+			e.respMu.Unlock()
 		}
 		return n
 	}
+	type addr struct {
+		blocked, failed bool
+		decision        string
+		slotAt          time.Time
+		seen            bool
+	}
+	byKey := map[string]*addr{}
 	for _, row := range rows {
 		key := row.IncidentID + "|" + row.IP
+		a := byKey[key]
+		if a == nil {
+			a = &addr{}
+			byKey[key] = a
+		}
+		a.seen = true
 		at, perr := time.ParseInLocation("2006-01-02 15:04:05", row.TS, time.UTC)
 		if perr != nil {
 			at = now
 		}
-		switch state := restoredState(row); state {
-		case "blocked":
-			e.setRespStatus(key, "done", now)
-			e.respMu.Lock()
-			e.respCap[row.IncidentID] = append(e.respCap[row.IncidentID], at)
-			e.respMu.Unlock()
-		case "failed":
-			// Блок не вышел, повтор responder'а после рестарта потерян: адрес не решён,
-			// но место в потолке он держал — держит и теперь.
-			e.respMu.Lock()
-			e.respCap[row.IncidentID] = append(e.respCap[row.IncidentID], at)
-			e.respMu.Unlock()
+		switch st := restoredState(row); st {
+		case "blocked", "failed":
+			if a.slotAt.IsZero() || at.Before(a.slotAt) {
+				a.slotAt = at
+			}
+			if st == "blocked" {
+				a.blocked = true
+			} else {
+				a.failed = true
+			}
 		case "":
 		default:
-			e.setRespStatus(key, state, now)
+			a.decision = st
 		}
+	}
+	assumed := 0
+	for _, inc := range collapsed {
+		for _, m := range inc.Members {
+			key := inc.IncidentID + "|" + m.IP
+			a := byKey[key]
+			if a == nil && e.memberResponds(m.Rules) {
+				a = &addr{blocked: true, slotAt: now}
+				assumed++
+			}
+			if a == nil {
+				continue
+			}
+			switch {
+			case a.blocked:
+				e.setRespStatus(key, "done", now)
+			case a.decision != "":
+				e.setRespStatus(key, a.decision, now)
+			}
+			if a.blocked || a.failed {
+				e.respMu.Lock()
+				e.respCap[inc.IncidentID] = append(e.respCap[inc.IncidentID], a.slotAt)
+				e.respMu.Unlock()
+			}
+		}
+	}
+	if assumed > 0 {
+		slog.Warn("ips: у адресов склеенных инцидентов нет записей в response_log — считаются заблокированными, место в потолке занято", "addresses", assumed)
 	}
 	return n
 }
 
+// memberResponds — среди правил адреса есть действующее правило с respond.
+func (e *engine) memberResponds(ids []string) bool {
+	for _, id := range ids {
+		if r := e.ruleFor(id); r != nil && respondsAt(r, r.Level) {
+			return true
+		}
+	}
+	return false
+}
+
+// collapseCap — потолок блоков склеенного инцидента: по его правилу, а если его
+// убрали — по любому правилу той же группы склейки (потолок в группе один), иначе
+// по умолчанию.
+func (e *engine) collapseCap(inc *incidents.Incident) (int, time.Duration) {
+	if r := e.ruleFor(inc.RuleID); r != nil && r.Collapsed() {
+		return r.IncidentCap()
+	}
+	// ключ «collapse:группа:подсеть»; в группе двоеточий нет, в подсети IPv6 — есть
+	group, _, _ := strings.Cut(strings.TrimPrefix(inc.GroupKey, "collapse:"), ":")
+	for _, r := range e.current() {
+		if r.Collapsed() && r.CollapseGroup() == group {
+			return r.IncidentCap()
+		}
+	}
+	return rules.DefaultIncidentCap, rules.DefaultIncidentCapWindow
+}
+
 // restoredState — что значила запись response_log для решения по адресу:
-// blocked (блок или симуляция — done и место в потолке), failed (сбой
-// исполнителя — только место), done/capped — решение без блока, "" — ожидание.
+// blocked (блок или симуляция), failed (сбой исполнителя или уведомление о
+// повторе — место в потолке, но не решение), done/capped — решение без блока,
+// "" — ожидание и служебные строки.
 func restoredState(row store.ResponseRow) string {
 	switch {
 	case strings.HasSuffix(row.Executor, ".unblock"):
-		return "done" // блок был и уже снят
+		return "blocked" // блок был и уже снят
 	case row.Executor != "argus" && row.OK == 1:
 		return "blocked"
 	case row.Executor != "argus":
 		return "failed"
+	case strings.HasPrefix(row.Detail, "все исполнители отказали"):
+		return "failed"
 	case strings.HasPrefix(row.Detail, "потолок блокировок"):
 		return "capped"
-	case strings.HasPrefix(row.Detail, "ожидание:"), strings.HasPrefix(row.Detail, "предупреждение:"), strings.HasPrefix(row.Detail, "адресов больше"):
+	case strings.HasPrefix(row.Detail, "ожидание:"), strings.HasPrefix(row.Detail, "предупреждение:"), strings.HasPrefix(row.Detail, "адресов больше"),
+		strings.HasPrefix(row.Detail, "адрес не найден"):
 		return ""
 	default:
 		return "done" // IDS, уже заблокирован, отказ по allowlist/never_block

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -36,8 +37,10 @@ func newFakeCH(t *testing.T) *fakeCH {
 	t.Helper()
 	f := &fakeCH{inserts: map[string][]string{}, selects: map[string]string{}, fail: map[string]bool{}}
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body := make([]byte, 1<<20)
-		n, _ := r.Body.Read(body)
+		// Тело целиком: один Read отдаёт только первый кусок, и большой INSERT
+		// (32 строки response_log) обрезался посреди строки.
+		body, _ := io.ReadAll(r.Body)
+		n := len(body)
 		q := r.URL.Query().Get("query")
 		f.mu.Lock()
 		defer f.mu.Unlock()

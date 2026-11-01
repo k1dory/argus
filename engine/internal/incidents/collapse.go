@@ -25,6 +25,8 @@ const (
 	// maxCollapsedEvents — событий в памяти склеенного инцидента (цепочка,
 	// автоответ, разбор): у подсети их может быть десятки тысяч.
 	maxCollapsedEvents = 2000
+	// minPartEvents — сколько свежих событий гарантировано каждой сработке в бюджете.
+	minPartEvents = 4
 )
 
 // IsCollapsedKey — ключ группы склеенного инцидента.
@@ -255,7 +257,10 @@ func (inc *Incident) aggregate() {
 	}
 	inc.Members = members
 
-	// Бюджет событий: свежие сработки держат события, у давних остаётся только счёт.
+	// Бюджет событий: у каждой сработки остаются её самые свежие события — сначала
+	// по minPartEvents всем (адрес с большим сканом не должен пропасть из автоответа,
+	// которому нужны события адреса), затем остаток бюджета по свежести сработок.
+	// У давних, на которые бюджета не хватило, остаются время и счёт.
 	parts := make([]*part, 0, len(inc.parts))
 	for _, p := range inc.parts {
 		parts = append(parts, p)
@@ -263,22 +268,26 @@ func (inc *Incident) aggregate() {
 	sort.Slice(parts, func(i, j int) bool { return parts[i].last > parts[j].last })
 	seen := map[*model.Event]bool{}
 	var evs []*model.Event
-	for _, p := range parts {
-		fresh := 0
-		for _, e := range p.events {
-			if !seen[e] {
-				fresh++
-			}
-		}
-		if len(evs)+fresh > maxCollapsedEvents {
-			p.events = nil
-			continue
-		}
-		for _, e := range p.events {
-			if !seen[e] {
+	keep := make(map[*part]int, len(parts))
+	take := func(p *part, n int) {
+		for i := len(p.events) - 1 - keep[p]; i >= 0 && n > 0 && len(evs) < maxCollapsedEvents; i-- {
+			keep[p]++
+			if e := p.events[i]; !seen[e] {
 				seen[e] = true
 				evs = append(evs, e)
+				n--
 			}
+		}
+	}
+	for _, p := range parts {
+		take(p, minPartEvents)
+	}
+	for _, p := range parts {
+		take(p, maxCollapsedEvents)
+	}
+	for _, p := range parts {
+		if k := keep[p]; k < len(p.events) {
+			p.events = p.events[len(p.events)-k:]
 		}
 	}
 	sort.SliceStable(evs, func(i, j int) bool { return evs[i].TS < evs[j].TS })
