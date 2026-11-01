@@ -260,6 +260,8 @@ services:
       SYSLOG_PEER_FORMAT: ${SYSLOG_PEER_FORMAT:-}           # формат отправителей: 10.0.0.5=cef,10.1.0.0/16=leef (без объявления — syslog)
       FLOW_NAT_ADDRS: ${FLOW_NAT_ADDRS:-}                   # внешние адреса NAT: потоки с ними → attrs.post_nat=1 (копия уже учтённого)
       ASN_DB_FILE: ${ASN_DB_FILE:-}                         # таблица IP→ASN (iptoasn TSV/.gz в /asn): attrs.src_asn/dst_asn; пусто — без ASN
+      ASN_DB_MIN_ROWS: ${ASN_DB_MIN_ROWS:-10000}            # меньше диапазонов — таблица отклоняется
+      ASN_DB_RELOAD: ${ASN_DB_RELOAD:-1m}                   # как часто проверять mtime файла
       SINK_PENDING_ROWS: ${SINK_PENDING_ROWS:-200000}       # оперативный буфер перед дисковой очередью; при заполнении — обратное давление
       SINK_SPOOL_DIR: /state/spool
       SINK_SPOOL_BYTES: ${SINK_SPOOL_BYTES:-8589934592}    # 8 ГБ на collector-state; при заполнении приём блокируется

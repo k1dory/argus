@@ -1,20 +1,46 @@
 #!/usr/bin/env bash
 # Обновить таблицу IP→ASN коллектора: scripts/asn-update.sh <каталог> [URL].
 # По умолчанию — ip2asn-combined.tsv.gz с iptoasn.com (PDDL, без ключа). Файл
-# скачивается во временный в том же каталоге, проверяется (gzip целиком, пять
-# полей в каждой строке, не меньше ASN_DB_MIN_ROWS строк) и только потом
-# атомарно заменяет ip2asn-combined.tsv.gz. Сбой — прежний файл остаётся, код
-# выхода ненулевой. Коллектор перечитывает файл по mtime и проверяет его ещё раз
-# (порядок диапазонов, адреса): битую таблицу он не примет и сам.
+# скачивается во временный в том же каталоге и проверяется тем же разбором, что
+# у коллектора (`collector asn-check`: поля, адреса, ASN, порядок диапазонов без
+# пересечений, не меньше ASN_DB_MIN_ROWS строк). Только годная таблица атомарно
+# заменяет ip2asn-combined.tsv.gz. Сбой — прежний файл остаётся, код ненулевой.
+#
+# Проверяющий: $ASN_CHECK (команда, получает путь файла), иначе `collector` из
+# PATH, иначе образ запущенного контейнера collector этого стека (docker run без
+# сети, только чтение). Нет ни одного — таблица не заменяется.
 set -euo pipefail
 
 dir=${1:?usage: asn-update.sh <каталог> [URL]}
 url=${2:-${ASN_DB_URL:-https://iptoasn.com/data/ip2asn-combined.tsv.gz}}
 min=${ASN_DB_MIN_ROWS:-10000}
 dest="$dir/ip2asn-combined.tsv.gz"
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
-[[ -d $dir ]] || { echo "asn-update: нет каталога $dir" >&2; exit 2; }
+[[ -d $dir && ! -L $dir ]] || { echo "asn-update: $dir — не каталог" >&2; exit 2; }
 [[ $min =~ ^[1-9][0-9]*$ ]] || { echo "asn-update: ASN_DB_MIN_ROWS — положительное число" >&2; exit 2; }
+# mv в симлинк на каталог положил бы файл внутрь чужого каталога, а в симлинк на
+# файл — заменил бы ссылку; на месте таблицы допустим только обычный файл.
+if [[ -L $dest || ( -e $dest && ! -f $dest ) ]]; then
+  echo "asn-update: $dest — не обычный файл, замена отклонена" >&2
+  exit 2
+fi
+
+check() {
+  if [[ -n ${ASN_CHECK:-} ]]; then
+    # shellcheck disable=SC2086 # команда с аргументами задаётся строкой
+    ASN_DB_MIN_ROWS=$min $ASN_CHECK "$1"
+  elif command -v collector >/dev/null 2>&1; then
+    ASN_DB_MIN_ROWS=$min collector asn-check "$1"
+  elif command -v docker >/dev/null 2>&1 && cid=$(docker compose --project-directory "$root" ps -q collector 2>/dev/null) && [[ -n $cid ]]; then
+    img=$(docker inspect -f '{{.Image}}' "$cid")
+    docker run --rm --network none --read-only -e ASN_DB_MIN_ROWS="$min" \
+      -v "$1:/check.tsv.gz:ro" "$img" asn-check /check.tsv.gz
+  else
+    echo "asn-update: нет проверяющего (ASN_CHECK, collector в PATH или запущенный контейнер collector)" >&2
+    return 2
+  fi
+}
 
 tmp=$(mktemp "$dir/.ip2asn.XXXXXX")
 trap 'rm -f "$tmp"' EXIT
@@ -24,16 +50,12 @@ if ! gzip -t "$tmp" 2>/dev/null; then
   echo "asn-update: не gzip или файл обрезан: $url" >&2
   exit 1
 fi
-read -r rows bad < <(gzip -dc "$tmp" | awk -F'\t' 'NF { n++; if (NF != 5) b++ } END { print n + 0, b + 0 }')
-if (( bad > 0 )); then
-  echo "asn-update: $bad строк не из пяти полей — файл не похож на iptoasn TSV" >&2
-  exit 1
-fi
-if (( rows < min )); then
-  echo "asn-update: $rows строк, нужно не меньше $min" >&2
-  exit 1
-fi
+# Контейнер проверяющего работает не от root: файл должен быть читаем.
 chmod 0644 "$tmp"
+if ! rows=$(check "$tmp"); then
+  echo "asn-update: таблица не прошла проверку, прежний файл оставлен" >&2
+  exit 1
+fi
 mv -f "$tmp" "$dest"
 trap - EXIT
 echo "asn-update: $dest — $rows диапазонов"
