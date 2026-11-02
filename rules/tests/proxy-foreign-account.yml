@@ -1,0 +1,7 @@
+# Учётная запись из чужой страны: alice из DE — инцидент; отказ (bob), аноним, своя страна
+# (carol) и событие без страны (dave) — нет.
+rule: a41c-net-077
+fixture: fixtures/events/proxy-access-account.ndjson
+expect_incidents: 1
+expect_actor: alice
+min_events: 2

@@ -134,7 +134,7 @@
   `request.uri`, `status`, `request.headers.User-Agent` — массив, `request.tls.server_name`.
   Предупреждения `http.handlers.reverse_proxy` («aborting with incomplete response» у gRPC-стримов
   NetBird) — не события.
-- Страны в логе Caddy нет: правило `proxy-foreign-access` требует известную страну
+- Страны в логе Caddy нет: правила `proxy-foreign-access` и `proxy-foreign-account` требуют известную страну
   (`attrs.country|regex: '^[A-Za-z]{2}$'`) — иначе оператор `not RU` совпал бы с пустым значением.
   Это общее свойство матчера: `not X` истинен для отсутствующего поля, добавляйте проверку
   на наличие.

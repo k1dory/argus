@@ -1,0 +1,26 @@
+# Вошедший пользователь работает с опубликованным сервисом из чужой страны: прокси
+# сообщил учётную запись (actor.kind=user) и ответ без отказа. Это уже не просто
+# география (proxy-foreign-access, a41c-net-076), а доступ под нашей учётной записью
+# оттуда, где сотрудников нет — признак чужих учётных данных. NetBird-прокси без
+# аутентификации пользователя не передаёт, такие события сюда не попадают.
+title: "Proxy: user session from outside the expected country"
+id: a41c-net-077
+level: medium
+tags: [attack.initial_access, attack.t1078]   # ATT&CK v20: Valid Accounts — вход под действующей учётной записью
+
+detection:
+  selection:
+    action: proxy.access
+    outcome: success
+    actor.kind: user
+    attrs.country: 'not RU'
+    attrs.country|regex: '^[A-Za-z]{2}$'
+  threshold:
+    kind: count
+    count: 1
+    window: 1h
+    group_by: actor.name
+  condition: selection and threshold
+
+analyst:
+  profile: on-prem-strict
