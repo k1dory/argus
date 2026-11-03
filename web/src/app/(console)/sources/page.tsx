@@ -20,9 +20,10 @@ import { SOURCE_ALIVE_LABELS } from "@/lib/shared/labels";
 import { describeThreshold, formatRhythm, RHYTHM_WINDOW_DAYS } from "@/lib/shared/source-health";
 import { fmtNum, formatAgo, formatTs } from "@/lib/shared/time";
 import { RangeFilters } from "@/components/console/range-filters";
+import { SourceHealthFilters } from "@/components/console/source-health-filters";
 import { RangePicker } from "@/components/console/range-picker";
 import { describeChips, inRange, inTime, patchHref, type SearchParamsLike } from "@/lib/shared/filters";
-import { parseSourceRanges, SOURCE_FEED_FIELDS, SOURCE_HEALTH_FIELDS, sourceFeedChips, sourceHealthChips, type SourceRanges } from "@/lib/shared/page-filters";
+import { parseSourceRanges, SOURCE_FEED_FIELDS, sourceFeedChips, sourceHealthChips, type SourceRanges } from "@/lib/shared/page-filters";
 
 export const dynamic = "force-dynamic";
 export const metadata: Metadata = { title: "Источники" };
@@ -65,13 +66,13 @@ function SourcesBody({ health, omitted, events, source, ingestBase, ranges, sp }
         <StatTile label="Классов" value={fmtNum(classes.size)} />
       </div>
 
-      <Panel label={`Коллекторы · источники за ${RHYTHM_WINDOW_DAYS} суток, счётчики за час`} meta={source ? "клик по источнику — фильтр ленты ниже" : undefined}>
+      <Panel label="Коллекторы" meta={`источники за ${RHYTHM_WINDOW_DAYS} суток`}>
         {omitted > 0 && (
           <p className="mb-2 text-sm text-[var(--status-warn)]" role="status">
             Замолчавших источников больше {fmtNum(STALE_SOURCES_LIMIT)}: ещё {fmtNum(omitted)} давно молчащих не показаны.
           </p>
         )}
-        <div className="mb-4"><RangeFilters fields={SOURCE_HEALTH_FIELDS} idPrefix="src-health" /></div>
+        <div className="mb-4"><SourceHealthFilters shown={shown.length} total={health.length} ranges={ranges} /></div>
         {health.length > 0 && shown.length === 0 ? (
           <p className="text-sm text-muted-foreground">Нет источников по фильтрам: {healthText} — ослабьте пороги.</p>
         ) : health.length === 0 ? (
