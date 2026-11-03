@@ -19,11 +19,12 @@ FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c
 COPY --from=busybox /bin/busybox /bin/busybox
 COPY --from=build /engine /engine
 COPY engine/argus.analyst.yml /etc/argus/argus.analyst.yml
-# Поставляемый набор этой версии (internal/registry). RULES_DIR (/rules) может
-# содержать и пользовательские правила — реестр берёт только эту копию, не /rules.
+# Поставляемый набор этой версии: и реестр (internal/registry), и сами правила
+# движка (RULES_DIR) — версия правил всегда равна версии образа. Пользовательские
+# правила — отдельный каталог RULES_USER_DIR (compose: /etc/argus/rules.d).
 COPY rules/ /usr/share/argus/shipped/rules/
 COPY fixtures/events/ /usr/share/argus/shipped/fixtures/
-ENV ANALYST_CONFIG=/etc/argus/argus.analyst.yml RULES_DIR=/rules
+ENV ANALYST_CONFIG=/etc/argus/argus.analyst.yml RULES_DIR=/usr/share/argus/shipped/rules RULES_USER_DIR=/etc/argus/rules.d
 EXPOSE 8090
 ENTRYPOINT ["/engine"]
 CMD ["run"]

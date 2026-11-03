@@ -49,6 +49,14 @@ argus_identities_src: ""
 argus_cmdb_src: ""
 argus_etc_dir: /etc/argus
 
+# Правила движка. Поставляемые движок берёт из своего образа (версия правил = версия
+# образа), каталог rules/ checkout в проде не монтируется. Свои правила — каталог
+# argus_user_rules_dir на хосте; argus_user_rules_src — каталог на управляющей машине,
+# который роль туда синхронизирует (пусто — каталог создаётся пустым и не трогается).
+# Правило с id поставляемого отвергается (событие argus.system / rules.rejected).
+argus_user_rules_dir: "{{ argus_etc_dir }}/rules.d"
+argus_user_rules_src: ""
+
 # ASN публичных адресов в событиях коллектора (attrs.src_asn и т.д.): таблица iptoasn.com
 # скачивается на хост в argus_asn_dir (scripts/asn-update.sh — проверка и атомарная замена)
 # и обновляется по cron; коллектор перечитывает её без рестарта.

@@ -62,7 +62,7 @@ engine() {
   if command -v go >/dev/null 2>&1; then
     (cd engine && RULES_DIR="$ROOT/rules" go run ./cmd/engine "$@")
   else
-    docker compose run --rm -v "$ROOT/rules:/rules:ro" -v "$ROOT/fixtures:/fixtures:ro" engine "$@"
+    docker compose run --rm -e RULES_DIR=/rules -e RULES_USER_DIR= -v "$ROOT/rules:/rules:ro" -v "$ROOT/fixtures:/fixtures:ro" engine "$@"
   fi
 }
 

@@ -41,6 +41,7 @@ type metrics struct {
 	analystRejected  atomic.Int64 // cooldown / суточный лимит
 	pollErrors       atomic.Int64
 	reloads          atomic.Int64
+	rulesRejected    atomic.Int64 // отвергнутых правил в действующем наборе (ruleset.go)
 	lastRun          atomic.Int64
 	diskFreePermille atomic.Int64 // свободно на самом заполненном диске ClickHouse, ‰
 	autoBlocks       atomic.Int64
@@ -55,7 +56,7 @@ type metrics struct {
 
 type engine struct {
 	rules      atomic.Pointer[[]*rules.Rule]
-	rulesDir   string
+	dirs       ruleSet    // поставляемые и пользовательские правила (ruleset.go)
 	reloadMu   sync.Mutex // rulesSig и перечитывание: цикл и POST /reload
 	workflowMu sync.Mutex // единственный писатель переходов и снимков инцидентов
 	rulesSig   string
@@ -152,16 +153,17 @@ func signature(dir string) string {
 func (e *engine) maybeReload(force bool) {
 	e.reloadMu.Lock()
 	defer e.reloadMu.Unlock()
-	sig := signature(e.rulesDir)
+	sig := e.dirs.signature()
 	if !force && sig == e.rulesSig {
 		return
 	}
-	rs, err := rules.Load(e.rulesDir)
+	rs, rejected, err := e.dirs.load()
 	if err != nil {
 		slog.Warn("rules reload: оставляю прежний набор", "err", err)
 		e.rulesSig = sig
 		return
 	}
+	e.reportRejected(e.ctx, rejected, time.Now())
 	e.rules.Store(&rs)
 	e.rulesSig = sig
 	e.m.reloads.Add(1)
@@ -234,9 +236,9 @@ func (e *engine) syncRespondMode(ctx context.Context) {
 	}
 }
 
-func newEngine(ctx context.Context, rulesDir string, rs []*rules.Rule, acfg analyst.Config, ch *store.ClickHouse, token, mtoken string) *engine {
+func newEngine(ctx context.Context, dirs ruleSet, rs []*rules.Rule, acfg analyst.Config, ch *store.ClickHouse, token, mtoken string) *engine {
 	e := &engine{
-		rulesDir: rulesDir, rulesSig: signature(rulesDir), ch: ch, acfg: acfg, ctx: ctx, token: token, mtoken: mtoken,
+		dirs: dirs, rulesSig: dirs.signature(), ch: ch, acfg: acfg, ctx: ctx, token: token, mtoken: mtoken,
 		an: analyst.New(acfg), en: enrich.New(ch, env("CMDB_FILE", "")),
 		tg: notify.NewTelegram(os.Getenv("TELEGRAM_BOT_TOKEN"), acfg.Notify.Telegram.ChatID),
 		mail: notify.NewEmail(acfg.Notify.Email.Host, acfg.Notify.Email.Port, acfg.Notify.Email.From,
@@ -292,8 +294,8 @@ func logShippedRegistry() {
 	slog.Info("registry", "rules", r, "sources", s, "actions", a)
 }
 
-func run(rulesDir string) {
-	rs := mustLoad(rulesDir)
+func run(dirs ruleSet) {
+	rs, rejected := mustLoadSet(dirs)
 	logShippedRegistry()
 	acfg, err := analyst.LoadConfig(env("ANALYST_CONFIG", ""))
 	if err != nil {
@@ -316,7 +318,8 @@ func run(rulesDir string) {
 		env("CLICKHOUSE_USER", "default"), env("CLICKHOUSE_PASSWORD", ""))
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	e := newEngine(ctx, rulesDir, rs, acfg, ch, token, env("METRICS_TOKEN", token))
+	e := newEngine(ctx, dirs, rs, acfg, ch, token, env("METRICS_TOKEN", token))
+	e.reportRejected(ctx, rejected, time.Now())
 	for _, msg := range e.resp.ConfigErrors() {
 		slog.Warn("respond config", "msg", msg)
 	}

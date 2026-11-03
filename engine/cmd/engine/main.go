@@ -53,13 +53,14 @@ func orDefault(v, def string) string {
 func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	rulesDir := env("RULES_DIR", "rules")
+	dirs := ruleSet{shipped: rulesDir, user: env("RULES_USER_DIR", "")}
 	args := os.Args[1:]
 	if len(args) == 0 {
 		args = []string{"run"}
 	}
 	switch args[0] {
 	case "run":
-		run(rulesDir)
+		run(dirs)
 	case "rules":
 		if len(args) < 2 {
 			fmt.Fprintln(os.Stderr, "engine rules list | test [--replay file] [--dir rules]")
@@ -67,7 +68,8 @@ func main() {
 		}
 		switch args[1] {
 		case "list":
-			for _, r := range mustLoad(rulesDir) {
+			rs, _ := mustLoadSet(dirs)
+			for _, r := range rs {
 				fmt.Printf("%-28s %-9s %-40s %s\n", r.ID, r.Level, r.Title, r.File)
 			}
 		case "test":
@@ -82,6 +84,20 @@ func main() {
 		fmt.Fprintln(os.Stderr, "неизвестная команда", args[0])
 		os.Exit(2)
 	}
+}
+
+// mustLoadSet — набор движка: без поставляемых правил запуск не имеет смысла,
+// отказы пользовательских возвращаются для отчёта.
+func mustLoadSet(dirs ruleSet) ([]*rules.Rule, []rejectedRule) {
+	rs, rejected, err := dirs.load()
+	if err != nil {
+		slog.Error("rules", "err", err)
+		os.Exit(1)
+	}
+	for _, r := range rejected {
+		slog.Error("правило отвергнуто", "file", r.File, "rule", r.RuleID, "reason", r.Reason, "err", r.Err)
+	}
+	return rs, rejected
 }
 
 func mustLoad(dir string) []*rules.Rule {

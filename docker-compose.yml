@@ -321,7 +321,7 @@ services:
           pids: 512
     restart: unless-stopped
 
-  # Ядро корреляции: правила из ./rules, инциденты, LLM-аналитик, Telegram, реагирование.
+  # Ядро корреляции: правила (поставляемые — из образа, свои — ./rules.d), инциденты, LLM-аналитик, Telegram, реагирование.
   engine:
     image: ${ARGUS_IMAGE_PREFIX:-argus}/engine:${APP_VERSION:-dev}
     build:
@@ -378,7 +378,11 @@ services:
       CLICKHOUSE_DB: argus
       CLICKHOUSE_USER: argus_engine
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_ENGINE_PASSWORD:?CLICKHOUSE_ENGINE_PASSWORD не задан — ./scripts/argus init}
-      RULES_DIR: /rules
+      # Поставляемые правила — копия своей версии в образе: обновление кода на хосте
+      # не меняет их под работающим движком. Свои правила — ARGUS_USER_RULES_DIR
+      # (по умолчанию ./rules.d); правило с id поставляемого отвергается.
+      RULES_DIR: /usr/share/argus/shipped/rules
+      RULES_USER_DIR: /etc/argus/rules.d
       CMDB_FILE: /etc/argus/cmdb.yml
       # Паспорт субъекта: персоны и алиасы (email, login, ip…) с интервалами действия;
       # файл перечитывается при изменении. Пусто — алиасы только из событий identity.alias и API.
@@ -414,7 +418,7 @@ services:
       SMTP_TO: ${SMTP_TO:-}
       RISK_REPORT_INTERVAL: ${RISK_REPORT_INTERVAL:-}
     volumes:
-      - ./rules:/rules:ro
+      - ${ARGUS_USER_RULES_DIR:-./rules.d}:/etc/argus/rules.d:ro
       - ./cmdb.yml:/etc/argus/cmdb.yml:ro
       - ./identities.yml:/etc/argus/identities.yml:ro
       - ./caddy/certs:/certs:ro

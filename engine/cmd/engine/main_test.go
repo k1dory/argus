@@ -117,7 +117,7 @@ func testEngine(t *testing.T, f *fakeCH, rulesDir string, rcfg respond.Config, t
 	ch := store.New(f.srv.URL, "argus", "default", "")
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	e := newEngine(ctx, rulesDir, rs, acfg, ch, token, mtoken)
+	e := newEngine(ctx, ruleSet{shipped: rulesDir}, rs, acfg, ch, token, mtoken)
 	e.reg = incidents.NewRegistry(0, nil)
 	return e
 }
