@@ -273,6 +273,11 @@ func parseSyslogLine(norm *normalize.Normalizer, zones parse.PeerZones, line str
 		e.Node = firstNonEmpty(peer.Node, peer.Addr)
 	}
 	attrsFromStructured(&e, sl.Structured)
+	// ПДн — после любого разборщика, общей проверкой: новый разборщик (VRP, MikroTik,
+	// QNAP…) не может её пропустить, а analyst.Route по pii=1 держит инцидент локально.
+	if e.PII == 0 && (normalize.HasPII(payload) || normalize.HasPII(sl.AppName)) {
+		e.PII = 1
+	}
 	// Происхождение ставит только коллектор: peer — адрес соединения, peer_cn — только
 	// из проверенного клиентского сертификата, scope считает emit по адресам.
 	if e.Attrs == nil {
