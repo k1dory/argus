@@ -51,7 +51,7 @@ func (n *Normalizer) inPrefixes(nets []netip.Prefix, ip string) bool {
 	if len(nets) == 0 {
 		return false
 	}
-	a, err := netip.ParseAddr(ip)
+	a, err := netip.ParseAddr(strings.TrimSpace(ip)) // как field|internal в движке
 	if err != nil {
 		return false
 	}
@@ -78,7 +78,7 @@ func UnmapPrefix(p netip.Prefix) (netip.Prefix, error) {
 
 // IsInternal — адрес из своих сетей (InternalNets или умолчания).
 func (n *Normalizer) IsInternal(ip string) bool {
-	a, err := netip.ParseAddr(ip)
+	a, err := netip.ParseAddr(strings.TrimSpace(ip)) // как field|internal в движке
 	if err != nil {
 		return false
 	}
