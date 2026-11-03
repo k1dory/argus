@@ -66,3 +66,41 @@ func TestFlowScopeAndFlags(t *testing.T) {
 		t.Fatalf("flags string")
 	}
 }
+
+// Те же сети, что у модификатора правил field|internal в движке: зона интерфейса
+// не мешает, IPv4-mapped CIDR приводится к IPv4 (ревью #105).
+func TestInternalZoneAndMappedPrefix(t *testing.T) {
+	n := &Normalizer{}
+	if !n.IsInternal("fe80::42%eth0") || n.FlowScope("fe80::42%eth0", "2001:db8::1") != "outbound" {
+		t.Fatal("link-local с зоной — свой адрес")
+	}
+	p, err := UnmapPrefix(netip.MustParsePrefix("::ffff:192.0.2.0/120"))
+	if err != nil || p != netip.MustParsePrefix("192.0.2.0/24") {
+		t.Fatalf("mapped /120 → %v, %v", p, err)
+	}
+	if _, err := UnmapPrefix(netip.MustParsePrefix("::ffff:0:0/95")); err == nil {
+		t.Fatal("IPv4-mapped короче /96 — ошибка")
+	}
+	if p, err := UnmapPrefix(netip.MustParsePrefix("2001:db8::/64")); err != nil || p.String() != "2001:db8::/64" {
+		t.Fatalf("обычный IPv6 без изменений: %v, %v", p, err)
+	}
+	n.InternalNets = []netip.Prefix{p, mustUnmap(t, "::ffff:192.0.2.0/120"), mustUnmap(t, "2001:db8:105::/64")}
+	for ip, want := range map[string]bool{"192.0.2.42": true, "::FFFF:C000:22A": true, "192.0.3.1": false, "2001:db8:105::42%eth0": true, "2001:db8:106::42%eth0": false} {
+		if n.IsInternal(ip) != want {
+			t.Errorf("%s: internal=%v, ожидалось %v", ip, !want, want)
+		}
+	}
+	n.NATAddrs = []netip.Prefix{mustUnmap(t, "::ffff:185.25.9.57/128")}
+	if nat := n.FromFlow(parse.Flow{SrcIP: "185.25.9.57", DstIP: "172.235.1.1", DstPort: 53, Proto: 17, Packets: 1}, "netflow.core", "185.25.9.1"); nat.Attrs["post_nat"] != "1" {
+		t.Fatalf("NAT-адрес в IPv4-mapped записи: %+v", nat.Attrs)
+	}
+}
+
+func mustUnmap(t *testing.T, s string) netip.Prefix {
+	t.Helper()
+	p, err := UnmapPrefix(netip.MustParsePrefix(s))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}

@@ -13,13 +13,18 @@ detection:
     action: proxy.access
     outcome: success
     actor.kind: user
+    # Учётная запись должна быть названа: без имени ключом стал бы узел прокси, а
+    # T1078 — утверждением про учётку, которой в событии нет.
+    actor.name|regex: '\S'
     attrs.country: 'not RU'
     attrs.country|regex: '^[A-Za-z]{2}$'
   threshold:
     kind: count
     count: 1
     window: 1h
-    group_by: actor.name
+    # Локальные учётки разных сервисов (portal-a/admin и portal-b/admin) — разные
+    # учётные записи: область — узел прокси (хост сервиса).
+    group_by: actor.name, node
   condition: selection and threshold
 
 analyst:

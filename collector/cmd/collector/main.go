@@ -724,6 +724,9 @@ func main() {
 				continue
 			}
 			pfx, perr := netip.ParsePrefix(c)
+			if perr == nil {
+				pfx, perr = normalize.UnmapPrefix(pfx)
+			}
 			if perr != nil {
 				slog.Error("INTERNAL_NETS", "cidr", c, "err", perr)
 				os.Exit(1)
@@ -744,6 +747,9 @@ func main() {
 				}
 			}
 			pfx, perr := netip.ParsePrefix(c)
+			if perr == nil {
+				pfx, perr = normalize.UnmapPrefix(pfx)
+			}
 			if perr != nil {
 				slog.Error("FLOW_NAT_ADDRS", "addr", c, "err", perr)
 				os.Exit(1)

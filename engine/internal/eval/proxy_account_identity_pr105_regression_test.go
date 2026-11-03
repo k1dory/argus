@@ -60,7 +60,7 @@ func TestPR105ForeignAccountRequiresNonblankIdentity(t *testing.T) {
 					if !tc.wantAccount {
 						t.Errorf("actor=%q kind=%q outcome=%q produced an account incident with key %q", tc.actor, tc.kind, tc.outcome, detection.Key)
 					}
-					if tc.wantAccount && (detection.Key != tc.actor || len(detection.Events) != len(events) || !slices.Contains(detection.Rule.Tags, "attack.t1078")) {
+					if tc.wantAccount && (detection.Key != tc.actor+"|"+events[0].Node || len(detection.Events) != len(events) || !slices.Contains(detection.Rule.Tags, "attack.t1078")) {
 						t.Errorf("named user's T1078 detection lost account grouping/evidence: %+v", detection)
 					}
 				default:
