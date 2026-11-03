@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { usePathname } from "next/navigation";
 import { loadScroll, restoreStep, saveScroll, scrollKey, shouldRestore } from "@/lib/shared/scroll-memory";
 
@@ -17,6 +17,11 @@ function navigationType(): string | undefined {
   }
 }
 
+/** Монотонные часы для таймаута: перевод системного времени не продлевает ожидание. */
+function monotonicNow(): number {
+  return typeof performance !== "undefined" && typeof performance.now === "function" ? performance.now() : Date.now();
+}
+
 /**
  * Помнит прокрутку страниц консоли и возвращает её после F5: страница приходит
  * потоком (скелет → данные), и браузер сам не успевает. Переходы внутри консоли
@@ -24,41 +29,55 @@ function navigationType(): string | undefined {
  */
 export function ScrollMemory() {
   const pathname = usePathname();
+  // Пока восстановление не закончено, промежуточная прокрутка (скелет, частичное
+  // восстановление браузера) не должна перезаписать сохранённую цель.
+  const pendingRef = useRef(false);
 
   // Восстановление — один раз на полную загрузку документа.
   useEffect(() => {
     if (!shouldRestore(navigationType())) return;
     let target: number | null = null;
+    const key = currentKey();
     try {
-      target = loadScroll(sessionStorage, currentKey(), Date.now());
+      target = loadScroll(sessionStorage, key, Date.now());
     } catch {
       return;
     }
     if (target == null) return;
     const goal = target;
-    const startedAt = Date.now();
+    const startedAt = monotonicNow();
     let done = false;
     let raf = 0;
     let observer: ResizeObserver | null = null;
     const stop = () => {
+      if (done) return;
       done = true;
+      pendingRef.current = false;
       cancelAnimationFrame(raf);
       observer?.disconnect();
       for (const ev of USER_EVENTS) window.removeEventListener(ev, stop, { capture: true });
+      window.removeEventListener("popstate", stop);
     };
     const env = {
       maxScroll: () => document.documentElement.scrollHeight - window.innerHeight,
       scrollTo: (y: number) => window.scrollTo({ top: y, behavior: "instant" as ScrollBehavior }),
-      now: () => Date.now(),
+      now: monotonicNow,
     };
     const tick = () => {
       if (done) return;
+      // Ушли на другой адрес (Back, переход роутера) — прокрутку ведёт уже он.
+      if (currentKey() !== key) {
+        stop();
+        return;
+      }
       cancelAnimationFrame(raf);
       if (restoreStep(env, goal, startedAt)) stop();
       else raf = requestAnimationFrame(tick);
     };
-    // Пользователь начал листать сам — больше не мешаем.
+    pendingRef.current = true;
+    // Пользователь начал листать сам или ушёл назад — больше не мешаем.
     for (const ev of USER_EVENTS) window.addEventListener(ev, stop, { capture: true, passive: true });
+    window.addEventListener("popstate", stop);
     observer = typeof ResizeObserver === "function" ? new ResizeObserver(() => tick()) : null;
     observer?.observe(document.body);
     tick();
@@ -69,6 +88,7 @@ export function ScrollMemory() {
   useEffect(() => {
     let raf = 0;
     const save = () => {
+      if (pendingRef.current) return;
       try {
         saveScroll(sessionStorage, currentKey(), window.scrollY, Date.now());
       } catch {
