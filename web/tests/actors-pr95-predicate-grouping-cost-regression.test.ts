@@ -2,7 +2,7 @@
 // identity_aliases. Построение предиката выполняется синхронно в web-процессе:
 // стоимость группировки не должна становиться квадратичной для такого ввода.
 // Считаем посещения записей интервалов вместо нестабильного wall-clock timeout.
-import { test, type TestContext } from "node:test";
+import { test } from "node:test";
 import assert from "node:assert/strict";
 import { aliasPredicate, parseIdentitiesDoc, type Alias, type Predicate } from "../src/lib/shared/actors";
 import { chTs } from "../src/lib/shared/log-query";
@@ -27,14 +27,17 @@ function fixture(repeated: boolean): Alias[] {
   }));
 }
 
-function buildWithVisitBudget(t: TestContext, aliases: Alias[]): Predicate {
+function buildWithVisitBudget(aliases: Alias[]): Predicate {
   const nativeIterator = Array.prototype[Symbol.iterator];
   const budget = 16 * aliases.length;
   let visits = 0;
   // Инструментируем только время синхронного вызова. Обычный обход и несколько
   // линейных проходов укладываются в запас; повторное копирование растущих
   // массивов исчерпывает его. Прерывание ограничивает и стоимость самого теста.
-  const iterator = t.mock.method(Array.prototype, Symbol.iterator, function* (this: unknown[]) {
+  // t.mock.method не принимает Array.prototype (он сам — экземпляр Array, Node 26 отвечает
+  // ERR_INVALID_ARG_TYPE), поэтому итератор подменяется дескриптором и восстанавливается в finally.
+  const descriptor = Object.getOwnPropertyDescriptor(Array.prototype, Symbol.iterator)!;
+  Object.defineProperty(Array.prototype, Symbol.iterator, { ...descriptor, value: function* (this: unknown[]) {
     for (const value of nativeIterator.call(this)) {
       if (value !== null && typeof value === "object"
         && "fromMs" in value && "toMs" in value
@@ -44,19 +47,19 @@ function buildWithVisitBudget(t: TestContext, aliases: Alias[]): Predicate {
       }
       yield value;
     }
-  });
+  } });
   try {
     return aliasPredicate(aliases, W);
   } finally {
-    iterator.mock.restore();
+    Object.defineProperty(Array.prototype, Symbol.iterator, descriptor);
   }
 }
 
 for (const repeated of [false, true]) {
-  test(`PR #95: бюджет построения предиката — ${repeated ? "одно значение в 1000 интервалах" : "1000 разных значений (контроль)"}`, (t) => {
+  test(`PR #95: бюджет построения предиката — ${repeated ? "одно значение в 1000 интервалах" : "1000 разных значений (контроль)"}`, () => {
     const aliases = fixture(repeated);
     assert.doesNotThrow(() => {
-      const predicate = buildWithVisitBudget(t, aliases);
+      const predicate = buildWithVisitBudget(aliases);
       assert.notEqual(predicate.sql, "0");
       assert.ok(Object.keys(predicate.params).length > 0);
     }, "повторяющееся значение не должно вызывать повторный обход всех накопленных интервалов");
