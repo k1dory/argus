@@ -55,8 +55,14 @@ export function ScrollMemory() {
       pendingRef.current = false;
       cancelAnimationFrame(raf);
       observer?.disconnect();
-      for (const ev of USER_EVENTS) window.removeEventListener(ev, stop, { capture: true });
+      for (const ev of USER_EVENTS) window.removeEventListener(ev, onUser, { capture: true });
       window.removeEventListener("popstate", stop);
+    };
+    // F5, Ctrl/Cmd+R и одиночные модификаторы — это не «пользователь листает»,
+    // а начало перезагрузки: цель должна пережить её (pendingRef не снимаем).
+    const onUser = (ev: Event) => {
+      if (ev.type === "keydown" && isReloadOrModifier(ev as KeyboardEvent)) return;
+      stop();
     };
     const env = {
       maxScroll: () => document.documentElement.scrollHeight - window.innerHeight,
@@ -76,7 +82,7 @@ export function ScrollMemory() {
     };
     pendingRef.current = true;
     // Пользователь начал листать сам или ушёл назад — больше не мешаем.
-    for (const ev of USER_EVENTS) window.addEventListener(ev, stop, { capture: true, passive: true });
+    for (const ev of USER_EVENTS) window.addEventListener(ev, onUser, { capture: true, passive: true });
     window.addEventListener("popstate", stop);
     observer = typeof ResizeObserver === "function" ? new ResizeObserver(() => tick()) : null;
     observer?.observe(document.body);
@@ -112,3 +118,12 @@ export function ScrollMemory() {
 }
 
 const USER_EVENTS = ["wheel", "touchstart", "keydown", "mousedown"] as const;
+
+const MODIFIER_KEYS = new Set(["Control", "Meta", "Shift", "Alt", "AltGraph", "OS"]);
+
+function isReloadOrModifier(ev: Pick<KeyboardEvent, "key" | "code" | "ctrlKey" | "metaKey">): boolean {
+  if (MODIFIER_KEYS.has(ev.key)) return true;
+  if (ev.key === "F5" || ev.code === "F5" || ev.key === "BrowserRefresh") return true;
+  const r = ev.code === "KeyR" || ev.key === "r" || ev.key === "R" || ev.key === "к" || ev.key === "К";
+  return r && (ev.ctrlKey === true || ev.metaKey === true);
+}
