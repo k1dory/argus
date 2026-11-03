@@ -407,19 +407,60 @@ func Load(dir string) ([]*Rule, error) {
 	return out, nil
 }
 
-// RuleError — правило, которое не загрузилось: файл (относительно каталога) и причина.
+// RuleError — правило, которое не загрузилось: файл (относительно каталога), id
+// (если разобрался), код причины без содержимого правила и полная ошибка для журнала.
 type RuleError struct {
-	File string
-	Err  error
+	File   string
+	ID     string
+	Reason string // schema_unknown_field | duplicate_id | parse_error | invalid_value (путь поля — только в Err)
+	Err    error
 }
 
 func (e RuleError) Error() string { return e.File + ": " + e.Err.Error() }
 func (e RuleError) Unwrap() error { return e.Err }
 
+// UnknownFieldError — поле внутри структуры детекта, которого эта версия движка не знает.
+type UnknownFieldError struct {
+	Path string // detection.group_by_next
+	Line int    // строка ключа в файле, 0 — не найдена (алиас, merge)
+}
+
+func (e *UnknownFieldError) Error() string {
+	at := ""
+	if e.Line > 0 {
+		at = fmt.Sprintf("line %d: ", e.Line)
+	}
+	return at + "поле " + e.Path + " неизвестно этой версии движка — правило не применено (обновите движок или уберите поле)"
+}
+
+// reasonOf — короткий код причины отказа, без имён полей и значений из правила.
+func reasonOf(err error) string {
+	var uf *UnknownFieldError
+	var te *yaml.TypeError
+	switch {
+	case errors.As(err, &uf):
+		return "schema_unknown_field"
+	case errors.As(err, &te), strings.HasPrefix(err.Error(), "yaml:"):
+		return "parse_error"
+	}
+	return "invalid_value"
+}
+
 // LoadAll — правила каталога по одному: отвергнутые (ошибка разбора, неизвестное
-// поле детекта, неверное значение) — в rejected, остальные загружаются. err — только
-// если каталог не прочитан.
+// поле детекта, неверное значение, повтор id) — в rejected, остальные загружаются.
+// err — только если каталог не прочитан.
 func LoadAll(dir string) (out []*Rule, rejected []RuleError, err error) {
+	out, rejected, err = LoadEach(dir)
+	if err != nil {
+		return nil, nil, err
+	}
+	out, dup := DedupeIDs(out, nil)
+	return out, append(rejected, dup...), nil
+}
+
+// LoadEach — как LoadAll, но без проверки повторов id: её делает вызывающий,
+// зная прежний набор (перечитывание движка, DedupeIDs с активными файлами).
+func LoadEach(dir string) (out []*Rule, rejected []RuleError, err error) {
 	paths, err := Files(dir)
 	if err != nil {
 		return nil, nil, err
@@ -432,13 +473,57 @@ func LoadAll(dir string) (out []*Rule, rejected []RuleError, err error) {
 		rel = filepath.ToSlash(rel)
 		r, err := LoadFile(p)
 		if err != nil {
-			rejected = append(rejected, RuleError{File: rel, Err: err})
+			rejected = append(rejected, RuleError{File: rel, ID: idOf(p), Reason: reasonOf(err), Err: err})
 			continue
 		}
 		r.File = rel
 		out = append(out, r)
 	}
 	return out, rejected, nil
+}
+
+// DedupeIDs — у каждого id одно правило: политика (respond, analyst, уровень) ищется
+// по id, и второй файл с тем же id молча подменил бы первый. Остаётся правило из того
+// файла, что был активен с этим id (activeFile: id → файл прежнего набора); если такого
+// нет (старт, оба файла новые) — отвергаются все с этим id: какой из них настоящий,
+// неизвестно, и выбирать молча нельзя.
+func DedupeIDs(rs []*Rule, activeFile map[string]string) (kept []*Rule, rejected []RuleError) {
+	byID := map[string][]*Rule{}
+	for _, r := range rs {
+		byID[r.ID] = append(byID[r.ID], r)
+	}
+	for _, r := range rs {
+		same := byID[r.ID]
+		if len(same) == 1 {
+			kept = append(kept, r)
+			continue
+		}
+		if f, ok := activeFile[r.ID]; ok && r.File == f {
+			kept = append(kept, r)
+			continue
+		}
+		files := make([]string, 0, len(same))
+		for _, o := range same {
+			files = append(files, o.File)
+		}
+		rejected = append(rejected, RuleError{File: r.File, ID: r.ID, Reason: "duplicate_id",
+			Err: fmt.Errorf("id %s повторяется в %s — правило не применено", r.ID, strings.Join(files, ", "))})
+	}
+	return kept, rejected
+}
+
+// idOf — id отвергнутого правила, если файл хотя бы разбирается (для события отказа).
+func idOf(path string) string {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var m map[string]any
+	if yaml.Unmarshal(raw, &m) != nil {
+		return ""
+	}
+	id, _ := m["id"].(string)
+	return id
 }
 
 // metaFields — метаданные правила (в том числе из Sigma): на детект не влияют и
@@ -449,32 +534,35 @@ var metaFields = map[string]bool{
 	"notes": true, "comment": true, "owner": true, "version": true,
 }
 
-// checkFields — схема полей правила по yaml-тегам структуры. Неизвестное поле внутри
-// структур детекта (detection, threshold, respond, analyst) — ошибка этого правила:
-// движок, который поле не знает (group_by_previous до своего релиза), не применит
-// правило частично — новый group_by без миграции завёл бы второй открытый инцидент
-// (argus1, INC-5312/INC-5370). Неизвестное поле верхнего уровня — предупреждение
-// (метаданные из metaFields — без него): прежде такие поля молча пропускались.
+// checkFields — схема полей правила по yaml-тегам структуры, на развёрнутом дереве:
+// алиасы и merge («<<») уже применены декодером, поэтому проверяется ровно то, что
+// попадёт в правило. Неизвестное поле внутри структур детекта (detection, threshold,
+// respond, analyst) — ошибка этого правила: движок, который поле не знает
+// (group_by_previous до своего релиза), не применит правило частично — новый
+// group_by без миграции завёл бы второй открытый инцидент (argus1, INC-5312/INC-5370).
+// Неизвестное поле верхнего уровня — предупреждение (метаданные из metaFields — без него).
 func checkFields(raw []byte) (warn []string, err error) {
-	var doc yaml.Node
-	if err := yaml.Unmarshal(raw, &doc); err != nil {
+	var tree map[string]any
+	if err := yaml.Unmarshal(raw, &tree); err != nil {
 		return nil, err
 	}
-	if len(doc.Content) == 0 || doc.Content[0].Kind != yaml.MappingNode {
-		return nil, nil
-	}
-	root := doc.Content[0]
+	var doc yaml.Node
+	_ = yaml.Unmarshal(raw, &doc) // только для номеров строк в сообщениях
 	top := yamlFields(reflect.TypeOf(Rule{}))
-	for i := 0; i+1 < len(root.Content); i += 2 {
-		k, v := root.Content[i], root.Content[i+1]
-		t, ok := top[k.Value]
+	keys := make([]string, 0, len(tree))
+	for k := range tree {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		t, ok := top[k]
 		if !ok {
-			if !metaFields[k.Value] {
-				warn = append(warn, fmt.Sprintf("line %d: поле %s неизвестно движку — пропущено", k.Line, k.Value))
+			if !metaFields[k] {
+				warn = append(warn, fmt.Sprintf("line %d: поле %s неизвестно движку — пропущено", keyLine(&doc, k), k))
 			}
 			continue
 		}
-		if err := strictStruct(v, t, k.Value); err != nil {
+		if err := strictStruct(tree[k], t, k, &doc); err != nil {
 			return warn, err
 		}
 	}
@@ -482,25 +570,53 @@ func checkFields(raw []byte) (warn []string, err error) {
 }
 
 // strictStruct — у вложенной структуры (не map) все поля известны.
-func strictStruct(n *yaml.Node, t reflect.Type, path string) error {
+func strictStruct(v any, t reflect.Type, path string, doc *yaml.Node) error {
 	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
-	if t.Kind() != reflect.Struct || n.Kind != yaml.MappingNode {
+	if t.Kind() != reflect.Struct {
 		return nil
 	}
+	m, ok := v.(map[string]any)
+	if !ok {
+		return nil // не отображение: тип проверит декодер
+	}
 	fields := yamlFields(t)
-	for i := 0; i+1 < len(n.Content); i += 2 {
-		k, v := n.Content[i], n.Content[i+1]
-		ft, ok := fields[k.Value]
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		ft, ok := fields[k]
 		if !ok {
-			return fmt.Errorf("line %d: поле %s.%s неизвестно этой версии движка — правило не применено (обновите движок или уберите поле)", k.Line, path, k.Value)
+			return &UnknownFieldError{Path: path + "." + k, Line: keyLine(doc, k)}
 		}
-		if err := strictStruct(v, ft, path+"."+k.Value); err != nil {
+		if err := strictStruct(m[k], ft, path+"."+k, doc); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// keyLine — строка первого ключа с таким именем в файле (0 — нет): только для сообщения.
+func keyLine(n *yaml.Node, key string) int {
+	if n == nil {
+		return 0
+	}
+	if n.Kind == yaml.MappingNode {
+		for i := 0; i+1 < len(n.Content); i += 2 {
+			if n.Content[i].Value == key {
+				return n.Content[i].Line
+			}
+		}
+	}
+	for _, c := range n.Content {
+		if l := keyLine(c, key); l > 0 {
+			return l
+		}
+	}
+	return 0
 }
 
 func yamlFields(t reflect.Type) map[string]reflect.Type {

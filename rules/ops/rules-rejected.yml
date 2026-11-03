@@ -1,0 +1,32 @@
+# Правило не работает: движок отверг его файл при загрузке или перечитывании —
+# неизвестное этой версии поле детекта (правило новее образа), повтор id, ошибка
+# разбора. На старте такого правила просто нет, при перечитывании действует прежняя
+# версия файла: это тихое выключение детекта, и дежурный должен о нём знать.
+# Событие source argus.system / action rules.rejected пишет сам движок с
+# attrs.transport: internal (у всего, что приходит снаружи, это поле перезаписывает
+# коллектор — подделать или закрыть инцидент через ingest нельзя). object — файл
+# правила, attrs.rule_id и attrs.reason — код причины; текст ошибки — в журнале
+# движка («rules: правило отвергнуто» / «rules reload: правило отвергнуто»).
+# Закрывает инцидент rules.recovered — файл снова загрузился.
+title: "ARGUS: rule file rejected by the engine"
+id: a41c-ops-068
+level: high
+tags: [argus.system, ops.rules]
+
+detection:
+  selection:
+    source: argus.system
+    action: rules.rejected
+    attrs.transport: internal
+  condition: selection
+  group_by: object
+
+dedupe: 24h
+
+close_on:
+  source: argus.system
+  action: rules.recovered
+  attrs.transport: internal
+
+analyst:
+  profile: mock             # разбор не нужен: journal движка (reason, файл, строка поля) — обновить образ или исправить правило
