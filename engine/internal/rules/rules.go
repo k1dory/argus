@@ -651,6 +651,14 @@ func internalNets() ([]netip.Prefix, error) {
 		if err != nil {
 			return nil, fmt.Errorf("INTERNAL_NETS: %w", err)
 		}
+		// ::ffff:192.0.2.0/120 — та же сеть, что 192.0.2.0/24: адрес события сравнивается
+		// после Unmap, префикс приводим так же. Короче /96 в IPv4 не переводится.
+		if p.Addr().Is4In6() {
+			if p.Bits() < 96 {
+				return nil, fmt.Errorf("INTERNAL_NETS: %s — IPv4-mapped короче /96", c)
+			}
+			p = netip.PrefixFrom(p.Addr().Unmap(), p.Bits()-96)
+		}
 		out = append(out, p)
 	}
 	return out, nil
@@ -661,7 +669,8 @@ func isInternal(nets []netip.Prefix, s string) bool {
 	if err != nil {
 		return false
 	}
-	a = a.Unmap()
+	// Зона интерфейса (fe80::42%eth0) — не часть адреса: Prefix.Contains её отвергает.
+	a = a.WithZone("").Unmap()
 	for _, p := range nets {
 		if p.Contains(a) {
 			return true

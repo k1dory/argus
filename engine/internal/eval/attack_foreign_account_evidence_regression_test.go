@@ -63,7 +63,7 @@ func TestPR76ForeignAccessRequiresAccountEvidence(t *testing.T) {
 						acc = append(acc, d)
 					}
 				}
-				if len(acc) != 1 || acc[0].Key != tc.actor || len(acc[0].Events) != 5 {
+				if len(acc) != 1 || acc[0].Key != tc.actor+"|"+events[0].Node || len(acc[0].Events) != 5 {
 					t.Fatalf("authenticated foreign access must be grouped by account with evidence: %+v", acc)
 				}
 				for _, tag := range []string{"attack.initial_access", "attack.t1078"} {
