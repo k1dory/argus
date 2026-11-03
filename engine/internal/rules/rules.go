@@ -3,14 +3,14 @@
 package rules
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
+	"log/slog"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -390,12 +390,40 @@ func Files(dir string) ([]string, error) {
 
 // Load читает все правила каталога (рекурсивно, без tests/), компилирует
 // матчеры. Rule.File — путь относительно каталога (wazuh/ssh-bruteforce.yml).
+// Load — все правила каталога; любое отвергнутое правило — ошибка (CLI, rules test,
+// проверки). Движок грузит через LoadAll: отвергнутое правило не роняет остальные.
 func Load(dir string) ([]*Rule, error) {
-	paths, err := Files(dir)
+	out, rejected, err := LoadAll(dir)
 	if err != nil {
 		return nil, err
 	}
-	var out []*Rule
+	if len(rejected) > 0 {
+		errs := make([]error, len(rejected))
+		for i := range rejected {
+			errs[i] = rejected[i]
+		}
+		return nil, errors.Join(errs...)
+	}
+	return out, nil
+}
+
+// RuleError — правило, которое не загрузилось: файл (относительно каталога) и причина.
+type RuleError struct {
+	File string
+	Err  error
+}
+
+func (e RuleError) Error() string { return e.File + ": " + e.Err.Error() }
+func (e RuleError) Unwrap() error { return e.Err }
+
+// LoadAll — правила каталога по одному: отвергнутые (ошибка разбора, неизвестное
+// поле детекта, неверное значение) — в rejected, остальные загружаются. err — только
+// если каталог не прочитан.
+func LoadAll(dir string) (out []*Rule, rejected []RuleError, err error) {
+	paths, err := Files(dir)
+	if err != nil {
+		return nil, nil, err
+	}
 	for _, p := range paths {
 		rel, err := filepath.Rel(dir, p)
 		if err != nil {
@@ -404,12 +432,88 @@ func Load(dir string) ([]*Rule, error) {
 		rel = filepath.ToSlash(rel)
 		r, err := LoadFile(p)
 		if err != nil {
-			return nil, fmt.Errorf("%s: %w", rel, err)
+			rejected = append(rejected, RuleError{File: rel, Err: err})
+			continue
 		}
 		r.File = rel
 		out = append(out, r)
 	}
-	return out, nil
+	return out, rejected, nil
+}
+
+// metaFields — метаданные правила (в том числе из Sigma): на детект не влияют и
+// разрешены без предупреждения.
+var metaFields = map[string]bool{
+	"description": true, "author": true, "references": true, "status": true, "date": true,
+	"modified": true, "falsepositives": true, "license": true, "fields": true, "related": true,
+	"notes": true, "comment": true, "owner": true, "version": true,
+}
+
+// checkFields — схема полей правила по yaml-тегам структуры. Неизвестное поле внутри
+// структур детекта (detection, threshold, respond, analyst) — ошибка этого правила:
+// движок, который поле не знает (group_by_previous до своего релиза), не применит
+// правило частично — новый group_by без миграции завёл бы второй открытый инцидент
+// (argus1, INC-5312/INC-5370). Неизвестное поле верхнего уровня — предупреждение
+// (метаданные из metaFields — без него): прежде такие поля молча пропускались.
+func checkFields(raw []byte) (warn []string, err error) {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		return nil, err
+	}
+	if len(doc.Content) == 0 || doc.Content[0].Kind != yaml.MappingNode {
+		return nil, nil
+	}
+	root := doc.Content[0]
+	top := yamlFields(reflect.TypeOf(Rule{}))
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		k, v := root.Content[i], root.Content[i+1]
+		t, ok := top[k.Value]
+		if !ok {
+			if !metaFields[k.Value] {
+				warn = append(warn, fmt.Sprintf("line %d: поле %s неизвестно движку — пропущено", k.Line, k.Value))
+			}
+			continue
+		}
+		if err := strictStruct(v, t, k.Value); err != nil {
+			return warn, err
+		}
+	}
+	return warn, nil
+}
+
+// strictStruct — у вложенной структуры (не map) все поля известны.
+func strictStruct(n *yaml.Node, t reflect.Type, path string) error {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if t.Kind() != reflect.Struct || n.Kind != yaml.MappingNode {
+		return nil
+	}
+	fields := yamlFields(t)
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		k, v := n.Content[i], n.Content[i+1]
+		ft, ok := fields[k.Value]
+		if !ok {
+			return fmt.Errorf("line %d: поле %s.%s неизвестно этой версии движка — правило не применено (обновите движок или уберите поле)", k.Line, path, k.Value)
+		}
+		if err := strictStruct(v, ft, path+"."+k.Value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func yamlFields(t reflect.Type) map[string]reflect.Type {
+	out := map[string]reflect.Type{}
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		name, _, _ := strings.Cut(f.Tag.Get("yaml"), ",")
+		if name == "" || name == "-" {
+			continue
+		}
+		out[name] = f.Type
+	}
+	return out
 }
 
 func LoadFile(path string) (*Rule, error) {
@@ -417,14 +521,15 @@ func LoadFile(path string) (*Rule, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Неизвестное поле — ошибка, а не молчаливый пропуск: движок старой версии,
-	// получивший правило с полем новее себя (group_by_previous до своего релиза),
-	// отвергнет набор и оставит прежний при перечитывании, а не применит его
-	// частично (новый group_by без миграции — второй открытый инцидент).
+	warn, err := checkFields(raw)
+	if err != nil {
+		return nil, err
+	}
+	for _, w := range warn {
+		slog.Warn("rules: "+w, "file", path)
+	}
 	var r Rule
-	dec := yaml.NewDecoder(bytes.NewReader(raw))
-	dec.KnownFields(true)
-	if err := dec.Decode(&r); err != nil && !errors.Is(err, io.EOF) {
+	if err := yaml.Unmarshal(raw, &r); err != nil {
 		return nil, err
 	}
 	if r.Respond != nil {

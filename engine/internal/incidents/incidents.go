@@ -242,9 +242,13 @@ func (r *Registry) Apply(dets []eval.Detection, now time.Time) (created, updated
 		key := inc.regKey()
 		if _, ok := r.open[key]; !ok {
 			legacy := d.Rule.ID + "|" + inc.ActorName + "|" + inc.Node
-			if ex, ok := r.open[legacy]; ok && ex.GroupKey == "" && inc.GroupKey != "" {
-				// Инцидент, заведённый до group_key (или восстановленный без него), —
-				// под старым ключом: его забирает первая сработка группы, а не новый инцидент.
+			if ex, ok := r.open[legacy]; ok && ex.GroupKey == "" && ex.GroupBy == "" && inc.GroupKey != "" &&
+				strings.TrimSpace(d.Rule.Detection.GroupByPrevious) == "" {
+				// Инцидент, заведённый до group_key (миграция 0034), — под старым ключом: его
+				// забирает первая сработка группы, а не новый инцидент. Только строка без
+				// записанного group_by (до 0039): с записанным пустой ключ — это группировка
+				// по субъекту или значение «-», а не отсутствие ключа. Если правило объявило
+				// group_by_previous, решает только previousGroup (с его GroupBy и границей).
 				delete(r.open, legacy)
 				ex.GroupKey, ex.GroupBy = inc.GroupKey, inc.GroupBy
 				r.open[key] = ex
@@ -266,6 +270,13 @@ func (r *Registry) Apply(dets []eval.Detection, now time.Time) (created, updated
 			continue
 		}
 		if ex, ok := r.open[key]; ok && !isFinal(ex.Status) {
+			if ex.GroupBy != inc.GroupBy {
+				// Ключ совпал, а group_by новый (или строка до 0039): инцидент теперь —
+				// группа текущего group_by. Это записывается и без новых событий, иначе
+				// он остался бы кандидатом на перенос для соседней группы.
+				ex.GroupBy = inc.GroupBy
+				ex.groupPending = true
+			}
 			if inc.EventCount <= ex.EventCount && inc.LastTS <= ex.LastTS {
 				continue // ничего нового
 			}

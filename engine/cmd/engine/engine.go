@@ -41,6 +41,8 @@ type metrics struct {
 	analystRejected  atomic.Int64 // cooldown / суточный лимит
 	pollErrors       atomic.Int64
 	reloads          atomic.Int64
+	reloadFailures   atomic.Int64 // перечитываний, в которых правила отвергнуты (набор частично прежний)
+	rulesRejected    atomic.Int64 // отвергнутых правил в последней загрузке
 	lastRun          atomic.Int64
 	diskFreePermille atomic.Int64 // свободно на самом заполненном диске ClickHouse, ‰
 	autoBlocks       atomic.Int64
@@ -148,24 +150,59 @@ func signature(dir string) string {
 	return b.String()
 }
 
-// maybeReload перечитывает правила, если каталог изменился; force — без проверки отпечатка.
-func (e *engine) maybeReload(force bool) {
+// maybeReload перечитывает правила, если каталог изменился; force — без проверки
+// отпечатка. Отвергнутое правило (разбор, неизвестное поле детекта) не роняет набор:
+// остальные применяются, а для отвергнутого остаётся прежняя версия того же файла.
+// Возвращает отвергнутые правила (для /reload).
+func (e *engine) maybeReload(force bool) []rules.RuleError {
 	e.reloadMu.Lock()
 	defer e.reloadMu.Unlock()
 	sig := signature(e.rulesDir)
 	if !force && sig == e.rulesSig {
-		return
+		return nil
 	}
-	rs, err := rules.Load(e.rulesDir)
-	if err != nil {
-		slog.Warn("rules reload: оставляю прежний набор", "err", err)
-		e.rulesSig = sig
-		return
-	}
-	e.rules.Store(&rs)
+	rs, rejected, err := rules.LoadAll(e.rulesDir)
 	e.rulesSig = sig
-	e.m.reloads.Add(1)
-	slog.Info("rules reloaded", "rules", len(rs))
+	if err != nil {
+		e.m.reloadFailures.Add(1)
+		slog.Warn("rules reload: каталог не прочитан — оставляю прежний набор", "err", err)
+		return []rules.RuleError{{File: e.rulesDir, Err: err}}
+	}
+	if len(rejected) > 0 {
+		prev := map[string]*rules.Rule{}
+		for _, r := range e.current() {
+			prev[r.File] = r
+		}
+		for _, re := range rejected {
+			if old := prev[re.File]; old != nil {
+				rs = append(rs, old)
+			}
+			slog.Warn("rules reload: правило отвергнуто — оставляю прежний набор для этого файла", "file", re.File, "err", re.Err)
+		}
+		sort.SliceStable(rs, func(i, j int) bool { return rs[i].File < rs[j].File })
+		e.m.reloadFailures.Add(1)
+	}
+	e.m.rulesRejected.Store(int64(len(rejected)))
+	e.rules.Store(&rs)
+	if len(rejected) == 0 {
+		e.m.reloads.Add(1)
+		slog.Info("rules reloaded", "rules", len(rs))
+	}
+	return rejected
+}
+
+// loadForRun — правила при старте: отвергнутые записываются в журнал и пропускаются,
+// остальные работают (прежней версии для них нет). Нечитаемый каталог — выход.
+func loadForRun(dir string) ([]*rules.Rule, int) {
+	rs, rejected, err := rules.LoadAll(dir)
+	if err != nil {
+		slog.Error("rules", "err", err)
+		os.Exit(1)
+	}
+	for _, re := range rejected {
+		slog.Error("rules: правило отвергнуто и не работает", "file", re.File, "err", re.Err)
+	}
+	return rs, len(rejected)
 }
 
 // observeIdentities применяет события identity.alias(.revoke) к таблицам
@@ -293,7 +330,7 @@ func logShippedRegistry() {
 }
 
 func run(rulesDir string) {
-	rs := mustLoad(rulesDir)
+	rs, rejected := loadForRun(rulesDir)
 	logShippedRegistry()
 	acfg, err := analyst.LoadConfig(env("ANALYST_CONFIG", ""))
 	if err != nil {
@@ -317,6 +354,7 @@ func run(rulesDir string) {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	e := newEngine(ctx, rulesDir, rs, acfg, ch, token, env("METRICS_TOKEN", token))
+	e.m.rulesRejected.Store(int64(rejected))
 	for _, msg := range e.resp.ConfigErrors() {
 		slog.Warn("respond config", "msg", msg)
 	}
