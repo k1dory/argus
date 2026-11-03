@@ -112,18 +112,43 @@
 - name: "Правила: снимок для движка"
   ansible.builtin.shell:
     cmd: |
-      set -eu
-      cd {{ argus_dir | quote }}
-      if command -v sha256sum >/dev/null 2>&1; then sum=sha256sum; else sum="shasum -a 256"; fi
-      h=$(find rules -type f | LC_ALL=C sort | while IFS= read -r f; do printf '%s\n' "$f"; $sum < "$f"; done | $sum | cut -c1-16)
+      set -euo pipefail
+      umask 022
       base={{ argus_rules_releases_dir | quote }}
-      d="$base/rules-$h"
-      if [ -d "$d" ]; then echo "exists $d"; exit 0; fi
       mkdir -p "$base"
-      rm -rf "$d.tmp"
-      cp -R rules "$d.tmp"
-      mv "$d.tmp" "$d"
-      echo "created $d"
+      chmod 755 "$base"
+      # Публикация и чистка снимков — под одним замком (каталог: mkdir атомарен).
+      # Замок старше часа — от упавшего прогона, его можно снять.
+      lock="$base/.lock"
+      waited=0
+      until mkdir "$lock" 2>/dev/null; do
+        if [ -n "$(find "$lock" -maxdepth 0 -mmin +60 2>/dev/null)" ]; then rmdir "$lock" 2>/dev/null || true; continue; fi
+        [ "$waited" -lt 6000 ] || { echo "снимок правил: замок $lock занят дольше 10 минут" >&2; exit 1; }
+        sleep 0.1; waited=$((waited + 1))
+      done
+      trap 'rmdir "$lock" 2>/dev/null || true' EXIT
+      cd {{ argus_dir | quote }}
+      # Ссылка внутри rules/ указывает за пределы снимка, и её цель хеш не видит.
+      links=$(find rules -type l)
+      if [ -n "$links" ]; then
+        echo "снимок правил: в rules/ символьные ссылки не поддерживаются: $links" >&2
+        exit 1
+      fi
+      # Хешируется подготовленная копия, а не checkout: обновление кода во время
+      # копирования не попадёт под чужой хеш.
+      tmp=$(mktemp -d "$base/.stage.XXXXXX")
+      cp -R rules/. "$tmp/"
+      chmod -R u=rwX,go=rX "$tmp"
+      if command -v sha256sum >/dev/null 2>&1; then sum=sha256sum; else sum="shasum -a 256"; fi
+      h=$(cd "$tmp" && find . -type f | LC_ALL=C sort | while IFS= read -r f; do printf '%s\n' "$f"; $sum < "$f" || exit 1; done | $sum | cut -c1-16)
+      d="$base/rules-$h"
+      if [ -d "$d" ]; then
+        rm -rf "$tmp"
+        echo "exists $d"
+      else
+        mv "$tmp" "$d"
+        echo "created $d"
+      fi
     executable: /bin/bash
   register: argus_rules_snapshot
   changed_when: argus_rules_snapshot.stdout.startswith('created')
@@ -199,7 +224,7 @@
   ansible.builtin.lineinfile:
     path: "{{ argus_dir }}/.env"
     regexp: "^#?ARGUS_RULES_HOST_DIR="
-    line: "ARGUS_RULES_HOST_DIR={{ argus_rules_snapshot.stdout.split()[-1] }}"
+    line: "ARGUS_RULES_HOST_DIR=\"{{ argus_rules_snapshot.stdout.strip().split(' ', 1)[1] }}\""
     mode: "0600"
 
 - name: ".env: профиль compose mcp"
@@ -393,15 +418,49 @@
   delay: 5
   until: argus_collector_ready.status == 200
 
-# Выкатка прошла: движок на новом снимке. Старые снимки — кроме текущего и
-# argus_rules_keep последних — удаляются (откат на прошлую версию их воссоздаст).
+# Выкатка прошла. Старые снимки удаляются под тем же замком, что и публикация.
+# Сохраняются снимок из .env (его выбрал последний прогон, в том числе параллельный
+# откат), смонтированный в движок (docker inspect), снимок этого прогона и
+# argus_rules_keep самых новых из остальных.
 - name: "Правила: старые снимки"
   ansible.builtin.shell:
     cmd: |
-      set -eu
-      cd {{ argus_rules_releases_dir | quote }}
-      cur=$(basename {{ argus_rules_snapshot.stdout.split()[-1] | quote }})
-      ls -1dt rules-* 2>/dev/null | grep -vxF "$cur" | grep -v '\.tmp$' | tail -n +{{ argus_rules_keep | int + 1 }} | while IFS= read -r d; do rm -rf -- "$d"; echo "removed $d"; done
+      set -euo pipefail
+      base={{ argus_rules_releases_dir | quote }}
+      lock="$base/.lock"
+      waited=0
+      until mkdir "$lock" 2>/dev/null; do
+        if [ -n "$(find "$lock" -maxdepth 0 -mmin +60 2>/dev/null)" ]; then rmdir "$lock" 2>/dev/null || true; continue; fi
+        [ "$waited" -lt 6000 ] || { echo "чистка снимков: замок $lock занят дольше 10 минут" >&2; exit 1; }
+        sleep 0.1; waited=$((waited + 1))
+      done
+      trap 'rmdir "$lock" 2>/dev/null || true' EXIT
+      keep=()
+      keep+=("$(basename {{ argus_rules_snapshot.stdout.strip().split(' ', 1)[1] | quote }})")
+      env={{ (argus_dir ~ '/.env') | quote }}
+      if [ -f "$env" ]; then
+        v=$(sed -n 's/^ARGUS_RULES_HOST_DIR=//p' "$env" | tail -n 1 | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+        [ -z "$v" ] || keep+=("$(basename "$v")")
+      fi
+      if command -v docker >/dev/null 2>&1; then
+        id=$(cd {{ argus_dir | quote }} && docker compose ps -q engine 2>/dev/null | head -n 1 || true)
+        if [ -n "$id" ]; then
+          m=$(docker inspect -f '{% raw %}{{range .Mounts}}{{if eq .Destination "/rules"}}{{.Source}}{{end}}{{end}}{% endraw %}' "$id" 2>/dev/null || true)
+          [ -z "$m" ] || keep+=("$(basename "$m")")
+        fi
+      fi
+      cd "$base"
+      rm -rf .stage.*
+      kept=0
+      while IFS= read -r d; do
+        case "$d" in rules-*) ;; *) continue ;; esac
+        skip=0
+        for k in "${keep[@]}"; do [ "$d" != "$k" ] || skip=1; done
+        [ "$skip" -eq 0 ] || continue
+        if [ "$kept" -lt {{ argus_rules_keep | int }} ]; then kept=$((kept + 1)); continue; fi
+        rm -rf -- "$d"
+        echo "removed $d"
+      done < <(ls -1dt rules-* 2>/dev/null || true)
     executable: /bin/bash
   register: argus_rules_prune
   changed_when: "'removed' in argus_rules_prune.stdout"
