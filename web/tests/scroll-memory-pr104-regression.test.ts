@@ -25,7 +25,8 @@ const INITIAL_URL = "/incidents?queue=open";
 const USER_EVENTS = ["wheel", "touchstart", "keydown", "mousedown"] as const;
 type Cleanup = undefined | (() => void);
 type Effect = { deps?: readonly unknown[]; cleanup?: Cleanup };
-type Listener = (event: { type: string; persisted?: boolean }) => void;
+type KeyboardInput = Partial<Pick<KeyboardEvent, "key" | "code" | "ctrlKey" | "metaKey" | "shiftKey">>;
+type Listener = (event: { type: string; persisted?: boolean } & KeyboardInput) => void;
 
 function fixture(options: {
   href?: string;
@@ -54,8 +55,9 @@ function fixture(options: {
   function capture(options?: boolean | { capture?: boolean }) {
     return typeof options === "boolean" ? options : options?.capture === true;
   }
-  function emit(type: string, persisted?: boolean) {
-    for (const { callback } of [...(listeners.get(type) ?? [])]) callback({ type, persisted });
+  function emit(type: string, init?: boolean | KeyboardInput) {
+    const event = typeof init === "boolean" ? { type, persisted: init } : { type, ...init };
+    for (const { callback } of [...(listeners.get(type) ?? [])]) callback(event);
   }
   const document = {
     body: {},
@@ -224,12 +226,46 @@ for (const destination of ["/sources", "/incidents?queue=closed"]) {
     f.render();
     assert.equal(f.resources().frames, 1, "сначала действительно ждём длинную страницу");
     f.navigate(destination, 600);
+    assert.deepEqual(f.resources(), { frames: 0, observers: 0, inputListeners: 0 },
+      "popstate останавливает восстановление сразу, до следующего tick");
     f.resize(5000);
     f.frame();
     assert.deepEqual(f.scrollCalls, [], "цель старого reload не должна прокручивать новый адрес");
     assert.equal(f.window.scrollY, 600, "сохраняется положение, выставленное роутером");
     assert.deepEqual(f.resources(), { frames: 0, observers: 0, inputListeners: 0 });
   });
+}
+
+// pushState/replaceState не посылают popstate: отмену должен заметить сам tick,
+// в том числе при смене только query (usePathname остаётся прежним).
+for (const destination of ["/sources", "/incidents?queue=closed"]) {
+  for (const trigger of ["rAF", "ResizeObserver"] as const) {
+    test(`PR104 follow-up: ${trigger} замечает новый адрес ${destination} без popstate`, (t) => {
+      const f = fixture();
+      t.after(f.unmount);
+      f.seed();
+      f.seed(destination, 1200);
+      f.render();
+      assert.equal(f.resources().frames, 1);
+
+      f.window.location = new URL(destination, f.window.location);
+      f.render();
+      f.window.scrollY = 200;
+      if (trigger === "rAF") f.frame();
+      else f.resize(5000);
+      f.resize(5000);
+      f.frame();
+
+      assert.deepEqual(f.scrollCalls, [], "старая цель не прокручивает новый адрес");
+      assert.equal(f.window.scrollY, 200);
+      assert.deepEqual(f.resources(), { frames: 0, observers: 0, inputListeners: 0 });
+      f.emit("scroll");
+      f.frame();
+      const saved = JSON.parse(f.storage.get(memory.SCROLL_STORE_KEY)!);
+      assert.equal(saved[destination].y, 200, "отмена снимает блокировку сохранения нового адреса");
+      assert.equal(saved[INITIAL_URL].y, 2400, "цель прежнего адреса остаётся прежней");
+    });
+  }
 }
 
 // P2: pagehide сохраняет высоту скелета вместо ещё не восстановленной цели.
@@ -254,6 +290,65 @@ for (const interimY of [0, 300]) {
   });
 }
 
+// P2: защита pendingRef пока покрывает reload кнопкой браузера, но не клавишей.
+// keydown вызывает stop(), разрешает save(), и pagehide теряет исходную цель.
+// Проверяем результат следующего reload, не способ исправления stop/pendingRef.
+const reloadShortcuts: { name: string; keys: KeyboardInput[] }[] = [
+  { name: "F5", keys: [{ key: "F5", code: "F5" }] },
+  { name: "Ctrl+R", keys: [
+    { key: "Control", code: "ControlLeft", ctrlKey: true },
+    { key: "r", code: "KeyR", ctrlKey: true },
+  ] },
+  { name: "Cmd+R", keys: [
+    { key: "Meta", code: "MetaLeft", metaKey: true },
+    { key: "r", code: "KeyR", metaKey: true },
+  ] },
+];
+for (const shortcut of reloadShortcuts) {
+  for (const interimY of [0, 300]) {
+    test(`PR104 follow-up: ${shortcut.name} во время восстановления не заменяет цель на ${interimY}`, (t) => {
+      const first = fixture();
+      t.after(first.unmount);
+      first.seed();
+      first.render();
+      assert.equal(first.resources().frames, 1, "цель 2400 пока недоступна");
+      first.window.scrollY = interimY;
+
+      // При фокусе внутри страницы keydown предшествует штатному reload.
+      // Нажатие отдельного Control/Meta тоже не является прокруткой.
+      for (const key of shortcut.keys) first.emit("keydown", key);
+      first.emit("pagehide", false);
+      first.unmount();
+
+      const second = fixture({ storage: first.storage, maxScroll: 5000 });
+      t.after(second.unmount);
+      second.render();
+      assert.equal(second.window.scrollY, 2400,
+        "клавиатурный reload должен сохранить ещё не достигнутую цель, как reload кнопкой браузера");
+    });
+  }
+}
+
+test("PR104 follow-up: scroll во время ожидания сохраняет цель, после восстановления запись возобновляется", (t) => {
+  const f = fixture();
+  t.after(f.unmount);
+  f.seed();
+  f.render();
+  f.window.scrollY = 300; // браузер восстановил доступную часть короткой страницы
+  f.emit("scroll");
+  f.frame();
+  assert.equal(JSON.parse(f.storage.get(memory.SCROLL_STORE_KEY)!)[INITIAL_URL].y, 2400);
+
+  f.resize(5000);
+  f.frame();
+  assert.equal(f.window.scrollY, 2400);
+  f.window.scrollY = 900;
+  f.emit("scroll");
+  f.frame();
+  assert.equal(JSON.parse(f.storage.get(memory.SCROLL_STORE_KEY)!)[INITIAL_URL].y, 900,
+    "успешное восстановление снимает блокировку сохранения");
+});
+
 // P3: 8 секунд должны отсчитываться монотонными часами, независимо от Date.now.
 test("PR104: перевод часов назад не продлевает rAF/ResizeObserver за пределы 8 секунд", (t) => {
   const f = fixture();
@@ -275,7 +370,7 @@ for (const event of USER_EVENTS) {
     t.after(f.unmount);
     f.seed();
     f.render();
-    f.emit(event);
+    f.emit(event, event === "keydown" ? { key: "ArrowDown", code: "ArrowDown" } : undefined);
     f.resize(5000);
     f.frame();
     assert.deepEqual(f.scrollCalls, []);
