@@ -122,8 +122,14 @@ var DefaultPIIFields = []string{"suser", "duser", "usrName", "user", "identUserN
 
 // HasPII — есть ли в строке e-mail или телефон.
 func HasPII(s string) bool {
-	return s != "" && (hasEmail(s) || phoneRe.MatchString(s))
+	return s != "" && (hasEmail(s) || phoneRe.MatchString(longDigitsRe.ReplaceAllString(s, " ")))
 }
+
+// longDigitsRe — сплошные числа длиннее 12 цифр: метки времени в мс (CEF rt, LEEF
+// devTime: 1780000000000), идентификаторы. В них phoneRe находит подстроку вида
+// 80000000000 и ложно ставит pii=1 — инцидент уходит с облачного маршрута и портит
+// долю ПДн. Телефон в журнале пишется с разделителями или не длиннее 12 цифр.
+var longDigitsRe = regexp.MustCompile(`\d{13,}`)
 
 // встроенная таблица вендоров: достаточно для старта без конфига
 var builtin = []SourceRule{
@@ -258,14 +264,16 @@ func (n *Normalizer) FromSyslog(sl parse.Syslog, raw string) model.Event {
 	for k, v := range sl.Structured {
 		e.Attrs[k] = v
 	}
-	// После Structured Data: SD-элемент [tag] не должен стереть исходный APP-NAME.
-	if rejectedTag != "" {
-		e.Attrs["tag"] = rejectedTag
-	}
 	if HasPII(sl.Message) {
 		e.PII = 1
 	}
 	e.Ensure()
+	// После Structured Data и чистки ключей в Ensure: SD-элемент [tag] или ключ,
+	// который чистка превращает в tag (ta<DEL>g), не должен стереть исходный APP-NAME.
+	if rejectedTag != "" {
+		e.Attrs["tag"] = rejectedTag
+		e.Ensure()
+	}
 	return e
 }
 
