@@ -524,7 +524,8 @@ func LoadFile(path string) (*Rule, error) {
 type matcher func(*model.Event) bool
 
 // compile превращает карту field → значение в матчеры. Поддерживаются
-// Sigma-модификаторы field|contains и операторы в строке: '> 90', 'regex x'.
+// Sigma-модификаторы field|contains, свой field|internal (адрес из INTERNAL_NETS)
+// и операторы в строке: '> 90', 'regex x'.
 func compile(m map[string]any) ([]matcher, error) {
 	var out []matcher
 	keys := make([]string, 0, len(m))
@@ -586,6 +587,19 @@ func valueMatcher(mod, v string) (func(string) bool, error) {
 		return func(s string) bool { return strings.HasPrefix(strings.ToLower(s), lv) }, nil
 	case "endswith":
 		return func(s string) bool { return strings.HasSuffix(strings.ToLower(s), lv) }, nil
+	case "internal":
+		// field|internal: true — адрес из своих сетей (INTERNAL_NETS, как у коллектора для
+		// attrs.scope), false — не из своих. Сравнение по netip: регистр, сокращение IPv6 и
+		// IPv4-mapped запись не важны; не адрес — не свой.
+		want, err := strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("internal: ожидалось true или false, получено %q", v)
+		}
+		nets, err := internalNets()
+		if err != nil {
+			return nil, err
+		}
+		return func(s string) bool { return isInternal(nets, s) == want }, nil
 	case "regex", "re":
 		re, err := regexp.Compile(v)
 		if err != nil {
@@ -615,6 +629,45 @@ func valueMatcher(mod, v string) (func(string) bool, error) {
 		}, nil
 	}
 	return nil, fmt.Errorf("неизвестный модификатор %q", mod)
+}
+
+// defaultInternalNets — свои сети при пустом INTERNAL_NETS; тот же список, что у коллектора.
+var defaultInternalNets = []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "fc00::/7", "fe80::/10", "::1/128"}
+
+// internalNets — INTERNAL_NETS на момент загрузки правила; непустой список заменяет умолчания.
+func internalNets() ([]netip.Prefix, error) {
+	var list []string
+	for _, c := range strings.Split(os.Getenv("INTERNAL_NETS"), ",") {
+		if c = strings.TrimSpace(c); c != "" {
+			list = append(list, c)
+		}
+	}
+	if len(list) == 0 {
+		list = defaultInternalNets
+	}
+	out := make([]netip.Prefix, 0, len(list))
+	for _, c := range list {
+		p, err := netip.ParsePrefix(c)
+		if err != nil {
+			return nil, fmt.Errorf("INTERNAL_NETS: %w", err)
+		}
+		out = append(out, p)
+	}
+	return out, nil
+}
+
+func isInternal(nets []netip.Prefix, s string) bool {
+	a, err := netip.ParseAddr(strings.TrimSpace(s))
+	if err != nil {
+		return false
+	}
+	a = a.Unmap()
+	for _, p := range nets {
+		if p.Contains(a) {
+			return true
+		}
+	}
+	return false
 }
 
 func asList(v any) []string {

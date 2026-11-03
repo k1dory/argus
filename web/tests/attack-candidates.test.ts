@@ -60,7 +60,11 @@ test("теги правил: техника относится к одной и�
   assert.deepEqual(mismatched, [], "техника из чужой тактики: кандидаты и тактика по умолчанию разойдутся");
   // Эксплуатационные правила (ops.*) — без ATT&CK; правилу ИБ без техники форма
   // закрытия подбирает кандидатов только по тактике.
-  const noTechnique = rules.filter((r) => !(r.tags ?? []).some((t) => t.startsWith("ops.")) && !ruleTechniques(r.tags ?? []).length).map((r) => r.file);
+  // Сигналы без техники — поимённо, с причиной: новое правило ИБ без техники тест не пропустит.
+  const signalOnly: Record<string, string> = {
+    "rules/proxy-foreign-access.yml": "география без скана и без учётной записи; вход пользователя — proxy-foreign-account (T1078)",
+  };
+  const noTechnique = rules.filter((r) => !signalOnly[r.file] && !(r.tags ?? []).some((t) => t.startsWith("ops.")) && !ruleTechniques(r.tags ?? []).length).map((r) => r.file);
   assert.deepEqual(noTechnique, [], "правило ИБ без attack.tNNNN");
 });
 
