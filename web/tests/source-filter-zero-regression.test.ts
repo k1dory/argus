@@ -48,7 +48,7 @@ test("коллекторы: событий до 0 оставляет тольк�
   assert.match(markup, /fixture\.earlier/);
   assert.doesNotMatch(markup, /fixture\.(active|idle)/);
   assert.match(bound(markup, "src-health-events-max"), /\bvalue="0"/);
-  assert.match(markup, /сбросить диапазоны/);
+  assert.match(markup, /Сбросить всё/);
 });
 
 test("коллекторы: EPS до 0 сохраняет источник с событиями за час, но без текущего потока", async () => {
@@ -63,7 +63,7 @@ test("коллекторы: пустые верхние границы возв�
   const markup = await page({ events_max: "", eps_max: "" });
   for (const source of ["zero", "active", "idle", "earlier"]) assert.ok(markup.includes(`fixture.${source}`));
   assert.match(bound(markup, "src-health-events-max"), /\bvalue=""/);
-  assert.doesNotMatch(markup, /сбросить диапазоны/);
+  assert.doesNotMatch(markup, /Сбросить всё/);
 });
 
 test("коллекторы: интервал последнего приёма остаётся UTC при нулевом пороге", async () => {
