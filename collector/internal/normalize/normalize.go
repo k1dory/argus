@@ -3,6 +3,7 @@
 package normalize
 
 import (
+	"fmt"
 	"net"
 	"net/netip"
 	"regexp"
@@ -54,7 +55,7 @@ func (n *Normalizer) inPrefixes(nets []netip.Prefix, ip string) bool {
 	if err != nil {
 		return false
 	}
-	a = a.Unmap()
+	a = a.WithZone("").Unmap() // зона интерфейса (fe80::1%eth0) — не часть адреса
 	for _, p := range nets {
 		if p.Contains(a) {
 			return true
@@ -63,13 +64,25 @@ func (n *Normalizer) inPrefixes(nets []netip.Prefix, ip string) bool {
 	return false
 }
 
+// UnmapPrefix — ::ffff:192.0.2.0/120 как 192.0.2.0/24: адреса сравниваются после
+// Unmap, префикс приводится так же. IPv4-mapped короче /96 в IPv4 не переводится — ошибка.
+func UnmapPrefix(p netip.Prefix) (netip.Prefix, error) {
+	if !p.Addr().Is4In6() {
+		return p, nil
+	}
+	if p.Bits() < 96 {
+		return p, fmt.Errorf("%s: IPv4-mapped короче /96", p)
+	}
+	return netip.PrefixFrom(p.Addr().Unmap(), p.Bits()-96), nil
+}
+
 // IsInternal — адрес из своих сетей (InternalNets или умолчания).
 func (n *Normalizer) IsInternal(ip string) bool {
 	a, err := netip.ParseAddr(ip)
 	if err != nil {
 		return false
 	}
-	a = a.Unmap()
+	a = a.WithZone("").Unmap() // зона интерфейса (fe80::1%eth0) — не часть адреса
 	nets := n.InternalNets
 	if len(nets) == 0 {
 		nets = defaultInternalNets
