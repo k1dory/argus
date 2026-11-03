@@ -241,9 +241,9 @@ var programTagRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_.-]{0,31}$`)
 func (n *Normalizer) FromSyslog(sl parse.Syslog, raw string) model.Event {
 	app := sl.AppName
 	attrs := map[string]string{"format": sl.Format, "procid": sl.ProcID, "msgid": sl.MsgID}
+	rejectedTag := ""
 	if app != "" && !programTagRe.MatchString(app) {
-		attrs["tag"] = app
-		app = ""
+		rejectedTag, app = sl.AppName, ""
 	}
 	e := model.Event{
 		Source: "syslog." + slug(firstNonEmpty(app, "generic")), SourceClass: "syslog",
@@ -257,6 +257,10 @@ func (n *Normalizer) FromSyslog(sl parse.Syslog, raw string) model.Event {
 	}
 	for k, v := range sl.Structured {
 		e.Attrs[k] = v
+	}
+	// После Structured Data: SD-элемент [tag] не должен стереть исходный APP-NAME.
+	if rejectedTag != "" {
+		e.Attrs["tag"] = rejectedTag
 	}
 	if HasPII(sl.Message) {
 		e.PII = 1

@@ -100,9 +100,18 @@ func ParseVRP(sl Syslog) (model.Event, bool) {
 		e.Action, e.Outcome, e.Severity = "system.config", "success", 4
 	case module == "IFNET" || module == "IFPDT" || strings.Contains(mnemonic, "LINK"):
 		e.Action = "net.link"
-		if strings.Contains(lower, "down") {
+		// Состояние — из параметров (OperStatus) и суффикса аварии linkDown_active/_clear:
+		// в тексте «The interface status changes.» нет ни up, ни down.
+		oper := strings.ToUpper(firstOf(kv, "OperStatus", "operStatus"))
+		state := e.Attrs["alarm_state"]
+		switch {
+		case oper == "DOWN" || (oper == "" && strings.EqualFold(e.Attrs["alarm"], "linkDown") && state == "active"):
 			e.Outcome, e.Severity = "failure", 5
-		} else if strings.Contains(lower, "up") {
+		case oper == "UP" || (oper == "" && strings.EqualFold(e.Attrs["alarm"], "linkDown") && state == "clear"):
+			e.Outcome = "success"
+		case strings.Contains(lower, "down"):
+			e.Outcome, e.Severity = "failure", 5
+		case strings.Contains(lower, "up"):
 			e.Outcome = "success"
 		}
 	default:
