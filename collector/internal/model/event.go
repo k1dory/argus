@@ -167,6 +167,22 @@ func (e *Event) fillDNSQuery() {
 	}
 }
 
+// cleanStable применяет Clean до неподвижной точки: удаление C0 может склеить
+// новую C1-последовательность (ta\xc2\x00\x80g → ta<U+0080>g → tag), и без этого
+// ключ схлопывался бы только при следующей чистке — поверх уже записанного attrs.tag.
+func cleanStable(s string) (string, bool) {
+	cut := false
+	for i := 0; i < 8; i++ {
+		v, c := Clean(s)
+		cut = cut || c
+		if v == s {
+			break
+		}
+		s = v
+	}
+	return s, cut
+}
+
 // Sanitize убирает управляющие символы (кроме \t) и ANSI-escape из строк,
 // которые показываются в UI, уходят в уведомления и в LLM, и режет их до
 // MaxFieldLen с пометкой attrs.truncated=1. Raw — улика: содержимое не
@@ -192,8 +208,8 @@ func (e *Event) Sanitize() {
 	fix(&e.SessionID)
 	fix(&e.Unit)
 	for k, v := range e.Attrs {
-		nv, cut := Clean(v)
-		nk, kcut := Clean(k)
+		nv, cut := cleanStable(v)
+		nk, kcut := cleanStable(k)
 		truncated = truncated || cut || kcut
 		if nk != k {
 			delete(e.Attrs, k)
