@@ -135,8 +135,39 @@ var DefaultPIIFields = []string{"suser", "duser", "usrName", "user", "identUserN
 
 // HasPII — есть ли в строке e-mail или телефон.
 func HasPII(s string) bool {
-	return s != "" && (hasEmail(s) || phoneRe.MatchString(s))
+	return s != "" && (hasEmail(s) || phoneRe.MatchString(blankLongDigits(s)))
 }
+
+// blankLongDigits заменяет пробелом сплошные числа из 13+ цифр — кроме тех, перед
+// которыми стоит «+»: «+4917612345678» — это международный телефон E.164 (до 15
+// цифр), он должен ставить pii=1. Ошибиться в сторону pii=1 дешевле: такое событие
+// просто не уходит в облачный маршрут аналитика.
+func blankLongDigits(s string) string {
+	idx := longDigitsRe.FindAllStringIndex(s, -1)
+	if len(idx) == 0 {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	last := 0
+	for _, m := range idx {
+		// «+» и не больше 15 цифр (предел E.164) — телефон; длиннее — идентификатор.
+		if m[0] > 0 && s[m[0]-1] == '+' && m[1]-m[0] <= 15 {
+			continue
+		}
+		b.WriteString(s[last:m[0]])
+		b.WriteByte(' ')
+		last = m[1]
+	}
+	b.WriteString(s[last:])
+	return b.String()
+}
+
+// longDigitsRe — сплошные числа длиннее 12 цифр: метки времени в мс (CEF rt, LEEF
+// devTime: 1780000000000), идентификаторы. В них phoneRe находит подстроку вида
+// 80000000000 и ложно ставит pii=1 — инцидент уходит с облачного маршрута и портит
+// долю ПДн. Число с «+» впереди не трогается — это международный телефон.
+var longDigitsRe = regexp.MustCompile(`\d{13,}`)
 
 // встроенная таблица вендоров: достаточно для старта без конфига
 var builtin = []SourceRule{
@@ -271,14 +302,16 @@ func (n *Normalizer) FromSyslog(sl parse.Syslog, raw string) model.Event {
 	for k, v := range sl.Structured {
 		e.Attrs[k] = v
 	}
-	// После Structured Data: SD-элемент [tag] не должен стереть исходный APP-NAME.
-	if rejectedTag != "" {
-		e.Attrs["tag"] = rejectedTag
-	}
 	if HasPII(sl.Message) {
 		e.PII = 1
 	}
 	e.Ensure()
+	// После Structured Data и чистки ключей в Ensure: SD-элемент [tag] или ключ,
+	// который чистка превращает в tag (ta<DEL>g), не должен стереть исходный APP-NAME.
+	if rejectedTag != "" {
+		e.Attrs["tag"] = rejectedTag
+		e.Ensure()
+	}
 	return e
 }
 

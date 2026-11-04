@@ -167,6 +167,30 @@ func (e *Event) fillDNSQuery() {
 	}
 }
 
+// ProvenanceAttrs — атрибуты, которые выставляет только сам коллектор (адрес
+// соединения, проверенный CN, направление, транспорт, исходное время). Грязный
+// ключ из присланных данных, который после чистки стал одним из них, отбрасывается.
+var ProvenanceAttrs = map[string]bool{"peer": true, "peer_cn": true, "scope": true, "transport": true, "ts_original": true}
+
+// cleanStable применяет Clean до неподвижной точки: удаление C0 может склеить
+// новую C1-последовательность (ta\xc2\x00\x80g → ta<U+0080>g → tag), и без этого
+// ключ схлопывался бы только при следующей чистке — поверх уже записанного attrs.tag.
+func cleanStable(s string) (string, bool) {
+	cut := false
+	// Каждый непустой проход Clean удаляет байты, поэтому len(s)+1 проходов
+	// гарантированно доводят до неподвижной точки (фиксированный предел обходили
+	// вложенностью C2/80 — ключ схлопывался в «peer» на следующей чистке).
+	for i, n := 0, len(s); i <= n; i++ {
+		v, c := Clean(s)
+		cut = cut || c
+		if v == s {
+			break
+		}
+		s = v
+	}
+	return s, cut
+}
+
 // Sanitize убирает управляющие символы (кроме \t) и ANSI-escape из строк,
 // которые показываются в UI, уходят в уведомления и в LLM, и режет их до
 // MaxFieldLen с пометкой attrs.truncated=1. Raw — улика: содержимое не
@@ -192,12 +216,18 @@ func (e *Event) Sanitize() {
 	fix(&e.SessionID)
 	fix(&e.Unit)
 	for k, v := range e.Attrs {
-		nv, cut := Clean(v)
-		nk, kcut := Clean(k)
+		nv, cut := cleanStable(v)
+		nk, kcut := cleanStable(k)
 		truncated = truncated || cut || kcut
 		if nk != k {
 			delete(e.Attrs, k)
 			if nk == "" {
+				continue
+			}
+			// Грязный ключ, который после чистки совпал с существующим, не
+			// перезаписывает его: иначе «pe<C1>er» из присланных атрибутов
+			// подменил бы peer/peer_cn/scope, выставленные коллектором.
+			if _, exists := e.Attrs[nk]; exists || ProvenanceAttrs[nk] {
 				continue
 			}
 		}

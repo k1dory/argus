@@ -272,6 +272,12 @@ func parseSyslogLine(norm *normalize.Normalizer, zones parse.PeerZones, line str
 	if e.Node == "" {
 		e.Node = firstNonEmpty(peer.Node, peer.Addr)
 	}
+	// Отклонённый тег syslog (FromSyslog → syslog.generic + attrs.tag) — ключ поиска
+	// прежнего источника: SD и чистка ключей ниже (ta<DEL>g → tag) не должны его стереть.
+	rejectedTag := ""
+	if e.Source == "syslog.generic" {
+		rejectedTag = e.Attrs["tag"]
+	}
 	attrsFromStructured(&e, sl.Structured)
 	// ПДн — после любого разборщика, общей проверкой: новый разборщик (VRP, MikroTik,
 	// QNAP…) не может её пропустить, а analyst.Route по pii=1 держит инцидент локально.
@@ -293,6 +299,10 @@ func parseSyslogLine(norm *normalize.Normalizer, zones parse.PeerZones, line str
 	// Узел из заголовка syslog и атрибуты SD пишутся после Ensure нормализатора:
 	// повторная чистка — управляющие символы, ANSI и потолок длины.
 	e.Sanitize()
+	if rejectedTag != "" {
+		e.Attrs["tag"] = rejectedTag
+		e.Sanitize()
+	}
 	return e, true
 }
 
