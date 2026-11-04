@@ -11,6 +11,7 @@ import { wazuhEnabled } from "@/lib/integrations";
 import { ServiceLeds } from "@/components/console/service-leds";
 import { Button } from "@/components/ui/button";
 import { Toaster } from "@/components/ui/sonner";
+import { ScrollMemory } from "@/components/console/scroll-memory";
 
 export default async function ConsoleLayout({ children }: { children: React.ReactNode }) {
   const session = await getSession();
@@ -45,6 +46,7 @@ export default async function ConsoleLayout({ children }: { children: React.Reac
       </header>
       <main id="main" className="flex min-w-0 flex-col gap-6 lg:gap-8" tabIndex={-1}>{children}</main>
       <Toaster />
+      <ScrollMemory />
     </div>
   );
 }
