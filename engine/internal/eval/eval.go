@@ -140,6 +140,11 @@ func excluded(e *model.Event, exc []Exception) bool {
 	return false
 }
 
+// GroupKey — ключ группы события, как его считает движок: значение group_by, а
+// если оно пустое — субъект, узел, адрес или «-». Нужен и при миграции ключа
+// (group_by_previous): старый group_key считался той же функцией.
+func GroupKey(keyOf func(*model.Event) string, e *model.Event) string { return groupKey(keyOf, e) }
+
 func groupKey(keyOf func(*model.Event) string, e *model.Event) string {
 	key := ""
 	if keyOf != nil {

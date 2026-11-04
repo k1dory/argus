@@ -41,6 +41,8 @@ type metrics struct {
 	analystRejected  atomic.Int64 // cooldown / суточный лимит
 	pollErrors       atomic.Int64
 	reloads          atomic.Int64
+	reloadFailures   atomic.Int64 // перечитываний, в которых правила отвергнуты (набор частично прежний)
+	rulesRejected    atomic.Int64 // отвергнутых правил в последней загрузке
 	uncleanRestarts  atomic.Int64 // старт после оборванного прошлого запуска (lifecycle.go)
 	lastRun          atomic.Int64
 	diskFreePermille atomic.Int64 // свободно на самом заполненном диске ClickHouse, ‰
@@ -55,28 +57,32 @@ type metrics struct {
 }
 
 type engine struct {
-	rules      atomic.Pointer[[]*rules.Rule]
-	rulesDir   string
-	reloadMu   sync.Mutex // rulesSig и перечитывание: цикл и POST /reload
-	workflowMu sync.Mutex // единственный писатель переходов и снимков инцидентов
-	rulesSig   string
-	ch         *store.ClickHouse
-	an         *analyst.Analyst
-	en         *enrich.Enricher
-	tg         *notify.Telegram
-	mail       *notify.Email
-	agg        *notify.Aggregator
-	hooks      *webhook.Dispatcher // nil — исходящие вебхуки не настроены
-	resp       *respond.Responder
-	acfg       analyst.Config
-	reg        *incidents.Registry
-	m          metrics
-	sched      *scheduler
-	ctx        context.Context // жизнь процесса: разборы и HTTP-ручки отменяются при остановке
-	token      string          // ENGINE_TOKEN; пусто только при ARGUS_DEV=1
-	mtoken     string          // METRICS_TOKEN (по умолчанию = ENGINE_TOKEN)
-	bufferMax  int             // ENGINE_BUFFER_MAX: потолок буфера кандидатов, 0 — без предела
-	lookback   time.Duration   // ENGINE_LOOKBACK_MAX: потолок глубины буфера и стартового курсора
+	rules    atomic.Pointer[[]*rules.Rule]
+	rulesDir string
+	reloadMu sync.Mutex // rulesSig и перечитывание: цикл и POST /reload
+	// Отказы правил: файлы, отвергнутые сейчас, и события rules.rejected/recovered,
+	// ещё не записанные в argus.events (повтор на следующем цикле). Под reloadMu.
+	rulesBad     map[string]bool
+	rulesPending []*model.Event
+	workflowMu   sync.Mutex // единственный писатель переходов и снимков инцидентов
+	rulesSig     string
+	ch           *store.ClickHouse
+	an           *analyst.Analyst
+	en           *enrich.Enricher
+	tg           *notify.Telegram
+	mail         *notify.Email
+	agg          *notify.Aggregator
+	hooks        *webhook.Dispatcher // nil — исходящие вебхуки не настроены
+	resp         *respond.Responder
+	acfg         analyst.Config
+	reg          *incidents.Registry
+	m            metrics
+	sched        *scheduler
+	ctx          context.Context // жизнь процесса: разборы и HTTP-ручки отменяются при остановке
+	token        string          // ENGINE_TOKEN; пусто только при ARGUS_DEV=1
+	mtoken       string          // METRICS_TOKEN (по умолчанию = ENGINE_TOKEN)
+	bufferMax    int             // ENGINE_BUFFER_MAX: потолок буфера кандидатов, 0 — без предела
+	lookback     time.Duration   // ENGINE_LOOKBACK_MAX: потолок глубины буфера и стартового курсора
 
 	sysMu  sync.Mutex
 	storms map[string]*incidents.Incident // rule_id → открытый инцидент «шторм»
@@ -151,24 +157,76 @@ func signature(dir string) string {
 	return b.String()
 }
 
-// maybeReload перечитывает правила, если каталог изменился; force — без проверки отпечатка.
-func (e *engine) maybeReload(force bool) {
+// maybeReload перечитывает правила, если каталог изменился; force — без проверки
+// отпечатка. Отвергнутое правило (разбор, неизвестное поле детекта, повтор id) не
+// роняет набор: остальные применяются, а для отвергнутого файла остаётся его прежняя
+// версия. Повтор id проверяется уже после этого слияния: принятый файл не может
+// занять id, который держит сохранённая версия другого файла (DedupeIDs оставляет
+// правило того файла, что был активен с этим id). Возвращает отвергнутые (для /reload).
+func (e *engine) maybeReload(force bool) []rules.RuleError {
 	e.reloadMu.Lock()
 	defer e.reloadMu.Unlock()
 	sig := signature(e.rulesDir)
 	if !force && sig == e.rulesSig {
-		return
+		return nil
 	}
-	rs, err := rules.Load(e.rulesDir)
-	if err != nil {
-		slog.Warn("rules reload: оставляю прежний набор", "err", err)
-		e.rulesSig = sig
-		return
-	}
-	e.rules.Store(&rs)
+	rs, rejected, err := rules.LoadEach(e.rulesDir)
 	e.rulesSig = sig
-	e.m.reloads.Add(1)
-	slog.Info("rules reloaded", "rules", len(rs))
+	if err != nil {
+		e.m.reloadFailures.Add(1)
+		slog.Warn("rules reload: каталог не прочитан — оставляю прежний набор", "err", err)
+		return []rules.RuleError{{File: e.rulesDir, Reason: "invalid_value", Err: err}}
+	}
+	prevByFile, activeFile := map[string]*rules.Rule{}, map[string]string{}
+	for _, r := range e.current() {
+		prevByFile[r.File] = r
+		activeFile[r.ID] = r.File
+	}
+	retained := map[string]bool{}
+	for done := 0; ; {
+		for _, re := range rejected[done:] {
+			if old := prevByFile[re.File]; old != nil && !retained[re.File] {
+				rs, retained[re.File] = append(rs, old), true
+			}
+		}
+		done = len(rejected)
+		kept, dup := rules.DedupeIDs(rs, activeFile)
+		rs = kept
+		if len(dup) == 0 {
+			break
+		}
+		rejected = append(rejected, dup...)
+	}
+	sort.SliceStable(rs, func(i, j int) bool { return rs[i].File < rs[j].File })
+	for _, re := range rejected {
+		slog.Warn("rules reload: правило отвергнуто — оставляю прежний набор для этого файла", "file", re.File, "reason", re.Reason, "err", re.Err)
+	}
+	if len(rejected) > 0 {
+		e.m.reloadFailures.Add(1)
+	}
+	e.m.rulesRejected.Store(int64(len(rejected)))
+	e.rules.Store(&rs)
+	e.noteRejected(rejected, rs, time.Now())
+	e.noteRecovered(time.Now())
+	if len(rejected) == 0 {
+		e.m.reloads.Add(1)
+		slog.Info("rules reloaded", "rules", len(rs))
+	}
+	return rejected
+}
+
+// loadForRun — правила при старте: отвергнутые записываются в журнал и пропускаются,
+// остальные работают (прежней версии для них нет). Нечитаемый каталог — выход.
+func loadForRun(dir string) ([]*rules.Rule, []rules.RuleError) {
+	rs, rejected, err := rules.LoadAll(dir)
+	if err != nil {
+		slog.Error("rules", "err", err)
+		os.Exit(1)
+	}
+	for _, re := range rejected {
+		slog.Error("rules: правило отвергнуто и не работает", "file", re.File, "reason", re.Reason, "err", re.Err)
+	}
+	return rs, rejected
 }
 
 // observeIdentities применяет события identity.alias(.revoke) к таблицам
@@ -296,7 +354,7 @@ func logShippedRegistry() {
 }
 
 func run(rulesDir string) {
-	rs := mustLoad(rulesDir)
+	rs, rejected := loadForRun(rulesDir)
 	logShippedRegistry()
 	acfg, err := analyst.LoadConfig(env("ANALYST_CONFIG", ""))
 	if err != nil {
@@ -320,6 +378,8 @@ func run(rulesDir string) {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	e := newEngine(ctx, rulesDir, rs, acfg, ch, token, env("METRICS_TOKEN", token))
+	e.m.rulesRejected.Store(int64(len(rejected)))
+	e.noteRejected(rejected, rs, time.Now())
 	for _, msg := range e.resp.ConfigErrors() {
 		slog.Warn("respond config", "msg", msg)
 	}
@@ -374,6 +434,9 @@ func run(rulesDir string) {
 			e.sysMu.Lock()
 			e.reg = reg
 			e.sysMu.Unlock()
+			e.reloadMu.Lock()
+			e.noteRecovered(time.Now()) // файлы, исправленные пока движок стоял
+			e.reloadMu.Unlock()
 			restored := e.restoreRespState(open, time.Now())
 			e.restoreKeys(ctx, time.Now())
 			slog.Info("engine started", "rules", len(rs), "open_incidents", len(open), "respond_restored", restored, "next", maxN+1, "poll", poll)
@@ -548,6 +611,7 @@ func (e *engine) loop(ctx context.Context, poll time.Duration) {
 			e.m.lastRun.Store(time.Now().Unix())
 		}
 		e.checkDisks(ctx, time.Now())
+		e.flushRulesEvents(ctx)
 		e.flushDigests(ctx)
 		go e.expireBlocks(context.WithoutCancel(ctx), time.Now())
 		select {

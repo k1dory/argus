@@ -3,11 +3,14 @@
 package rules
 
 import (
+	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -68,6 +71,11 @@ type Rule struct {
 		// нового ключа, у событий которой старый ключ совпадает (то же правило,
 		// субъект и узел). Без поля смена group_by заводит новые инциденты.
 		GroupByPrevious string `yaml:"group_by_previous"`
+		// GroupByPreviousBefore — для инцидентов без записанного group_by (строки до
+		// миграции 0039): по прежнему group_by заведены только те, что созданы раньше
+		// этого момента (UTC, «2006-01-02 15:04:05» или RFC 3339) — например, слияния
+		// смены group_by. Без поля такие инциденты не подхватываются.
+		GroupByPreviousBefore string `yaml:"group_by_previous_before"`
 	} `yaml:"detection"`
 	Enrich    []any          `yaml:"enrich"` // edr.process_tree: 120s | ngfw.sessions: 120s | cmdb.owner
 	Analyst   Analyst        `yaml:"analyst"`
@@ -92,6 +100,8 @@ type Rule struct {
 	filter    []matcher
 	closeOn   []matcher
 	reset     []matcher // detection.reset
+
+	previousBefore time.Time // detection.group_by_previous_before
 }
 
 // Respond — что делать автоматически при создании инцидента этим правилом.
@@ -283,8 +293,18 @@ func (r *Rule) Window() time.Duration {
 	return 10 * time.Minute
 }
 
-// normGroupBy — group_by без пробелов вокруг полей, для сравнения.
-func normGroupBy(gb string) string {
+func parseBefore(s string) (time.Time, error) {
+	if t, err := time.ParseInLocation("2006-01-02 15:04:05", s, time.UTC); err == nil {
+		return t, nil
+	}
+	return time.Parse(time.RFC3339, s)
+}
+
+// GroupByPreviousBefore — граница group_by_previous_before (нулевое время — не задана).
+func (r *Rule) GroupByPreviousBefore() time.Time { return r.previousBefore }
+
+// NormGroupBy — group_by без пробелов вокруг полей, для сравнения и записи в инцидент.
+func NormGroupBy(gb string) string {
 	parts := strings.Split(gb, ",")
 	for i := range parts {
 		parts[i] = strings.TrimSpace(parts[i])
@@ -370,12 +390,81 @@ func Files(dir string) ([]string, error) {
 
 // Load читает все правила каталога (рекурсивно, без tests/), компилирует
 // матчеры. Rule.File — путь относительно каталога (wazuh/ssh-bruteforce.yml).
+// Load — все правила каталога; любое отвергнутое правило — ошибка (CLI, rules test,
+// проверки). Движок грузит через LoadAll: отвергнутое правило не роняет остальные.
 func Load(dir string) ([]*Rule, error) {
-	paths, err := Files(dir)
+	out, rejected, err := LoadAll(dir)
 	if err != nil {
 		return nil, err
 	}
-	var out []*Rule
+	if len(rejected) > 0 {
+		errs := make([]error, len(rejected))
+		for i := range rejected {
+			errs[i] = rejected[i]
+		}
+		return nil, errors.Join(errs...)
+	}
+	return out, nil
+}
+
+// RuleError — правило, которое не загрузилось: файл (относительно каталога), id
+// (если разобрался), код причины без содержимого правила и полная ошибка для журнала.
+type RuleError struct {
+	File   string
+	ID     string
+	Reason string // schema_unknown_field | duplicate_id | parse_error | invalid_value (путь поля — только в Err)
+	Err    error
+}
+
+func (e RuleError) Error() string { return e.File + ": " + e.Err.Error() }
+func (e RuleError) Unwrap() error { return e.Err }
+
+// UnknownFieldError — поле внутри структуры детекта, которого эта версия движка не знает.
+type UnknownFieldError struct {
+	Path string // detection.group_by_next
+	Line int    // строка ключа в файле, 0 — не найдена (алиас, merge)
+}
+
+func (e *UnknownFieldError) Error() string {
+	at := ""
+	if e.Line > 0 {
+		at = fmt.Sprintf("line %d: ", e.Line)
+	}
+	return at + "поле " + e.Path + " неизвестно этой версии движка — правило не применено (обновите движок или уберите поле)"
+}
+
+// reasonOf — короткий код причины отказа, без имён полей и значений из правила.
+func reasonOf(err error) string {
+	var uf *UnknownFieldError
+	var te *yaml.TypeError
+	switch {
+	case errors.As(err, &uf):
+		return "schema_unknown_field"
+	case errors.As(err, &te), strings.HasPrefix(err.Error(), "yaml:"):
+		return "parse_error"
+	}
+	return "invalid_value"
+}
+
+// LoadAll — правила каталога по одному: отвергнутые (ошибка разбора, неизвестное
+// поле детекта, неверное значение, повтор id) — в rejected, остальные загружаются.
+// err — только если каталог не прочитан.
+func LoadAll(dir string) (out []*Rule, rejected []RuleError, err error) {
+	out, rejected, err = LoadEach(dir)
+	if err != nil {
+		return nil, nil, err
+	}
+	out, dup := DedupeIDs(out, nil)
+	return out, append(rejected, dup...), nil
+}
+
+// LoadEach — как LoadAll, но без проверки повторов id: её делает вызывающий,
+// зная прежний набор (перечитывание движка, DedupeIDs с активными файлами).
+func LoadEach(dir string) (out []*Rule, rejected []RuleError, err error) {
+	paths, err := Files(dir)
+	if err != nil {
+		return nil, nil, err
+	}
 	for _, p := range paths {
 		rel, err := filepath.Rel(dir, p)
 		if err != nil {
@@ -384,18 +473,207 @@ func Load(dir string) ([]*Rule, error) {
 		rel = filepath.ToSlash(rel)
 		r, err := LoadFile(p)
 		if err != nil {
-			return nil, fmt.Errorf("%s: %w", rel, err)
+			rejected = append(rejected, RuleError{File: rel, ID: idOf(p), Reason: reasonOf(err), Err: err})
+			continue
 		}
 		r.File = rel
 		out = append(out, r)
 	}
-	return out, nil
+	return out, rejected, nil
+}
+
+// DedupeIDs — у каждого id одно правило: политика (respond, analyst, уровень) ищется
+// по id, и второй файл с тем же id молча подменил бы первый. Остаётся правило из того
+// файла, что был активен с этим id (activeFile: id → файл прежнего набора); если такого
+// нет (старт, оба файла новые) — файл, первый по пути в лексикографическом порядке.
+// Остальные отвергаются (duplicate_id): подброшенный zz-*.yml с id штатного правила
+// не выключает его.
+func DedupeIDs(rs []*Rule, activeFile map[string]string) (kept []*Rule, rejected []RuleError) {
+	byID := map[string][]*Rule{}
+	for _, r := range rs {
+		byID[r.ID] = append(byID[r.ID], r)
+	}
+	for _, r := range rs {
+		same := byID[r.ID]
+		if len(same) == 1 {
+			kept = append(kept, r)
+			continue
+		}
+		winner := ""
+		if f, ok := activeFile[r.ID]; ok {
+			for _, o := range same {
+				if o.File == f {
+					winner = f
+				}
+			}
+		}
+		if winner == "" {
+			winner = same[0].File
+			for _, o := range same[1:] {
+				if o.File < winner {
+					winner = o.File
+				}
+			}
+		}
+		if r.File == winner {
+			kept = append(kept, r)
+			continue
+		}
+		files := make([]string, 0, len(same))
+		for _, o := range same {
+			files = append(files, o.File)
+		}
+		rejected = append(rejected, RuleError{File: r.File, ID: r.ID, Reason: "duplicate_id",
+			Err: fmt.Errorf("id %s повторяется в %s — действует %s, это правило не применено", r.ID, strings.Join(files, ", "), winner)})
+	}
+	return kept, rejected
+}
+
+// idOf — id отвергнутого правила, если файл хотя бы разбирается (для события отказа).
+func idOf(path string) string {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var m map[string]any
+	if yaml.Unmarshal(raw, &m) != nil {
+		return ""
+	}
+	id, _ := m["id"].(string)
+	return id
+}
+
+// metaFields — метаданные правила (в том числе из Sigma): на детект не влияют и
+// разрешены без предупреждения.
+var metaFields = map[string]bool{
+	"description": true, "author": true, "references": true, "status": true, "date": true,
+	"modified": true, "falsepositives": true, "license": true, "fields": true, "related": true,
+	"notes": true, "comment": true, "owner": true, "version": true,
+}
+
+// checkFields — схема полей правила по yaml-тегам структуры, на развёрнутом дереве:
+// алиасы и merge («<<») уже применены декодером, поэтому проверяется ровно то, что
+// попадёт в правило. Неизвестное поле внутри структур детекта (detection, threshold,
+// respond, analyst) — ошибка этого правила: движок, который поле не знает
+// (group_by_previous до своего релиза), не применит правило частично — новый
+// group_by без миграции завёл бы второй открытый инцидент (argus1, INC-5312/INC-5370).
+// Неизвестное поле верхнего уровня — предупреждение (метаданные из metaFields — без него).
+func checkFields(raw []byte) (warn []string, err error) {
+	var tree map[string]any
+	if err := yaml.Unmarshal(raw, &tree); err != nil {
+		return nil, err
+	}
+	var doc yaml.Node
+	_ = yaml.Unmarshal(raw, &doc) // только для номеров строк в сообщениях
+	top := yamlFields(reflect.TypeOf(Rule{}))
+	keys := make([]string, 0, len(tree))
+	for k := range tree {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		t, ok := top[k]
+		if !ok {
+			if !metaFields[k] {
+				warn = append(warn, fmt.Sprintf("line %d: поле %s неизвестно движку — пропущено", keyLine(&doc, k), k))
+			}
+			continue
+		}
+		if err := strictStruct(tree[k], t, k, &doc); err != nil {
+			return warn, err
+		}
+	}
+	return warn, nil
+}
+
+// strictStruct — у вложенной структуры (не map) все поля известны.
+func strictStruct(v any, t reflect.Type, path string, doc *yaml.Node) error {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if t.Kind() != reflect.Struct {
+		return nil
+	}
+	if mm, ok := v.(map[any]any); ok {
+		// Отображение с нестроковым ключом (7: …): декодер разложит его в структуру,
+		// молча пропустив и такие ключи, и неизвестные строковые — отказ правила.
+		for k := range mm {
+			if _, str := k.(string); !str {
+				return &UnknownFieldError{Path: fmt.Sprintf("%s.%v", path, k), Line: keyLine(doc, fmt.Sprint(k))}
+			}
+		}
+		conv := make(map[string]any, len(mm))
+		for k, x := range mm {
+			conv[k.(string)] = x
+		}
+		v = conv
+	}
+	m, ok := v.(map[string]any)
+	if !ok {
+		return nil // не отображение: тип проверит декодер
+	}
+	fields := yamlFields(t)
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		ft, ok := fields[k]
+		if !ok {
+			return &UnknownFieldError{Path: path + "." + k, Line: keyLine(doc, k)}
+		}
+		if err := strictStruct(m[k], ft, path+"."+k, doc); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// keyLine — строка первого ключа с таким именем в файле (0 — нет): только для сообщения.
+func keyLine(n *yaml.Node, key string) int {
+	if n == nil {
+		return 0
+	}
+	if n.Kind == yaml.MappingNode {
+		for i := 0; i+1 < len(n.Content); i += 2 {
+			if n.Content[i].Value == key {
+				return n.Content[i].Line
+			}
+		}
+	}
+	for _, c := range n.Content {
+		if l := keyLine(c, key); l > 0 {
+			return l
+		}
+	}
+	return 0
+}
+
+func yamlFields(t reflect.Type) map[string]reflect.Type {
+	out := map[string]reflect.Type{}
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		name, _, _ := strings.Cut(f.Tag.Get("yaml"), ",")
+		if name == "" || name == "-" {
+			continue
+		}
+		out[name] = f.Type
+	}
+	return out
 }
 
 func LoadFile(path string) (*Rule, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
+	}
+	warn, err := checkFields(raw)
+	if err != nil {
+		return nil, err
+	}
+	for _, w := range warn {
+		slog.Warn("rules: "+w, "file", path)
 	}
 	var r Rule
 	if err := yaml.Unmarshal(raw, &r); err != nil {
@@ -494,9 +772,19 @@ func LoadFile(path string) (*Rule, error) {
 		if Getter(prev) == nil {
 			return nil, fmt.Errorf("group_by_previous: неизвестное поле %q", prev)
 		}
-		if normGroupBy(prev) == normGroupBy(r.GroupBy()) {
+		if NormGroupBy(prev) == NormGroupBy(r.GroupBy()) {
 			return nil, fmt.Errorf("group_by_previous совпадает с group_by %q — миграции ключа нет, поле лишнее", r.GroupBy())
 		}
+	}
+	if b := strings.TrimSpace(r.Detection.GroupByPreviousBefore); b != "" {
+		if strings.TrimSpace(r.Detection.GroupByPrevious) == "" {
+			return nil, fmt.Errorf("group_by_previous_before без group_by_previous")
+		}
+		t, err := parseBefore(b)
+		if err != nil {
+			return nil, fmt.Errorf("group_by_previous_before %q: ожидается «2006-01-02 15:04:05» (UTC) или RFC 3339", b)
+		}
+		r.previousBefore = t
 	}
 	for _, f := range r.CloseMatch {
 		if Getter(f) == nil {
