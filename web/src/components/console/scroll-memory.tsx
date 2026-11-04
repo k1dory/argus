@@ -121,9 +121,13 @@ const USER_EVENTS = ["wheel", "touchstart", "keydown", "mousedown"] as const;
 
 const MODIFIER_KEYS = new Set(["Control", "Meta", "Shift", "Alt", "AltGraph", "OS"]);
 
-function isReloadOrModifier(ev: Pick<KeyboardEvent, "key" | "code" | "ctrlKey" | "metaKey">): boolean {
+function isReloadOrModifier(ev: Pick<KeyboardEvent, "key" | "code" | "ctrlKey" | "metaKey" | "altKey">): boolean {
   if (MODIFIER_KEYS.has(ev.key)) return true;
   if (ev.key === "F5" || ev.code === "F5" || ev.key === "BrowserRefresh") return true;
-  const r = ev.code === "KeyR" || ev.key === "r" || ev.key === "R" || ev.key === "к" || ev.key === "К";
-  return r && (ev.ctrlKey === true || ev.metaKey === true);
+  // AltGr (Ctrl+Alt) вводит символы вроде «®» — это не перезагрузка.
+  if (ev.altKey === true || (ev.ctrlKey !== true && ev.metaKey !== true)) return false;
+  // Латинская раскладка — по символу (в Dvorak на месте KeyR стоит «p», это печать);
+  // нелатинская (кириллица, арабская…) — по физической клавише, как делает браузер.
+  const k = ev.key.toLowerCase();
+  return /^[a-z]$/.test(k) ? k === "r" : ev.code === "KeyR" || k === "к";
 }
