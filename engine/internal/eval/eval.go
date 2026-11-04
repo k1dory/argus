@@ -151,11 +151,25 @@ func groupKey(keyOf func(*model.Event) string, e *model.Event) string {
 	return key
 }
 
+// window — окно группы. all — все события группы в порядке оценки, только
+// дописываются; окно — all[start:]. Сработка — срез all[detStart:] без копии:
+// ни сдвиг окна, ни повторное достижение порога не копируют окно.
 type window struct {
-	events []*model.Event
-	fired  bool
-	det    int            // индекс текущей сработки группы в out (при fired)
-	vals   map[string]int // distinct: значение поля → событий с ним в окне
+	all      []*model.Event
+	start    int
+	fired    bool
+	det      int            // индекс текущей сработки группы в out (при fired)
+	detStart int            // начало событий текущей сработки в all
+	vals     map[string]int // distinct: значение поля → событий с ним в окне
+}
+
+func (g *window) events() []*model.Event { return g.all[g.start:] }
+
+// evidence — события текущей сработки: срез с cap == len, чтобы дописывание
+// снаружи (инцидент) не затёрло общий массив группы.
+func (g *window) evidence() []*model.Event {
+	n := len(g.all)
+	return g.all[g.detStart:n:n]
 }
 
 // add / drop — учёт значения distinct при входе события в окно и выходе из него.
@@ -209,7 +223,7 @@ func runRule(r *rules.Rule, events []*model.Event, now time.Time, absence map[st
 		// любые три за окно.
 		if r.UsesReset() && r.MatchReset(e) {
 			if g := groups[groupKey(keyOf, e)]; g != nil {
-				g.events, g.fired, g.vals = nil, false, nil
+				g.start, g.fired, g.vals = len(g.all), false, nil
 			}
 			continue
 		}
@@ -224,27 +238,20 @@ func runRule(r *rules.Rule, events []*model.Event, now time.Time, absence map[st
 		}
 		t := e.Time()
 		cut := t.Add(-win)
+		evs := g.events()
 		i := 0
-		for i < len(g.events) && g.events[i].Time().Before(cut) {
+		for i < len(evs) && evs[i].Time().Before(cut) {
 			i++
 		}
 		if i > 0 {
-			g.drop(valueOf, g.events[:i])
-			g.events = g.events[i:]
-			// Срез держит выбывшие события в общем массиве; когда окно занимает
-			// меньше половины ёмкости — уплотняем (амортизированно O(1) на событие,
-			// без копии окна на каждом сдвиге).
-			if cap(g.events) > 64 && len(g.events) < cap(g.events)/2 {
-				g.events = append(make([]*model.Event, 0, 2*len(g.events)+1), g.events...)
-			}
+			g.drop(valueOf, evs[:i])
+			g.start += i
 		}
-		g.events = append(g.events, e)
-		g.add(valueOf, e)
-		// Сдвиг окна сам по себе серию не обрывает: пока группа держит порог,
-		// события дописываются в ту же сработку. Прежде сработка
-		// заводилась заново на каждом событии после сдвига — с копией всего окна:
-		// сканер с 40 тыс. событий давал десятки тысяч сработок и O(n²) памяти
-		// (OOM движка на argus1, 02.11).
+		// Серия продолжается, пока группа держит порог: сдвиг окна сам по себе её не
+		// обрывает (прежде каждое событие после сдвига заводило новую сработку с
+		// копией окна — OOM движка на argus1, 02.11). Держит ли — по окну ДО нового
+		// события: серия, опустившаяся ниже порога за паузу, закончилась, и пришедшее
+		// событие начинает новую (count: 1 раз в 2 минуты при окне 1m — две сработки).
 		if g.fired {
 			switch {
 			case kind == "":
@@ -257,36 +264,36 @@ func runRule(r *rules.Rule, events []*model.Event, now time.Time, absence map[st
 				g.fired = false
 			}
 		}
+		g.all = append(g.all, e)
+		g.add(valueOf, e)
 
 		switch kind {
 		case "": // без порога: первое событие в окне заводит сработку, остальные склеиваются
 			if !g.fired {
-				g.fired, g.det = true, len(out)
-				out = append(out, Detection{Rule: r, Key: key, Events: []*model.Event{e}, First: t, Last: t})
+				g.fired, g.det, g.detStart = true, len(out), len(g.all)-1
+				out = append(out, Detection{Rule: r, Key: key, Events: g.evidence(), First: t, Last: t})
 			} else {
-				appendAt(out, g.det, e, t)
+				g.extend(out, t)
 			}
 		case "distinct", "count", "consecutive":
 			if g.fired {
-				appendAt(out, g.det, e, t)
+				g.extend(out, t)
 				continue
 			}
 			if reachedWindow(th, g, valueOf) {
-				g.fired, g.det = true, len(out)
-				evs := make([]*model.Event, len(g.events))
-				copy(evs, g.events)
-				out = append(out, Detection{Rule: r, Key: key, Events: evs, First: evs[0].Time(), Last: t})
+				g.fired, g.det, g.detStart = true, len(out), g.start
+				ev := g.evidence()
+				out = append(out, Detection{Rule: r, Key: key, Events: ev, First: ev[0].Time(), Last: t})
 			}
 		case "periodic":
 			if g.fired {
-				appendAt(out, g.det, e, t)
+				g.extend(out, t)
 				continue
 			}
-			if ok, reason := periodic(th, g.events); ok {
-				g.fired, g.det = true, len(out)
-				evs := make([]*model.Event, len(g.events))
-				copy(evs, g.events)
-				out = append(out, Detection{Rule: r, Key: key, Events: evs, First: evs[0].Time(), Last: t, Reason: reason})
+			if ok, reason := periodic(th, g.events()); ok {
+				g.fired, g.det, g.detStart = true, len(out), g.start
+				ev := g.evidence()
+				out = append(out, Detection{Rule: r, Key: key, Events: ev, First: ev[0].Time(), Last: t, Reason: reason})
 			}
 		case "absence":
 			// накапливаем; решение — после прохода, относительно now
@@ -298,7 +305,9 @@ func runRule(r *rules.Rule, events []*model.Event, now time.Time, absence map[st
 		// буфер мог потерять его при чистке по потолку, состояние — нет.
 		lastOf := map[string]*model.Event{}
 		for k, g := range groups {
-			lastOf[k] = g.events[len(g.events)-1]
+			if len(g.all) > 0 {
+				lastOf[k] = g.all[len(g.all)-1]
+			}
 		}
 		for k, e := range absence {
 			if len(exc) > 0 && excluded(e, exc) {
@@ -325,10 +334,10 @@ func runRule(r *rules.Rule, events []*model.Event, now time.Time, absence map[st
 	return out
 }
 
-// appendAt — событие в текущую сработку группы (индекс в out хранит окно).
-func appendAt(out []Detection, i int, e *model.Event, t time.Time) {
-	out[i].Events = append(out[i].Events, e)
-	out[i].Last = t
+// extend — текущая сработка группы растёт до последнего события группы.
+func (g *window) extend(out []Detection, t time.Time) {
+	out[g.det].Events = g.evidence()
+	out[g.det].Last = t
 }
 
 // holds — серия группы с порогом продолжается после сдвига окна, пока порог держится.
@@ -337,7 +346,7 @@ func holds(kind string, th *rules.Threshold, g *window, valueOf func(*model.Even
 	case "distinct", "count", "consecutive":
 		return reachedWindow(th, g, valueOf)
 	case "periodic":
-		ok, _ := periodic(th, g.events)
+		ok, _ := periodic(th, g.events())
 		return ok
 	}
 	return false
@@ -349,7 +358,7 @@ func reachedWindow(th *rules.Threshold, g *window, valueOf func(*model.Event) st
 	if th.Distinct > 0 && valueOf != nil && len(g.vals) < th.Distinct {
 		return false
 	}
-	if th.Count > 0 && len(g.events) < th.Count {
+	if th.Count > 0 && len(g.events()) < th.Count {
 		return false
 	}
 	return true
