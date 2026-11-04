@@ -25,7 +25,7 @@ const INITIAL_URL = "/incidents?queue=open";
 const USER_EVENTS = ["wheel", "touchstart", "keydown", "mousedown"] as const;
 type Cleanup = undefined | (() => void);
 type Effect = { deps?: readonly unknown[]; cleanup?: Cleanup };
-type KeyboardInput = Partial<Pick<KeyboardEvent, "key" | "code" | "ctrlKey" | "metaKey" | "shiftKey">>;
+type KeyboardInput = Partial<Pick<KeyboardEvent, "key" | "code" | "ctrlKey" | "metaKey" | "shiftKey" | "altKey">>;
 type Listener = (event: { type: string; persisted?: boolean } & KeyboardInput) => void;
 
 function fixture(options: {
@@ -303,6 +303,34 @@ const reloadShortcuts: { name: string; keys: KeyboardInput[] }[] = [
     { key: "Meta", code: "MetaLeft", metaKey: true },
     { key: "r", code: "KeyR", metaKey: true },
   ] },
+  { name: "Ctrl+F5", keys: [
+    { key: "Control", code: "ControlRight", ctrlKey: true },
+    { key: "F5", code: "F5", ctrlKey: true },
+  ] },
+  { name: "Shift+F5", keys: [
+    { key: "Shift", code: "ShiftLeft", shiftKey: true },
+    { key: "F5", code: "F5", shiftKey: true },
+  ] },
+  { name: "Ctrl+Shift+R", keys: [
+    { key: "Control", code: "ControlLeft", ctrlKey: true },
+    { key: "Shift", code: "ShiftRight", ctrlKey: true, shiftKey: true },
+    { key: "R", code: "KeyR", ctrlKey: true, shiftKey: true },
+  ] },
+  { name: "Cmd+Shift+R", keys: [
+    { key: "Meta", code: "MetaRight", metaKey: true },
+    { key: "Shift", code: "ShiftLeft", metaKey: true, shiftKey: true },
+    { key: "R", code: "KeyR", metaKey: true, shiftKey: true },
+  ] },
+  { name: "Ctrl+к (ЙЦУКЕН)", keys: [{ key: "к", code: "KeyR", ctrlKey: true }] },
+  { name: "Cmd+К (ЙЦУКЕН, Caps Lock)", keys: [{ key: "К", code: "KeyR", metaKey: true }] },
+  { name: "Ctrl+ق (арабская раскладка)", keys: [{ key: "ق", code: "KeyR", ctrlKey: true }] },
+  { name: "Ctrl+к без code", keys: [{ key: "к", code: "", ctrlKey: true }] },
+  { name: "Cmd+R без code", keys: [{ key: "R", code: "", metaKey: true }] },
+  // В Dvorak буква R находится на физической KeyO: нельзя чинить ложный
+  // Ctrl+P ниже, запретив настоящий reload с несовпадающими key и code.
+  { name: "Ctrl+R (Dvorak)", keys: [{ key: "r", code: "KeyO", ctrlKey: true }] },
+  { name: "Cmd+R (Dvorak)", keys: [{ key: "r", code: "KeyO", metaKey: true }] },
+  { name: "BrowserRefresh", keys: [{ key: "BrowserRefresh", code: "BrowserRefresh" }] },
 ];
 for (const shortcut of reloadShortcuts) {
   for (const interimY of [0, 300]) {
@@ -327,6 +355,106 @@ for (const shortcut of reloadShortcuts) {
         "клавиатурный reload должен сохранить ещё не достигнутую цель, как reload кнопкой браузера");
     });
   }
+}
+
+const modifierInputs: KeyboardInput[] = [
+  { key: "Control", code: "ControlLeft", ctrlKey: true },
+  { key: "Meta", code: "MetaRight", metaKey: true },
+  { key: "Shift", code: "ShiftRight", shiftKey: true },
+  { key: "Alt", code: "AltLeft", altKey: true },
+  { key: "AltGraph", code: "AltRight", ctrlKey: true, altKey: true },
+  { key: "OS", code: "MetaLeft", metaKey: true },
+];
+for (const input of modifierInputs) {
+  test(`PR104 keydown: одиночный ${input.key} сохраняет цель и продолжает ожидание`, (t) => {
+    const f = fixture();
+    t.after(f.unmount);
+    f.seed();
+    f.render();
+    f.window.scrollY = 200;
+    f.emit("keydown", input);
+    f.emit("scroll");
+    f.frame();
+    assert.equal(JSON.parse(f.storage.get(memory.SCROLL_STORE_KEY)!)[INITIAL_URL].y, 2400);
+    assert.deepEqual(f.resources(), { frames: 1, observers: 1, inputListeners: 4 });
+
+    f.resize(5000);
+    f.frame();
+    assert.deepEqual(f.scrollCalls, [2400], "модификатор не отменяет и не замораживает восстановление");
+    assert.deepEqual(f.resources(), { frames: 0, observers: 0, inputListeners: 0 });
+  });
+}
+
+const nonReloadInputs: { name: string; keys: KeyboardInput[] }[] = [
+  // Регрессия: AltGr может выставлять ctrlKey и altKey одновременно.
+  // US-International: AltGr+R вводит ®, перезагрузки нет.
+  // https://www.w3.org/TR/uievents/#keys-modifiers
+  // https://learn.microsoft.com/en-us/globalization/keyboards/kbdusx.html
+  { name: "AltGr+R (ввод ® в US-International)", keys: [
+    { key: "Control", code: "ControlLeft", ctrlKey: true },
+    { key: "AltGraph", code: "AltRight", ctrlKey: true, altKey: true },
+    { key: "®", code: "KeyR", ctrlKey: true, altKey: true },
+  ] },
+  { name: "Ctrl+Alt+R", keys: [
+    { key: "Control", code: "ControlLeft", ctrlKey: true },
+    { key: "Alt", code: "AltLeft", ctrlKey: true, altKey: true },
+    { key: "r", code: "KeyR", ctrlKey: true, altKey: true },
+  ] },
+  // Отдельная регрессия: физическая KeyR в Dvorak означает P.
+  // Ctrl/Cmd+P вызывает печать, поэтому ожидание старой позиции надо отменить.
+  // https://learn.microsoft.com/en-us/globalization/keyboards/kbddv.html
+  { name: "Ctrl+P (Dvorak, code=KeyR)", keys: [
+    { key: "Control", code: "ControlLeft", ctrlKey: true },
+    { key: "p", code: "KeyR", ctrlKey: true },
+  ] },
+  { name: "Cmd+P (Dvorak, code=KeyR)", keys: [
+    { key: "Meta", code: "MetaLeft", metaKey: true },
+    { key: "p", code: "KeyR", metaKey: true },
+  ] },
+  // Контроли: совпадения R/KeyR без Ctrl/Cmd и остальные клавиши тоже
+  // считаются вмешательством пользователя, в том числе после модификатора.
+  { name: "r без модификаторов", keys: [{ key: "r", code: "KeyR" }] },
+  { name: "к без модификаторов", keys: [{ key: "к", code: "KeyR" }] },
+  { name: "Shift+R", keys: [
+    { key: "Shift", code: "ShiftLeft", shiftKey: true },
+    { key: "R", code: "KeyR", shiftKey: true },
+  ] },
+  { name: "Alt+R", keys: [
+    { key: "Alt", code: "AltLeft", altKey: true },
+    { key: "r", code: "KeyR", altKey: true },
+  ] },
+  { name: "Ctrl+F", keys: [
+    { key: "Control", code: "ControlLeft", ctrlKey: true },
+    { key: "f", code: "KeyF", ctrlKey: true },
+  ] },
+  { name: "Cmd+F", keys: [
+    { key: "Meta", code: "MetaLeft", metaKey: true },
+    { key: "f", code: "KeyF", metaKey: true },
+  ] },
+  { name: "PageDown", keys: [{ key: "PageDown", code: "PageDown" }] },
+  { name: "Space", keys: [{ key: " ", code: "Space" }] },
+  { name: "Escape", keys: [{ key: "Escape", code: "Escape" }] },
+];
+for (const input of nonReloadInputs) {
+  test(`PR104 keydown: ${input.name} останавливает восстановление`, (t) => {
+    const f = fixture();
+    t.after(f.unmount);
+    f.seed();
+    f.render();
+    f.window.scrollY = 200;
+    for (const key of input.keys) f.emit("keydown", key);
+
+    // Приход данных после ввода не должен уводить пользователя на старые 2400.
+    f.resize(5000);
+    f.frame();
+    assert.deepEqual(f.scrollCalls, [], "после действия без reload нельзя возвращать старую позицию");
+    assert.equal(f.window.scrollY, 200);
+    assert.deepEqual(f.resources(), { frames: 0, observers: 0, inputListeners: 0 });
+
+    // Отмена также обязана снять pendingRef: сохраняется выбранная позиция.
+    f.emit("pagehide", false);
+    assert.equal(JSON.parse(f.storage.get(memory.SCROLL_STORE_KEY)!)[INITIAL_URL].y, 200);
+  });
 }
 
 test("PR104 follow-up: scroll во время ожидания сохраняет цель, после восстановления запись возобновляется", (t) => {
