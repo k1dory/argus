@@ -25,7 +25,7 @@ func pr99ReloadFixture(t *testing.T) (*engine, *bytes.Buffer) {
 		t.Fatal(err)
 	}
 	e := &engine{
-		rulesDir: dir, rulesSig: signature(dir), token: "fixture", mtoken: "fixture",
+		dirs: ruleSet{shipped: dir}, rulesSig: signature(dir), token: "fixture", mtoken: "fixture",
 		resp: respond.New(respond.Config{Mode: respond.ModeIDS, ManualTTL: "1h"}),
 	}
 	e.rules.Store(&rs)
@@ -40,7 +40,7 @@ func pr99WriteUnsupportedRule(t *testing.T, e *engine) {
 	t.Helper()
 	// Model a newer mounted rule arriving before its compatible engine image.
 	next := strings.Replace(pr99ReloadRule, "Previous rules", "New rules", 1) + "  group_by_next: attrs.peer\n"
-	if err := os.WriteFile(filepath.Join(e.rulesDir, "custom.yml"), []byte(next), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(e.dirs.shipped, "custom.yml"), []byte(next), 0o600); err != nil {
 		t.Fatal(err)
 	}
 }

@@ -15,6 +15,10 @@ services:
     environment:
       ARGUS_DEV: "1"
       ARGUS_ANALYST_FORCE_PROFILE: mock
+      # Стенд: правила из ./rules checkout — правка видна без пересборки образа.
+      RULES_DIR: /rules
+    volumes:
+      - ./rules:/rules:ro
   web:
     environment:
       # http://127.0.0.1:3001 без TLS: кука без Secure

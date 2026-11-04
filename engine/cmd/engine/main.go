@@ -53,13 +53,14 @@ func orDefault(v, def string) string {
 func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	rulesDir := env("RULES_DIR", "rules")
+	dirs := ruleSet{shipped: rulesDir, user: env("RULES_USER_DIR", "")}
 	args := os.Args[1:]
 	if len(args) == 0 {
 		args = []string{"run"}
 	}
 	switch args[0] {
 	case "run":
-		run(rulesDir)
+		run(dirs)
 	case "rules":
 		if len(args) < 2 {
 			fmt.Fprintln(os.Stderr, "engine rules list | test [--replay file] [--dir rules]")
@@ -67,7 +68,8 @@ func main() {
 		}
 		switch args[1] {
 		case "list":
-			for _, r := range mustLoad(rulesDir) {
+			rs, _ := mustLoadSet(dirs)
+			for _, r := range rs {
 				fmt.Printf("%-28s %-9s %-40s %s\n", r.ID, r.Level, r.Title, r.File)
 			}
 		case "test":
@@ -82,6 +84,20 @@ func main() {
 		fmt.Fprintln(os.Stderr, "неизвестная команда", args[0])
 		os.Exit(2)
 	}
+}
+
+// mustLoadSet — набор движка: без поставляемых правил запуск не имеет смысла,
+// отказы пользовательских возвращаются для отчёта.
+func mustLoadSet(dirs ruleSet) ([]*rules.Rule, []rules.RuleError) {
+	rs, rejected, err := dirs.load()
+	if err != nil {
+		slog.Error("rules", "err", err)
+		os.Exit(1)
+	}
+	for _, r := range rejected {
+		slog.Error("правило отвергнуто", "file", rejectKey(r), "rule", r.ID, "reason", r.Reason, "err", r.Err)
+	}
+	return rs, rejected
 }
 
 func mustLoad(dir string) []*rules.Rule {
@@ -132,9 +148,28 @@ type ruleTest struct {
 func rulesTest(defaultDir string, argv []string) int {
 	fs := flag.NewFlagSet("rules test", flag.ExitOnError)
 	replay := fs.String("replay", "", "NDJSON с событиями единой схемы: показать сработки всех правил")
-	dir := fs.String("dir", defaultDir, "каталог правил")
+	dir := fs.String("dir", defaultDir, "каталог правил (явно — только он, без RULES_USER_DIR)")
 	_ = fs.Parse(argv)
-	rs := mustLoad(*dir)
+	explicit := false
+	fs.Visit(func(f *flag.Flag) { explicit = explicit || f.Name == "dir" })
+	// Без --dir — тот же набор, что у движка и rules list: поставляемые и
+	// RULES_USER_DIR. Тесты (tests/) — только каталога --dir/RULES_DIR.
+	// Отвергнутое правило RULES_USER_DIR (разбор, shipped_id_taken, duplicate_id) —
+	// провал проверки: тесты и replay по остальным выполняются, код выхода — 1.
+	var rs []*rules.Rule
+	var rejected []rules.RuleError
+	if explicit {
+		rs = mustLoad(*dir)
+	} else {
+		rs, rejected = mustLoadSet(ruleSet{shipped: *dir, user: env("RULES_USER_DIR", "")})
+	}
+	pass := 0
+	if len(rejected) > 0 {
+		pass = 1
+		for _, re := range rejected {
+			fmt.Printf("FAIL %-32s отвергнуто: %s\n", rejectKey(re), re.Reason)
+		}
+	}
 
 	if *replay != "" {
 		events, err := readNDJSON(*replay)
@@ -163,14 +198,14 @@ func rulesTest(defaultDir string, argv []string) int {
 			}
 			fmt.Println()
 		}
-		return 0
+		return pass
 	}
 
 	paths, _ := filepath.Glob(filepath.Join(*dir, "tests", "*.yml"))
 	sort.Strings(paths)
 	if len(paths) == 0 {
 		fmt.Println("нет тестов в", filepath.Join(*dir, "tests"))
-		return 0
+		return pass
 	}
 	ruleByID := map[string]*rules.Rule{}
 	for _, r := range rs {
@@ -245,5 +280,5 @@ func rulesTest(defaultDir string, argv []string) int {
 	if failed > 0 {
 		return 1
 	}
-	return 0
+	return pass
 }

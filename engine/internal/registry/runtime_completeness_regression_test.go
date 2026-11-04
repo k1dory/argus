@@ -18,7 +18,10 @@ func TestRuntimeRegistryRequiresFixtures(t *testing.T) {
 			current.Store(nil)
 
 			dir := runtimeRegistryFixture(t)
-			fixtures := filepath.Join(dir, "fixtures")
+			fixtures := filepath.Join(dir, "fixtures", "events") // раскладка образа
+			if err := os.Mkdir(filepath.Dir(fixtures), 0o700); err != nil {
+				t.Fatal(err)
+			}
 			switch layout {
 			case "empty":
 				if err := os.Mkdir(fixtures, 0o700); err != nil {
@@ -47,8 +50,8 @@ func TestRuntimeRegistryLoadsCompleteBundle(t *testing.T) {
 	t.Cleanup(func() { current.Store(previous) })
 	current.Store(nil)
 	dir := runtimeRegistryFixture(t)
-	fixtures := filepath.Join(dir, "fixtures")
-	if err := os.Mkdir(fixtures, 0o700); err != nil {
+	fixtures := filepath.Join(dir, "fixtures", "events") // раскладка образа
+	if err := os.MkdirAll(fixtures, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(fixtures, "events.ndjson"),

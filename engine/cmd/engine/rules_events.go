@@ -21,8 +21,9 @@ func (e *engine) node() string {
    работает: на старте его просто нет, при перечитывании действует прежняя версия.
    Это тихое выключение детекта, поэтому движок пишет в argus.events событие
    rulesRejectedEvent (system.go): source argus.system / action rules.rejected,
-   object — файл правила, attrs.rule_id, attrs.reason — код причины без содержимого
-   правила, attrs.transport: internal (снаружи это поле перезаписывает коллектор,
+   object — файл правила с префиксом каталога (shipped/ или user/, ruleset.go;
+   user/ без файла — пользовательский каталог отвергнут целиком), attrs.rule_id,
+   attrs.reason — код причины без содержимого правила, attrs.transport: internal (снаружи это поле перезаписывает коллектор,
    подделать событие через ingest нельзя); когда файл снова загрузился —
    rules.recovered. Инцидент заводит обычное правило rules/ops/rules-rejected.yml;
    метрика — argus_engine_rules_rejected. */
@@ -35,8 +36,9 @@ func (e *engine) noteRejected(rejected []rules.RuleError, _ []*rules.Rule, now t
 	}
 	bad := map[string]bool{}
 	for _, re := range rejected {
-		bad[re.File] = true
-		e.rulesPending = append(e.rulesPending, rulesRejectedEvent(now, e.node(), re.File, re.ID, re.Reason))
+		k := rejectKey(re)
+		bad[k] = true
+		e.rulesPending = append(e.rulesPending, rulesRejectedEvent(now, e.node(), k, re.ID, re.Reason))
 	}
 	e.rulesBad = bad
 	if n := len(e.rulesPending); n > 1000 {
@@ -55,10 +57,12 @@ func (e *engine) noteRecovered(now time.Time) {
 	if reg == nil {
 		return
 	}
-	loaded := map[string]string{}
+	// Ключ — файл с префиксом каталога (ruleKey), как object события отказа;
+	// user/ — пользовательский каталог целиком: загрузился, если сейчас не отвергнут.
+	loaded := map[string]string{userPrefix: ""}
 	var watch []string
 	for _, r := range e.current() {
-		loaded[r.File] = r.ID
+		loaded[ruleKey(r)] = r.ID
 		if a, _ := r.Detection.Selection["action"].(string); a == "rules.rejected" {
 			watch = append(watch, r.ID)
 		}

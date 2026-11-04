@@ -73,9 +73,9 @@ func diskEvent(now time.Time, node string, d store.Disk, freeRatio float64) *mod
 }
 
 // rulesRejectedEvent — событие единой схемы об отвергнутом правиле (rules_events.go):
-// object — файл правила относительно каталога, attrs.rule_id (если разобран),
-// attrs.reason — короткий код (schema_unknown_field | duplicate_id | parse_error |
-// invalid_value); текст ошибки — только в журнал движка, не в событие.
+// object — файл правила с префиксом каталога (shipped/ или user/, ruleKey),
+// attrs.rule_id (если разобран), attrs.reason — короткий код (schema_unknown_field |
+// duplicate_id | parse_error | invalid_value | shipped_id_taken); текст ошибки — только в журнал движка, не в событие.
 func rulesRejectedEvent(now time.Time, node, file, ruleID, reason string) *model.Event {
 	ev := &model.Event{
 		TS: model.FormatTS(now), Source: systemSource, SourceClass: "telemetry", Vendor: "ARGUS", Product: "engine",

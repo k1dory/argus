@@ -59,9 +59,11 @@ func Stats() (rules, sources, actions int) {
 // Loaded — реестр загружен (выгрузка датасета без него не запускается).
 func Loaded() bool { s := current.Load(); return s != nil && len(s.rules) > 0 }
 
-// Load читает dir/rules (без rules/tests) и dir/fixtures/*.ndjson.
+// Load читает dir/rules (без rules/tests) и dir/fixtures/events/*.ndjson — та же
+// раскладка, что в репозитории: встроенные тесты правил образа (fixture:
+// fixtures/events/…) находят свои фикстуры.
 func Load(dir string) error {
-	return LoadDirs(filepath.Join(dir, "rules"), filepath.Join(dir, "fixtures"))
+	return LoadDirs(filepath.Join(dir, "rules"), filepath.Join(dir, "fixtures", "events"))
 }
 
 // LoadDirs — реестр из каталога правил и каталога фикстур событий.

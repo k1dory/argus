@@ -103,6 +103,26 @@
     - scripts/gen-sample.sh
     - scripts/bench-ingest.sh
 
+# Свои правила — вне checkout: поставляемые движок берёт из образа, поэтому
+# обновление кода не меняет правила под ещё работающим старым движком (rc34).
+- name: "Правила: каталог своих правил"
+  ansible.builtin.file:
+    path: "{{ argus_user_rules_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: "Правила: свои правила с управляющей машины"
+  ansible.posix.synchronize:
+    src: "{{ argus_user_rules_src | regex_replace('/*$', '') }}/"
+    dest: "{{ argus_user_rules_dir }}/"
+    archive: false
+    recursive: true
+    delete: true
+    rsync_opts: ["--chmod=Du=rwx,Dgo=rx,Fu=rw,Fgo=r", "--no-links"]
+  when: argus_user_rules_src | length > 0
+
 # Боевые карты идентичностей и CMDB живут вне checkout: git reset по тегу их не трогает,
 # а compose подхватывает docker-compose.override.yml сам. Запись in-place (unsafe_writes):
 # файлы примонтированы в движок как файлы, новый inode контейнер бы не увидел; содержимое
@@ -169,6 +189,13 @@
   loop_control:
     label: "{{ item.key }}"
   no_log: true
+
+- name: ".env: каталог своих правил"
+  ansible.builtin.lineinfile:
+    path: "{{ argus_dir }}/.env"
+    regexp: "^#?ARGUS_USER_RULES_DIR="
+    line: "ARGUS_USER_RULES_DIR={{ argus_user_rules_dir }}"
+    mode: "0600"
 
 - name: ".env: профиль compose mcp"
   ansible.builtin.lineinfile:

@@ -49,12 +49,13 @@ func TestRegistrySmokeWorksWithoutAppletLinks(t *testing.T) {
 	scratch := t.TempDir()
 	bin := filepath.Join(scratch, "bin")
 	shipped := filepath.Join(scratch, "shipped")
-	for _, dir := range []string{bin, filepath.Join(shipped, "fixtures"), filepath.Join(scratch, "home"), filepath.Join(scratch, "tmp")} {
+	// Раскладка образа (#111): shipped/fixtures/events/*.ndjson, как в репозитории.
+	for _, dir := range []string{bin, filepath.Join(shipped, "fixtures", "events"), filepath.Join(scratch, "home"), filepath.Join(scratch, "tmp")} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			t.Fatal(err)
 		}
 	}
-	fixture := filepath.Join(shipped, "fixtures", "events.ndjson")
+	fixture := filepath.Join(shipped, "fixtures", "events", "qa.ndjson")
 	if err := os.WriteFile(fixture, []byte("{\"source\":\"qa\",\"action\":\"qa\"}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +83,7 @@ func TestRegistrySmokeWorksWithoutAppletLinks(t *testing.T) {
 	}
 	// Positive control proves the fixture is accessible through the explicit
 	// multicall executable before running the workflow's unchanged snippet.
-	if out, err := run("/bin/busybox ls /usr/share/argus/shipped/fixtures/*.ndjson >/dev/null"); err != nil {
+	if out, err := run("/bin/busybox ls /usr/share/argus/shipped/fixtures/events/*.ndjson >/dev/null"); err != nil {
 		t.Fatalf("harness control failed: %v\n%s", err, out)
 	}
 	if out, err := run(match[1]); err != nil {

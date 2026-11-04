@@ -62,7 +62,13 @@ engine() {
   if command -v go >/dev/null 2>&1; then
     (cd engine && RULES_DIR="$ROOT/rules" go run ./cmd/engine "$@")
   else
-    docker compose run --rm -v "$ROOT/rules:/rules:ro" -v "$ROOT/fixtures:/fixtures:ro" engine "$@"
+    if [ "${1:-} ${2:-}" = "rules test" ]; then
+      # тесты правил — по checkout (правила и фикстуры этой рабочей копии)
+      docker compose run --rm -e RULES_DIR=/rules -e RULES_USER_DIR= -v "$ROOT/rules:/rules:ro" -v "$ROOT/fixtures:/fixtures:ro" engine "$@"
+    else
+      # rules list и прочее — тот же набор, что у работающего движка: образ + RULES_USER_DIR
+      docker compose run --rm engine "$@"
+    fi
   fi
 }
 

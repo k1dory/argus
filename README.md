@@ -53,6 +53,12 @@ API. Wazuh подключается как модуль, а не как цент
 - `rules/` — правила корреляции как файлы в git: `rules/*.yml` — нейтральные к вендору,
   `rules/ops/` — эксплуатация (диск, тишина узла), `rules/wazuh/` — на алертах Wazuh;
   `fixtures/` — записанный трафик и телеметрия для `argus rules test`.
+  В проде движок берёт эти правила из своего образа (`RULES_DIR=/usr/share/argus/shipped/rules`):
+  версия правил всегда равна версии движка, и обновление кода на хосте не меняет их под
+  работающим старым движком. Свои правила — каталог `rules.d/` (`ARGUS_USER_RULES_DIR`, роль
+  `argus` — `/etc/argus/rules.d`); правило там с `id` поставляемого отвергается
+  (`argus.system` / `rules.rejected`, метрика `argus_engine_rules_rejected`). Стенд
+  (`make up-dev`) по-прежнему монтирует `./rules` — правки видны без пересборки.
 - `shipper/` — Rust, модуль Wazuh. Тейлит `/var/ossec/logs/alerts/alerts.json` (NDJSON),
   переживает ротацию и усечение файла, ведёт чекпоинт (inode+offset), пишет батчами в
   `argus.wazuh_alerts`.

@@ -21,7 +21,7 @@ func TestPR99Round4MixedKeyReloadKeepsPreviousRuleAndReportsRejection(t *testing
 		t.Fatal(err)
 	}
 	e := &engine{
-		rulesDir: dir, rulesSig: signature(dir), token: "fixture", mtoken: "fixture",
+		dirs: ruleSet{shipped: dir}, rulesSig: signature(dir), token: "fixture", mtoken: "fixture",
 		resp: respond.New(respond.Config{Mode: respond.ModeIDS, ManualTTL: "1h"}),
 	}
 	e.rules.Store(&rs)
@@ -44,7 +44,7 @@ func TestPR99Round4MixedKeyReloadKeepsPreviousRuleAndReportsRejection(t *testing
 	if got := e.m.reloadFailures.Load(); got != 1 || e.m.reloads.Load() != 0 {
 		t.Errorf("reload failure was reported as success: failures=%d successes=%d", got, e.m.reloads.Load())
 	}
-	if len(e.rulesPending) != 1 || e.rulesPending[0].Action != "rules.rejected" || e.rulesPending[0].Object != "protected.yml" {
+	if len(e.rulesPending) != 1 || e.rulesPending[0].Action != "rules.rejected" || e.rulesPending[0].Object != "shipped/protected.yml" {
 		t.Errorf("missing operational rejection event: %+v", e.rulesPending)
 	}
 }

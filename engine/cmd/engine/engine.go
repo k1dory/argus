@@ -58,7 +58,7 @@ type metrics struct {
 
 type engine struct {
 	rules    atomic.Pointer[[]*rules.Rule]
-	rulesDir string
+	dirs     ruleSet    // поставляемые и пользовательские правила (ruleset.go)
 	reloadMu sync.Mutex // rulesSig и перечитывание: цикл и POST /reload
 	// Отказы правил: файлы, отвергнутые сейчас, и события rules.rejected/recovered,
 	// ещё не записанные в argus.events (повтор на следующем цикле). Под reloadMu.
@@ -151,7 +151,8 @@ func signature(dir string) string {
 	var b strings.Builder
 	for _, p := range paths {
 		if st, err := os.Stat(p); err == nil {
-			fmt.Fprintf(&b, "%s|%d|%d;", p, st.Size(), st.ModTime().UnixNano())
+			// права — тоже: после chmod файл мог стать (не)читаемым, и набор меняется
+			fmt.Fprintf(&b, "%s|%d|%d|%o;", p, st.Size(), st.ModTime().UnixNano(), st.Mode())
 		}
 	}
 	return b.String()
@@ -162,44 +163,61 @@ func signature(dir string) string {
 // роняет набор: остальные применяются, а для отвергнутого файла остаётся его прежняя
 // версия. Повтор id проверяется уже после этого слияния: принятый файл не может
 // занять id, который держит сохранённая версия другого файла (DedupeIDs оставляет
-// правило того файла, что был активен с этим id). Возвращает отвергнутые (для /reload).
+// правило того файла, что был активен с этим id). Оба каталога (ruleset.go) идут
+// через один механизм; поставляемое правило главнее пользовательского с тем же id
+// (shipped_id_taken), битый пользовательский каталог отвергается целиком.
+// Возвращает отвергнутые (для /reload).
 func (e *engine) maybeReload(force bool) []rules.RuleError {
 	e.reloadMu.Lock()
 	defer e.reloadMu.Unlock()
-	sig := signature(e.rulesDir)
+	sig := e.dirs.signature()
 	if !force && sig == e.rulesSig {
 		return nil
 	}
-	rs, rejected, err := rules.LoadEach(e.rulesDir)
+	shipped, user, rejected, err := e.dirs.loadEach()
 	e.rulesSig = sig
 	if err != nil {
 		e.m.reloadFailures.Add(1)
 		slog.Warn("rules reload: каталог не прочитан — оставляю прежний набор", "err", err)
-		return []rules.RuleError{{File: e.rulesDir, Reason: "invalid_value", Err: err}}
+		return []rules.RuleError{{File: e.dirs.shipped, Reason: "invalid_value", Err: err}}
 	}
-	prevByFile, activeFile := map[string]*rules.Rule{}, map[string]string{}
+	prevByKey := map[string]*rules.Rule{}
+	activeShipped, activeUser := map[string]string{}, map[string]string{}
 	for _, r := range e.current() {
-		prevByFile[r.File] = r
-		activeFile[r.ID] = r.File
+		prevByKey[ruleKey(r)] = r
+		if r.User {
+			activeUser[r.ID] = r.File
+		} else {
+			activeShipped[r.ID] = r.File
+		}
 	}
 	retained := map[string]bool{}
+	var rs []*rules.Rule
 	for done := 0; ; {
 		for _, re := range rejected[done:] {
-			if old := prevByFile[re.File]; old != nil && !retained[re.File] {
-				rs, retained[re.File] = append(rs, old), true
+			k := rejectKey(re)
+			if old := prevByKey[k]; old != nil && !retained[k] {
+				retained[k] = true
+				if old.User {
+					user = append(user, old)
+				} else {
+					shipped = append(shipped, old)
+				}
 			}
 		}
 		done = len(rejected)
-		kept, dup := rules.DedupeIDs(rs, activeFile)
-		rs = kept
+		var dup []rules.RuleError
+		shipped, user, dup = resolveRuleSet(shipped, user, activeShipped, activeUser)
 		if len(dup) == 0 {
+			rs = append(shipped, user...)
 			break
 		}
 		rejected = append(rejected, dup...)
 	}
-	sort.SliceStable(rs, func(i, j int) bool { return rs[i].File < rs[j].File })
+	rejected = uniqueRejections(rejected)
+	sort.SliceStable(rs, func(i, j int) bool { return ruleKey(rs[i]) < ruleKey(rs[j]) })
 	for _, re := range rejected {
-		slog.Warn("rules reload: правило отвергнуто — оставляю прежний набор для этого файла", "file", re.File, "reason", re.Reason, "err", re.Err)
+		slog.Warn("rules reload: правило отвергнуто — оставляю прежний набор для этого файла", "file", rejectKey(re), "reason", re.Reason, "err", re.Err)
 	}
 	if len(rejected) > 0 {
 		e.m.reloadFailures.Add(1)
@@ -216,17 +234,21 @@ func (e *engine) maybeReload(force bool) []rules.RuleError {
 }
 
 // loadForRun — правила при старте: отвергнутые записываются в журнал и пропускаются,
-// остальные работают (прежней версии для них нет). Нечитаемый каталог — выход.
-func loadForRun(dir string) ([]*rules.Rule, []rules.RuleError) {
-	rs, rejected, err := rules.LoadAll(dir)
+// остальные работают (прежней версии для них нет; при повторе id внутри каталога
+// остаётся файл, первый по пути). Нечитаемый каталог поставляемых правил — выход;
+// битый пользовательский каталог отвергается целиком, поставляемые работают.
+func loadForRun(dirs ruleSet) ([]*rules.Rule, []rules.RuleError) {
+	shipped, user, rejected, err := dirs.loadEach()
 	if err != nil {
 		slog.Error("rules", "err", err)
 		os.Exit(1)
 	}
+	shipped, user, dup := resolveRuleSet(shipped, user, nil, nil)
+	rejected = append(rejected, dup...)
 	for _, re := range rejected {
-		slog.Error("rules: правило отвергнуто и не работает", "file", re.File, "reason", re.Reason, "err", re.Err)
+		slog.Error("rules: правило отвергнуто и не работает", "file", rejectKey(re), "reason", re.Reason, "err", re.Err)
 	}
-	return rs, rejected
+	return append(shipped, user...), rejected
 }
 
 // observeIdentities применяет события identity.alias(.revoke) к таблицам
@@ -295,9 +317,9 @@ func (e *engine) syncRespondMode(ctx context.Context) {
 	}
 }
 
-func newEngine(ctx context.Context, rulesDir string, rs []*rules.Rule, acfg analyst.Config, ch *store.ClickHouse, token, mtoken string) *engine {
+func newEngine(ctx context.Context, dirs ruleSet, rs []*rules.Rule, acfg analyst.Config, ch *store.ClickHouse, token, mtoken string) *engine {
 	e := &engine{
-		rulesDir: rulesDir, rulesSig: signature(rulesDir), ch: ch, acfg: acfg, ctx: ctx, token: token, mtoken: mtoken,
+		dirs: dirs, rulesSig: dirs.signature(), ch: ch, acfg: acfg, ctx: ctx, token: token, mtoken: mtoken,
 		an: analyst.New(acfg), en: enrich.New(ch, env("CMDB_FILE", "")),
 		tg: notify.NewTelegram(os.Getenv("TELEGRAM_BOT_TOKEN"), acfg.Notify.Telegram.ChatID),
 		mail: notify.NewEmail(acfg.Notify.Email.Host, acfg.Notify.Email.Port, acfg.Notify.Email.From,
@@ -353,8 +375,8 @@ func logShippedRegistry() {
 	slog.Info("registry", "rules", r, "sources", s, "actions", a)
 }
 
-func run(rulesDir string) {
-	rs, rejected := loadForRun(rulesDir)
+func run(dirs ruleSet) {
+	rs, rejected := loadForRun(dirs)
 	logShippedRegistry()
 	acfg, err := analyst.LoadConfig(env("ANALYST_CONFIG", ""))
 	if err != nil {
@@ -377,7 +399,7 @@ func run(rulesDir string) {
 		env("CLICKHOUSE_USER", "default"), env("CLICKHOUSE_PASSWORD", ""))
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	e := newEngine(ctx, rulesDir, rs, acfg, ch, token, env("METRICS_TOKEN", token))
+	e := newEngine(ctx, dirs, rs, acfg, ch, token, env("METRICS_TOKEN", token))
 	e.m.rulesRejected.Store(int64(len(rejected)))
 	e.noteRejected(rejected, rs, time.Now())
 	for _, msg := range e.resp.ConfigErrors() {

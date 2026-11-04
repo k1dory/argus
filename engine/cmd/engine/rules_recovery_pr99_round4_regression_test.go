@@ -18,9 +18,9 @@ import (
 
 func pr99Round4StartupState(t *testing.T, dir string, open []incidents.Incident, now time.Time) *engine {
 	t.Helper()
-	rs, rejected := loadForRun(dir)
+	rs, rejected := loadForRun(ruleSet{shipped: dir})
 	e := &engine{
-		rulesDir: dir, rulesSig: signature(dir), token: "fixture", mtoken: "fixture",
+		dirs: ruleSet{shipped: dir}, rulesSig: signature(dir), token: "fixture", mtoken: "fixture",
 		resp: respond.New(respond.Config{Mode: respond.ModeIDS, ManualTTL: "1h"}),
 	}
 	e.rules.Store(&rs)
@@ -51,7 +51,7 @@ func TestPR99Round4RuleRecoverySurvivesStateDiscontinuity(t *testing.T) {
 				t.Fatalf("fixture must emit the original rejection: %+v", e.rulesPending)
 			}
 			created, _, _ := e.reg.Apply(eval.Run(e.current(), e.rulesPending), now)
-			if len(created) != 1 || created[0].RuleID != "a41c-ops-068" || created[0].GroupKey != "custom.yml" {
+			if len(created) != 1 || created[0].RuleID != "a41c-ops-068" || created[0].GroupKey != "shipped/custom.yml" {
 				t.Fatalf("fixture must open the file's operational incident: %+v", created)
 			}
 			// Retain only the public persisted state, as ClickHouse does.

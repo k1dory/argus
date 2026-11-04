@@ -41,14 +41,14 @@ func TestRulesRejectedEventsAndRecovery(t *testing.T) {
 		t.Fatalf("события отказа: %+v", evs)
 	}
 	ev := evs[0]
-	if ev.Source != systemSource || ev.Action != "rules.rejected" || ev.Object != "r.yml" || ev.Attrs["transport"] != "internal" ||
+	if ev.Source != systemSource || ev.Action != "rules.rejected" || ev.Object != "shipped/r.yml" || ev.Attrs["transport"] != "internal" ||
 		ev.Attrs["rule_id"] != "t-ev" || ev.Attrs["reason"] != "schema_unknown_field" {
 		t.Fatalf("поля события отказа: %+v", ev)
 	}
 	if _, leaked := ev.Attrs["error"]; leaked {
 		t.Fatal("текст ошибки ушёл в событие")
 	}
-	if created, _, _ := e.reg.Apply(eval.Run(e.current(), []*model.Event{&ev}), time.Now()); len(created) != 1 || created[0].GroupKey != "r.yml" {
+	if created, _, _ := e.reg.Apply(eval.Run(e.current(), []*model.Event{&ev}), time.Now()); len(created) != 1 || created[0].GroupKey != "shipped/r.yml" {
 		t.Fatalf("инцидент отказа: %+v", created)
 	}
 
@@ -60,7 +60,7 @@ func TestRulesRejectedEventsAndRecovery(t *testing.T) {
 	}
 	e.flushRulesEvents(ctx)
 	evs = eventsOf(t, f)
-	if len(evs) != 2 || evs[1].Action != "rules.recovered" || evs[1].Object != "r.yml" || evs[1].Attrs["transport"] != "internal" {
+	if len(evs) != 2 || evs[1].Action != "rules.recovered" || evs[1].Object != "shipped/r.yml" || evs[1].Attrs["transport"] != "internal" {
 		t.Fatalf("восстановление: %+v", evs)
 	}
 	// Сбой записи — событие не теряется, повтор на следующем цикле.

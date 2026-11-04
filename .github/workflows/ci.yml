@@ -215,7 +215,7 @@ jobs:
           docker build -q -f engine/Dockerfile -t argus-ci/engine:check .
           docker run --rm --entrypoint /bin/busybox argus-ci/engine:check test -s /usr/share/argus/shipped/rules/host-ssh-bruteforce.yml
           # в distroless нет ссылок на аплеты busybox — только встроенные команды sh
-          docker run --rm --entrypoint /bin/busybox argus-ci/engine:check sh -c 'for f in /usr/share/argus/shipped/fixtures/*.ndjson; do test -s "$f" && exit 0; done; exit 1'
+          docker run --rm --entrypoint /bin/busybox argus-ci/engine:check sh -c 'for f in /usr/share/argus/shipped/fixtures/events/*.ndjson; do test -s "$f" && exit 0; done; exit 1'
 
   e2e:
     # Полный контур в docker compose: replay → инциденты и вердикты, argus_ro только читает,

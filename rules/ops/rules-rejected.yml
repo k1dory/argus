@@ -5,7 +5,9 @@
 # Событие source argus.system / action rules.rejected пишет сам движок с
 # attrs.transport: internal (у всего, что приходит снаружи, это поле перезаписывает
 # коллектор — подделать или закрыть инцидент через ingest нельзя). object — файл
-# правила, attrs.rule_id и attrs.reason — код причины; текст ошибки — в журнале
+# правила с префиксом каталога: shipped/… (из образа) или user/… (RULES_USER_DIR;
+# просто user/ — пользовательский каталог отвергнут целиком), attrs.rule_id и
+# attrs.reason — код причины (в том числе shipped_id_taken); текст ошибки — в журнале
 # движка («rules: правило отвергнуто» / «rules reload: правило отвергнуто»).
 # Закрывает инцидент rules.recovered — файл снова загрузился.
 title: "ARGUS: rule file rejected by the engine"

@@ -23,7 +23,7 @@ func TestPR99Round4StartupCollisionDoesNotDisableShippedRule(t *testing.T) {
 	const unsafeExit = 86
 	if dir := os.Getenv("ARGUS_PR99_ROUND4_STARTUP_DIR"); dir != "" {
 		fmt.Fprintln(os.Stdout, entered)
-		rs, _ := loadForRun(dir)
+		rs, _ := loadForRun(ruleSet{shipped: dir})
 		for _, r := range rs {
 			if r.ID == os.Getenv("ARGUS_PR99_ROUND4_STARTUP_ID") && r.File == os.Getenv("ARGUS_PR99_ROUND4_STARTUP_FILE") {
 				os.Exit(0)
@@ -62,7 +62,7 @@ func TestPR99Round4StartupCollisionDoesNotDisableShippedRule(t *testing.T) {
 			if protected == nil {
 				t.Fatal("fixture did not load the shipped detector")
 			}
-			e := &engine{rulesDir: dir, rulesSig: signature(dir)}
+			e := &engine{dirs: ruleSet{shipped: dir}, rulesSig: signature(dir)}
 			e.rules.Store(&rs)
 			duplicate := "title: Duplicate addition\nid: " + protected.ID + "\nlevel: low\ndetection:\n  selection: {action: unrelated.fixture}\n"
 			// Sort after the original: before this delta the original also

@@ -37,7 +37,7 @@ func TestPR99DeltaRejectedReloadCannotShadowRetainedRule(t *testing.T) {
 				t.Fatal(err)
 			}
 			e := &engine{
-				rulesDir: dir, rulesSig: signature(dir), token: "fixture", mtoken: "fixture",
+				dirs: ruleSet{shipped: dir}, rulesSig: signature(dir), token: "fixture", mtoken: "fixture",
 				resp: respond.New(respond.Config{Mode: respond.ModeIDS, ManualTTL: "1h"}),
 			}
 			e.rules.Store(&initial)

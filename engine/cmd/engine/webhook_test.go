@@ -71,7 +71,7 @@ func hookEngine(t *testing.T, f *fakeCH, rulesDir string) (*engine, *hookSink) {
 	acfg.Notify.Webhooks = []webhook.TargetConfig{{Name: "soc", Kind: "webhook", MinLevel: "high",
 		URLEnv: "TEST_HOOK_URL", SecretEnv: "TEST_HOOK_SECRET", AllowHTTP: true}}
 	ctx, cancel := context.WithCancel(context.Background())
-	e := newEngine(ctx, rulesDir, rs, acfg, store.New(f.srv.URL, "argus", "default", ""), "s", "s")
+	e := newEngine(ctx, ruleSet{shipped: rulesDir}, rs, acfg, store.New(f.srv.URL, "argus", "default", ""), "s", "s")
 	if e.hooks == nil {
 		t.Fatal("цель вебхука не включилась")
 	}
