@@ -33,7 +33,12 @@ services:
     # Образ пришпилен по digest multi-arch index (совпадает на Hub и зеркалах).
     image: ${REGISTRY_MIRROR:-docker.io}/clickhouse/clickhouse-server:24.8@sha256:1ffa82edee000a42c09313bd9f1293d94c570aee74babc1b3ca9983a35fa597b
     environment:
-      CLICKHOUSE_DB: argus
+      # CLICKHOUSE_DB не задаём: с ним entrypoint образа на пустом томе поднимает
+      # временный сервер под пользователем clickhouse и гасит его kill от root, а
+      # без CAP_KILL (cap_drop: ALL) это «Operation not permitted» → «Finishing of
+      # ClickHouse init process failed» → рестарт, и compose считает сервис
+      # unhealthy (e2e падал так через 1–2 с после старта). Базу argus создаёт
+      # migrator (CREATE DATABASE IF NOT EXISTS).
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-argus}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?CLICKHOUSE_PASSWORD не задан — ./scripts/argus init}
       # Админ нужен только migrator'у (CREATE USER / GRANT для служебных
