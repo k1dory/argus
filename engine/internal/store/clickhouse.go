@@ -532,6 +532,34 @@ func (c *ClickHouse) Disks(ctx context.Context) ([]Disk, error) {
 	return disks, nil
 }
 
+// LastEngineLifecycle — последнее событие жизненного цикла движка этого узла
+// (engine.started | engine.stopped, attrs.transport internal) за 30 дней: "" —
+// такого нет (первый запуск). По нему старт отличает штатный перезапуск от
+// оборванного (OOM, kill): после started без stopped прошлый процесс не дошёл до
+// штатной остановки.
+func (c *ClickHouse) LastEngineLifecycle(ctx context.Context, node string) (action, ts string, err error) {
+	out, err := c.do(ctx, `SELECT action, toString(ts) AS at FROM events
+		WHERE ts >= now() - INTERVAL 30 DAY AND source_class = 'telemetry' AND source = 'argus.system'
+		  AND product = 'engine' AND node = {node:String} AND action IN ('engine.started', 'engine.stopped')
+		  AND attrs['transport'] = 'internal'
+		ORDER BY ts DESC LIMIT 1 FORMAT JSONEachRow`, nil, map[string]string{"node": node})
+	if err != nil {
+		return "", "", err
+	}
+	line := bytes.TrimSpace(out)
+	if len(line) == 0 {
+		return "", "", nil
+	}
+	var row struct {
+		Action string `json:"action"`
+		At     string `json:"at"`
+	}
+	if err := json.Unmarshal(line, &row); err != nil {
+		return "", "", errors.New("events: неожиданная строка ответа ClickHouse")
+	}
+	return row.Action, row.At, nil
+}
+
 // OperatorState — актуальные статус/владелец/заметка инцидентов, как их
 // видит консоль. Движок держит инциденты в памяти и без этой сверки
 // перезаписал бы своей старой копией то, что дежурный поменял в консоли.

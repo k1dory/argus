@@ -1,0 +1,29 @@
+# Движок перезапускается без штатной остановки: OOM по лимиту cgroup, kill, паника.
+# Пока он в цикле, детект не работает — на argus1 (02.11–04.11) это длилось почти
+# двое суток и было видно только в журнале Docker. Событие engine.restarted пишет
+# сам движок при старте, если прошлый запуск не дошёл до engine.stopped
+# (attrs.reason: oom — cgroup насчитала oom_kill, unclean — иначе). Снаружи
+# attrs.transport перезаписывает приём, подделать сработку через ingest нельзя.
+# Два оборванных старта за полчаса — цикл: смотрите `docker logs argus-engine-1`,
+# метрику argus_engine_unclean_restarts_total и профиль (ENGINE_PPROF_ADDR).
+title: "ARGUS: engine restart loop"
+id: a41c-ops-069
+level: high
+tags: [argus.system, ops.availability]
+
+detection:
+  selection:
+    source: argus.system
+    action: engine.restarted
+    attrs.transport: internal
+  threshold:
+    kind: count
+    count: 2
+    window: 30m
+    group_by: node
+  condition: selection and threshold
+
+auto_close: 2h
+
+analyst:
+  profile: mock             # разбор не нужен: журнал движка, memory.events и pprof heap

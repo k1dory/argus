@@ -69,6 +69,7 @@ func (e *engine) handler() http.Handler {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		fmt.Fprintf(w, "argus_engine_rules %d\n", len(e.current()))
 		fmt.Fprintf(w, "argus_engine_rules_reloads_total %d\n", e.m.reloads.Load())
+		fmt.Fprintf(w, "argus_engine_unclean_restarts_total %d\n", e.m.uncleanRestarts.Load())
 		fmt.Fprintf(w, "argus_engine_events_polled_total %d\n", e.m.eventsPolled.Load())
 		fmt.Fprintf(w, "argus_engine_incidents_created_total %d\n", e.m.incidentsCreated.Load())
 		fmt.Fprintf(w, "argus_engine_incidents_autoclosed_total %d\n", e.m.incidentsClosed.Load())

@@ -387,6 +387,8 @@ services:
       ENGINE_BUFFER_MAX: ${ENGINE_BUFFER_MAX:-1000000}
       ENGINE_LOOKBACK_MAX: ${ENGINE_LOOKBACK_MAX:-1h}
       LISTEN_ADDR: ":8090"
+      # Профили Go (heap, allocs, profile) за METRICS_TOKEN на отдельном порту; пусто — выключено.
+      ENGINE_PPROF_ADDR: ${ENGINE_PPROF_ADDR:-}
       # Профили аналитика — argus.analyst.yml; секреты только через окружение.
       ARGUS_ANALYST_PROFILE: ${ARGUS_ANALYST_PROFILE:-mock}
       ARGUS_ANALYST_FORCE_PROFILE: ${ARGUS_ANALYST_FORCE_PROFILE:-mock}
@@ -420,6 +422,8 @@ services:
       - ./caddy/certs:/certs:ro
     ports:
       - "127.0.0.1:8090:8090"   # /metrics и /healthz — только localhost
+      # pprof (ENGINE_PPROF_ADDR=:6060 в .env, за METRICS_TOKEN): по умолчанию выключен
+      - "127.0.0.1:${ENGINE_PPROF_PORT:-6060}:6060"
     networks: [data, egress]
     <<: [*harden, *logging]
     healthcheck:
