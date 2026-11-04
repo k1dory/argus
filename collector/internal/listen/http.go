@@ -222,8 +222,12 @@ func (h *HTTPHandlers) acceptEvents(w http.ResponseWriter, r *http.Request, even
 		if events[i].Attrs == nil {
 			events[i].Attrs = map[string]string{}
 		}
+		// Все атрибуты происхождения (peer_cn, scope, transport, ts_original)
+		// из тела не принимаются: их выставит коллектор дальше по конвейеру.
+		for k := range model.ProvenanceAttrs {
+			delete(events[i].Attrs, k)
+		}
 		events[i].Attrs["peer"] = addr
-		delete(events[i].Attrs, "peer_cn")
 	}
 	if h.EmitBatch != nil {
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)

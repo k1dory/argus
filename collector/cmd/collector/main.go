@@ -623,9 +623,8 @@ func main() {
 		skew.apply(&e, model.Now())
 		// Направление для любого события с двумя адресами (NGFW, firewall, syslog), не только
 		// NetFlow: правила про «снаружи внутрь» одни на все источники.
-		if e.SrcIP != "" && e.DstIP != "" && e.Attrs["scope"] == "" {
-			e.Attrs["scope"] = norm.FlowScope(e.SrcIP, e.DstIP)
-		}
+		// Присланному scope не доверяем: его считает только коллектор по адресам.
+		setScope(e.Attrs, e.SrcIP, e.DstIP, norm.FlowScope)
 		item := queuedEvent{event: e}
 		if transport != "udp" {
 			item.ack = make(chan error, 1)
@@ -816,9 +815,7 @@ func main() {
 			asn.Enrich(events[i].Attrs, events[i].SrcIP, events[i].DstIP, asnDB.Table())
 			skew.apply(&events[i], model.Now())
 			// Направление — и для готовых событий NDJSON (агенты Vector, журналы фаерволов).
-			if events[i].SrcIP != "" && events[i].DstIP != "" && events[i].Attrs["scope"] == "" {
-				events[i].Attrs["scope"] = norm.FlowScope(events[i].SrcIP, events[i].DstIP)
-			}
+			setScope(events[i].Attrs, events[i].SrcIP, events[i].DstIP, norm.FlowScope)
 			rows[i] = events[i]
 		}
 		if err := pq.PushContext(requestCtx, rows); err != nil {
@@ -1329,4 +1326,15 @@ func expandEnv(s string) string {
 		}
 		return sub[2]
 	})
+}
+
+// setScope — attrs.scope только по адресам события: присланное значение (NDJSON,
+// S3, CEF/LEEF) затирается, без двух адресов направления нет. Правила «снаружи
+// внутрь» и автоответ решают по нему, поэтому держателю ingest-токена его не задать.
+func setScope(attrs map[string]string, src, dst string, flowScope func(string, string) string) {
+	if src != "" && dst != "" {
+		attrs["scope"] = flowScope(src, dst)
+		return
+	}
+	delete(attrs, "scope")
 }
