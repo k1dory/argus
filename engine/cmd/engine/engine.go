@@ -204,6 +204,7 @@ func (e *engine) maybeReload(force bool) []rules.RuleError {
 	e.m.rulesRejected.Store(int64(len(rejected)))
 	e.rules.Store(&rs)
 	e.noteRejected(rejected, rs, time.Now())
+	e.noteRecovered(time.Now())
 	if len(rejected) == 0 {
 		e.m.reloads.Add(1)
 		slog.Info("rules reloaded", "rules", len(rs))
@@ -423,6 +424,9 @@ func run(rulesDir string) {
 			e.sysMu.Lock()
 			e.reg = reg
 			e.sysMu.Unlock()
+			e.reloadMu.Lock()
+			e.noteRecovered(time.Now()) // файлы, исправленные пока движок стоял
+			e.reloadMu.Unlock()
 			restored := e.restoreRespState(open, time.Now())
 			e.restoreKeys(ctx, time.Now())
 			slog.Info("engine started", "rules", len(rs), "open_incidents", len(open), "respond_restored", restored, "next", maxN+1, "poll", poll)

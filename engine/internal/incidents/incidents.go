@@ -467,6 +467,21 @@ func (r *Registry) Reconcile(toWrite []*Incident, ops map[string]Operator, engin
 
 // OpenByRule — открытый инцидент правила (первый попавшийся), nil если нет.
 // Нужен системным инцидентам движка, чтобы после рестарта закрывать свои же.
+// OpenGroupKeys — group_key открытых инцидентов правила (по ним движок узнаёт, по
+// каким файлам правил ещё открыт инцидент отказа, и после рестарта тоже).
+func (r *Registry) OpenGroupKeys(ruleID string) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []string
+	for _, inc := range r.open {
+		if inc.RuleID == ruleID && !isFinal(inc.Status) && inc.GroupKey != "" {
+			out = append(out, inc.GroupKey)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 func (r *Registry) OpenByRule(ruleID string) *Incident {
 	r.mu.Lock()
 	defer r.mu.Unlock()

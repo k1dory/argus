@@ -27,9 +27,9 @@ func (e *engine) node() string {
    rules.recovered. Инцидент заводит обычное правило rules/ops/rules-rejected.yml;
    метрика — argus_engine_rules_rejected. */
 
-// noteRejected — события по итогам загрузки: rules.rejected на каждый отвергнутый
-// файл, rules.recovered на файл, который был отвергнут и снова загрузился.
-func (e *engine) noteRejected(rejected []rules.RuleError, active []*rules.Rule, now time.Time) {
+// noteRejected — rules.rejected на каждый отвергнутый файл. rules.recovered —
+// noteRecovered, по открытым инцидентам.
+func (e *engine) noteRejected(rejected []rules.RuleError, _ []*rules.Rule, now time.Time) {
 	if e.rulesBad == nil {
 		e.rulesBad = map[string]bool{}
 	}
@@ -38,20 +38,39 @@ func (e *engine) noteRejected(rejected []rules.RuleError, active []*rules.Rule, 
 		bad[re.File] = true
 		e.rulesPending = append(e.rulesPending, rulesRejectedEvent(now, e.node(), re.File, re.ID, re.Reason))
 	}
-	loaded := map[string]string{}
-	for _, r := range active {
-		loaded[r.File] = r.ID
-	}
-	for file := range e.rulesBad {
-		if id, ok := loaded[file]; ok && !bad[file] {
-			ev := rulesRejectedEvent(now, e.node(), file, id, "")
-			ev.Action, ev.Outcome = "rules.recovered", "success"
-			e.rulesPending = append(e.rulesPending, ev)
-		}
-	}
 	e.rulesBad = bad
 	if n := len(e.rulesPending); n > 1000 {
 		e.rulesPending = e.rulesPending[n-1000:]
+	}
+}
+
+// noteRecovered — rules.recovered по каждому файлу, по которому открыт инцидент
+// правила отказа (selection action: rules.rejected) и который сейчас загружен: не по
+// памяти о прошлых отказах, а по открытым инцидентам реестра — переживает рестарт и
+// временное исчезновение файла. Вызывающий держит reloadMu.
+func (e *engine) noteRecovered(now time.Time) {
+	e.sysMu.Lock()
+	reg := e.reg
+	e.sysMu.Unlock()
+	if reg == nil {
+		return
+	}
+	loaded := map[string]string{}
+	var watch []string
+	for _, r := range e.current() {
+		loaded[r.File] = r.ID
+		if a, _ := r.Detection.Selection["action"].(string); a == "rules.rejected" {
+			watch = append(watch, r.ID)
+		}
+	}
+	for _, ruleID := range watch {
+		for _, file := range reg.OpenGroupKeys(ruleID) {
+			if id, ok := loaded[file]; ok && !e.rulesBad[file] {
+				ev := rulesRejectedEvent(now, e.node(), file, id, "")
+				ev.Action, ev.Outcome = "rules.recovered", "success"
+				e.rulesPending = append(e.rulesPending, ev)
+			}
+		}
 	}
 }
 

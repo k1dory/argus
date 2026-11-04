@@ -485,8 +485,9 @@ func LoadEach(dir string) (out []*Rule, rejected []RuleError, err error) {
 // DedupeIDs — у каждого id одно правило: политика (respond, analyst, уровень) ищется
 // по id, и второй файл с тем же id молча подменил бы первый. Остаётся правило из того
 // файла, что был активен с этим id (activeFile: id → файл прежнего набора); если такого
-// нет (старт, оба файла новые) — отвергаются все с этим id: какой из них настоящий,
-// неизвестно, и выбирать молча нельзя.
+// нет (старт, оба файла новые) — файл, первый по пути в лексикографическом порядке.
+// Остальные отвергаются (duplicate_id): подброшенный zz-*.yml с id штатного правила
+// не выключает его.
 func DedupeIDs(rs []*Rule, activeFile map[string]string) (kept []*Rule, rejected []RuleError) {
 	byID := map[string][]*Rule{}
 	for _, r := range rs {
@@ -498,7 +499,23 @@ func DedupeIDs(rs []*Rule, activeFile map[string]string) (kept []*Rule, rejected
 			kept = append(kept, r)
 			continue
 		}
-		if f, ok := activeFile[r.ID]; ok && r.File == f {
+		winner := ""
+		if f, ok := activeFile[r.ID]; ok {
+			for _, o := range same {
+				if o.File == f {
+					winner = f
+				}
+			}
+		}
+		if winner == "" {
+			winner = same[0].File
+			for _, o := range same[1:] {
+				if o.File < winner {
+					winner = o.File
+				}
+			}
+		}
+		if r.File == winner {
 			kept = append(kept, r)
 			continue
 		}
@@ -507,7 +524,7 @@ func DedupeIDs(rs []*Rule, activeFile map[string]string) (kept []*Rule, rejected
 			files = append(files, o.File)
 		}
 		rejected = append(rejected, RuleError{File: r.File, ID: r.ID, Reason: "duplicate_id",
-			Err: fmt.Errorf("id %s повторяется в %s — правило не применено", r.ID, strings.Join(files, ", "))})
+			Err: fmt.Errorf("id %s повторяется в %s — действует %s, это правило не применено", r.ID, strings.Join(files, ", "), winner)})
 	}
 	return kept, rejected
 }
@@ -576,6 +593,20 @@ func strictStruct(v any, t reflect.Type, path string, doc *yaml.Node) error {
 	}
 	if t.Kind() != reflect.Struct {
 		return nil
+	}
+	if mm, ok := v.(map[any]any); ok {
+		// Отображение с нестроковым ключом (7: …): декодер разложит его в структуру,
+		// молча пропустив и такие ключи, и неизвестные строковые — отказ правила.
+		for k := range mm {
+			if _, str := k.(string); !str {
+				return &UnknownFieldError{Path: fmt.Sprintf("%s.%v", path, k), Line: keyLine(doc, fmt.Sprint(k))}
+			}
+		}
+		conv := make(map[string]any, len(mm))
+		for k, x := range mm {
+			conv[k.(string)] = x
+		}
+		v = conv
 	}
 	m, ok := v.(map[string]any)
 	if !ok {

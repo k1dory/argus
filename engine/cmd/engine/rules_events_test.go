@@ -8,16 +8,22 @@ import (
 	"testing"
 	"time"
 
+	"github.com/devitex-soft/argus/engine/internal/eval"
 	"github.com/devitex-soft/argus/engine/internal/model"
 	"github.com/devitex-soft/argus/engine/internal/respond"
 )
 
 // Отказ правила виден: событие rules.rejected (object — файл, attrs.rule_id,
 // attrs.reason — код без содержимого правила, attrs.transport: internal) уходит в
-// argus.events, метрика растёт; файл снова загрузился — rules.recovered.
+// argus.events, метрика растёт; файл снова загрузился, а инцидент a41c-ops-068 по
+// нему открыт — rules.recovered.
 func TestRulesRejectedEventsAndRecovery(t *testing.T) {
 	good := "title: t\nid: t-ev\nlevel: low\ndetection:\n  selection: {action: x}\n  condition: selection\n"
-	dir := rulesDirWith(t, map[string]string{"r.yml": good})
+	ops, err := os.ReadFile(filepath.Join("..", "..", "..", "rules", "ops", "rules-rejected.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := rulesDirWith(t, map[string]string{"r.yml": good, "ops.yml": string(ops)})
 	f := newFakeCH(t)
 	e := testEngine(t, f, dir, respond.Config{}, "s", "s")
 	ctx := context.Background()
@@ -41,6 +47,9 @@ func TestRulesRejectedEventsAndRecovery(t *testing.T) {
 	}
 	if _, leaked := ev.Attrs["error"]; leaked {
 		t.Fatal("текст ошибки ушёл в событие")
+	}
+	if created, _, _ := e.reg.Apply(eval.Run(e.current(), []*model.Event{&ev}), time.Now()); len(created) != 1 || created[0].GroupKey != "r.yml" {
+		t.Fatalf("инцидент отказа: %+v", created)
 	}
 
 	if err := os.WriteFile(filepath.Join(dir, "r.yml"), []byte(good), 0o600); err != nil {
