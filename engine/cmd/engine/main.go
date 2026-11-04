@@ -154,11 +154,21 @@ func rulesTest(defaultDir string, argv []string) int {
 	fs.Visit(func(f *flag.Flag) { explicit = explicit || f.Name == "dir" })
 	// Без --dir — тот же набор, что у движка и rules list: поставляемые и
 	// RULES_USER_DIR. Тесты (tests/) — только каталога --dir/RULES_DIR.
+	// Отвергнутое правило RULES_USER_DIR (разбор, shipped_id_taken, duplicate_id) —
+	// провал проверки: тесты и replay по остальным выполняются, код выхода — 1.
 	var rs []*rules.Rule
+	var rejected []rules.RuleError
 	if explicit {
 		rs = mustLoad(*dir)
 	} else {
-		rs, _ = mustLoadSet(ruleSet{shipped: *dir, user: env("RULES_USER_DIR", "")})
+		rs, rejected = mustLoadSet(ruleSet{shipped: *dir, user: env("RULES_USER_DIR", "")})
+	}
+	pass := 0
+	if len(rejected) > 0 {
+		pass = 1
+		for _, re := range rejected {
+			fmt.Printf("FAIL %-32s отвергнуто: %s\n", rejectKey(re), re.Reason)
+		}
 	}
 
 	if *replay != "" {
@@ -188,14 +198,14 @@ func rulesTest(defaultDir string, argv []string) int {
 			}
 			fmt.Println()
 		}
-		return 0
+		return pass
 	}
 
 	paths, _ := filepath.Glob(filepath.Join(*dir, "tests", "*.yml"))
 	sort.Strings(paths)
 	if len(paths) == 0 {
 		fmt.Println("нет тестов в", filepath.Join(*dir, "tests"))
-		return 0
+		return pass
 	}
 	ruleByID := map[string]*rules.Rule{}
 	for _, r := range rs {
@@ -270,5 +280,5 @@ func rulesTest(defaultDir string, argv []string) int {
 	if failed > 0 {
 		return 1
 	}
-	return 0
+	return pass
 }

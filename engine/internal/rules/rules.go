@@ -493,42 +493,41 @@ func LoadEach(dir string) (out []*Rule, rejected []RuleError, err error) {
 // Остальные отвергаются (duplicate_id): подброшенный zz-*.yml с id штатного правила
 // не выключает его.
 func DedupeIDs(rs []*Rule, activeFile map[string]string) (kept []*Rule, rejected []RuleError) {
-	byID := map[string][]*Rule{}
+	type group struct {
+		winner string
+		n      int
+	}
+	byID := map[string]*group{}
+	present := make(map[[2]string]bool, len(rs))
 	for _, r := range rs {
-		byID[r.ID] = append(byID[r.ID], r)
+		present[[2]string{r.ID, r.File}] = true
+		g := byID[r.ID]
+		if g == nil {
+			g = &group{winner: r.File}
+			byID[r.ID] = g
+		} else if r.File < g.winner {
+			g.winner = r.File
+		}
+		g.n++
+	}
+	for id, g := range byID {
+		if g.n < 2 {
+			continue
+		}
+		if f, ok := activeFile[id]; ok && present[[2]string{id, f}] {
+			g.winner = f
+		}
 	}
 	for _, r := range rs {
-		same := byID[r.ID]
-		if len(same) == 1 {
+		g := byID[r.ID]
+		if g.n == 1 || r.File == g.winner {
 			kept = append(kept, r)
 			continue
 		}
-		winner := ""
-		if f, ok := activeFile[r.ID]; ok {
-			for _, o := range same {
-				if o.File == f {
-					winner = f
-				}
-			}
-		}
-		if winner == "" {
-			winner = same[0].File
-			for _, o := range same[1:] {
-				if o.File < winner {
-					winner = o.File
-				}
-			}
-		}
-		if r.File == winner {
-			kept = append(kept, r)
-			continue
-		}
-		files := make([]string, 0, len(same))
-		for _, o := range same {
-			files = append(files, o.File)
-		}
+		// Только действующий файл и число повторов: копия всего списка в каждой
+		// ошибке — квадратичная память при тысячах пользовательских файлов.
 		rejected = append(rejected, RuleError{File: r.File, ID: r.ID, Reason: "duplicate_id",
-			Err: fmt.Errorf("id %s повторяется в %s — действует %s, это правило не применено", r.ID, strings.Join(files, ", "), winner)})
+			Err: fmt.Errorf("id %s повторяется в %d файлах — действует %s, это правило не применено", r.ID, g.n, g.winner)})
 	}
 	return kept, rejected
 }
