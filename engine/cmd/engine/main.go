@@ -148,9 +148,18 @@ type ruleTest struct {
 func rulesTest(defaultDir string, argv []string) int {
 	fs := flag.NewFlagSet("rules test", flag.ExitOnError)
 	replay := fs.String("replay", "", "NDJSON с событиями единой схемы: показать сработки всех правил")
-	dir := fs.String("dir", defaultDir, "каталог правил")
+	dir := fs.String("dir", defaultDir, "каталог правил (явно — только он, без RULES_USER_DIR)")
 	_ = fs.Parse(argv)
-	rs := mustLoad(*dir)
+	explicit := false
+	fs.Visit(func(f *flag.Flag) { explicit = explicit || f.Name == "dir" })
+	// Без --dir — тот же набор, что у движка и rules list: поставляемые и
+	// RULES_USER_DIR. Тесты (tests/) — только каталога --dir/RULES_DIR.
+	var rs []*rules.Rule
+	if explicit {
+		rs = mustLoad(*dir)
+	} else {
+		rs, _ = mustLoadSet(ruleSet{shipped: *dir, user: env("RULES_USER_DIR", "")})
+	}
 
 	if *replay != "" {
 		events, err := readNDJSON(*replay)

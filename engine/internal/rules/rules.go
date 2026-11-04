@@ -393,7 +393,7 @@ func Load(dir string) ([]*Rule, error) {
 }
 
 func LoadFile(path string) (*Rule, error) {
-	raw, err := os.ReadFile(path)
+	raw, err := readRuleFile(path)
 	if err != nil {
 		return nil, err
 	}

@@ -6,7 +6,6 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/devitex-soft/argus/engine/internal/model"
@@ -74,23 +73,30 @@ func (s ruleSet) load() ([]*rules.Rule, []rejectedRule, error) {
 	if err != nil {
 		return out, []rejectedRule{{File: userPrefix, Reason: rejectParseError, Err: err.Error()}}, nil
 	}
-	taken := make(map[string]string, len(out)+len(us)) // id → файл
+	// id → файл и каталог владельца: происхождение — по каталогу, из которого
+	// правило загружено, а не по префиксу пути (поставляемый rules/user/x.yml —
+	// всё равно поставляемый).
+	type owner struct {
+		file string
+		user bool
+	}
+	taken := make(map[string]owner, len(out)+len(us))
 	for _, r := range out {
-		taken[r.ID] = r.File
+		taken[r.ID] = owner{file: r.File}
 	}
 	var rejected []rejectedRule
 	for _, r := range us {
 		file := userPrefix + r.File
-		if owner, dup := taken[r.ID]; dup {
+		if o, dup := taken[r.ID]; dup {
 			reason := rejectDuplicateID
-			if !strings.HasPrefix(owner, userPrefix) {
+			if !o.user {
 				reason = rejectShippedIDTaken
 			}
-			rejected = append(rejected, rejectedRule{File: file, RuleID: r.ID, Reason: reason, Err: "id " + r.ID + " уже занят: " + owner})
+			rejected = append(rejected, rejectedRule{File: file, RuleID: r.ID, Reason: reason, Err: "id " + r.ID + " уже занят: " + o.file})
 			continue
 		}
 		r.File = file
-		taken[r.ID] = file
+		taken[r.ID] = owner{file: file, user: true}
 		out = append(out, r)
 	}
 	return out, rejected, nil

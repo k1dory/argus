@@ -46,14 +46,14 @@ func TestLoadImageLayout(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(dir, "rules"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(filepath.Join(dir, "fixtures"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(dir, "fixtures", "events"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	rule := "id: x-1\ntitle: Shipped\nlevel: high\ntags: [attack.t1110]\ndetection:\n  selection:\n    source: host.sshd\n    action: auth.ssh\n  condition: selection\n"
 	if err := os.WriteFile(filepath.Join(dir, "rules", "x.yml"), []byte(rule), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "fixtures", "a.ndjson"), []byte(`{"source":"edr.kaspersky","action":"file.read"}`+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "fixtures", "events", "a.ndjson"), []byte(`{"source":"edr.kaspersky","action":"file.read"}`+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := Load(dir); err != nil {

@@ -82,7 +82,7 @@ func TestRegistrySmokeWorksWithoutAppletLinks(t *testing.T) {
 	}
 	// Positive control proves the fixture is accessible through the explicit
 	// multicall executable before running the workflow's unchanged snippet.
-	if out, err := run("/bin/busybox ls /usr/share/argus/shipped/fixtures/*.ndjson >/dev/null"); err != nil {
+	if out, err := run("/bin/busybox ls /usr/share/argus/shipped/fixtures/events/*.ndjson >/dev/null"); err != nil {
 		t.Fatalf("harness control failed: %v\n%s", err, out)
 	}
 	if out, err := run(match[1]); err != nil {

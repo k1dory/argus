@@ -73,7 +73,7 @@ func TestDockerfileEngineRegistryCopy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"COPY rules/ /usr/share/argus/shipped/rules/", "COPY fixtures/events/ /usr/share/argus/shipped/fixtures/"} {
+	for _, want := range []string{"COPY rules/ /usr/share/argus/shipped/rules/", "COPY fixtures/events/ /usr/share/argus/shipped/fixtures/events/"} {
 		if !strings.Contains(string(df), want) {
 			t.Errorf("engine/Dockerfile: нет %q", want)
 		}

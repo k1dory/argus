@@ -41,12 +41,13 @@ func TestDatasetRegistryPreflight(t *testing.T) {
 				}
 			}
 			if layout == "empty-fixtures" || layout == "complete" {
-				if err := os.Mkdir(filepath.Join(dir, "fixtures"), 0o700); err != nil {
+				// раскладка образа: shipped/fixtures/events (как в репозитории)
+				if err := os.MkdirAll(filepath.Join(dir, "fixtures", "events"), 0o700); err != nil {
 					t.Fatal(err)
 				}
 			}
 			if layout == "complete" {
-				if err := os.WriteFile(filepath.Join(dir, "fixtures", "events.ndjson"),
+				if err := os.WriteFile(filepath.Join(dir, "fixtures", "events", "events.ndjson"),
 					[]byte("{\"source\":\"edr.kaspersky\",\"action\":\"file.read\"}\n"), 0o600); err != nil {
 					t.Fatal(err)
 				}

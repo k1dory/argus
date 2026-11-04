@@ -143,7 +143,8 @@ func signature(dir string) string {
 	var b strings.Builder
 	for _, p := range paths {
 		if st, err := os.Stat(p); err == nil {
-			fmt.Fprintf(&b, "%s|%d|%d;", p, st.Size(), st.ModTime().UnixNano())
+			// права — тоже: после chmod файл мог стать (не)читаемым, и набор меняется
+			fmt.Fprintf(&b, "%s|%d|%d|%o;", p, st.Size(), st.ModTime().UnixNano(), st.Mode())
 		}
 	}
 	return b.String()

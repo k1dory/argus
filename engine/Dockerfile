@@ -23,7 +23,7 @@ COPY engine/argus.analyst.yml /etc/argus/argus.analyst.yml
 # движка (RULES_DIR) — версия правил всегда равна версии образа. Пользовательские
 # правила — отдельный каталог RULES_USER_DIR (compose: /etc/argus/rules.d).
 COPY rules/ /usr/share/argus/shipped/rules/
-COPY fixtures/events/ /usr/share/argus/shipped/fixtures/
+COPY fixtures/events/ /usr/share/argus/shipped/fixtures/events/
 ENV ANALYST_CONFIG=/etc/argus/argus.analyst.yml RULES_DIR=/usr/share/argus/shipped/rules RULES_USER_DIR=/etc/argus/rules.d
 EXPOSE 8090
 ENTRYPOINT ["/engine"]
