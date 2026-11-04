@@ -41,7 +41,9 @@ type metrics struct {
 	analystRejected  atomic.Int64 // cooldown / суточный лимит
 	pollErrors       atomic.Int64
 	reloads          atomic.Int64
-	rulesRejected    atomic.Int64 // отвергнутых правил в действующем наборе (ruleset.go)
+	reloadFailures   atomic.Int64 // перечитываний, в которых правила отвергнуты (набор частично прежний)
+	rulesRejected    atomic.Int64 // отвергнутых правил в последней загрузке
+	uncleanRestarts  atomic.Int64 // старт после оборванного прошлого запуска (lifecycle.go)
 	lastRun          atomic.Int64
 	diskFreePermille atomic.Int64 // свободно на самом заполненном диске ClickHouse, ‰
 	autoBlocks       atomic.Int64
@@ -55,28 +57,32 @@ type metrics struct {
 }
 
 type engine struct {
-	rules      atomic.Pointer[[]*rules.Rule]
-	dirs       ruleSet    // поставляемые и пользовательские правила (ruleset.go)
-	reloadMu   sync.Mutex // rulesSig и перечитывание: цикл и POST /reload
-	workflowMu sync.Mutex // единственный писатель переходов и снимков инцидентов
-	rulesSig   string
-	ch         *store.ClickHouse
-	an         *analyst.Analyst
-	en         *enrich.Enricher
-	tg         *notify.Telegram
-	mail       *notify.Email
-	agg        *notify.Aggregator
-	hooks      *webhook.Dispatcher // nil — исходящие вебхуки не настроены
-	resp       *respond.Responder
-	acfg       analyst.Config
-	reg        *incidents.Registry
-	m          metrics
-	sched      *scheduler
-	ctx        context.Context // жизнь процесса: разборы и HTTP-ручки отменяются при остановке
-	token      string          // ENGINE_TOKEN; пусто только при ARGUS_DEV=1
-	mtoken     string          // METRICS_TOKEN (по умолчанию = ENGINE_TOKEN)
-	bufferMax  int             // ENGINE_BUFFER_MAX: потолок буфера кандидатов, 0 — без предела
-	lookback   time.Duration   // ENGINE_LOOKBACK_MAX: потолок глубины буфера и стартового курсора
+	rules    atomic.Pointer[[]*rules.Rule]
+	dirs     ruleSet    // поставляемые и пользовательские правила (ruleset.go)
+	reloadMu sync.Mutex // rulesSig и перечитывание: цикл и POST /reload
+	// Отказы правил: файлы, отвергнутые сейчас, и события rules.rejected/recovered,
+	// ещё не записанные в argus.events (повтор на следующем цикле). Под reloadMu.
+	rulesBad     map[string]bool
+	rulesPending []*model.Event
+	workflowMu   sync.Mutex // единственный писатель переходов и снимков инцидентов
+	rulesSig     string
+	ch           *store.ClickHouse
+	an           *analyst.Analyst
+	en           *enrich.Enricher
+	tg           *notify.Telegram
+	mail         *notify.Email
+	agg          *notify.Aggregator
+	hooks        *webhook.Dispatcher // nil — исходящие вебхуки не настроены
+	resp         *respond.Responder
+	acfg         analyst.Config
+	reg          *incidents.Registry
+	m            metrics
+	sched        *scheduler
+	ctx          context.Context // жизнь процесса: разборы и HTTP-ручки отменяются при остановке
+	token        string          // ENGINE_TOKEN; пусто только при ARGUS_DEV=1
+	mtoken       string          // METRICS_TOKEN (по умолчанию = ENGINE_TOKEN)
+	bufferMax    int             // ENGINE_BUFFER_MAX: потолок буфера кандидатов, 0 — без предела
+	lookback     time.Duration   // ENGINE_LOOKBACK_MAX: потолок глубины буфера и стартового курсора
 
 	sysMu  sync.Mutex
 	storms map[string]*incidents.Incident // rule_id → открытый инцидент «шторм»
@@ -100,6 +106,8 @@ type engine struct {
 	// потолок буфера (ENGINE_BUFFER_MAX) их не выбрасывает. Пишет и читает только
 	// главный цикл (loop → ingest → cycle).
 	absence *eval.AbsenceState
+
+	cgroupEvents string // memory.events cgroup: счётчик oom_kill для engine.restarted
 
 	excWarnMu sync.Mutex
 	excWarned map[string]bool
@@ -150,25 +158,97 @@ func signature(dir string) string {
 	return b.String()
 }
 
-// maybeReload перечитывает правила, если каталог изменился; force — без проверки отпечатка.
-func (e *engine) maybeReload(force bool) {
+// maybeReload перечитывает правила, если каталог изменился; force — без проверки
+// отпечатка. Отвергнутое правило (разбор, неизвестное поле детекта, повтор id) не
+// роняет набор: остальные применяются, а для отвергнутого файла остаётся его прежняя
+// версия. Повтор id проверяется уже после этого слияния: принятый файл не может
+// занять id, который держит сохранённая версия другого файла (DedupeIDs оставляет
+// правило того файла, что был активен с этим id). Оба каталога (ruleset.go) идут
+// через один механизм; поставляемое правило главнее пользовательского с тем же id
+// (shipped_id_taken), битый пользовательский каталог отвергается целиком.
+// Возвращает отвергнутые (для /reload).
+func (e *engine) maybeReload(force bool) []rules.RuleError {
 	e.reloadMu.Lock()
 	defer e.reloadMu.Unlock()
 	sig := e.dirs.signature()
 	if !force && sig == e.rulesSig {
-		return
+		return nil
 	}
-	rs, rejected, err := e.dirs.load()
-	if err != nil {
-		slog.Warn("rules reload: оставляю прежний набор", "err", err)
-		e.rulesSig = sig
-		return
-	}
-	e.reportRejected(e.ctx, rejected, time.Now())
-	e.rules.Store(&rs)
+	shipped, user, rejected, err := e.dirs.loadEach()
 	e.rulesSig = sig
-	e.m.reloads.Add(1)
-	slog.Info("rules reloaded", "rules", len(rs))
+	if err != nil {
+		e.m.reloadFailures.Add(1)
+		slog.Warn("rules reload: каталог не прочитан — оставляю прежний набор", "err", err)
+		return []rules.RuleError{{File: e.dirs.shipped, Reason: "invalid_value", Err: err}}
+	}
+	prevByKey := map[string]*rules.Rule{}
+	activeShipped, activeUser := map[string]string{}, map[string]string{}
+	for _, r := range e.current() {
+		prevByKey[ruleKey(r)] = r
+		if r.User {
+			activeUser[r.ID] = r.File
+		} else {
+			activeShipped[r.ID] = r.File
+		}
+	}
+	retained := map[string]bool{}
+	var rs []*rules.Rule
+	for done := 0; ; {
+		for _, re := range rejected[done:] {
+			k := rejectKey(re)
+			if old := prevByKey[k]; old != nil && !retained[k] {
+				retained[k] = true
+				if old.User {
+					user = append(user, old)
+				} else {
+					shipped = append(shipped, old)
+				}
+			}
+		}
+		done = len(rejected)
+		var dup []rules.RuleError
+		shipped, user, dup = resolveRuleSet(shipped, user, activeShipped, activeUser)
+		if len(dup) == 0 {
+			rs = append(shipped, user...)
+			break
+		}
+		rejected = append(rejected, dup...)
+	}
+	rejected = uniqueRejections(rejected)
+	sort.SliceStable(rs, func(i, j int) bool { return ruleKey(rs[i]) < ruleKey(rs[j]) })
+	for _, re := range rejected {
+		slog.Warn("rules reload: правило отвергнуто — оставляю прежний набор для этого файла", "file", rejectKey(re), "reason", re.Reason, "err", re.Err)
+	}
+	if len(rejected) > 0 {
+		e.m.reloadFailures.Add(1)
+	}
+	e.m.rulesRejected.Store(int64(len(rejected)))
+	e.rules.Store(&rs)
+	e.noteRejected(rejected, rs, time.Now())
+	e.noteRecovered(time.Now())
+	if len(rejected) == 0 {
+		e.m.reloads.Add(1)
+		slog.Info("rules reloaded", "rules", len(rs))
+	}
+	return rejected
+}
+
+// loadForRun — правила при старте: отвергнутые записываются в журнал и пропускаются,
+// остальные работают (прежней версии для них нет; при повторе id внутри каталога
+// остаётся файл, первый по пути). Нечитаемый каталог поставляемых правил — выход;
+// битый пользовательский каталог отвергается целиком, поставляемые работают.
+func loadForRun(dirs ruleSet) ([]*rules.Rule, []rules.RuleError) {
+	shipped, user, rejected, err := dirs.loadEach()
+	if err != nil {
+		slog.Error("rules", "err", err)
+		os.Exit(1)
+	}
+	shipped, user, dup := resolveRuleSet(shipped, user, nil, nil)
+	rejected = append(rejected, dup...)
+	for _, re := range rejected {
+		slog.Error("rules: правило отвергнуто и не работает", "file", rejectKey(re), "reason", re.Reason, "err", re.Err)
+	}
+	return append(shipped, user...), rejected
 }
 
 // observeIdentities применяет события identity.alias(.revoke) к таблицам
@@ -250,7 +330,7 @@ func newEngine(ctx context.Context, dirs ruleSet, rs []*rules.Rule, acfg analyst
 		respState: map[string]respEntry{},
 		respKeys:  map[string]*respKey{}, respFlight: map[string]bool{}, respSlots: map[string]map[string]time.Time{},
 		respDeferred: map[string]*incidents.Incident{}, respExcluded: map[string]exclusion{},
-		excWarned: map[string]bool{},
+		excWarned: map[string]bool{}, cgroupEvents: cgroupMemoryEvents,
 		identFile: env("IDENTITIES_FILE", ""),
 		absence:   eval.NewAbsenceState(0),
 	}
@@ -296,7 +376,7 @@ func logShippedRegistry() {
 }
 
 func run(dirs ruleSet) {
-	rs, rejected := mustLoadSet(dirs)
+	rs, rejected := loadForRun(dirs)
 	logShippedRegistry()
 	acfg, err := analyst.LoadConfig(env("ANALYST_CONFIG", ""))
 	if err != nil {
@@ -320,7 +400,8 @@ func run(dirs ruleSet) {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	e := newEngine(ctx, dirs, rs, acfg, ch, token, env("METRICS_TOKEN", token))
-	e.reportRejected(ctx, rejected, time.Now())
+	e.m.rulesRejected.Store(int64(len(rejected)))
+	e.noteRejected(rejected, rs, time.Now())
 	for _, msg := range e.resp.ConfigErrors() {
 		slog.Warn("respond config", "msg", msg)
 	}
@@ -347,6 +428,13 @@ func run(dirs ruleSet) {
 	e.startAnalystWorkers()
 	e.hooks.Start(ctx)
 	go e.serveHTTP(ctx, env("LISTEN_ADDR", ":8090"))
+	if addr := env("ENGINE_PPROF_ADDR", ""); addr != "" {
+		if e.mtoken == "" && os.Getenv("ARGUS_DEV") != "1" {
+			slog.Error("ENGINE_PPROF_ADDR без METRICS_TOKEN/ENGINE_TOKEN — pprof не поднят")
+		} else {
+			go e.servePprof(ctx, addr)
+		}
+	}
 	if raw := env("RISK_REPORT_INTERVAL", ""); raw != "" {
 		interval, err := time.ParseDuration(raw)
 		if err != nil || interval < time.Hour {
@@ -368,9 +456,19 @@ func run(dirs ruleSet) {
 			e.sysMu.Lock()
 			e.reg = reg
 			e.sysMu.Unlock()
+			e.reloadMu.Lock()
+			e.noteRecovered(time.Now()) // файлы, исправленные пока движок стоял
+			e.reloadMu.Unlock()
 			restored := e.restoreRespState(open, time.Now())
 			e.restoreKeys(ctx, time.Now())
 			slog.Info("engine started", "rules", len(rs), "open_incidents", len(open), "respond_restored", restored, "next", maxN+1, "poll", poll)
+			// Поиск прошлого запуска идёт по всему сроку хранения events: на первом
+			// запуске это может быть долго — детект его не ждёт.
+			go func(at time.Time) {
+				actx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+				defer cancel()
+				e.announceStart(actx, at)
+			}(time.Now())
 			break
 		}
 		slog.Warn("clickhouse недоступен, жду", "err", err)
@@ -381,6 +479,7 @@ func run(dirs ruleSet) {
 		}
 	}
 	e.loop(ctx, poll)
+	e.announceStop(time.Now())
 	// ctx уже отменён: недоставленное из очереди и отложенные повторы не
 	// выполнятся (отметок о них нет — после перезапуска они не повторятся),
 	// ждём только выхода воркеров с текущей попыткой.
@@ -534,6 +633,7 @@ func (e *engine) loop(ctx context.Context, poll time.Duration) {
 			e.m.lastRun.Store(time.Now().Unix())
 		}
 		e.checkDisks(ctx, time.Now())
+		e.flushRulesEvents(ctx)
 		e.flushDigests(ctx)
 		go e.expireBlocks(context.WithoutCancel(ctx), time.Now())
 		select {

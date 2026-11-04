@@ -276,7 +276,11 @@ export function aliasPredicate(aliases: Alias[], window: Window, prefix = "", ts
       const col = aliasColumnExpr(a.kind);
       const byValue = byColumn.get(col) ?? new Map<string, { fromMs: number; toMs: number }[]>();
       byColumn.set(col, byValue);
-      byValue.set(a.value, [...(byValue.get(a.value) ?? []), iv]);
+      // push в массив значения: копия на каждый интервал делала группировку O(n²)
+      // (20 000 интервалов одного адреса — около 200 млн копирований в web-процессе).
+      const ivs = byValue.get(a.value);
+      if (ivs) ivs.push(iv);
+      else byValue.set(a.value, [iv]);
     }
     const from: string[] = [], to: string[] = [];
     const lookups: string[] = [];
@@ -541,7 +545,9 @@ export function ambiguousAliases(all: Alias[], window: Window): Set<string> {
   for (const a of all) {
     if (isHeld(a) || !aliasInterval(a, window)) continue;
     const key = aliasKey(a);
-    byKey.set(key, [...(byKey.get(key) ?? []), a]);
+    const list = byKey.get(key);
+    if (list) list.push(a);
+    else byKey.set(key, [a]);
   }
   const out = new Set<string>();
   for (const [key, list] of byKey) {

@@ -129,11 +129,11 @@ func TestPR111ShippedIDReasonDoesNotDependOnSubdirectoryName(t *testing.T) {
 	}
 	for _, rejection := range rejected {
 		want := rejectDuplicateID
-		if rejection.RuleID == "qa-shipped" {
+		if rejection.ID == "qa-shipped" {
 			want = rejectShippedIDTaken
 		}
 		if rejection.Reason != want {
-			t.Errorf("rejected %q: got %q, want %q; shipped/user origin cannot be inferred from Rule.File", rejection.RuleID, rejection.Reason, want)
+			t.Errorf("rejected %q: got %q, want %q; shipped/user origin cannot be inferred from Rule.File", rejection.ID, rejection.Reason, want)
 		}
 	}
 }

@@ -96,7 +96,11 @@ export async function listPersons(range: ActorRange | Window, now = Date.now()):
     allAliases(),
   ]);
   const byPerson = new Map<string, Alias[]>();
-  for (const a of aliases) byPerson.set(a.person_id, [...(byPerson.get(a.person_id) ?? []), a]);
+  for (const a of aliases) {
+    const list = byPerson.get(a.person_id);
+    if (list) list.push(a);
+    else byPerson.set(a.person_id, [a]);
+  }
   const events = new Map<string, { events: number; last_ts: string | null }>();
   const incidents = new Map<string, number>();
   const plan = activityPlan(persons.map((p) => ({ id: p.person_id, aliases: byPerson.get(p.person_id) ?? [] })), w);

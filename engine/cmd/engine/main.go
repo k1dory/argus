@@ -88,14 +88,14 @@ func main() {
 
 // mustLoadSet — набор движка: без поставляемых правил запуск не имеет смысла,
 // отказы пользовательских возвращаются для отчёта.
-func mustLoadSet(dirs ruleSet) ([]*rules.Rule, []rejectedRule) {
+func mustLoadSet(dirs ruleSet) ([]*rules.Rule, []rules.RuleError) {
 	rs, rejected, err := dirs.load()
 	if err != nil {
 		slog.Error("rules", "err", err)
 		os.Exit(1)
 	}
 	for _, r := range rejected {
-		slog.Error("правило отвергнуто", "file", r.File, "rule", r.RuleID, "reason", r.Reason, "err", r.Err)
+		slog.Error("правило отвергнуто", "file", rejectKey(r), "rule", r.ID, "reason", r.Reason, "err", r.Err)
 	}
 	return rs, rejected
 }

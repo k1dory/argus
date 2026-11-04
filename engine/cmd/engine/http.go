@@ -69,7 +69,9 @@ func (e *engine) handler() http.Handler {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		fmt.Fprintf(w, "argus_engine_rules %d\n", len(e.current()))
 		fmt.Fprintf(w, "argus_engine_rules_reloads_total %d\n", e.m.reloads.Load())
+		fmt.Fprintf(w, "argus_engine_rules_reload_failures_total %d\n", e.m.reloadFailures.Load())
 		fmt.Fprintf(w, "argus_engine_rules_rejected %d\n", e.m.rulesRejected.Load())
+		fmt.Fprintf(w, "argus_engine_unclean_restarts_total %d\n", e.m.uncleanRestarts.Load())
 		fmt.Fprintf(w, "argus_engine_events_polled_total %d\n", e.m.eventsPolled.Load())
 		fmt.Fprintf(w, "argus_engine_incidents_created_total %d\n", e.m.incidentsCreated.Load())
 		fmt.Fprintf(w, "argus_engine_incidents_autoclosed_total %d\n", e.m.incidentsClosed.Load())
@@ -127,8 +129,20 @@ func (e *engine) handler() http.Handler {
 		writeJSON(w, http.StatusOK, map[string]any{"exception_fields": eval.ExceptionFields()})
 	}))
 	mux.HandleFunc("POST /reload", requireToken(e.token, func(w http.ResponseWriter, r *http.Request) {
-		e.maybeReload(true)
+		rejected := e.maybeReload(true)
 		e.maybeSyncIdentities(r.Context(), true) // identities.yml перечитывается вместе с правилами
+		if len(rejected) > 0 {
+			// Отказ не скрывается за 202: вызывающий видит файл и причину (текст ошибки
+			// разбора — строка и имя поля из правила, не данные событий).
+			list := make([]map[string]string, 0, len(rejected))
+			for _, re := range rejected {
+				list = append(list, map[string]string{"file": re.File, "error": re.Err.Error()})
+			}
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
+				"error": "правила отвергнуты — для них оставлен прежний набор", "rejected": list, "rules": len(e.current()),
+			})
+			return
+		}
 		w.WriteHeader(http.StatusAccepted)
 		fmt.Fprintf(w, "rules: %d\n", len(e.current()))
 	}))

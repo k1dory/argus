@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -96,6 +97,7 @@ func TestRuleSetReloadReportsRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.maybeReload(false)
+	e.flushRulesEvents(context.Background()) // события отказа пишет цикл (rules_events.go), не перечитывание
 	if e.m.rulesRejected.Load() != 1 || len(e.current()) != 1 || e.current()[0].Detection.Selection["action"] != "ship.action" {
 		t.Fatalf("после перечитывания: rejected=%d rules=%d", e.m.rulesRejected.Load(), len(e.current()))
 	}

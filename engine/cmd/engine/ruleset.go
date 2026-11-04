@@ -1,14 +1,11 @@
 package main
 
 import (
-	"context"
 	"errors"
+	"fmt"
 	"io/fs"
-	"log/slog"
 	"os"
-	"time"
 
-	"github.com/devitex-soft/argus/engine/internal/model"
 	"github.com/devitex-soft/argus/engine/internal/rules"
 )
 
@@ -19,10 +16,12 @@ import (
    не меняет их под ещё работающим старым движком (rc34, дубль INC-5312).
    Пользовательские правила — отдельный каталог хоста (RULES_USER_DIR,
    необязателен). Поставляемое правило главнее: пользовательское с тем же id
-   отвергается, а не подменяет штатный детект; сбой разбора пользовательского
-   каталога отвергает его целиком, но движок работает на поставляемых. Каждый
-   отказ — в журнал, метрику argus_engine_rules_rejected и событие
-   argus.system / rules.rejected (его ловит правило ops). */
+   отвергается (shipped_id_taken), а не подменяет штатный детект; повтор id внутри
+   пользовательских — duplicate_id; сбой разбора пользовательского каталога
+   отвергает его целиком, но движок работает на поставляемых. Отказы обоих
+   каталогов идут одним путём (rules_events.go): журнал, метрика
+   argus_engine_rules_rejected и событие argus.system / rules.rejected, object —
+   файл с префиксом каталога (shipped/ или user/); его ловит правило ops. */
 
 // ruleSet — поставляемый и пользовательский каталоги правил.
 type ruleSet struct {
@@ -31,20 +30,37 @@ type ruleSet struct {
 }
 
 // userPrefix — префикс Rule.File пользовательского правила: в списке правил и
-// в событии отказа видно, откуда оно.
-const userPrefix = "user/"
+// в событии отказа видно, откуда оно. shippedPrefix — префикс поставляемого
+// файла в событии отказа (Rule.File поставляемого — без префикса, как в rules list).
+const (
+	userPrefix    = "user/"
+	shippedPrefix = "shipped/"
+)
 
-// Причины отказа (attrs.reason события rules.rejected).
+// Причины отказа (attrs.reason события rules.rejected), кроме тех, что даёт
+// пакет rules (schema_unknown_field, invalid_value).
 const (
 	rejectShippedIDTaken = "shipped_id_taken"
 	rejectDuplicateID    = "duplicate_id"
 	rejectParseError     = "parse_error"
 )
 
-// rejectedRule — отвергнутое правило: файл (с префиксом каталога), id, если
-// разобран, код причины и текст ошибки (только для журнала).
-type rejectedRule struct {
-	File, RuleID, Reason, Err string
+// ruleKey — файл правила с префиксом каталога: ключ прежней версии при
+// перечитывании и object события отказа. Происхождение — по каталогу загрузки
+// (Rule.User), не по пути: поставляемый user/x.yml — shipped/user/x.yml.
+func ruleKey(r *rules.Rule) string {
+	if r.User {
+		return r.File
+	}
+	return shippedPrefix + r.File
+}
+
+// rejectKey — то же для отвергнутого файла.
+func rejectKey(re rules.RuleError) string {
+	if re.User {
+		return re.File
+	}
+	return shippedPrefix + re.File
 }
 
 // signature — отпечаток обоих каталогов: перечитывание при изменении любого.
@@ -56,77 +72,101 @@ func (s ruleSet) signature() string {
 	return sig
 }
 
-// load — правила обоих каталогов. Ошибка — только у поставляемого каталога
-// (без него детекта нет); отказы пользовательских — в rejected.
-func (s ruleSet) load() ([]*rules.Rule, []rejectedRule, error) {
-	out, err := rules.Load(s.shipped)
+// loadEach — правила обоих каталогов по файлам, без проверки повторов id (её
+// делает resolveRuleSet, зная прежний набор). Отвергнутые файлы поставляемого
+// каталога — в rejected по одному; ошибка — только если он не прочитан. Любой
+// сбой пользовательского каталога (нечитаемый каталог или файл, FIFO, сверх
+// предела размера, ошибка разбора) отвергает его целиком: одна запись user/.
+func (s ruleSet) loadEach() (shipped, user []*rules.Rule, rejected []rules.RuleError, err error) {
+	shipped, rejected, err = rules.LoadEach(s.shipped)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if s.user == "" {
+		return shipped, nil, rejected, nil
+	}
+	if _, err := os.Stat(s.user); errors.Is(err, fs.ErrNotExist) {
+		return shipped, nil, rejected, nil
+	}
+	us, bad, err := rules.LoadEach(s.user)
+	if err == nil && len(bad) > 0 {
+		errs := make([]error, len(bad))
+		for i := range bad {
+			errs[i] = bad[i]
+		}
+		err = errors.Join(errs...)
+	}
+	if err != nil {
+		return shipped, nil, append(rejected, rules.RuleError{File: userPrefix, Reason: rejectParseError, Err: err, User: true}), nil
+	}
+	for _, r := range us {
+		r.File, r.User = userPrefix+r.File, true
+	}
+	return shipped, us, rejected, nil
+}
+
+// resolveRuleSet — по одному правилу на id. Внутри каждого каталога — DedupeIDs
+// (остаётся файл, активный с этим id; без него — первый по пути); затем
+// пользовательское с id поставляемого отвергается: поставляемое главнее, даже
+// если пользовательское было активно раньше. activeShipped / activeUser: id →
+// Rule.File прежнего набора по каталогам (nil — старт).
+func resolveRuleSet(shipped, user []*rules.Rule, activeShipped, activeUser map[string]string) (keptShipped, keptUser []*rules.Rule, rejected []rules.RuleError) {
+	keptShipped, rejected = rules.DedupeIDs(shipped, activeShipped)
+	taken := make(map[string]string, len(keptShipped))
+	for _, r := range keptShipped {
+		taken[r.ID] = r.File
+	}
+	free := make([]*rules.Rule, 0, len(user))
+	for _, r := range user {
+		if f, ok := taken[r.ID]; ok {
+			rejected = append(rejected, rules.RuleError{File: r.File, ID: r.ID, Reason: rejectShippedIDTaken, User: true,
+				Err: fmt.Errorf("id %s занят поставляемым правилом %s — пользовательское не применено", r.ID, shippedPrefix+f)})
+			continue
+		}
+		free = append(free, r)
+	}
+	keptUser, dup := rules.DedupeIDs(free, activeUser)
+	for i := range dup {
+		dup[i].User = true
+	}
+	return keptShipped, keptUser, append(rejected, dup...)
+}
+
+// uniqueRejections — по одной записи на файл (первая причина): сохранённая
+// прежняя версия, отвергнутая повторно, не удваивает отказ в метрике и событиях.
+func uniqueRejections(rejected []rules.RuleError) []rules.RuleError {
+	seen := make(map[string]bool, len(rejected))
+	out := rejected[:0]
+	for _, re := range rejected {
+		if k := rejectKey(re); !seen[k] {
+			seen[k] = true
+			out = append(out, re)
+		}
+	}
+	return out
+}
+
+// load — набор правил для CLI (rules list, rules test без --dir): поставляемые
+// строго — любой отказ в них ошибка (как rules.Load), пользовательские — как у
+// движка: битый каталог отвергнут целиком, повторы и занятые id — в rejected.
+func (s ruleSet) load() ([]*rules.Rule, []rules.RuleError, error) {
+	shipped, user, rejected, err := s.loadEach()
 	if err != nil {
 		return nil, nil, err
 	}
-	if s.user == "" {
-		return out, nil, nil
-	}
-	if _, err := os.Stat(s.user); errors.Is(err, fs.ErrNotExist) {
-		return out, nil, nil
-	}
-	us, err := rules.Load(s.user)
-	if err != nil {
-		return out, []rejectedRule{{File: userPrefix, Reason: rejectParseError, Err: err.Error()}}, nil
-	}
-	// id → файл и каталог владельца: происхождение — по каталогу, из которого
-	// правило загружено, а не по префиксу пути (поставляемый rules/user/x.yml —
-	// всё равно поставляемый).
-	type owner struct {
-		file string
-		user bool
-	}
-	taken := make(map[string]owner, len(out)+len(us))
-	for _, r := range out {
-		taken[r.ID] = owner{file: r.File}
-	}
-	var rejected []rejectedRule
-	for _, r := range us {
-		file := userPrefix + r.File
-		if o, dup := taken[r.ID]; dup {
-			reason := rejectDuplicateID
-			if !o.user {
-				reason = rejectShippedIDTaken
-			}
-			rejected = append(rejected, rejectedRule{File: file, RuleID: r.ID, Reason: reason, Err: "id " + r.ID + " уже занят: " + o.file})
-			continue
+	shipped, user, dup := resolveRuleSet(shipped, user, nil, nil)
+	rejected = append(rejected, dup...)
+	var userRejected []rules.RuleError
+	var errs []error
+	for _, re := range rejected {
+		if re.User {
+			userRejected = append(userRejected, re)
+		} else {
+			errs = append(errs, re)
 		}
-		r.File = file
-		taken[r.ID] = owner{file: file, user: true}
-		out = append(out, r)
 	}
-	return out, rejected, nil
-}
-
-// reportRejected — отказы набора правил: журнал, метрика и по событию на каждый
-// отказ (best effort: без хранилища — только журнал и метрика).
-func (e *engine) reportRejected(ctx context.Context, rejected []rejectedRule, now time.Time) {
-	e.m.rulesRejected.Store(int64(len(rejected)))
-	if len(rejected) == 0 {
-		return
+	if len(errs) > 0 {
+		return nil, nil, errors.Join(errs...)
 	}
-	events := make([]*model.Event, 0, len(rejected))
-	for _, r := range rejected {
-		slog.Error("правило отвергнуто — детект по нему не работает", "file", r.File, "rule", r.RuleID, "reason", r.Reason, "err", r.Err)
-		events = append(events, rulesRejectedEvent(now, e.ch.Host(), r.File, r.RuleID, r.Reason))
-	}
-	if err := e.ch.InsertEvents(ctx, events); err != nil {
-		slog.Warn("rules.rejected: события не записаны", "err", err)
-	}
-}
-
-// rulesRejectedEvent — событие единой схемы об отвергнутом правиле. Текста
-// ошибки и содержимого правила в нём нет: только файл, id и код причины.
-func rulesRejectedEvent(now time.Time, node, file, ruleID, reason string) *model.Event {
-	ev := &model.Event{
-		TS: model.FormatTS(now), Source: systemSource, SourceClass: "telemetry", Vendor: "ARGUS", Product: "engine",
-		Action: "rules.rejected", Outcome: "failure", ActorName: "argus-engine", ActorKind: "system",
-		Object: file, Node: node,
-		Attrs: map[string]string{"transport": "internal", "rule_id": ruleID, "reason": reason},
-	}
-	return ev
+	return append(shipped, user...), userRejected, nil
 }

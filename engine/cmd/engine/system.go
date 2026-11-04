@@ -72,6 +72,26 @@ func diskEvent(now time.Time, node string, d store.Disk, freeRatio float64) *mod
 	return ev
 }
 
+// rulesRejectedEvent — событие единой схемы об отвергнутом правиле (rules_events.go):
+// object — файл правила с префиксом каталога (shipped/ или user/, ruleKey),
+// attrs.rule_id (если разобран), attrs.reason — короткий код (schema_unknown_field |
+// duplicate_id | parse_error | invalid_value | shipped_id_taken); текст ошибки — только в журнал движка, не в событие.
+func rulesRejectedEvent(now time.Time, node, file, ruleID, reason string) *model.Event {
+	ev := &model.Event{
+		TS: model.FormatTS(now), Source: systemSource, SourceClass: "telemetry", Vendor: "ARGUS", Product: "engine",
+		Action: "rules.rejected", Outcome: "failure", ActorName: "argus-engine", ActorKind: "system",
+		Object: file, Node: node, Attrs: map[string]string{"transport": "internal"},
+	}
+	if ruleID != "" {
+		ev.Attrs["rule_id"] = ruleID
+	}
+	if reason != "" {
+		ev.Attrs["reason"] = reason
+	}
+	ev.Ensure()
+	return ev
+}
+
 // stormIncidents — по отброшенным сработкам: завести или дописать инцидент
 // «шторм» на правило, закрыть стихшие. Возвращает инциденты к записи.
 func (e *engine) stormIncidents(ctx context.Context, dropped map[string]int, now time.Time) []*incidents.Incident {

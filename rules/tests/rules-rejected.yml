@@ -1,0 +1,7 @@
+# Отвергнуты два файла: ops/collector-clock-skew.yml (дважды — один инцидент) и
+# custom/dup.yml; событие с attrs.transport не internal (пришло через ingest) — не в счёт.
+rule: a41c-ops-068
+fixture: fixtures/events/rules-rejected.ndjson
+expect_incidents: 2
+expect_actor: ops/collector-clock-skew.yml
+min_events: 1
