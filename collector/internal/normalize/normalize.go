@@ -138,7 +138,8 @@ func blankLongDigits(s string) string {
 	b.Grow(len(s))
 	last := 0
 	for _, m := range idx {
-		if m[0] > 0 && s[m[0]-1] == '+' {
+		// «+» и не больше 15 цифр (предел E.164) — телефон; длиннее — идентификатор.
+		if m[0] > 0 && s[m[0]-1] == '+' && m[1]-m[0] <= 15 {
 			continue
 		}
 		b.WriteString(s[last:m[0]])
