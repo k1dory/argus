@@ -170,8 +170,14 @@ export function encodeParam(value: string | number, type: string | undefined): s
 export const PARAMS_IN_URL_MAX = 64 * 1024;
 /** Предел значения поля формы ClickHouse (http_max_field_value_size, 128 КиБ на 24.8) с запасом. */
 export const FORM_FIELD_MAX = 120 * 1024;
-/** Параметры в URL при длинном SQL — пока URI не ближе запаса к http_max_uri_size (1 MiB). */
-export const URI_PARAMS_MAX = 960 * 1024;
+/** URI запроса не длиннее стольких байт: http_max_uri_size (1 MiB) с запасом. */
+export const URI_MAX = 1000 * 1024;
+
+/** URL в пределах ClickHouse: весь URI и каждое поле — в том виде, в каком уходят. */
+function urlFits(url: URL): boolean {
+  if (Buffer.byteLength(url.pathname + url.search, "utf8") > URI_MAX) return false;
+  return url.search.slice(1).split("&").every((part) => part.length - part.indexOf("=") - 1 <= FORM_FIELD_MAX);
+}
 
 /** Граница multipart, которой нет ни в одной части. */
 function multipartBoundary(parts: string[]): string {
@@ -186,7 +192,7 @@ function chFetch(sql: string, params: Record<string, string | number>, settings:
 }
 
 async function chFetchWithSlot(sql: string, params: Record<string, string | number>, settings: ChSettings, format: string | null): Promise<string> {
-  const url = new URL(CH_URL);
+  let url = new URL(CH_URL);
   // null убирает настройку совсем, в том числе заданную в самом CLICKHOUSE_URL.
   for (const [key, value] of Object.entries({ ...DEFAULT_SETTINGS, ...settings })) {
     if (value === null) url.searchParams.delete(key);
@@ -202,21 +208,38 @@ async function chFetchWithSlot(sql: string, params: Record<string, string | numb
   // Параметры — в URL, пока он короткий; большие (массивы значений сотен персон) — телом
   // multipart/form-data вместе с запросом: URI ClickHouse не длиннее 1 MiB
   // (http_max_uri_size), и запрос с тысячей персон иначе получил бы HTTP 414. Только для
-  // чтения: у INSERT в теле — данные. В multipart запрос — тоже поле формы, а у поля (и у
-  // параметра URL — его разбирает тот же HTMLForm) предел FORM_FIELD_MAX байт: SQL длиннее
-  // уходит телом text/plain, параметры — в URL, если он помещается.
+  // чтения: у INSERT в теле — данные. У каждого поля формы предел FORM_FIELD_MAX: в
+  // multipart — сырое значение (и запрос — тоже поле), в URL — percent-encoded строка, до
+  // декодирования (HTMLForm::readQuery). Поэтому вариант с URL проверяется по URL,
+  // собранному тем же URLSearchParams, а не по оценке: «~» там уже %7E.
   let body: string = sql;
   let contentType = "text/plain";
-  const urlBytes = encoded.reduce((n, [k, v]) => n + k.length + encodeURIComponent(v).length + 2, 0);
-  const multipart = urlBytes > PARAMS_IN_URL_MAX && !/^\s*INSERT\b/i.test(sql)
-    && !(Buffer.byteLength(sql, "utf8") > FORM_FIELD_MAX && urlBytes <= URI_PARAMS_MAX);
-  if (multipart) {
+  const isInsert = /^\s*INSERT\b/i.test(sql);
+  const withParams = new URL(url);
+  for (const [key, value] of encoded) withParams.searchParams.set(key, value);
+  const fitsUrl = urlFits(withParams);
+  // В multipart уходят только query и param_*: настройки и поля CLICKHOUSE_URL остаются в
+  // URL, и он сам должен помещаться (log_comment из 15 000 иероглифов — 135 КБ в URL).
+  const fitsForm = urlFits(url) && Buffer.byteLength(sql, "utf8") <= FORM_FIELD_MAX
+    && encoded.every(([, v]) => Buffer.byteLength(v, "utf8") <= FORM_FIELD_MAX);
+  const short = Buffer.byteLength(withParams.search, "utf8") - Buffer.byteLength(url.search, "utf8") <= PARAMS_IN_URL_MAX;
+  // INSERT: данные в теле, параметры — всегда в URL, и он проверяется так же.
+  const transport = isInsert ? (fitsUrl ? "url" : null)
+    : short && fitsUrl ? "url" : fitsForm ? "form" : fitsUrl ? "url" : null;
+  if (transport === null) {
+    // Ни так, ни так ClickHouse запрос не примет (414 или «Field value too long») — ошибка
+    // здесь, с размерами, а не непонятный ответ сервера. В журнал — только размеры и SQL без данных.
+    const message = `запрос не помещается в HTTP ClickHouse: SQL ${Buffer.byteLength(sql, "utf8")} байт, параметров ${encoded.length}, URL ${Buffer.byteLength(withParams.pathname + withParams.search, "utf8")} байт`;
+    console.error(`clickhouse: ${message}`, "\nSQL:", sqlForLog(sql));
+    throw new ClickHouseError(message, null, null);
+  }
+  if (transport === "form") {
     const boundary = multipartBoundary([sql, ...encoded.map(([, v]) => v)]);
     contentType = `multipart/form-data; boundary=${boundary}`;
     body = [["query", sql] as const, ...encoded].map(([name, value]) =>
       `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`).join("") + `--${boundary}--\r\n`;
   } else {
-    for (const [key, value] of encoded) url.searchParams.set(key, value);
+    url = withParams;
   }
   let resp: Response;
   try {

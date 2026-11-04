@@ -1,0 +1,32 @@
+# Вошедший пользователь работает с опубликованным сервисом из чужой страны: прокси
+# сообщил учётную запись (actor.kind=user) и ответ без отказа. Это уже не просто
+# география (proxy-foreign-access, a41c-net-076), а доступ под нашей учётной записью
+# оттуда, где сотрудников нет — признак чужих учётных данных. NetBird-прокси без
+# аутентификации пользователя не передаёт, такие события сюда не попадают.
+title: "Proxy: user session from outside the expected country"
+id: a41c-net-077
+level: medium
+tags: [attack.initial_access, attack.t1078]   # ATT&CK v20: Valid Accounts — вход под действующей учётной записью
+
+detection:
+  selection:
+    action: proxy.access
+    outcome: success
+    actor.kind: user
+    # Учётная запись должна быть названа: без имени ключом стал бы узел прокси, а
+    # T1078 — утверждением про учётку, которой в событии нет. \S в RE2 — только ASCII:
+    # класс ниже — «не unicode.IsSpace» (ASCII-пробелы, \v, U+0085 и категория Z).
+    actor.name|regex: '[^\s\v\x{85}\p{Z}]'
+    attrs.country: 'not RU'
+    attrs.country|regex: '^[A-Za-z]{2}$'
+  threshold:
+    kind: count
+    count: 1
+    window: 1h
+    # Локальные учётки разных сервисов (portal-a/admin и portal-b/admin) — разные
+    # учётные записи: область — узел прокси (хост сервиса).
+    group_by: actor.name, node
+  condition: selection and threshold
+
+analyst:
+  profile: on-prem-strict

@@ -43,6 +43,7 @@ type metrics struct {
 	reloads          atomic.Int64
 	reloadFailures   atomic.Int64 // перечитываний, в которых правила отвергнуты (набор частично прежний)
 	rulesRejected    atomic.Int64 // отвергнутых правил в последней загрузке
+	uncleanRestarts  atomic.Int64 // старт после оборванного прошлого запуска (lifecycle.go)
 	lastRun          atomic.Int64
 	diskFreePermille atomic.Int64 // свободно на самом заполненном диске ClickHouse, ‰
 	autoBlocks       atomic.Int64
@@ -105,6 +106,8 @@ type engine struct {
 	// потолок буфера (ENGINE_BUFFER_MAX) их не выбрасывает. Пишет и читает только
 	// главный цикл (loop → ingest → cycle).
 	absence *eval.AbsenceState
+
+	cgroupEvents string // memory.events cgroup: счётчик oom_kill для engine.restarted
 
 	excWarnMu sync.Mutex
 	excWarned map[string]bool
@@ -305,7 +308,7 @@ func newEngine(ctx context.Context, rulesDir string, rs []*rules.Rule, acfg anal
 		respState: map[string]respEntry{},
 		respKeys:  map[string]*respKey{}, respFlight: map[string]bool{}, respSlots: map[string]map[string]time.Time{},
 		respDeferred: map[string]*incidents.Incident{}, respExcluded: map[string]exclusion{},
-		excWarned: map[string]bool{},
+		excWarned: map[string]bool{}, cgroupEvents: cgroupMemoryEvents,
 		identFile: env("IDENTITIES_FILE", ""),
 		absence:   eval.NewAbsenceState(0),
 	}
@@ -403,6 +406,13 @@ func run(rulesDir string) {
 	e.startAnalystWorkers()
 	e.hooks.Start(ctx)
 	go e.serveHTTP(ctx, env("LISTEN_ADDR", ":8090"))
+	if addr := env("ENGINE_PPROF_ADDR", ""); addr != "" {
+		if e.mtoken == "" && os.Getenv("ARGUS_DEV") != "1" {
+			slog.Error("ENGINE_PPROF_ADDR без METRICS_TOKEN/ENGINE_TOKEN — pprof не поднят")
+		} else {
+			go e.servePprof(ctx, addr)
+		}
+	}
 	if raw := env("RISK_REPORT_INTERVAL", ""); raw != "" {
 		interval, err := time.ParseDuration(raw)
 		if err != nil || interval < time.Hour {
@@ -430,6 +440,7 @@ func run(rulesDir string) {
 			restored := e.restoreRespState(open, time.Now())
 			e.restoreKeys(ctx, time.Now())
 			slog.Info("engine started", "rules", len(rs), "open_incidents", len(open), "respond_restored", restored, "next", maxN+1, "poll", poll)
+			e.announceStart(ctx, time.Now())
 			break
 		}
 		slog.Warn("clickhouse недоступен, жду", "err", err)
@@ -440,6 +451,7 @@ func run(rulesDir string) {
 		}
 	}
 	e.loop(ctx, poll)
+	e.announceStop(time.Now())
 	// ctx уже отменён: недоставленное из очереди и отложенные повторы не
 	// выполнятся (отметок о них нет — после перезапуска они не повторятся),
 	// ждём только выхода воркеров с текущей попыткой.

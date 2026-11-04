@@ -273,3 +273,33 @@ func TestRespondBlockCapAndSubnet(t *testing.T) {
 		t.Fatalf("цели: %v", targets)
 	}
 }
+
+func TestInternalModifier(t *testing.T) {
+	yml := "title: m\nid: m-2\nlevel: low\ndetection:\n  selection:\n    src.ip|internal: %s\n  condition: selection\n"
+	t.Setenv("INTERNAL_NETS", "")
+	in := load(t, fmt.Sprintf(yml, "true"))
+	out := load(t, fmt.Sprintf(yml, "false"))
+	for ip, want := range map[string]bool{
+		"10.1.2.3": true, "100.64.0.1": true, "FD12::5": true, "0:0:0:0:0:0:0:1": true, "::FFFF:C0A8:105": true,
+		"203.0.113.7": false, "100.128.0.1": false, "2001:db8::1": false, "": false, "not-an-ip": false,
+	} {
+		e := &model.Event{SrcIP: ip}
+		if in.Match(e) != want || out.Match(e) == want {
+			t.Errorf("%q: internal=%v, ожидалось %v (false — обратное)", ip, in.Match(e), want)
+		}
+	}
+	// Непустой INTERNAL_NETS заменяет умолчания, как у коллектора.
+	t.Setenv("INTERNAL_NETS", "185.25.9.0/24")
+	own := load(t, fmt.Sprintf(yml, "true"))
+	if !own.Match(&model.Event{SrcIP: "185.25.9.42"}) || own.Match(&model.Event{SrcIP: "10.1.2.3"}) {
+		t.Error("INTERNAL_NETS должен задавать свои сети вместо умолчаний")
+	}
+	for _, bad := range []struct{ nets, val string }{{"", "maybe"}, {"10.0.0.0/33", "true"}} {
+		t.Setenv("INTERNAL_NETS", bad.nets)
+		p := filepath.Join(t.TempDir(), "r.yml")
+		_ = os.WriteFile(p, []byte(fmt.Sprintf(yml, bad.val)), 0o600)
+		if _, err := LoadFile(p); err == nil {
+			t.Errorf("INTERNAL_NETS=%q, значение %q: ожидалась ошибка загрузки", bad.nets, bad.val)
+		}
+	}
+}

@@ -1,0 +1,7 @@
+# argus-ch: три оборванных старта за 20 минут — инцидент; одиночный на другом узле
+# и подделка с transport http — не в счёт.
+rule: a41c-ops-069
+fixture: fixtures/events/engine-restart-loop.ndjson
+expect_incidents: 1
+expect_actor: argus-ch
+min_events: 3

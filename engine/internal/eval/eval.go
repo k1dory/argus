@@ -159,6 +159,34 @@ func groupKey(keyOf func(*model.Event) string, e *model.Event) string {
 type window struct {
 	events []*model.Event
 	fired  bool
+	det    int            // индекс текущей сработки группы в out (при fired)
+	vals   map[string]int // distinct: значение поля → событий с ним в окне
+}
+
+// add / drop — учёт значения distinct при входе события в окно и выходе из него.
+func (g *window) add(valueOf func(*model.Event) string, e *model.Event) {
+	if valueOf == nil {
+		return
+	}
+	if v := valueOf(e); v != "" {
+		if g.vals == nil {
+			g.vals = map[string]int{}
+		}
+		g.vals[v]++
+	}
+}
+
+func (g *window) drop(valueOf func(*model.Event) string, evs []*model.Event) {
+	if valueOf == nil {
+		return
+	}
+	for _, e := range evs {
+		if v := valueOf(e); v != "" {
+			if g.vals[v]--; g.vals[v] <= 0 {
+				delete(g.vals, v)
+			}
+		}
+	}
 }
 
 // runRule — сработки одного правила. absence — последние события групп правила
@@ -186,7 +214,7 @@ func runRule(r *rules.Rule, events []*model.Event, now time.Time, absence map[st
 		// любые три за окно.
 		if r.UsesReset() && r.MatchReset(e) {
 			if g := groups[groupKey(keyOf, e)]; g != nil {
-				g.events, g.fired = nil, false
+				g.events, g.fired, g.vals = nil, false, nil
 			}
 			continue
 		}
@@ -206,37 +234,61 @@ func runRule(r *rules.Rule, events []*model.Event, now time.Time, absence map[st
 			i++
 		}
 		if i > 0 {
+			g.drop(valueOf, g.events[:i])
 			g.events = g.events[i:]
-			g.fired = false
+			// Срез держит выбывшие события в общем массиве; когда окно занимает
+			// меньше половины ёмкости — уплотняем (амортизированно O(1) на событие,
+			// без копии окна на каждом сдвиге).
+			if cap(g.events) > 64 && len(g.events) < cap(g.events)/2 {
+				g.events = append(make([]*model.Event, 0, 2*len(g.events)+1), g.events...)
+			}
 		}
 		g.events = append(g.events, e)
+		g.add(valueOf, e)
+		// Сдвиг окна сам по себе серию не обрывает: пока группа держит порог,
+		// события дописываются в ту же сработку. Прежде сработка
+		// заводилась заново на каждом событии после сдвига — с копией всего окна:
+		// сканер с 40 тыс. событий давал десятки тысяч сработок и O(n²) памяти
+		// (OOM движка на argus1, 02.11).
+		if g.fired {
+			switch {
+			case kind == "":
+				// без порога окно — склейка от начала сработки: её первое событие вышло
+				// из окна — следующее заводит новую (dedupe: 24h — «раз в сутки»)
+				if out[g.det].First.Before(cut) {
+					g.fired = false
+				}
+			case i > 0 && !holds(kind, th, g, valueOf):
+				g.fired = false
+			}
+		}
 
 		switch kind {
 		case "": // без порога: первое событие в окне заводит сработку, остальные склеиваются
 			if !g.fired {
-				g.fired = true
+				g.fired, g.det = true, len(out)
 				out = append(out, Detection{Rule: r, Key: key, Events: []*model.Event{e}, First: t, Last: t})
 			} else {
-				appendTo(out, r, key, e, t)
+				appendAt(out, g.det, e, t)
 			}
 		case "distinct", "count", "consecutive":
 			if g.fired {
-				appendTo(out, r, key, e, t)
+				appendAt(out, g.det, e, t)
 				continue
 			}
-			if reached(th, g.events, valueOf) {
-				g.fired = true
+			if reachedWindow(th, g, valueOf) {
+				g.fired, g.det = true, len(out)
 				evs := make([]*model.Event, len(g.events))
 				copy(evs, g.events)
 				out = append(out, Detection{Rule: r, Key: key, Events: evs, First: evs[0].Time(), Last: t})
 			}
 		case "periodic":
 			if g.fired {
-				appendTo(out, r, key, e, t)
+				appendAt(out, g.det, e, t)
 				continue
 			}
 			if ok, reason := periodic(th, g.events); ok {
-				g.fired = true
+				g.fired, g.det = true, len(out)
 				evs := make([]*model.Event, len(g.events))
 				copy(evs, g.events)
 				out = append(out, Detection{Rule: r, Key: key, Events: evs, First: evs[0].Time(), Last: t, Reason: reason})
@@ -278,14 +330,34 @@ func runRule(r *rules.Rule, events []*model.Event, now time.Time, absence map[st
 	return out
 }
 
-func appendTo(out []Detection, r *rules.Rule, key string, e *model.Event, t time.Time) {
-	for j := len(out) - 1; j >= 0; j-- {
-		if out[j].Rule == r && out[j].Key == key {
-			out[j].Events = append(out[j].Events, e)
-			out[j].Last = t
-			return
-		}
+// appendAt — событие в текущую сработку группы (индекс в out хранит окно).
+func appendAt(out []Detection, i int, e *model.Event, t time.Time) {
+	out[i].Events = append(out[i].Events, e)
+	out[i].Last = t
+}
+
+// holds — серия группы с порогом продолжается после сдвига окна, пока порог держится.
+func holds(kind string, th *rules.Threshold, g *window, valueOf func(*model.Event) string) bool {
+	switch kind {
+	case "distinct", "count", "consecutive":
+		return reachedWindow(th, g, valueOf)
+	case "periodic":
+		ok, _ := periodic(th, g.events)
+		return ok
 	}
+	return false
+}
+
+// reachedWindow — порог по окну группы: distinct — по счётчикам значений окна
+// (без прохода по событиям), count — по длине окна.
+func reachedWindow(th *rules.Threshold, g *window, valueOf func(*model.Event) string) bool {
+	if th.Distinct > 0 && valueOf != nil && len(g.vals) < th.Distinct {
+		return false
+	}
+	if th.Count > 0 && len(g.events) < th.Count {
+		return false
+	}
+	return true
 }
 
 func reached(th *rules.Threshold, evs []*model.Event, valueOf func(*model.Event) string) bool {
