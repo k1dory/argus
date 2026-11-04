@@ -265,26 +265,29 @@ func needsClean(s string) bool {
 }
 
 func strip(s string) string {
-	var b strings.Builder
-	b.Grow(len(s))
+	// Буфер со «снятием вершины»: удаление C0 между 0xC2 и продолжением склеивает
+	// новую C1-пару (\xc2\x00\x80 → U+0080). Такая пара снимается сразу, и одна
+	// чистка даёт неподвижную точку за линейное время, без повторных проходов.
+	b := make([]byte, 0, len(s))
 	for i := 0; i < len(s); {
 		c := s[i]
 		switch {
 		case c == 0x1b: // ESC: CSI «\x1b[...m», OSC «\x1b]...BEL», либо двухбайтовая
 			i += skipEscape(s[i:])
 		case c == '\n' || c == '\r':
-			b.WriteByte(' ')
+			b = append(b, ' ')
 			i++
 		case c < 0x20 && c != '\t', c == 0x7f:
 			i++
-		case c == 0xc2 && i+1 < len(s) && s[i+1] >= 0x80 && s[i+1] <= 0x9f: // C1
-			i += 2
+		case c >= 0x80 && c <= 0x9f && len(b) > 0 && b[len(b)-1] == 0xc2: // C1, в т.ч. склеенный
+			b = b[:len(b)-1]
+			i++
 		default:
-			b.WriteByte(c)
+			b = append(b, c)
 			i++
 		}
 	}
-	return b.String()
+	return string(b)
 }
 
 // skipEscape возвращает длину ESC-последовательности, начинающейся в s[0].

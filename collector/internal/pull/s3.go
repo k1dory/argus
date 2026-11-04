@@ -307,6 +307,11 @@ func (s *S3) fetchFrom(ctx context.Context, key string, skip int) (done, n int, 
 		if e.Source == "" {
 			e.Source = s.cfg.Name
 		}
+		// Происхождение ставит коллектор: peer, peer_cn, scope, transport и
+		// ts_original из содержимого объекта не принимаются.
+		for k := range model.ProvenanceAttrs {
+			delete(e.Attrs, k)
+		}
 		e.Ensure()
 		s.Emit(e)
 		n++
