@@ -14,8 +14,9 @@ detection:
     outcome: success
     actor.kind: user
     # Учётная запись должна быть названа: без имени ключом стал бы узел прокси, а
-    # T1078 — утверждением про учётку, которой в событии нет.
-    actor.name|regex: '\S'
+    # T1078 — утверждением про учётку, которой в событии нет. \S в RE2 — только ASCII:
+    # класс ниже — «не unicode.IsSpace» (ASCII-пробелы, \v, U+0085 и категория Z).
+    actor.name|regex: '[^\s\v\x{85}\p{Z}]'
     attrs.country: 'not RU'
     attrs.country|regex: '^[A-Za-z]{2}$'
   threshold:
