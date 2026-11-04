@@ -532,32 +532,43 @@ func (c *ClickHouse) Disks(ctx context.Context) ([]Disk, error) {
 	return disks, nil
 }
 
+// EngineLifecycle — последнее событие жизненного цикла движка узла.
+type EngineLifecycle struct {
+	Action  string `json:"action"`   // engine.started | engine.stopped; "" — первый запуск
+	At      string `json:"at"`       // ts события
+	OOMKill string `json:"oom_kill"` // счётчик oom_kill cgroup на тот момент ("" — не прочитан)
+}
+
 // LastEngineLifecycle — последнее событие жизненного цикла движка этого узла
-// (engine.started | engine.stopped, attrs.transport internal) за 30 дней: "" —
-// такого нет (первый запуск). По нему старт отличает штатный перезапуск от
-// оборванного (OOM, kill): после started без stopped прошлый процесс не дошёл до
-// штатной остановки.
-func (c *ClickHouse) LastEngineLifecycle(ctx context.Context, node string) (action, ts string, err error) {
-	out, err := c.do(ctx, `SELECT action, toString(ts) AS at FROM events
-		WHERE ts >= now() - INTERVAL 30 DAY AND source_class = 'telemetry' AND source = 'argus.system'
+// (engine.started | engine.stopped, attrs.transport internal) за весь срок
+// хранения events (TTL 180 дней): после месяца работы аварийный рестарт иначе
+// выглядел бы первым запуском. Чтение — от новых к старым до первой строки
+// (ORDER BY ts DESC LIMIT 1), обычно — последние парты. По нему старт отличает
+// штатный перезапуск от оборванного (OOM, kill).
+func (c *ClickHouse) LastEngineLifecycle(ctx context.Context, node string) (action, at string, err error) {
+	row, err := c.LastEngineLifecycleRow(ctx, node)
+	return row.Action, row.At, err
+}
+
+// LastEngineLifecycleRow — то же со снимком oom_kill прошлого старта.
+func (c *ClickHouse) LastEngineLifecycleRow(ctx context.Context, node string) (EngineLifecycle, error) {
+	out, err := c.do(ctx, `SELECT action, toString(ts) AS at, attrs['oom_kill'] AS oom_kill FROM events
+		WHERE ts >= now() - INTERVAL 180 DAY AND source_class = 'telemetry' AND source = 'argus.system'
 		  AND product = 'engine' AND node = {node:String} AND action IN ('engine.started', 'engine.stopped')
 		  AND attrs['transport'] = 'internal'
 		ORDER BY ts DESC LIMIT 1 FORMAT JSONEachRow`, nil, map[string]string{"node": node})
 	if err != nil {
-		return "", "", err
+		return EngineLifecycle{}, err
 	}
 	line := bytes.TrimSpace(out)
 	if len(line) == 0 {
-		return "", "", nil
+		return EngineLifecycle{}, nil
 	}
-	var row struct {
-		Action string `json:"action"`
-		At     string `json:"at"`
-	}
+	var row EngineLifecycle
 	if err := json.Unmarshal(line, &row); err != nil {
-		return "", "", errors.New("events: неожиданная строка ответа ClickHouse")
+		return EngineLifecycle{}, errors.New("events: неожиданная строка ответа ClickHouse")
 	}
-	return row.Action, row.At, nil
+	return row, nil
 }
 
 // OperatorState — актуальные статус/владелец/заметка инцидентов, как их

@@ -53,30 +53,46 @@ func cgroupOOMKills(path string) int {
 
 const cgroupMemoryEvents = "/sys/fs/cgroup/memory.events"
 
+// restartReason — oom, только если oom_kill вырос с прошлого старта: счётчик
+// накопительный, и старый OOM живой cgroup не причина нынешнего обрыва. Счётчик
+// меньше прежнего — cgroup пересоздана, тогда oom — по любому ненулевому. Без
+// прежнего снимка — по ненулевому.
+func restartReason(prev string, cur int) string {
+	if cur <= 0 {
+		return "unclean"
+	}
+	if p, err := strconv.Atoi(prev); err == nil && cur == p {
+		return "unclean"
+	}
+	return "oom"
+}
+
 // announceStart — engine.restarted (если прошлый запуск оборвался) и engine.started.
 // Сбой хранилища не останавливает старт: событие — наблюдаемость, не условие работы.
 func (e *engine) announceStart(ctx context.Context, now time.Time) {
 	node := e.ch.Host()
 	var events []*model.Event
-	last, lastTS, err := e.ch.LastEngineLifecycle(ctx, node)
+	last, err := e.ch.LastEngineLifecycleRow(ctx, node)
 	if err != nil {
 		slog.Warn("жизненный цикл: прошлый запуск не прочитан", "err", err)
 	}
 	oom := cgroupOOMKills(e.cgroupEvents)
-	if last == "engine.started" {
-		reason := "unclean"
-		if oom > 0 {
-			reason = "oom"
-		}
-		attrs := map[string]string{"reason": reason, "previous_start": lastTS}
+	var startAttrs map[string]string
+	if oom >= 0 {
+		// снимок счётчика: следующий старт считает причину по приросту
+		startAttrs = map[string]string{"oom_kill": strconv.Itoa(oom)}
+	}
+	if last.Action == "engine.started" {
+		reason := restartReason(last.OOMKill, oom)
+		attrs := map[string]string{"reason": reason, "previous_start": last.At}
 		if oom >= 0 {
 			attrs["oom_kill"] = strconv.Itoa(oom)
 		}
 		e.m.uncleanRestarts.Add(1)
-		slog.Error("прошлый запуск движка оборвался без штатной остановки", "reason", reason, "previous_start", lastTS, "oom_kill", oom)
+		slog.Error("прошлый запуск движка оборвался без штатной остановки", "reason", reason, "previous_start", last.At, "oom_kill", oom, "oom_kill_at_start", last.OOMKill)
 		events = append(events, lifecycleEvent(now, node, "engine.restarted", "failure", attrs))
 	}
-	events = append(events, lifecycleEvent(now, node, "engine.started", "success", nil))
+	events = append(events, lifecycleEvent(now, node, "engine.started", "success", startAttrs))
 	if err := e.ch.InsertEvents(ctx, events); err != nil {
 		slog.Warn("жизненный цикл: события старта не записаны", "err", err)
 	}

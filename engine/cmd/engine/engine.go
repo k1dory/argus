@@ -377,7 +377,13 @@ func run(rulesDir string) {
 			restored := e.restoreRespState(open, time.Now())
 			e.restoreKeys(ctx, time.Now())
 			slog.Info("engine started", "rules", len(rs), "open_incidents", len(open), "respond_restored", restored, "next", maxN+1, "poll", poll)
-			e.announceStart(ctx, time.Now())
+			// Поиск прошлого запуска идёт по всему сроку хранения events: на первом
+			// запуске это может быть долго — детект его не ждёт.
+			go func(at time.Time) {
+				actx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+				defer cancel()
+				e.announceStart(actx, at)
+			}(time.Now())
 			break
 		}
 		slog.Warn("clickhouse недоступен, жду", "err", err)
