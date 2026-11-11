@@ -53,9 +53,11 @@ class BackupCronTest(unittest.TestCase):
         )
 
     def test_garbage_and_zero_rejected_before_cron(self):
-        for bad in ("2; rm -rf /", "0", "7d", "-1"):
-            self.assertFalse(assert_ok(argus_backup_keep_days=bad), bad)
-        self.assertFalse(assert_ok(argus_backup_reserve_mb="10G"))
+        for bad in ("2; rm -rf /", "0", "7d", "-1", "08", "2\n", "\n", "2\r\n", " 2"):
+            self.assertFalse(assert_ok(argus_backup_keep_days=bad), repr(bad))
+        for bad in ("10G", "01024", "20480\n", "\n", "99999999"):
+            self.assertFalse(assert_ok(argus_backup_reserve_mb=bad), repr(bad))
+        self.assertTrue(assert_ok(argus_backup_keep_days="9999", argus_backup_reserve_mb="0"))
         self.assertLess(NAMES.index("Резервные копии — проверка ротации и резерва"),
                         NAMES.index("Резервные копии по cron"))
 

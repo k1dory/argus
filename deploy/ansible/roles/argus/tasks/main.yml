@@ -416,9 +416,13 @@
 # из мусора, а BACKUP_KEEP_DAYS=0 — удаление всех наборов старше суток.
 - name: Резервные копии — проверка ротации и резерва
   ansible.builtin.assert:
+    # `$` в re допускает завершающий перевод строки — он разорвал бы строку
+    # crontab, поэтому значение ещё и сверяется с собой после trim.
     that:
       - argus_backup_keep_days | string is match('^([1-9][0-9]{0,3})?$')
-      - argus_backup_reserve_mb | string is match('^([0-9]{1,7})?$')
+      - argus_backup_keep_days | string == (argus_backup_keep_days | string | trim)
+      - argus_backup_reserve_mb | string is match('^(0|[1-9][0-9]{0,6})?$')
+      - argus_backup_reserve_mb | string == (argus_backup_reserve_mb | string | trim)
     fail_msg: "argus_backup_keep_days — целое 1…9999 дней или пусто, argus_backup_reserve_mb — целое МБ или пусто"
     quiet: true
   when: argus_backup_cron
