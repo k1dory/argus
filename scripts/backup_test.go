@@ -41,7 +41,7 @@ case "$1 $2" in
   cp "$src" "$4"; exit 0 ;;
 "run --rm")
   case "$*" in
-  *" du -sk "*) echo "$(( ${FAKE_VOL_BYTES:-0} / 1024 ))	/v" ;;
+  *" du -sk "*) echo "$(( ${FAKE_VOL_BYTES:-0} / 1024 ))	/v"; [ -n "${FAKE_DU_FAIL:-}" ] && exit 1 ;;
   *" tar "*) head -c "${FAKE_VOL_BYTES:-10}" /dev/zero ;;
   esac
   exit 0 ;;
@@ -75,10 +75,13 @@ echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
 echo "fake 0 0 $(( (FAKE_CAP - used) / 1024 )) 0% /"
 `
 
-// stat -c %d / stat -f %d: номер «устройства»; том на отдельном диске — с FAKE_SEPARATE.
+// stat [-L] -c %d / -f %d: номер «устройства»; том на отдельном диске — с FAKE_SEPARATE.
+// Ссылка без -L отвечает устройством, где лежит сама ссылка (как staging).
 const fakeStat = `#!/usr/bin/env bash
-for p; do :; done
-if [ -n "${FAKE_SEPARATE:-}" ] && [ "$p" = "$FAKE_STAGING" ]; then echo 2; else echo 1; fi
+deref=; for p; do [ "$p" = -L ] && deref=1; done
+stg=1; [ -n "${FAKE_SEPARATE:-}" ] && stg=2
+if [ -L "$p" ] && [ -z "$deref" ]; then echo "$stg"; exit 0; fi
+if [ "$p" = "$FAKE_STAGING" ]; then echo "$stg"; else echo 1; fi
 `
 
 const fakeDate = `#!/usr/bin/env bash
@@ -465,6 +468,82 @@ func TestBackupEnvAndNumbers(t *testing.T) {
 		}
 		if bytes.Contains([]byte(e.dockerLog(t)), []byte("compose")) {
 			t.Fatalf("%s: docker вызван до проверки чисел", bad)
+		}
+	}
+}
+
+// Ревью #118 r2 P1: оборванный запуск оставляет *.part даже со всеми четырьмя
+// файлами — это не полный набор, удаляется первым, исправный остаётся.
+func TestBackupKilledRunWithFourPartFilesIsNotComplete(t *testing.T) {
+	e := newBackupEnv(t, "")
+	e.set(t, "20261110T030001Z", 30*mb, true)
+	b := filepath.Join(e.dir, "argus-20261111T030001Z")
+	for _, x := range []string{".zip.part", "-web-auth.tar.gz.enc.part", "-shipper-state.tar.gz.part", "-collector-state.tar.gz.enc.part"} {
+		e.write(t, b+x, string(make([]byte, 2*mb)), 0o600)
+	}
+	// Нужно 2·est + тома 3 МиБ + резерв ≈ 40,4 МиБ; после удаления мусора свободно 40.
+	out, err := e.run(t, 70*mb, 2*mb, 2*mb)
+	if err == nil {
+		t.Fatalf("места не хватает и после удаления мусора — нужен отказ\n%s", out)
+	}
+	if left, _ := filepath.Glob(b + "*"); len(left) != 0 {
+		t.Fatalf("оборванный набор не удалён целиком: %v\n%s", left, out)
+	}
+	if !e.exists("argus-20261110T030001Z.zip") || !e.exists("argus-20261110T030001Z-collector-state.tar.gz.enc") {
+		t.Fatalf("исправный набор удалён ради места\n%s", out)
+	}
+}
+
+func TestBackupLeavesNoPartFiles(t *testing.T) {
+	e := newBackupEnv(t, "")
+	out, err := e.run(t, 200*mb, 2*mb, 2*mb)
+	if err != nil {
+		t.Fatalf("backup: %v\n%s", err, out)
+	}
+	if p, _ := filepath.Glob(filepath.Join(e.dir, "*.part")); len(p) != 0 {
+		t.Fatalf("остались *.part: %v", p)
+	}
+}
+
+// Ревью #118 r2 P2: BACKUP_DIR — ссылка на другой диск; staging на корне полон.
+func TestBackupSymlinkedDirOnOtherDiskChecksStaging(t *testing.T) {
+	e := newBackupEnv(t, "")
+	e.set(t, "20261109T030001Z", mb, true)
+	e.set(t, "20261110T030001Z", mb, true)
+	link := filepath.Join(e.root, "link")
+	if err := os.Symlink(e.dir, link); err != nil {
+		t.Fatal(err)
+	}
+	out, err := e.run(t, 500*mb, 2*mb, 2*mb, "BACKUP_DIR="+link, "FAKE_SEPARATE=1",
+		"FAKE_STAGING_CAP="+strconv.Itoa(10*mb))
+	if err == nil {
+		t.Fatalf("staging переполнен — нужен отказ\n%s", out)
+	}
+	if strings.Contains(e.dockerLog(t), "BACKUP DATABASE") {
+		t.Fatalf("BACKUP запущен: ссылка принята за тот же диск\n%s", out)
+	}
+	for _, s := range []string{"20261109T030001Z", "20261110T030001Z"} {
+		if !e.exists("argus-" + s + ".zip") {
+			t.Fatalf("набор %s удалён\n%s", s, out)
+		}
+	}
+}
+
+// Ревью #118 r2 P2: du с ошибкой и частичным числом — отказ до удаления и BACKUP.
+func TestBackupVolumeEstimateFailureStopsEarly(t *testing.T) {
+	e := newBackupEnv(t, "")
+	e.set(t, "20261109T030001Z", 20*mb, true)
+	e.set(t, "20261110T030001Z", 20*mb, true)
+	out, err := e.run(t, 60*mb, 2*mb, 2*mb, "FAKE_DU_FAIL=1", "FAKE_VOL_BYTES=131072")
+	if err == nil {
+		t.Fatalf("ошибка du должна давать отказ\n%s", out)
+	}
+	if strings.Contains(e.dockerLog(t), "BACKUP DATABASE") {
+		t.Fatalf("BACKUP запущен при ошибке оценки тома")
+	}
+	for _, s := range []string{"20261109T030001Z", "20261110T030001Z"} {
+		if !e.exists("argus-" + s + ".zip") {
+			t.Fatalf("набор %s удалён при ошибке оценки\n%s", s, out)
 		}
 	}
 }

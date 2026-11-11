@@ -27,6 +27,7 @@
 # Непустые BACKUP_KEEP_DAYS / BACKUP_RESERVE_MB / BACKUP_DIR из окружения сильнее
 # .env (так роль задаёт их из инвентаря); пустое значение = не задано.
 set -euo pipefail
+shopt -s inherit_errexit
 umask 077
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
 ENV_KEEP="${BACKUP_KEEP_DAYS-}" ENV_RESERVE="${BACKUP_RESERVE_MB-}" ENV_DIR="${BACKUP_DIR-}"
@@ -51,15 +52,17 @@ STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 NAME="argus-$STAMP"
 ALPINE="${REGISTRY_MIRROR:-docker.io}/library/alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc"
 # Файлы набора — только такие имена; всё прочее в каталоге скрипт не трогает.
-SET_RE='^(argus-[0-9]{8}T[0-9]{6}Z)(\.zip|\.complete|-web-auth\.tar\.gz(\.enc|\.age)?|-shipper-state\.tar\.gz|-collector-state\.tar\.gz\.(enc|age))$'
+# Пока набор пишется, его файлы называются *.part: оборванный запуск (в т.ч. kill -9)
+# не оставит набор, похожий на полный старого формата.
+SET_RE='^(argus-[0-9]{8}T[0-9]{6}Z)(\.zip|\.complete|-web-auth\.tar\.gz(\.enc|\.age)?|-shipper-state\.tar\.gz|-collector-state\.tar\.gz\.(enc|age))(\.part)?$'
 SET_SUFFIXES=".zip .complete -web-auth.tar.gz -web-auth.tar.gz.enc -web-auth.tar.gz.age -shipper-state.tar.gz -collector-state.tar.gz.enc -collector-state.tar.gz.age"
 
 # Способ шифрования выбираем до начала работы, чтобы не оставить открытый архив.
 if command -v age >/dev/null 2>&1 && [ -n "${BACKUP_AGE_RECIPIENT:-}" ]; then
-  enc() { age -r "$BACKUP_AGE_RECIPIENT" -o "$1.age"; }
+  enc() { age -r "$BACKUP_AGE_RECIPIENT" -o "$1"; }
   EXT=age
 elif [ -n "${BACKUP_KEY:-}" ]; then
-  enc() { openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:BACKUP_KEY -out "$1.enc"; }
+  enc() { openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:BACKUP_KEY -out "$1"; }
   EXT=enc
 else
   echo "backup: нет ключа шифрования — задайте BACKUP_AGE_RECIPIENT (age) или BACKUP_KEY (openssl) в .env" >&2
@@ -134,13 +137,19 @@ avail_dir() { # свободно в каталоге, байт; KiB из df бе
 avail_staging() { # свободно на диске backups ClickHouse за вычетом его резервирований, байт
   q "SELECT unreserved_space FROM system.disks WHERE name = 'backups'"
 }
-dev_of() { stat -c %d -- "$1" 2>/dev/null || stat -f %d -- "$1"; }
+# -L: BACKUP_DIR может быть ссылкой на другой диск — нужен диск цели, а не ссылки.
+dev_of() { stat -L -c %d -- "$1" 2>/dev/null || stat -L -f %d -- "$1"; }
 SAME_FS=0
-if [ -n "$STAGING_HOST" ] && [ "$(dev_of "$STAGING_HOST")" = "$(dev_of "$BACKUP_DIR")" ]; then SAME_FS=1; fi
+if [ -n "$STAGING_HOST" ]; then
+  D1="$(dev_of "$STAGING_HOST")" || { say_err "не удалось определить диск $STAGING_HOST"; exit 1; }
+  D2="$(dev_of "$BACKUP_DIR")" || { say_err "не удалось определить диск $BACKUP_DIR"; exit 1; }
+  [ "$D1" = "$D2" ] && SAME_FS=1
+fi
 
-is_complete() { # набор: признак или (старый формат) все четыре файла
-  local b="$BACKUP_DIR/$1"
+is_complete() { # набор: признак или (старый формат, без *.part) все четыре файла
+  local b="$BACKUP_DIR/$1" x
   [ -e "$b.complete" ] && return 0
+  for x in $SET_SUFFIXES; do [ -e "$b$x.part" ] && return 1; done
   [ -e "$b.zip" ] && [ -e "$b-shipper-state.tar.gz" ] &&
     { [ -e "$b-web-auth.tar.gz.enc" ] || [ -e "$b-web-auth.tar.gz.age" ] || [ -e "$b-web-auth.tar.gz" ]; } &&
     { [ -e "$b-collector-state.tar.gz.enc" ] || [ -e "$b-collector-state.tar.gz.age" ]; }
@@ -161,7 +170,7 @@ scan_sets() { # → ALL_SETS, COMPLETE_SETS по возрастанию врем
 }
 delete_set() {
   local x
-  for x in $SET_SUFFIXES; do rm -f -- "$BACKUP_DIR/$1$x"; done
+  for x in $SET_SUFFIXES; do rm -f -- "$BACKUP_DIR/$1$x" "$BACKUP_DIR/$1$x.part"; done
 }
 # Кого удалить ради места: сначала неполные наборы, затем старейший полный — но не последний полный.
 prune_victim() {
@@ -192,7 +201,9 @@ ensure_space() { # нужно байт, измеритель, его аргум�
 num_or_fail() { [[ $2 =~ ^[0-9]+$ ]] || { say_err "$1: не число ($2)"; return 1; }; echo "$2"; }
 vol_bytes() { # оценка архива тома: размер содержимого + 1 МиБ на tar/gzip/шифрование
   local kb
-  kb="$(docker run --rm -v "${PROJECT}_$1:/v:ro" "$ALPINE" du -sk /v | awk 'NR==1 {print $1}')"
+  # du печатает частичный итог и при ошибке обхода — код проверяем явно.
+  kb="$(docker run --rm -v "${PROJECT}_$1:/v:ro" "$ALPINE" du -sk /v | awk 'NR==1 {print $1}')" ||
+    { say_err "оценка тома $1: du завершился с ошибкой"; return 1; }
   num_or_fail "оценка тома $1" "$kb" >/dev/null || return 1
   echo $((kb * 1024 + 1048576))
 }
@@ -222,8 +233,9 @@ SIZE="$(docker compose exec -T clickhouse stat -c %s "$CH_ARCHIVE" || true)"
 if [[ ! $SIZE =~ ^[0-9]+$ ]] && [ -n "$STAGING_HOST" ]; then SIZE="$(wc -c <"$STAGING_HOST/$NAME.zip" | tr -d ' ')"; fi
 SIZE="$(num_or_fail "размер архива" "$SIZE")"
 ensure_space $((SIZE + VOLS)) avail_dir "$BACKUP_DIR" "$BACKUP_DIR" 1
-CREATED+=("$BACKUP_DIR/$NAME.zip")
-docker compose cp "clickhouse:$CH_ARCHIVE" "$BACKUP_DIR/$NAME.zip"
+FINAL=("$BACKUP_DIR/$NAME.zip")
+CREATED+=("$BACKUP_DIR/$NAME.zip.part" "$BACKUP_DIR/$NAME.zip")
+docker compose cp "clickhouse:$CH_ARCHIVE" "$BACKUP_DIR/$NAME.zip.part"
 q "SYSTEM UNFREEZE" >/dev/null 2>&1 || true
 rm_staging
 STAGED=0
@@ -237,19 +249,23 @@ volume() { # имя тома, шифровать ли (1/0)
   ensure_space "$need" avail_dir "$BACKUP_DIR" "$BACKUP_DIR (том $1)" 1
   if [ "$2" = 1 ]; then
     echo "backup volume $1 (шифрование: $EXT)"
-    CREATED+=("$out.$EXT")
-    tarvol "$1" | enc "$out"
+    out="$out.$EXT"
+    CREATED+=("$out.part" "$out")
+    tarvol "$1" | enc "$out.part"
   else
     echo "backup volume $1"
-    CREATED+=("$out")
-    tarvol "$1" >"$out"
+    CREATED+=("$out.part" "$out")
+    tarvol "$1" >"$out.part"
   fi
+  FINAL+=("$out")
 }
 volume web-auth 1
 volume shipper-state 0
 volume collector-state 1
 
-# Набор полон: признак ставится последним, после него сбой набор уже не откатывает.
+# Набор полон: *.part → окончательные имена, признак — последним; после него
+# сбой набор уже не откатывает.
+for f in "${FINAL[@]}"; do mv -f -- "$f.part" "$f"; done
 CREATED+=("$BACKUP_DIR/$NAME.complete")
 : >"$BACKUP_DIR/$NAME.complete"
 DONE=1
@@ -263,6 +279,8 @@ rotate() {
   for s in ${ALL_SETS[@]+"${ALL_SETS[@]}"}; do
     for x in $SET_SUFFIXES; do
       f="$BACKUP_DIR/$s$x"
+      [ -e "$f" ] && break
+      f="$f.part"
       [ -e "$f" ] && break
     done
     if [ -n "$(find "$f" -maxdepth 0 -mtime +"$KEEP" -print)" ]; then
