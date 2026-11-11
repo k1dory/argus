@@ -480,7 +480,13 @@ high 1 час, medium 4 часа, low 24 часа. Просрочка показ
 Бэкап: `./scripts/backup.sh` — `BACKUP DATABASE` + тома `web-auth` (пользователи, TOTP —
 шифруется), `shipper-state` и `collector-state` (очередь сырых событий — шифруется)
 в `BACKUP_DIR` (по умолчанию `/var/backups/argus`, вне
-дерева проекта), ротация `BACKUP_KEEP_DAYS` (14). Шифрование: `age`
+дерева проекта), ротация `BACKUP_KEEP_DAYS` (14); признак полного набора —
+`argus-<UTC>.complete`. Место: перед `BACKUP`, копированием архива и каждым томом на
+диске должно остаться `BACKUP_RESERVE_MB` (10240) сверх нужного; не хватает — удаляются
+неполные, затем самые старые полные наборы (последний полный не удаляется никогда, и
+ротацией тоже), иначе отказ до записи с причиной в syslog (`argus-backup`). При сбое
+файлы запуска и копия на диске `backups` ClickHouse удаляются. В роли —
+`argus_backup_keep_days` / `argus_backup_reserve_mb` (сильнее `.env`). Шифрование: `age`
 (`BACKUP_AGE_RECIPIENT`, восстановление — `BACKUP_AGE_IDENTITY`) или, если `age` нет,
 `openssl enc -aes-256-cbc -pbkdf2` с `BACKUP_KEY`; без ключа скрипт отказывает. Ключ
 храните отдельно от бэкапов. Перед восстановлением остановите `collector`,
