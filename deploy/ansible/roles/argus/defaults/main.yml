@@ -70,6 +70,11 @@ argus_asn_cron_minute: "17"
 argus_backup_cron: true
 argus_backup_cron_hour: "3"
 argus_backup_cron_minute: "0"
+# Ротация (дней) и резерв свободного места (МБ), которые backup.sh оставляет диску.
+# Пусто — решают .env хоста или умолчания скрипта (14 дней, 10240 МБ); заданное
+# здесь сильнее .env.
+argus_backup_keep_days: ""
+argus_backup_reserve_mb: ""
 
 # Сколько ждать `make up` (сборка образов на первом прогоне идёт долго) и старт консоли.
 argus_up_timeout_sec: 1800
