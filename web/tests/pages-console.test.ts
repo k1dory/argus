@@ -337,7 +337,7 @@ test("правила: таблица с порогом, профилем и до
 test("настройки: администратор — пользователи, исключения, реагирование, лицензия, аудит; наблюдатель — без форм", async () => {
   mocks.queries.listExceptions = async () => [{ rule_id: "ssh.bruteforce", field: "actor.name", value: "scanner", reason: "сканер ИБ", incident_id: "INC-2", created_by: "admin", created_at: NOW }];
   mocks.queries.auditTail = async () => [{ ts: NOW, user: "admin", action: "incident.status", target: "INC-2", detail: "closed" }];
-  mocks.queries.licenseStats = async () => ({ peak_eps_30d: 150, avg_eps_7d: 12.34, events_30d: 1_000_000, retention_days: 180, sources: 9 });
+  mocks.queries.licenseStats = async () => ({ peak_eps_30d: 150, avg_eps_7d: 12.34, events_30d: 1_000_000, retention_days: 180, netflow_retention_days: 30, sources: 9 });
   mocks.queries.respondStatus = async () => ({ mode: "ips", mode_from: "console", enabled: true, ttl: "1h", allowlist: ["10.0.0.0/8"], active: [{ ip: "198.51.100.9", incident: "INC-7", until: "0001-01-01 00:00:00", manual: true }], excluded: [{ ip: "192.0.2.44", since: "2026-11-01 10:00:00", until: "2026-11-02 10:00:00", actor: "admin", reason: "сканер партнёра" }], config_errors: ["нет пароля Wazuh"], pending: 2, requested: "ips" });
   mocks.queries.responseLog = async () => [{ ts: NOW, incident_id: "INC-7", rule_id: "r", ip: "198.51.100.9", mode: "manual", executor: "ngfw", dry_run: 0, ok: 0, detail: "timeout", reason: "оператор", actor: "admin" }];
 
@@ -350,6 +350,7 @@ test("настройки: администратор — пользовател�
   assert.match(text, /сканер ИБ/);
   assert.match(text, /IPS — автоблокировка/);
   assert.match(text, /TTL 1h · активных блокировок 1 · в очереди повторов 2/);
+  assert.match(text, /180 сут\., NetFlow — 30 сут\. \(TTL argus\.events\)/);
   assert.match(text, /конфиг: нет пароля Wazuh/);
   assert.match(text, /198\.51\.100\.9 \( ?INC-7 ?\) постоянно/);
   assert.match(text, /10\.0\.0\.0\/8/);
