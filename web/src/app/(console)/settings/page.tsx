@@ -287,7 +287,7 @@ export default async function SettingsPage() {
               <dt className="text-muted-foreground">средний EPS, 7 д</dt><dd>{fmtNum(ch.data.license.avg_eps_7d, 2)}</dd>
               <dt className="text-muted-foreground">событий за 30 д</dt><dd>{fmtNum(ch.data.license.events_30d)}</dd>
               <dt className="text-muted-foreground">источников</dt><dd>{ch.data.license.sources}</dd>
-              <dt className="text-muted-foreground">хранение событий</dt><dd>{ch.data.license.retention_days} сут. (TTL argus.events)</dd>
+              <dt className="text-muted-foreground">хранение событий</dt><dd>{ch.data.license.retention_days} сут., NetFlow — {ch.data.license.netflow_retention_days} сут. (TTL argus.events)</dd>
               <dt className="text-muted-foreground">редакция</dt>
               <dd>{editionFor(ch.data.license.peak_eps_30d)}</dd>
             </dl>

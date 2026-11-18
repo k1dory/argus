@@ -55,7 +55,7 @@ export type QueryMocks = {
   rulesFalsePositives: () => Promise<Record<string, { rule_id: string; total: number; false_positive: number; closed: number }>>;
   listExceptions: () => Promise<Record<string, unknown>[]>;
   auditTail: (limit?: number) => Promise<Record<string, unknown>[]>;
-  licenseStats: () => Promise<{ peak_eps_30d: number; avg_eps_7d: number; events_30d: number; retention_days: number; sources: number }>;
+  licenseStats: () => Promise<{ peak_eps_30d: number; avg_eps_7d: number; events_30d: number; retention_days: number; netflow_retention_days: number; sources: number }>;
   respondStatus: () => Promise<Record<string, unknown>>;
   responseLog: (opts?: { incidentId?: string; limit?: number }) => Promise<Record<string, unknown>[]>;
   verdictsFor: (ids: string[]) => Promise<Record<string, Record<string, unknown>>>;
@@ -169,7 +169,7 @@ export function installNextMocks(): Mocks {
     rulesFalsePositives: async () => ({}),
     listExceptions: async () => [],
     auditTail: async () => [],
-    licenseStats: async () => ({ peak_eps_30d: 0, avg_eps_7d: 0, events_30d: 0, retention_days: 180, sources: 0 }),
+    licenseStats: async () => ({ peak_eps_30d: 0, avg_eps_7d: 0, events_30d: 0, retention_days: 180, netflow_retention_days: 30, sources: 0 }),
     respondStatus: async () => ({ mode: "simulate", mode_from: "config", enabled: false, ttl: "", allowlist: [], active: [], config_errors: [], pending: 0, requested: null }),
     responseLog: async () => [],
     verdictsFor: async () => ({}),

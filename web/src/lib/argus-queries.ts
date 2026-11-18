@@ -986,7 +986,7 @@ export async function rulesFalsePositives(): Promise<Record<string, RuleFP>> {
 
 /* ===== Лицензионный учёт: пиковый EPS по дням, глубина хранения ===== */
 
-export type LicenseStats = { peak_eps_30d: number; avg_eps_7d: number; events_30d: number; retention_days: number; sources: number };
+export type LicenseStats = { peak_eps_30d: number; avg_eps_7d: number; events_30d: number; retention_days: number; netflow_retention_days: number; sources: number };
 
 export async function licenseStats(): Promise<LicenseStats> {
   const [peak] = await chQuery<{ peak: string; avg7: string; total30: string; sources: string }>(
@@ -1000,6 +1000,7 @@ export async function licenseStats(): Promise<LicenseStats> {
     avg_eps_7d: Number(peak?.avg7 ?? 0),
     events_30d: Number(peak?.total30 ?? 0),
     retention_days: 180,
+    netflow_retention_days: 30, // миграция 0040: TTL для source_class = 'netflow'
     sources: Number(peak?.sources ?? 0),
   };
 }

@@ -49,6 +49,7 @@ services:
       - clickhouse-backups:/var/lib/clickhouse/backups
       - ./clickhouse/config.d/backups.xml:/etc/clickhouse-server/config.d/backups.xml:ro
       - ./clickhouse/config.d/memory.xml:/etc/clickhouse-server/config.d/memory.xml:ro
+      - ./clickhouse/config.d/system-logs.xml:/etc/clickhouse-server/config.d/system-logs.xml:ro
     # Порт наружу не публикуется: сеть data — internal. Запросы с хоста —
     # docker compose exec clickhouse clickhouse-client (бэкап так и делает).
     networks: [data]
