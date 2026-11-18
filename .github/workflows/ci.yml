@@ -109,7 +109,14 @@ jobs:
           ARGUS_TEST_CLICKHOUSE_URL: http://localhost:8123
           ARGUS_TEST_CLICKHOUSE_PASSWORD: ci-only
         run: cd web && npm test && npm run build
-      - name: npm audit (high/critical — блокирующий)
+      # Блокирует только то, что попадает в образ: он собирается как Next standalone,
+      # инструменты сборки и линтеры (shadcn CLI, eslint, typescript-eslint) в него
+      # не входят и недоверенный ввод не обрабатывают. Для picomatch (ReDoS, все
+      # версии <=4.0.7) исправления на 2026-11-18 нет — полный аудит виден ниже.
+      - name: npm audit, зависимости образа (high/critical — блокирующий)
+        run: cd web && npm audit --omit=dev --audit-level=high
+      - name: npm audit, все зависимости (информационный)
+        continue-on-error: true
         run: cd web && npm audit --audit-level=high
 
   policies:
