@@ -1,0 +1,37 @@
+<!-- Служебные журналы ClickHouse живут на том же диске, что и события, а по
+     умолчанию у них нет TTL: на argus1 за три недели они набрали ~32 ГБ — почти
+     столько же, сколько сами события, — и вместе с бэкапами забили диск (2026-11-17).
+     ARGUS их не читает; оператору для разбора нужны свежие query_log и part_log,
+     поэтому они остаются на 7 дней. text_log — только warning и выше.
+     Профилировочные trace_log и processors_profile_log отключены.
+     При смене TTL ClickHouse переименовывает старую таблицу в <имя>_0 и заводит
+     новую: старые данные удаляются вручную (DROP TABLE system.<имя>_N). -->
+<clickhouse>
+    <query_log>
+        <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
+    </query_log>
+    <part_log>
+        <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
+    </part_log>
+    <query_views_log>
+        <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
+    </query_views_log>
+    <asynchronous_insert_log>
+        <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
+    </asynchronous_insert_log>
+    <metric_log>
+        <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
+    </metric_log>
+    <asynchronous_metric_log>
+        <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
+    </asynchronous_metric_log>
+    <error_log>
+        <ttl>event_date + INTERVAL 30 DAY DELETE</ttl>
+    </error_log>
+    <text_log>
+        <level>warning</level>
+        <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
+    </text_log>
+    <trace_log remove="1"/>
+    <processors_profile_log remove="1"/>
+</clickhouse>
