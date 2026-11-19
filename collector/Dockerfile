@@ -3,7 +3,7 @@
 #   curl -sI -H 'Accept: application/vnd.oci.image.index.v1+json' \
 #     https://mirror.gcr.io/v2/library/golang/manifests/1.26 | grep -i docker-content-digest
 ARG REGISTRY=docker.io
-FROM ${REGISTRY}/library/golang:1.26.10@sha256:670bb5aa5349ae03b8516764718486f4f16399134bdc9acd0c46a23f043ab05c AS build
+FROM ${REGISTRY}/library/golang:1.26.11@sha256:4165ee6bf3b7811fd7b40373290405c83d0167dcb87ee5f29c427cdcef45ff8f AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
