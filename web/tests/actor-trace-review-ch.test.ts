@@ -5,6 +5,7 @@ import { applyAllMigrations, ch, liveSkip as skip, serializeLiveFile } from "./_
 import { spanEventsHref, type ActorTrace } from "../src/lib/shared/actor-trace";
 import type { Alias } from "../src/lib/shared/actors";
 import { chTs } from "../src/lib/shared/log-query";
+import { journalQuery, parseJournalParams } from "../src/lib/shared/journal";
 
 serializeLiveFile({ before, after });
 before(async () => { if (skip === false) await applyAllMigrations(); });
@@ -76,7 +77,7 @@ test("F3: ссылка sudo не включает другого субъект�
   ], async (trace, f) => {
     const span = spans(trace).find((s) => s.section === "host")!;
     assert.equal(span.count, 1, "чужое событие не попало в саму трассу");
-    const url = new URL(spanEventsHref(f.ip, span, trace.bucketSec, "priv.sudo"), "http://test");
+    const url = new URL(spanEventsHref(f.ip, span, trace.bucketSec, "priv.sudo")!, "http://test");
     const b = search().buildWhere({
       index: "events", range: "24h", page: 1, q: url.searchParams.get("q")!,
       from: url.searchParams.get("from")!, to: url.searchParams.get("to")!,
@@ -113,5 +114,62 @@ test("F6: объекты с общими первыми 160 байтами не 
     const app = spans(trace).filter((s) => s.section === "app");
     assert.equal(app.length, 2);
     assert.deepEqual(app.map((s) => s.count), [1, 1]);
+  });
+});
+
+
+async function journalRows(href: string) {
+  const f = parseJournalParams(new URL(href, "http://test").searchParams);
+  const b = search().buildWhere({
+    index: "events", page: 1, q: journalQuery(f),
+    range: f.range, from: f.from, to: f.to,
+  });
+  assert.equal(b.error, null);
+  // ts_s, а не ts: одноимённый алиас затенил бы колонку в WHERE (String против DateTime64).
+  const rows = await ch().chQuery<{ ts_s: string; object: string }>(
+    "SELECT toString(ts) AS ts_s, object FROM events WHERE " + b.where + " ORDER BY ts",
+    b.params,
+  );
+  return rows.map((r) => ({ ts: r.ts_s, object: r.object }));
+}
+
+test("R1: SQL-корзина с отказом до sudo и успехом после него", { skip }, async () => {
+  await withTrace((f) => [
+    { ts: chTs(f.fromMs), node: f.node, src_ip: f.ip,
+      action: "auth.ssh", outcome: "failure" },
+    { ts: chTs(f.fromMs + 20_000), node: f.node, action: "priv.sudo" },
+    { ts: chTs(f.fromMs + 50_000), node: f.node, src_ip: f.ip,
+      action: "auth.ssh", outcome: "success" },
+  ], (trace) => {
+    const owner = trace.sessions.flatMap((s) => s.origins)
+      .find((o) => o.spans.some((s) => s.section === "host"))!;
+    assert.equal(owner.origin, "");
+    assert.ok(owner.spans.every((s) => !s.attached));
+  });
+});
+
+test("R2: журнал не возвращает события до начала владения алиасом", { skip }, async () => {
+  await withTrace((f) => [
+    // Тот же логин/узел до valid_from принадлежал предыдущему владельцу.
+    { ts: chTs(f.fromMs - 10_000), node: f.node, action: "priv.sudo" },
+    { ts: chTs(f.fromMs + 10_000), node: f.node, action: "priv.sudo" },
+  ], async (trace, f) => {
+    const span = spans(trace).find((s) => s.section === "host")!;
+    assert.equal(span.count, 1);
+    const rows = await journalRows(spanEventsHref("", span, trace.bucketSec, "priv.sudo")!);
+    assert.deepEqual(rows.map((r) => r.ts), [chTs(f.fromMs + 10_000)]);
+  });
+});
+
+test("R4: объект длиннее лимита журнала — ссылки нет, вместо неё не журнал по обрезанному условию", { skip }, async () => {
+  const prefix = "https://example.test/" + "x".repeat(2100);
+  await withTrace(() => [
+    { object: prefix + "/a", action: "app.open" },
+    { object: prefix + "/b", action: "app.close" },
+  ], async (trace) => {
+    const app = spans(trace).filter((s) => s.section === "app");
+    assert.equal(app.length, 2);
+    const span = app.find((s) => s.target === prefix + "/a")!;
+    assert.equal(spanEventsHref("", span, trace.bucketSec, "app.open"), null);
   });
 });

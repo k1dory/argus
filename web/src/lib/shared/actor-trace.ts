@@ -3,7 +3,8 @@
 // собирается дерево. Чистые функции — без ClickHouse, проверяются юнит-тестами.
 import { appendTerm } from "./search-query";
 import { toDtParam } from "./filters";
-import { tsMs, type ActorIncident, type ActorRange, type Section } from "./actors";
+import { ACTOR_KINDS, activeAliases, aliasMatches, tsMs, type ActorIncident, type ActorRange, type Alias, type Section } from "./actors";
+import { MAX_Q_LEN } from "./journal";
 
 /** Чем является цель: узел, адрес назначения, объект события или (если ничего нет) источник. */
 export type TargetKind = "node" | "dst" | "object" | "source";
@@ -19,13 +20,21 @@ export type TraceRow = {
   action: string;
   /** actor_name события ('' у NetFlow) — для ссылки в журнал в границах субъекта. */
   actor?: string;
+  /** Что именно на узле (команда sudo, объект сеанса) — только раздел host. */
+  detail?: string;
   count: number;
   fails: number;
   first_ts: string;
   last_ts: string;
+  /** Время первого неотказного события корзины ('' или эпоха — успехов не было). */
+  first_ok_ts?: string;
 };
 
-export type TraceAction = { action: string; source: string; count: number; fails: number; first: number; last: number };
+export type TraceAction = { action: string; source: string; count: number; fails: number; first: number; last: number; actors: string[];
+  /** Команды/объекты действия на узле, частые — первыми (до TRACE_DETAILS_MAX). */
+  details: string[] };
+
+export const TRACE_DETAILS_MAX = 5;
 /** Интервал активности внутри полосы. */
 export type Segment = [from: number, to: number];
 
@@ -85,7 +94,7 @@ export const TRACE_ROWS_MAX = 20_000;
 const FAIL_RE = /fail|deny|denied|error/i;
 export const isFailOutcome = (outcome: string): boolean => FAIL_RE.test(outcome);
 
-type Item = TraceRow & { firstMs: number; lastMs: number };
+type Item = TraceRow & { firstMs: number; lastMs: number; okMs: number | null };
 
 function toItems(rows: TraceRow[]): Item[] {
   const out: Item[] = [];
@@ -93,7 +102,12 @@ function toItems(rows: TraceRow[]): Item[] {
     const firstMs = tsMs(r.first_ts);
     const lastMs = tsMs(r.last_ts) ?? firstMs;
     if (firstMs === null || lastMs === null) continue;
-    out.push({ ...r, count: Number(r.count), fails: Number(r.fails), dst_port: Number(r.dst_port) || 0, firstMs, lastMs: Math.max(firstMs, lastMs) });
+    const count = Number(r.count);
+    const fails = Number(r.fails);
+    // Успех корзины: явное время из SQL; без него — только если отказов не было вовсе.
+    const ok = tsMs(r.first_ok_ts);
+    const okMs = ok !== null && ok > 86_400_000 ? ok : fails === 0 && count > 0 ? firstMs : null;
+    out.push({ ...r, count, fails, dst_port: Number(r.dst_port) || 0, firstMs, lastMs: Math.max(firstMs, lastMs), okMs });
   }
   return out.sort((a, b) => a.firstMs - b.firstMs || a.lastMs - b.lastMs);
 }
@@ -130,14 +144,21 @@ function mergeSegments(segs: Segment[], joinMs: number): Segment[] {
 const spanKey = (it: Pick<TraceRow, "section" | "target" | "target_kind" | "dst_port">) => `${it.section}\u0000${it.target_kind}\u0000${it.target}\u0000${it.dst_port}`;
 
 function buildSpan(items: Item[], joinMs: number): TraceSpan {
-  const actions = new Map<string, TraceAction>();
+  const actions = new Map<string, { a: TraceAction; items: Item[] }>();
   for (const it of items) {
     const k = `${it.source}\u0000${it.action}`;
-    const a = actions.get(k);
-    if (a) {
-      a.count += it.count; a.fails += it.fails;
-      a.first = Math.min(a.first, it.firstMs); a.last = Math.max(a.last, it.lastMs);
-    } else actions.set(k, { action: it.action, source: it.source, count: it.count, fails: it.fails, first: it.firstMs, last: it.lastMs });
+    const e = actions.get(k);
+    if (e) {
+      e.a.count += it.count; e.a.fails += it.fails;
+      e.a.first = Math.min(e.a.first, it.firstMs); e.a.last = Math.max(e.a.last, it.lastMs);
+      e.items.push(it);
+    } else actions.set(k, { a: { action: it.action, source: it.source, count: it.count, fails: it.fails, first: it.firstMs, last: it.lastMs, actors: [], details: [] }, items: [it] });
+  }
+  for (const e of actions.values()) {
+    e.a.actors = rankActors(e.items);
+    const d = new Map<string, number>();
+    for (const i of e.items) if (i.detail) d.set(i.detail, (d.get(i.detail) ?? 0) + i.count);
+    e.a.details = [...d.entries()].sort((x, y) => y[1] - x[1] || x[0].localeCompare(y[0])).slice(0, TRACE_DETAILS_MAX).map(([k]) => k);
   }
   const h = items[0];
   return {
@@ -146,7 +167,7 @@ function buildSpan(items: Item[], joinMs: number): TraceSpan {
     count: items.reduce((s, i) => s + i.count, 0), fails: items.reduce((s, i) => s + i.fails, 0),
     sources: [...new Set(items.map((i) => i.source))].sort(),
     actors: rankActors(items),
-    actions: [...actions.values()].sort((a, b) => b.count - a.count || a.first - b.first),
+    actions: [...actions.values()].map((e) => e.a).sort((a, b) => b.count - a.count || a.first - b.first),
     segments: mergeSegments(items.map((i) => [i.firstMs, i.lastMs]), joinMs),
   };
 }
@@ -175,12 +196,19 @@ function rankActors(items: Pick<TraceRow, "actor" | "count">[]): string[] {
 const SECTION_ORDER: Record<Section, number> = { login: 0, app: 1, host: 2, change: 3, other: 4, network: 5 };
 
 function buildOrigins(items: Item[], joinMs: number, networkTop: number): TraceOrigin[] {
-  // События без адреса источника (sudo, сеанс на узле) — к источнику успешного
-  // входа на тот же узел, случившегося раньше. Источников несколько — не угадываем:
-  // событие остаётся в ветке «без адреса».
-  const logins = items.filter((it) => it.origin && it.target_kind === "node" && (it.section === "login" || it.section === "host") && it.count > it.fails);
+  // События без адреса источника (sudo, сеанс на узле) — к источнику входа на
+  // тот же узел: только раздел «вход», только успех и только раньше события
+  // (по времени первого успеха, а не первого события корзины). Источников
+  // несколько — не угадываем: событие остаётся в ветке «без адреса».
+  const loginsByNode = new Map<string, { origin: string; okMs: number }[]>();
+  for (const it of items) {
+    if (!it.origin || it.target_kind !== "node" || it.section !== "login" || it.okMs === null) continue;
+    const list = loginsByNode.get(it.target) ?? [];
+    list.push({ origin: it.origin, okMs: it.okMs });
+    loginsByNode.set(it.target, list);
+  }
   const entryFor = (it: Item): string | null => {
-    const origins = new Set(logins.filter((l) => l.target === it.target && l.firstMs <= it.firstMs).map((l) => l.origin));
+    const origins = new Set((loginsByNode.get(it.target) ?? []).filter((l) => l.okMs <= it.firstMs).map((l) => l.origin));
     return origins.size === 1 ? [...origins][0] : null;
   };
   const byOrigin = new Map<string, Map<string, { items: Item[]; attached: boolean }>>();
@@ -306,24 +334,58 @@ export function fmtDuration(ms: number): string {
   return m % 60 ? `${h} ч ${m % 60} мин` : `${h} ч`;
 }
 
-/** Окно ссылки: границы с запасом в корзину, по минутам. */
-function windowParams(first: number, last: number, bucketSec: number): string {
-  const pad = bucketSec * 1000;
-  return `from=${toDtParam(Math.floor((first - pad) / 60_000) * 60_000)}&to=${toDtParam(Math.ceil((last + pad) / 60_000) * 60_000)}`;
+/** Потолок строки поиска журнала (MAX_QUERY_LEN в search.ts, MAX_Q_LEN в journal.ts):
+ *  длиннее — журнал молча обрежет условия, поэтому такую ссылку не строим. */
+export const TRACE_LINK_Q_MAX = MAX_Q_LEN;
+
+/** Интервалы владения значением фильтра: actor — субъектные алиасы, src — ip. */
+export type OwnerScope = (field: "actor" | "src", value: string) => Segment[];
+
+/** Интервалы владения из алиасов субъекта (удержанные не дают владения). */
+export function ownerScope(aliases: Alias[]): OwnerScope {
+  const live = activeAliases(aliases);
+  return (field, value) => live
+    .filter((a) => (field === "actor" ? ACTOR_KINDS.includes(a.kind) : a.kind === "ip") && aliasMatches(a, value))
+    .map((a): Segment => [tsMs(a.valid_from) ?? 0, a.valid_to ? tsMs(a.valid_to) ?? Infinity : Infinity])
+    .sort((x, y) => x[0] - y[0]);
+}
+
+/** Окно ссылки: точное до секунды и не шире интервала владения; null — интервала нет. */
+function linkWindow(first: number, last: number, owner: Segment[] | null): string | null {
+  let from = Math.floor(first / 1000) * 1000;
+  // +1 с: событие в той же секунде попадает и при «<», и при «<=» в журнале.
+  let to = Math.floor(last / 1000) * 1000 + 1000;
+  if (owner) {
+    const iv = owner.find(([a, b]) => a <= first && first <= b);
+    if (!iv) return null;
+    from = Math.max(from, Math.ceil(iv[0] / 1000) * 1000);
+    to = Math.min(to, Math.floor(iv[1] / 1000) * 1000);
+    if (to < from) return null;
+  }
+  return `from=${toDtParam(from, true)}&to=${toDtParam(to, true)}`;
 }
 
 /**
- * Журнал событий полосы: структурные поля цели, окно полосы и граница субъекта.
- * Есть actor_name — фильтр по самому частому (язык поиска без ИЛИ: ссылка
- * показывает подмножество событий субъекта, но не чужие). Нет — фильтр по
- * адресу источника: у сети без субъекта он и есть алиас.
+ * Журнал событий полосы или действия: структурные поля цели, окно активности
+ * и граница субъекта. actor — самый частый у самого действия (язык поиска без
+ * ИЛИ: ссылка показывает подмножество событий субъекта, но не чужие); окно
+ * обрезано интервалом владения алиасом. Без actor — фильтр по адресу источника.
+ * null — ссылку честно построить нельзя (нет интервала, условия длиннее лимита).
  */
-export function spanEventsHref(origin: string, s: Pick<TraceSpan, "target" | "target_kind" | "dst_port" | "first" | "last" | "attached"> & { actors?: string[] }, bucketSec: number, action?: string): string {
+export function spanEventsHref(
+  origin: string,
+  s: Pick<TraceSpan, "target" | "target_kind" | "dst_port" | "first" | "last" | "attached"> & { actors?: string[]; actions?: TraceAction[] },
+  _bucketSec: number,
+  action?: string,
+  owner?: OwnerScope,
+): string | null {
   const L = { literal: true };
+  const act = action ? s.actions?.find((a) => a.action === action) : undefined;
+  const actor = (act ? act.actors : s.actors)?.[0];
+  const useSrc = Boolean(origin && !s.attached);
   let q = "";
-  const actor = s.actors?.[0];
   if (actor) q = appendTerm(q, "actor", actor, L);
-  if (origin && !s.attached) q = appendTerm(q, "src", origin, L);
+  if (useSrc) q = appendTerm(q, "src", origin, L);
   if (s.target) {
     if (s.target_kind === "node") q = appendTerm(q, "node", s.target, L);
     else if (s.target_kind === "dst") {
@@ -333,10 +395,15 @@ export function spanEventsHref(origin: string, s: Pick<TraceSpan, "target" | "ta
     else q = appendTerm(q, "object", s.target, L);
   }
   if (action) q = appendTerm(q, "action", action, L);
-  return `/events?q=${encodeURIComponent(q)}&${windowParams(s.first, s.last, bucketSec)}`;
+  if (q.length > TRACE_LINK_Q_MAX) return null;
+  const scope = owner ? (actor ? owner("actor", actor) : useSrc ? owner("src", origin) : null) : null;
+  const w = linkWindow(act ? act.first : s.first, act ? act.last : s.last, scope);
+  return w ? `/events?q=${encodeURIComponent(q)}&${w}` : null;
 }
 
-/** Журнал по адресу источника в окне ветки: значение — литерал языка поиска. */
-export function originEventsHref(o: Pick<TraceOrigin, "origin" | "first" | "last">, bucketSec: number): string {
-  return `/events?q=${encodeURIComponent(appendTerm("", "src", o.origin, { literal: true }))}&${windowParams(o.first, o.last, bucketSec)}`;
+/** Журнал по адресу источника в окне ветки: значение — литерал языка поиска; все субъекты. */
+export function originEventsHref(o: Pick<TraceOrigin, "origin" | "first" | "last">): string | null {
+  const q = appendTerm("", "src", o.origin, { literal: true });
+  if (q.length > TRACE_LINK_Q_MAX) return null;
+  return `/events?q=${encodeURIComponent(q)}&${linkWindow(o.first, o.last, null)}`;
 }

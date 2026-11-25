@@ -5,9 +5,9 @@ import { ChevronRight } from "lucide-react";
 import { LevelBadge } from "@/components/console/incident-badges";
 import { Empty, Panel } from "@/components/console/panel";
 import { Badge } from "@/components/ui/badge";
-import { fmtDuration, originEventsHref, spanEventsHref, spanLabel, TRACE_SECTION_LABELS, type ActorTrace, type TraceOrigin, type TraceSession, type TraceSpan } from "@/lib/shared/actor-trace";
+import { fmtDuration, originEventsHref, ownerScope, spanEventsHref, spanLabel, TRACE_SECTION_LABELS, type ActorTrace, type OwnerScope, type TraceOrigin, type TraceSession, type TraceSpan } from "@/lib/shared/actor-trace";
 import { fmtNum, formatTs } from "@/lib/shared/time";
-import type { Section } from "@/lib/shared/actors";
+import type { Alias, Section } from "@/lib/shared/actors";
 
 // Свои цвета, не --chart-*: красный занят отказами, а в тёмной теме chart-1 серый.
 const SECTION_COLOR: Record<Section, string> = {
@@ -65,9 +65,9 @@ const s_title = (span: TraceSpan) => `${span.target_kind === "object" ? span.tar
 
 const ROW = "grid grid-cols-[minmax(260px,38%)_1fr_80px] items-center gap-3 px-3 py-1";
 
-function SpanRow({ origin, span, session, bucketSec }: { origin: string; span: TraceSpan; session: TraceSession; bucketSec: number }) {
+function SpanRow({ origin, span, session, ctx }: { origin: string; span: TraceSpan; session: TraceSession; ctx: Ctx }) {
   const label = spanLabel(span);
-  const href = span.folded ? undefined : spanEventsHref(origin, span, bucketSec);
+  const href = span.folded ? null : spanEventsHref(origin, span, ctx.bucketSec, undefined, ctx.owner);
   const shownActions = span.actions.slice(0, 6);
   return (
     <div className={`${ROW} border-t border-border/30 hover:bg-[var(--muted)]/30`}>
@@ -85,13 +85,20 @@ function SpanRow({ origin, span, session, bucketSec }: { origin: string; span: T
         </div>
         {(shownActions.length > 0 || span.sources.length > 0) && (
           <div className="mt-0.5 flex flex-wrap gap-x-2 pl-1 font-mono text-[11px] text-muted-foreground">
-            {shownActions.map((a) => (
-              <Link key={`${a.source}|${a.action}`} href={spanEventsHref(origin, span, bucketSec, a.action)} className="hover:text-foreground hover:underline" title={`${a.source} · ${formatTs(a.first)} → ${formatTs(a.last)}`}>
-                {a.action}
-                {a.count > 1 && <span> ×{fmtNum(a.count)}</span>}
-                {a.fails > 0 && <span className="text-[var(--status-err)]"> ✕{fmtNum(a.fails)}</span>}
-              </Link>
-            ))}
+            {shownActions.map((a) => {
+              const ah = span.folded ? null : spanEventsHref(origin, span, ctx.bucketSec, a.action, ctx.owner);
+              const body = (
+                <>
+                  {a.action}
+                  {a.count > 1 && <span> ×{fmtNum(a.count)}</span>}
+                  {a.fails > 0 && <span className="text-[var(--status-err)]"> ✕{fmtNum(a.fails)}</span>}
+                </>
+              );
+              const title = `${a.source}${a.actors[0] ? ` · ${a.actors[0]}` : ""} · ${formatTs(a.first)} → ${formatTs(a.last)}`;
+              return ah
+                ? <Link key={`${a.source}|${a.action}`} href={ah} className="hover:text-foreground hover:underline" title={title}>{body}</Link>
+                : <span key={`${a.source}|${a.action}`} title={`${title} · ссылку в журнал построить нельзя`}>{body}</span>;
+            })}
             {span.actions.length > shownActions.length && <span>+{span.actions.length - shownActions.length}</span>}
             {span.actions.length === 0 && <span>{span.sources.join(" · ")}</span>}
           </div>
@@ -108,7 +115,8 @@ function SpanRow({ origin, span, session, bucketSec }: { origin: string; span: T
   );
 }
 
-function OriginBlock({ o, session, bucketSec }: { o: TraceOrigin; session: TraceSession; bucketSec: number }) {
+function OriginBlock({ o, session, ctx }: { o: TraceOrigin; session: TraceSession; ctx: Ctx }) {
+  const originHref = o.origin ? originEventsHref(o) : null;
   const nodes = new Set(o.spans.filter((s) => s.target_kind === "node").map((s) => s.target)).size;
   // Действия человека — сверху по времени; сеть — свёрнутым блоком в конце: это фон, а не поступки.
   const acts = o.spans.filter((s) => s.section !== "network");
@@ -119,7 +127,7 @@ function OriginBlock({ o, session, bucketSec }: { o: TraceOrigin; session: Trace
       <div className={`${ROW} bg-[var(--muted)]/20`}>
         <div className="flex min-w-0 items-center gap-2 text-xs">
           <span className="text-muted-foreground">{o.origin ? "из" : "без адреса источника"}</span>
-          {o.origin && <Link href={originEventsHref(o, bucketSec)} title="События с этого адреса в окне ветки — всех субъектов" className="font-mono font-medium hover:underline">{o.origin}</Link>}
+          {o.origin && (originHref ? <Link href={originHref} title="События с этого адреса в окне ветки — всех субъектов" className="font-mono font-medium hover:underline">{o.origin}</Link> : <span className="font-mono font-medium">{o.origin}</span>)}
           <span className="truncate text-[11px] text-muted-foreground">
             {fmtDuration(o.last - o.first)}{nodes ? ` · узлов ${nodes}` : ""}
           </span>
@@ -130,7 +138,7 @@ function OriginBlock({ o, session, bucketSec }: { o: TraceOrigin; session: Trace
           {o.fails > 0 && <div className="text-[10px] text-[var(--status-err)]">отказов {fmtNum(o.fails)}</div>}
         </div>
       </div>
-      {acts.map((s, i) => <SpanRow key={`${s.section}|${s.target_kind}|${s.target}|${i}`} origin={o.origin} span={s} session={session} bucketSec={bucketSec} />)}
+      {acts.map((s, i) => <SpanRow key={`${s.section}|${s.target_kind}|${s.target}|${i}`} origin={o.origin} span={s} session={session} ctx={ctx} />)}
       {net.length > 0 && (
         <details className="group/net">
           <summary className={`${ROW} cursor-pointer list-none border-t border-border/30 hover:bg-[var(--muted)]/30`}>
@@ -142,7 +150,7 @@ function OriginBlock({ o, session, bucketSec }: { o: TraceOrigin; session: Trace
             <Track from={session.first} to={session.last} segments={net.flatMap((s) => s.segments)} color={SECTION_COLOR.network} dim />
             <span className="text-right font-mono text-xs text-muted-foreground">{fmtNum(net.reduce((n, s) => n + s.count, 0))}</span>
           </summary>
-          {net.map((s, i) => <SpanRow key={`net|${s.target}|${s.dst_port}|${s.folded ?? ""}|${i}`} origin={o.origin} span={s} session={session} bucketSec={bucketSec} />)}
+          {net.map((s, i) => <SpanRow key={`net|${s.target}|${s.dst_port}|${s.folded ?? ""}|${i}`} origin={o.origin} span={s} session={session} ctx={ctx} />)}
         </details>
       )}
     </div>
@@ -159,7 +167,11 @@ function sessionSummary(s: TraceSession): string {
   return parts.filter(Boolean).join(" ");
 }
 
-export function ActorTraceView({ trace }: { trace: ActorTrace }) {
+type Ctx = { bucketSec: number; owner?: OwnerScope };
+
+/** aliases — для границ ссылок в журнал по интервалам владения алиасами. */
+export function ActorTraceView({ trace, aliases }: { trace: ActorTrace; aliases?: Alias[] }) {
+  const ctx: Ctx = { bucketSec: trace.bucketSec, owner: aliases ? ownerScope(aliases) : undefined };
   const interactive = trace.sessions.filter((s) => !s.networkOnly);
   const meta = `сессия — активность без перерыва дольше ${fmtDuration(trace.gapMs)} · сеть — топ ${trace.networkTop} адресов на источник${trace.truncated ? " · выборка упёрлась в потолок, показаны свежие" : ""}`;
   return (
@@ -190,7 +202,7 @@ export function ActorTraceView({ trace }: { trace: ActorTrace }) {
                   <Axis from={s.first} to={s.last} />
                   <span className="c-label text-right">событий</span>
                 </div>
-                {s.origins.map((o) => <OriginBlock key={o.origin || "∅"} o={o} session={s} bucketSec={trace.bucketSec} />)}
+                {s.origins.map((o) => <OriginBlock key={o.origin || "∅"} o={o} session={s} ctx={ctx} />)}
               </div>
             </details>
           ))}

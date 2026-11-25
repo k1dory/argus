@@ -481,10 +481,11 @@ export async function actorTrace(aliases: Alias[], range: ActorRange, opts: { no
   const inner = (net: boolean) => `
     SELECT toStartOfInterval(ts, toIntervalSecond({b:UInt32})) AS bucket, ${SECTION_SQL} AS section, src_ip AS origin,
            ${TRACE_TARGET_SQL} AS tgt, tgt.1 AS target, tgt.2 AS target_kind, ${net ? "dst_port" : "toUInt16(0)"} AS port,
-           source, action, actor_name AS actor, count() AS count, ${TRACE_FAIL_SQL} AS fails, toString(min(ts)) AS first_ts, toString(max(ts)) AS last_ts
+           source, action, actor_name AS actor, if(section = 'host', object, '') AS detail, count() AS count, ${TRACE_FAIL_SQL} AS fails, toString(min(ts)) AS first_ts, toString(max(ts)) AS last_ts,
+           toString(minIf(ts, NOT match(lowerUTF8(outcome), 'fail|deny|denied|error'))) AS first_ok_ts
     FROM events WHERE ${base} AND ${net ? "" : "NOT "}(${SECTION_SQL} = 'network')
-    GROUP BY bucket, section, origin, tgt, port, source, action, actor`;
-  const cols = "section, origin, target, target_kind, port AS dst_port, source, action, actor, count, fails, first_ts, last_ts";
+    GROUP BY bucket, section, origin, tgt, port, source, action, actor, detail`;
+  const cols = "section, origin, target, target_kind, port AS dst_port, source, action, actor, detail, count, fails, first_ts, last_ts, first_ok_ts";
   // Сеть: топ назначений (а не строк «назначение × действие») на корзину и источник —
   // иначе много действий к одному адресу вытесняли бы остальные адреса.
   const netRanked = `

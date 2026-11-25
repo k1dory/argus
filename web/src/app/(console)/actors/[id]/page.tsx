@@ -16,8 +16,10 @@ import { safeQuery } from "@/lib/clickhouse";
 import { audit } from "@/lib/argus-queries";
 import { actorReport, actorTrace, getPerson, personAliases } from "@/lib/actors";
 import { ActorTraceView } from "@/components/console/actor-trace";
-import { attachIncidents, type ActorTrace } from "@/lib/shared/actor-trace";
-import { aliasEventsHref, aliasKey, holdPolicy, isHeld, parseActorRange, PERSON_ID_RE, primaryAlias, SECTION_LABELS, SECTIONS, type ActorReport, type Section } from "@/lib/shared/actors";
+import { attachIncidents, ownerScope, type ActorTrace } from "@/lib/shared/actor-trace";
+import { ActorFeed } from "@/components/console/actor-feed";
+import { buildFeed, parseFeedFilter, type FeedFilter } from "@/lib/shared/actor-feed";
+import { tsMs, aliasEventsHref, aliasKey, holdPolicy, isHeld, parseActorRange, PERSON_ID_RE, primaryAlias, SECTION_LABELS, SECTIONS, type ActorReport, type Section } from "@/lib/shared/actors";
 import { isIncidentStatus } from "@/lib/shared/incidents";
 import type { LogItem } from "@/lib/shared/log-query";
 import { RANGES } from "@/lib/shared/ranges";
@@ -40,6 +42,7 @@ export default async function ActorPage({ params, searchParams }: PageProps<"/ac
   if (!PERSON_ID_RE.test(id)) notFound();
   const sp = await searchParams;
   const range = parseActorRange(typeof sp.range === "string" ? sp.range : undefined);
+  const feed = parseFeedFilter(typeof sp.feed === "string" ? sp.feed : undefined);
   const base = `/actors/${encodeURIComponent(id)}`;
 
   // Сначала журнал действий: нет записи о просмотре — нет данных.
@@ -150,12 +153,16 @@ export default async function ActorPage({ params, searchParams }: PageProps<"/ac
         )}
       </Panel>
 
-      {!rr.ok ? <StorageUnavailable reason={rr.error} /> : <ReportBody r={rr.data} range={range} trace={tr.ok ? tr.data : null} traceError={tr.ok ? null : tr.error} />}
+      {!rr.ok ? <StorageUnavailable reason={rr.error} /> : <ReportBody r={rr.data} range={range} trace={tr.ok ? tr.data : null} traceError={tr.ok ? null : tr.error} feed={feed} base={base} />}
     </>
   );
 }
 
-function ReportBody({ r, range, trace, traceError }: { r: ActorReport; range: string; trace: ActorTrace | null; traceError: string | null }) {
+function ReportBody({ r, range, trace, traceError, feed, base }: { r: ActorReport; range: string; trace: ActorTrace | null; traceError: string | null; feed: FeedFilter; base: string }) {
+  // «Сейчас» — момент сборки отчёта: чистый рендер, и время ленты сходится с окном.
+  const now = tsMs(r.generated_at) ?? 0;
+  const feedItems = trace ? buildFeed(trace, { incidents: r.incidents, owner: ownerScope(r.aliases) }) : [];
+  const feedHref = (f: FeedFilter) => `${base}?range=${range}${f === "all" ? "" : `&feed=${f}`}#activity`;
   const primary = primaryAlias(r.aliases);
   return (
     <>
@@ -185,7 +192,9 @@ function ReportBody({ r, range, trace, traceError }: { r: ActorReport; range: st
         </dl>
       </Panel>
 
-      {trace ? <ActorTraceView trace={trace} /> : (
+      {trace && <ActorFeed items={feedItems} filter={feed} now={now} hrefFor={feedHref} />}
+
+      {trace ? <ActorTraceView trace={trace} aliases={r.aliases} /> : (
         <Panel label="Трассировка" meta="недоступна">
           <p className="text-sm text-muted-foreground">Не удалось построить трассировку: {traceError ?? "ошибка хранилища"}. Ниже — события по разделам.</p>
         </Panel>

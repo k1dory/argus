@@ -101,21 +101,22 @@ test("ссылка в журнал: структурные поля полосы
   const t = buildTrace([ssh(0, "10.8.0.5", "pve125"), sudo(3, "pve125"), flow(5, "1.2.3.4")], { bucketSec: 60 });
   const o = t.sessions[0].origins[0];
   const sudoSpan = o.spans.find((s) => s.section === "host")!;
-  const url = new URL(spanEventsHref(o.origin, sudoSpan, 60, "priv.sudo"), "http://x");
+  const url = new URL(spanEventsHref(o.origin, sudoSpan, 60, "priv.sudo")!, "http://x");
   const terms = parseQuery(url.searchParams.get("q")!);
   // sudo привязан выводом — src в журнале у него пустой, фильтровать по нему нельзя.
   assert.deepEqual(terms.map((x) => [x.field, x.value]), [["node", "pve125"], ["action", "priv.sudo"]]);
-  assert.equal(url.searchParams.get("from"), "2026-11-20T08:02");
-  assert.equal(url.searchParams.get("to"), "2026-11-20T08:04");
+  // Окно — точное до секунды: активность действия, без запаса в корзину.
+  assert.equal(url.searchParams.get("from"), "2026-11-20T08:03:00");
+  assert.equal(url.searchParams.get("to"), "2026-11-20T08:03:01");
   const net = o.spans.find((s) => s.section === "network")!;
-  const q = parseQuery(new URL(spanEventsHref(o.origin, net, 60), "http://x").searchParams.get("q")!);
+  const q = parseQuery(new URL(spanEventsHref(o.origin, net, 60)!, "http://x").searchParams.get("q")!);
   assert.deepEqual(q.map((x) => [x.field, x.value]), [["src", "10.8.0.5"], ["dst", "1.2.3.4"], ["dport", "443"]]);
 });
 
 test("значение со звёздочкой в ссылке — литерал, а не маска", () => {
   const t = buildTrace([row({ min: 0, section: "app", target: "app*", target_kind: "object" })]);
   const s = t.sessions[0].origins[0].spans[0];
-  const [term] = parseQuery(new URL(spanEventsHref("", s, 60), "http://x").searchParams.get("q")!);
+  const [term] = parseQuery(new URL(spanEventsHref("", s, 60)!, "http://x").searchParams.get("q")!);
   assert.equal(term.quoted, true);
 });
 
@@ -125,4 +126,15 @@ test("сеть дальше 5 минут от действий не растяг
   assert.equal(new Date(s.first).toISOString(), new Date(T0 + 100 * 60_000).toISOString());
   assert.equal(new Date(s.last).toISOString(), new Date(T0 + 113 * 60_000).toISOString());
   assert.equal(t.sessions.filter((x) => x.networkOnly).length, 2);
+});
+
+test("ссылка обрезается интервалом владения алиасом; вне интервала — ссылки нет", () => {
+  const t = buildTrace([{ ...sudo(0), actor: "alice", last_ts: at(20) }]);
+  const span = t.sessions[0].origins[0].spans[0];
+  const owner = (field: "actor" | "src", v: string): [number, number][] =>
+    field === "actor" && v === "alice" ? [[T0 - 3600_000, T0 + 10 * 60_000]] : [];
+  const url = new URL(spanEventsHref("", span, 60, undefined, owner)!, "http://x");
+  assert.equal(url.searchParams.get("to"), "2026-11-20T08:10:00", "алиас закрыт в 08:10 — дальше не его события");
+  const none = () => [] as [number, number][];
+  assert.equal(spanEventsHref("", span, 60, undefined, none), null);
 });
