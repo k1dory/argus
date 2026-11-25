@@ -5,8 +5,7 @@ import { ChevronRight } from "lucide-react";
 import { LevelBadge } from "@/components/console/incident-badges";
 import { Empty, Panel } from "@/components/console/panel";
 import { Badge } from "@/components/ui/badge";
-import { fmtDuration, spanEventsHref, spanLabel, TRACE_SECTION_LABELS, type ActorTrace, type TraceOrigin, type TraceSession, type TraceSpan } from "@/lib/shared/actor-trace";
-import { searchHref } from "@/lib/shared/search-href";
+import { fmtDuration, originEventsHref, spanEventsHref, spanLabel, TRACE_SECTION_LABELS, type ActorTrace, type TraceOrigin, type TraceSession, type TraceSpan } from "@/lib/shared/actor-trace";
 import { fmtNum, formatTs } from "@/lib/shared/time";
 import type { Section } from "@/lib/shared/actors";
 
@@ -62,6 +61,8 @@ function Axis({ from, to }: { from: number; to: number }) {
   );
 }
 
+const s_title = (span: TraceSpan) => `${span.target_kind === "object" ? span.target : spanLabel(span)} — события в журнале${span.actors.length ? ` по ${span.actors[0]}${span.actors.length > 1 ? ` (ещё алиасов: ${span.actors.length - 1})` : ""}` : ""}`;
+
 const ROW = "grid grid-cols-[minmax(260px,38%)_1fr_80px] items-center gap-3 px-3 py-1";
 
 function SpanRow({ origin, span, session, bucketSec }: { origin: string; span: TraceSpan; session: TraceSession; bucketSec: number }) {
@@ -76,7 +77,7 @@ function SpanRow({ origin, span, session, bucketSec }: { origin: string; span: T
             {TRACE_SECTION_LABELS[span.section]}
           </span>
           {href ? (
-            <Link href={href} className="truncate font-mono hover:underline" title={`${label} — события в журнале`}>{label}</Link>
+            <Link href={href} className="truncate font-mono hover:underline" title={`${s_title(span)}`}>{label}</Link>
           ) : (
             <span className="truncate font-mono text-muted-foreground">{label}</span>
           )}
@@ -118,7 +119,7 @@ function OriginBlock({ o, session, bucketSec }: { o: TraceOrigin; session: Trace
       <div className={`${ROW} bg-[var(--muted)]/20`}>
         <div className="flex min-w-0 items-center gap-2 text-xs">
           <span className="text-muted-foreground">{o.origin ? "из" : "без адреса источника"}</span>
-          {o.origin && <Link href={searchHref.eventSrc(o.origin)} className="font-mono font-medium hover:underline">{o.origin}</Link>}
+          {o.origin && <Link href={originEventsHref(o, bucketSec)} title="События с этого адреса в окне ветки — всех субъектов" className="font-mono font-medium hover:underline">{o.origin}</Link>}
           <span className="truncate text-[11px] text-muted-foreground">
             {fmtDuration(o.last - o.first)}{nodes ? ` · узлов ${nodes}` : ""}
           </span>

@@ -17,6 +17,8 @@ export type TraceRow = {
   dst_port: number;
   source: string;
   action: string;
+  /** actor_name события ('' у NetFlow) — для ссылки в журнал в границах субъекта. */
+  actor?: string;
   count: number;
   fails: number;
   first_ts: string;
@@ -37,6 +39,8 @@ export type TraceSpan = {
   count: number;
   fails: number;
   sources: string[];
+  /** actor_name событий полосы, частые — первыми. */
+  actors: string[];
   actions: TraceAction[];
   segments: Segment[];
   /** Свёрнутая строка «ещё N адресов» (только сеть). */
@@ -141,6 +145,7 @@ function buildSpan(items: Item[], joinMs: number): TraceSpan {
     first: Math.min(...items.map((i) => i.firstMs)), last: Math.max(...items.map((i) => i.lastMs)),
     count: items.reduce((s, i) => s + i.count, 0), fails: items.reduce((s, i) => s + i.fails, 0),
     sources: [...new Set(items.map((i) => i.source))].sort(),
+    actors: rankActors(items),
     actions: [...actions.values()].sort((a, b) => b.count - a.count || a.first - b.first),
     segments: mergeSegments(items.map((i) => [i.firstMs, i.lastMs]), joinMs),
   };
@@ -155,27 +160,36 @@ function foldNetwork(spans: TraceSpan[], top: number): TraceSpan[] {
     section: "network", target: "", target_kind: "dst", dst_port: 0,
     first: Math.min(...rest.map((s) => s.first)), last: Math.max(...rest.map((s) => s.last)),
     count: rest.reduce((n, s) => n + s.count, 0), fails: rest.reduce((n, s) => n + s.fails, 0),
-    sources: [...new Set(rest.flatMap((s) => s.sources))].sort(), actions: [],
+    sources: [...new Set(rest.flatMap((s) => s.sources))].sort(), actors: [], actions: [],
     segments: mergeSegments(rest.flatMap((s) => s.segments), 0), folded: rest.length,
   };
   return [...spans.filter((s) => s.section !== "network" || keep.has(s)), folded];
 }
 
+function rankActors(items: Pick<TraceRow, "actor" | "count">[]): string[] {
+  const n = new Map<string, number>();
+  for (const i of items) if (i.actor) n.set(i.actor, (n.get(i.actor) ?? 0) + i.count);
+  return [...n.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([a]) => a);
+}
+
 const SECTION_ORDER: Record<Section, number> = { login: 0, app: 1, host: 2, change: 3, other: 4, network: 5 };
 
 function buildOrigins(items: Item[], joinMs: number, networkTop: number): TraceOrigin[] {
-  // События без адреса источника (sudo, сеанс на узле) — к источнику, с которого
-  // в этой сессии был вход на тот же узел. Иначе — отдельная ветка «без адреса».
-  const entry = new Map<string, string>();
-  for (const it of items) {
-    if (it.origin && it.target_kind === "node" && (it.section === "login" || it.section === "host") && !entry.has(it.target)) entry.set(it.target, it.origin);
-  }
+  // События без адреса источника (sudo, сеанс на узле) — к источнику успешного
+  // входа на тот же узел, случившегося раньше. Источников несколько — не угадываем:
+  // событие остаётся в ветке «без адреса».
+  const logins = items.filter((it) => it.origin && it.target_kind === "node" && (it.section === "login" || it.section === "host") && it.count > it.fails);
+  const entryFor = (it: Item): string | null => {
+    const origins = new Set(logins.filter((l) => l.target === it.target && l.firstMs <= it.firstMs).map((l) => l.origin));
+    return origins.size === 1 ? [...origins][0] : null;
+  };
   const byOrigin = new Map<string, Map<string, { items: Item[]; attached: boolean }>>();
   for (const it of items) {
     let origin = it.origin;
     let attached = false;
-    if (!origin && it.target_kind === "node" && entry.has(it.target)) {
-      origin = entry.get(it.target)!;
+    const entry = !origin && it.target_kind === "node" ? entryFor(it) : null;
+    if (entry) {
+      origin = entry;
       attached = true;
     }
     const spans = byOrigin.get(origin) ?? new Map();
@@ -274,10 +288,14 @@ export const TRACE_SECTION_LABELS: Record<Section, string> = {
   login: "вход", host: "узел", network: "сеть", app: "приложение", change: "изменение", other: "прочее",
 };
 
+/** Подпись объекта в строке; ключ и ссылка — по полному значению. */
+const OBJECT_LABEL_MAX = 160;
+
 export function spanLabel(s: Pick<TraceSpan, "target" | "target_kind" | "dst_port" | "folded">): string {
   if (s.folded) return `ещё ${s.folded} адресов`;
   if (s.target_kind === "dst") return s.dst_port ? `${s.target}:${s.dst_port}` : s.target || "—";
-  return s.target || "—";
+  const t = s.target || "—";
+  return s.target_kind === "object" && t.length > OBJECT_LABEL_MAX ? `${t.slice(0, OBJECT_LABEL_MAX)}…` : t;
 }
 
 export function fmtDuration(ms: number): string {
@@ -288,10 +306,23 @@ export function fmtDuration(ms: number): string {
   return m % 60 ? `${h} ч ${m % 60} мин` : `${h} ч`;
 }
 
-/** Журнал событий полосы: структурные поля цели и окно полосы (с запасом в корзину). */
-export function spanEventsHref(origin: string, s: Pick<TraceSpan, "target" | "target_kind" | "dst_port" | "first" | "last" | "attached">, bucketSec: number, action?: string): string {
+/** Окно ссылки: границы с запасом в корзину, по минутам. */
+function windowParams(first: number, last: number, bucketSec: number): string {
+  const pad = bucketSec * 1000;
+  return `from=${toDtParam(Math.floor((first - pad) / 60_000) * 60_000)}&to=${toDtParam(Math.ceil((last + pad) / 60_000) * 60_000)}`;
+}
+
+/**
+ * Журнал событий полосы: структурные поля цели, окно полосы и граница субъекта.
+ * Есть actor_name — фильтр по самому частому (язык поиска без ИЛИ: ссылка
+ * показывает подмножество событий субъекта, но не чужие). Нет — фильтр по
+ * адресу источника: у сети без субъекта он и есть алиас.
+ */
+export function spanEventsHref(origin: string, s: Pick<TraceSpan, "target" | "target_kind" | "dst_port" | "first" | "last" | "attached"> & { actors?: string[] }, bucketSec: number, action?: string): string {
   const L = { literal: true };
   let q = "";
+  const actor = s.actors?.[0];
+  if (actor) q = appendTerm(q, "actor", actor, L);
   if (origin && !s.attached) q = appendTerm(q, "src", origin, L);
   if (s.target) {
     if (s.target_kind === "node") q = appendTerm(q, "node", s.target, L);
@@ -302,8 +333,10 @@ export function spanEventsHref(origin: string, s: Pick<TraceSpan, "target" | "ta
     else q = appendTerm(q, "object", s.target, L);
   }
   if (action) q = appendTerm(q, "action", action, L);
-  const pad = bucketSec * 1000;
-  const from = toDtParam(Math.floor((s.first - pad) / 60_000) * 60_000);
-  const to = toDtParam(Math.ceil((s.last + pad) / 60_000) * 60_000);
-  return `/events?q=${encodeURIComponent(q)}&from=${from}&to=${to}`;
+  return `/events?q=${encodeURIComponent(q)}&${windowParams(s.first, s.last, bucketSec)}`;
+}
+
+/** Журнал по адресу источника в окне ветки: значение — литерал языка поиска. */
+export function originEventsHref(o: Pick<TraceOrigin, "origin" | "first" | "last">, bucketSec: number): string {
+  return `/events?q=${encodeURIComponent(appendTerm("", "src", o.origin, { literal: true }))}&${windowParams(o.first, o.last, bucketSec)}`;
 }

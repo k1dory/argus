@@ -459,7 +459,9 @@ export async function actorReport(person: Person, aliases: Alias[], range: Actor
 /* ===== Трассировка ===== */
 
 /** Куда: узел, иначе адрес назначения (сеть), иначе объект, иначе источник. */
-const TRACE_TARGET_SQL = `multiIf(node != '', tuple(node, 'node'), dst_ip != '' AND section = 'network', tuple(dst_ip, 'dst'), object != '', tuple(substring(object, 1, 160), 'object'), tuple(source, 'source'))`;
+// У сети цель — назначение: в node NetFlow коллектор пишет экспортёр. Объект —
+// целиком: обрезка в ключе склеивала бы разные длинные URL; режется только подпись.
+const TRACE_TARGET_SQL = `multiIf(section = 'network' AND dst_ip != '', tuple(dst_ip, 'dst'), node != '', tuple(node, 'node'), object != '', tuple(object, 'object'), tuple(source, 'source'))`;
 const TRACE_FAIL_SQL = `countIf(match(lowerUTF8(outcome), 'fail|deny|denied|error'))`;
 
 /**
@@ -479,13 +481,18 @@ export async function actorTrace(aliases: Alias[], range: ActorRange, opts: { no
   const inner = (net: boolean) => `
     SELECT toStartOfInterval(ts, toIntervalSecond({b:UInt32})) AS bucket, ${SECTION_SQL} AS section, src_ip AS origin,
            ${TRACE_TARGET_SQL} AS tgt, tgt.1 AS target, tgt.2 AS target_kind, ${net ? "dst_port" : "toUInt16(0)"} AS port,
-           source, action, count() AS count, ${TRACE_FAIL_SQL} AS fails, toString(min(ts)) AS first_ts, toString(max(ts)) AS last_ts
+           source, action, actor_name AS actor, count() AS count, ${TRACE_FAIL_SQL} AS fails, toString(min(ts)) AS first_ts, toString(max(ts)) AS last_ts
     FROM events WHERE ${base} AND ${net ? "" : "NOT "}(${SECTION_SQL} = 'network')
-    GROUP BY bucket, section, origin, tgt, port, source, action`;
-  const cols = "section, origin, target, target_kind, port AS dst_port, source, action, count, fails, first_ts, last_ts";
+    GROUP BY bucket, section, origin, tgt, port, source, action, actor`;
+  const cols = "section, origin, target, target_kind, port AS dst_port, source, action, actor, count, fails, first_ts, last_ts";
+  // Сеть: топ назначений (а не строк «назначение × действие») на корзину и источник —
+  // иначе много действий к одному адресу вытесняли бы остальные адреса.
+  const netRanked = `
+    SELECT *, dense_rank() OVER (PARTITION BY bucket, origin ORDER BY dst_total DESC, target, port) AS dst_rank FROM (
+      SELECT *, sum(count) OVER (PARTITION BY bucket, origin, target, target_kind, port) AS dst_total FROM (${inner(true)}))`;
   const [act, net] = await Promise.all([
     chQuery<TraceRow>(`SELECT ${cols} FROM (${inner(false)}) ORDER BY bucket DESC, count DESC LIMIT {cap:UInt32}`, params),
-    chQuery<TraceRow>(`SELECT ${cols} FROM (${inner(true)}) ORDER BY bucket DESC, count DESC LIMIT {top:UInt32} BY bucket, origin LIMIT {cap:UInt32}`, params),
+    chQuery<TraceRow>(`SELECT ${cols} FROM (${netRanked}) WHERE dst_rank <= {top:UInt32} ORDER BY bucket DESC, count DESC LIMIT {cap:UInt32}`, params),
   ]);
   return buildTrace([...act, ...net], { bucketSec, truncated: act.length >= TRACE_ROWS_MAX || net.length >= TRACE_ROWS_MAX });
 }
