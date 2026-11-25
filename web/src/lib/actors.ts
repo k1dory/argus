@@ -9,6 +9,7 @@ import { chCommand, chQuery as chQueryRaw, safeQuery } from "./clickhouse";
 import { SEARCH_SETTINGS } from "./search";
 import { chTs, LOG_COLUMNS, toLogItem, type LogItem } from "./shared/log-query";
 import type { TriageBinding } from "./shared/triage";
+import { buildTrace, TRACE_BUCKET_SEC, TRACE_NETWORK_TOP, TRACE_ROWS_MAX, type ActorTrace, type TraceRow } from "./shared/actor-trace";
 import {
   activityPlan, formEncodedBytes,
   ACTOR_KEYS_EXPR, ACTOR_KINDS, activeAliases, aliasColumnExpr, aliasPredicate, aliasPrefilter, aliasActiveAt, aliasMatches, aliasKey, ambiguousAliases, bucketEvents, canonicalIp, canonicalPhone, chStringArray, clampWindow, SECTION_LABELS, SECTION_SQL, SECTIONS, CONFIRMED_NOTE_PREFIX, HOLD_CONFIDENCE, HOLD_NOTE_PREFIX, isAliasKind, isHeld, LOWERCASE_KINDS, normalizeAliasValue, rangeWindow, resolveStatus,
@@ -453,6 +454,40 @@ export async function actorReport(person: Person, aliases: Alias[], range: Actor
     incidents, timeline, limit, missing,
     generated_at: chTs(now),
   };
+}
+
+/* ===== Трассировка ===== */
+
+/** Куда: узел, иначе адрес назначения (сеть), иначе объект, иначе источник. */
+const TRACE_TARGET_SQL = `multiIf(node != '', tuple(node, 'node'), dst_ip != '' AND section = 'network', tuple(dst_ip, 'dst'), object != '', tuple(substring(object, 1, 160), 'object'), tuple(source, 'source'))`;
+const TRACE_FAIL_SQL = `countIf(match(lowerUTF8(outcome), 'fail|deny|denied|error'))`;
+
+/**
+ * Агрегаты для трассировки: корзина времени × раздел × откуда (src_ip) × куда ×
+ * источник × действие. Сеть — отдельным запросом и только топ адресов
+ * назначения на корзину и источник: NetFlow — основной объём событий и иначе
+ * вытеснил бы всё остальное. Свежие корзины — первыми, потолок строк общий.
+ */
+export async function actorTrace(aliases: Alias[], range: ActorRange, opts: { now?: number; window?: Window } = {}): Promise<ActorTrace> {
+  const now = opts.now ?? Date.now();
+  const w = clampWindow(opts.window ?? rangeWindow(range, now));
+  const bucketSec = TRACE_BUCKET_SEC[range];
+  const pred = aliasPredicate(aliases, w);
+  const pf = aliasPrefilter(aliases);
+  const params: Record<string, string | number> = { ...pred.params, ...pf.params, from: chTs(w.fromMs), to: chTs(w.toMs), b: bucketSec, cap: TRACE_ROWS_MAX, top: TRACE_NETWORK_TOP };
+  const base = `ts >= parseDateTime64BestEffort({from:String}, 3, 'UTC') AND ts < parseDateTime64BestEffort({to:String}, 3, 'UTC') AND ${pf.sql} AND ${pred.sql}`;
+  const inner = (net: boolean) => `
+    SELECT toStartOfInterval(ts, toIntervalSecond({b:UInt32})) AS bucket, ${SECTION_SQL} AS section, src_ip AS origin,
+           ${TRACE_TARGET_SQL} AS tgt, tgt.1 AS target, tgt.2 AS target_kind, ${net ? "dst_port" : "toUInt16(0)"} AS port,
+           source, action, count() AS count, ${TRACE_FAIL_SQL} AS fails, toString(min(ts)) AS first_ts, toString(max(ts)) AS last_ts
+    FROM events WHERE ${base} AND ${net ? "" : "NOT "}(${SECTION_SQL} = 'network')
+    GROUP BY bucket, section, origin, tgt, port, source, action`;
+  const cols = "section, origin, target, target_kind, port AS dst_port, source, action, count, fails, first_ts, last_ts";
+  const [act, net] = await Promise.all([
+    chQuery<TraceRow>(`SELECT ${cols} FROM (${inner(false)}) ORDER BY bucket DESC, count DESC LIMIT {cap:UInt32}`, params),
+    chQuery<TraceRow>(`SELECT ${cols} FROM (${inner(true)}) ORDER BY bucket DESC, count DESC LIMIT {top:UInt32} BY bucket, origin LIMIT {cap:UInt32}`, params),
+  ]);
+  return buildTrace([...act, ...net], { bucketSec, truncated: act.length >= TRACE_ROWS_MAX || net.length >= TRACE_ROWS_MAX });
 }
 
 /* ===== Запись: upsert персон и алиасов, закрытие алиаса ===== */

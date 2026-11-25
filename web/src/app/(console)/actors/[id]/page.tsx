@@ -14,7 +14,9 @@ import { Button } from "@/components/ui/button";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { safeQuery } from "@/lib/clickhouse";
 import { audit } from "@/lib/argus-queries";
-import { actorReport, getPerson, personAliases } from "@/lib/actors";
+import { actorReport, actorTrace, getPerson, personAliases } from "@/lib/actors";
+import { ActorTraceView } from "@/components/console/actor-trace";
+import { attachIncidents, type ActorTrace } from "@/lib/shared/actor-trace";
 import { aliasEventsHref, aliasKey, holdPolicy, isHeld, parseActorRange, PERSON_ID_RE, primaryAlias, SECTION_LABELS, SECTIONS, type ActorReport, type Section } from "@/lib/shared/actors";
 import { isIncidentStatus } from "@/lib/shared/incidents";
 import type { LogItem } from "@/lib/shared/log-query";
@@ -66,7 +68,11 @@ export default async function ActorPage({ params, searchParams }: PageProps<"/ac
   }
   const [person, aliases] = pr.data;
   if (!person) notFound();
-  const rr = await safeQuery(() => actorReport(person, aliases, range, TIMELINE_LIMIT));
+  const [rr, tr] = await Promise.all([
+    safeQuery(() => actorReport(person, aliases, range, TIMELINE_LIMIT)),
+    safeQuery(() => actorTrace(aliases, range)),
+  ]);
+  if (rr.ok && tr.ok) attachIncidents(tr.data.sessions, rr.data.incidents, tr.data.gapMs);
   const isAdmin = session.role === "admin";
 
   return (
@@ -144,12 +150,12 @@ export default async function ActorPage({ params, searchParams }: PageProps<"/ac
         )}
       </Panel>
 
-      {!rr.ok ? <StorageUnavailable reason={rr.error} /> : <ReportBody r={rr.data} range={range} />}
+      {!rr.ok ? <StorageUnavailable reason={rr.error} /> : <ReportBody r={rr.data} range={range} trace={tr.ok ? tr.data : null} traceError={tr.ok ? null : tr.error} />}
     </>
   );
 }
 
-function ReportBody({ r, range }: { r: ActorReport; range: string }) {
+function ReportBody({ r, range, trace, traceError }: { r: ActorReport; range: string; trace: ActorTrace | null; traceError: string | null }) {
   const primary = primaryAlias(r.aliases);
   return (
     <>
@@ -179,9 +185,11 @@ function ReportBody({ r, range }: { r: ActorReport; range: string }) {
         </dl>
       </Panel>
 
-      {SECTIONS.filter((s): s is Exclude<Section, "other"> => s !== "other").map((s) => (
-        <SectionPanel key={s} section={s} items={r.sections[s]} limit={r.limit} />
-      ))}
+      {trace ? <ActorTraceView trace={trace} /> : (
+        <Panel label="Трассировка" meta="недоступна">
+          <p className="text-sm text-muted-foreground">Не удалось построить трассировку: {traceError ?? "ошибка хранилища"}. Ниже — события по разделам.</p>
+        </Panel>
+      )}
 
       <Panel label="Инциденты" meta="actor_name инцидента ∈ алиасов, действовавших на его начало">
         {r.incidents.length === 0 ? <Empty>Инцидентов с субъектом в периоде нет.</Empty> : (
@@ -199,16 +207,27 @@ function ReportBody({ r, range }: { r: ActorReport; range: string }) {
         )}
       </Panel>
 
-      <Panel
-        label={`Таймлайн · последние ${fmtNum(r.timeline.length)}${r.timeline.length >= r.limit ? ` из не больше ${fmtNum(r.limit)}` : ""}`}
-        meta={primary ? <Link href={aliasEventsHref(primary, range as "24h" | "7d" | "30d")} className="text-[var(--ring)] hover:underline">открыть в журнале по {primary.value}</Link> : undefined}
-        bodyClassName="p-0"
-      >
-        {r.timeline.length === 0 ? <Empty className="p-4">Событий нет.</Empty> : <EventTable items={r.timeline} />}
-      </Panel>
+      <details className="group" open={!trace}>
+        <summary className="c-label cursor-pointer list-none py-2 text-muted-foreground hover:text-foreground">
+          <span className="inline-block transition-transform group-open:rotate-90">›</span> События списком — по разделам и лента
+        </summary>
+        <div className="mt-4 space-y-6">
+          {SECTIONS.filter((s): s is Exclude<Section, "other"> => s !== "other").map((s) => (
+            <SectionPanel key={s} section={s} items={r.sections[s]} limit={r.limit} />
+          ))}
+          <Panel
+            label={`Таймлайн · последние ${fmtNum(r.timeline.length)}${r.timeline.length >= r.limit ? ` из не больше ${fmtNum(r.limit)}` : ""}`}
+            meta={primary ? <Link href={aliasEventsHref(primary, range as "24h" | "7d" | "30d")} className="text-[var(--ring)] hover:underline">открыть в журнале по {primary.value}</Link> : undefined}
+            bodyClassName="p-0"
+          >
+            {r.timeline.length === 0 ? <Empty className="p-4">Событий нет.</Empty> : <EventTable items={r.timeline} />}
+          </Panel>
+        </div>
+      </details>
 
       <Panel label="Чего нет в данных">
         <ul className="list-disc space-y-1 pl-5 text-sm text-muted-foreground">
+          <li>Трассировка — агрегаты по корзинам времени: сессия делится перерывом активности, а не выходом из системы (выхода источники почти не пишут); сеть показана топом адресов назначения. События без адреса источника привязываются к источнику входа на тот же узел в этой сессии — это вывод, а не факт из журнала.</li>
           <li>Содержимого данных внутри приложений: паспорт строится по журналу событий, а не по данным систем.</li>
           <li>Событий вне интервалов действия алиасов: до «действует с» и после «по» они субъекту не приписываются.</li>
           <li>Источников, не подключённых к ARGUS, и событий старше срока хранения.</li>
