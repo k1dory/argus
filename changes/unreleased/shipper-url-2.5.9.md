@@ -1,0 +1,1 @@
+- **shipper: `url` 2.5.9 (RUSTSEC-2026-0592).** Переполнение стека в `Url::origin()` на вложенных `blob:` URL; блокирующий `cargo audit` в CI падал на всех PR.
