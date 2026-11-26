@@ -2,7 +2,7 @@ import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { applyAllMigrations, ch, liveSkip as skip, serializeLiveFile } from "./_ch-live";
-import { spanEventsHref, type ActorTrace } from "../src/lib/shared/actor-trace";
+import { spanEventsHref, TRACE_ROWS_MAX, type ActorTrace } from "../src/lib/shared/actor-trace";
 import type { Alias } from "../src/lib/shared/actors";
 import { chTs } from "../src/lib/shared/log-query";
 import { journalQuery, parseJournalParams } from "../src/lib/shared/journal";
@@ -171,5 +171,20 @@ test("R4: объект длиннее лимита журнала — ссылк
     assert.equal(app.length, 2);
     const span = app.find((s) => s.target === prefix + "/a")!;
     assert.equal(spanEventsHref("", span, trace.bucketSec, "app.open"), null);
+  });
+});
+
+test("detail: уникальные команды не вытесняют отказ из одной корзины", { skip }, async () => {
+  const n = TRACE_ROWS_MAX + 1;
+  await withTrace((f) => [
+    ...Array.from({ length: n }, (_, i) =>
+      Array.from({ length: 2 }, () => ({
+        node: f.node, action: "priv.sudo", object: `command-${i}`,
+      }))).flat(),
+    { node: f.node, action: "priv.sudo", object: "denied-command", outcome: "failure" },
+  ], (trace) => {
+    assert.equal(spans(trace).reduce((n, s) => n + s.fails, 0), 1);
+    assert.equal(spans(trace).reduce((n, s) => n + s.count, 0), 2 * n + 1);
+    assert.equal(trace.truncated, false);
   });
 });

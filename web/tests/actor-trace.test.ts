@@ -107,7 +107,7 @@ test("ссылка в журнал: структурные поля полосы
   assert.deepEqual(terms.map((x) => [x.field, x.value]), [["node", "pve125"], ["action", "priv.sudo"]]);
   // Окно — точное до секунды: активность действия, без запаса в корзину.
   assert.equal(url.searchParams.get("from"), "2026-11-20T08:03:00");
-  assert.equal(url.searchParams.get("to"), "2026-11-20T08:03:01");
+  assert.equal(url.searchParams.get("to"), "2026-11-20T08:03:00");
   const net = o.spans.find((s) => s.section === "network")!;
   const q = parseQuery(new URL(spanEventsHref(o.origin, net, 60)!, "http://x").searchParams.get("q")!);
   assert.deepEqual(q.map((x) => [x.field, x.value]), [["src", "10.8.0.5"], ["dst", "1.2.3.4"], ["dport", "443"]]);
@@ -131,10 +131,10 @@ test("сеть дальше 5 минут от действий не растяг
 test("ссылка обрезается интервалом владения алиасом; вне интервала — ссылки нет", () => {
   const t = buildTrace([{ ...sudo(0), actor: "alice", last_ts: at(20) }]);
   const span = t.sessions[0].origins[0].spans[0];
-  const owner = (field: "actor" | "src", v: string): [number, number][] =>
+  const owner = (field: "actor" | "src" | "node", v: string): [number, number][] =>
     field === "actor" && v === "alice" ? [[T0 - 3600_000, T0 + 10 * 60_000]] : [];
   const url = new URL(spanEventsHref("", span, 60, undefined, owner)!, "http://x");
-  assert.equal(url.searchParams.get("to"), "2026-11-20T08:10:00", "алиас закрыт в 08:10 — дальше не его события");
+  assert.equal(url.searchParams.get("to"), "2026-11-20T08:09:59", "алиас закрыт в 08:10 (исключительно) — журнал режет «<=» по секундам");
   const none = () => [] as [number, number][];
   assert.equal(spanEventsHref("", span, 60, undefined, none), null);
 });

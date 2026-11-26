@@ -12,7 +12,7 @@ const row = (p: Partial<TraceRow> & { min: number }): TraceRow => ({
   count: 1, fails: 0, first_ts: at(p.min), last_ts: at(p.min), ...p,
 });
 const ssh = (min: number, fails = 0) => row({ min, section: "login", origin: "10.8.0.5", target: "pve125", target_kind: "node", action: "auth.ssh", count: 1 + fails, fails, first_ok_ts: at(min) });
-const sudo = (min: number, cmd: string, fails = 0) => row({ min, section: "host", target: "pve125", target_kind: "node", action: "priv.sudo", detail: cmd, fails, count: 1 });
+const sudo = (min: number, cmd: string, fails = 0) => row({ min, section: "host", target: "pve125", target_kind: "node", action: "priv.sudo", details: [cmd], fails, count: 1 });
 
 test("строки ленты: понятный заголовок, кто/откуда/команды, свежие первыми, без сети", () => {
   const t = buildTrace([ssh(0), sudo(1, "qm list"), sudo(2, "qm start 171"),

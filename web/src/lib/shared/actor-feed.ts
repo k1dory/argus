@@ -3,7 +3,7 @@
 // отказов и инцидентов. Сеть в ленту не идёт: это фон, а не поступки.
 import type { ActorIncident, Section } from "./actors";
 import { tsMs } from "./actors";
-import { spanLabel, spanEventsHref, type ActorTrace, type OwnerScope, type TraceAction, type TraceSpan } from "./actor-trace";
+import { LOGOUT_RE, spanLabel, spanEventsHref, type ActorTrace, type OwnerScope, type TraceAction, type TraceSpan } from "./actor-trace";
 
 export const FEED_FILTERS = ["flagged", "all", "login", "host", "app", "change"] as const;
 export type FeedFilter = (typeof FEED_FILTERS)[number];
@@ -45,6 +45,7 @@ export function feedTitle(span: Pick<TraceSpan, "section" | "target" | "target_k
   const allFailed = act.fails > 0 && act.fails >= act.count;
   switch (span.section) {
     case "login": {
+      if (LOGOUT_RE.test(a)) return `Выход${span.target_kind === "node" ? ` с ${t}` : ` из ${t}`}`;
       const how = has(a, "ssh") ? "по SSH " : "";
       const where = span.target_kind === "node" ? `на ${t}` : span.target_kind === "source" ? `в ${t}` : `в ${t}`;
       return `${allFailed ? "Неудачный вход" : "Вход"} ${how}${where}`.replace(/\s+/g, " ");
@@ -88,7 +89,7 @@ export function buildFeed(trace: ActorTrace, opts: BuildFeedOptions = {}): FeedI
             count: act.count, fails: act.fails,
             flagged: act.fails > 0,
             badge: act.fails > 0 ? (act.fails >= act.count ? "отказ" : "были отказы") : undefined,
-            href: spanEventsHref(o.origin, span, trace.bucketSec, act.action, opts.owner),
+            href: spanEventsHref(o.origin, span, trace.bucketSec, act, opts.owner),
           });
         }
       }

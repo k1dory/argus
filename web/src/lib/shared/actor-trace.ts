@@ -20,8 +20,8 @@ export type TraceRow = {
   action: string;
   /** actor_name события ('' у NetFlow) — для ссылки в журнал в границах субъекта. */
   actor?: string;
-  /** Что именно на узле (команда sudo, объект сеанса) — только раздел host. */
-  detail?: string;
+  /** Что именно на узле (команды sudo, объект сеанса) — topK корзины, только раздел host. */
+  details?: string[];
   count: number;
   fails: number;
   first_ts: string;
@@ -157,7 +157,7 @@ function buildSpan(items: Item[], joinMs: number): TraceSpan {
   for (const e of actions.values()) {
     e.a.actors = rankActors(e.items);
     const d = new Map<string, number>();
-    for (const i of e.items) if (i.detail) d.set(i.detail, (d.get(i.detail) ?? 0) + i.count);
+    for (const i of e.items) for (const x of i.details ?? []) if (x) d.set(x, (d.get(x) ?? 0) + i.count);
     e.a.details = [...d.entries()].sort((x, y) => y[1] - x[1] || x[0].localeCompare(y[0])).slice(0, TRACE_DETAILS_MAX).map(([k]) => k);
   }
   const h = items[0];
@@ -202,7 +202,7 @@ function buildOrigins(items: Item[], joinMs: number, networkTop: number): TraceO
   // несколько — не угадываем: событие остаётся в ветке «без адреса».
   const loginsByNode = new Map<string, { origin: string; okMs: number }[]>();
   for (const it of items) {
-    if (!it.origin || it.target_kind !== "node" || it.section !== "login" || it.okMs === null) continue;
+    if (!it.origin || it.target_kind !== "node" || it.section !== "login" || it.okMs === null || LOGOUT_RE.test(it.action)) continue;
     const list = loginsByNode.get(it.target) ?? [];
     list.push({ origin: it.origin, okMs: it.okMs });
     loginsByNode.set(it.target, list);
@@ -339,48 +339,62 @@ export function fmtDuration(ms: number): string {
 export const TRACE_LINK_Q_MAX = MAX_Q_LEN;
 
 /** Интервалы владения значением фильтра: actor — субъектные алиасы, src — ip. */
-export type OwnerScope = (field: "actor" | "src", value: string) => Segment[];
+export type OwnerScope = (field: "actor" | "src" | "node", value: string) => Segment[];
 
-/** Интервалы владения из алиасов субъекта (удержанные не дают владения). */
+/** Интервалы владения из алиасов субъекта [valid_from, valid_to) (удержанные не дают владения). */
 export function ownerScope(aliases: Alias[]): OwnerScope {
   const live = activeAliases(aliases);
+  const fits = (field: "actor" | "src" | "node", a: Alias) =>
+    field === "actor" ? ACTOR_KINDS.includes(a.kind) : field === "src" ? a.kind === "ip" : a.kind === "host";
   return (field, value) => live
-    .filter((a) => (field === "actor" ? ACTOR_KINDS.includes(a.kind) : a.kind === "ip") && aliasMatches(a, value))
+    .filter((a) => fits(field, a) && aliasMatches(a, value))
     .map((a): Segment => [tsMs(a.valid_from) ?? 0, a.valid_to ? tsMs(a.valid_to) ?? Infinity : Infinity])
     .sort((x, y) => x[0] - y[0]);
 }
 
-/** Окно ссылки: точное до секунды и не шире интервала владения; null — интервала нет. */
-function linkWindow(first: number, last: number, owner: Segment[] | null): string | null {
-  let from = Math.floor(first / 1000) * 1000;
-  // +1 с: событие в той же секунде попадает и при «<», и при «<=» в журнале.
-  let to = Math.floor(last / 1000) * 1000 + 1000;
-  if (owner) {
-    const iv = owner.find(([a, b]) => a <= first && first <= b);
-    if (!iv) return null;
-    from = Math.max(from, Math.ceil(iv[0] / 1000) * 1000);
-    to = Math.min(to, Math.floor(iv[1] / 1000) * 1000);
-    if (to < from) return null;
+const floorS = (ms: number) => Math.floor(ms / 1000) * 1000;
+const ceilS = (ms: number) => Math.ceil(ms / 1000) * 1000;
+
+/**
+ * Окно ссылки в секундах журнала (ts >= from AND ts <= to, обе границы — целые
+ * секунды). Без интервала владения — [⌊first⌋, ⌈last⌉]. С интервалом [vf, vt):
+ * from ≥ vf, to < vt — иначе захватили бы события прежнего или следующего
+ * владельца. null — окно не задевает активность (непредставимо в секундах).
+ */
+export function linkWindow(first: number, last: number, iv: Segment | null): [number, number] | null {
+  let from = floorS(first);
+  let to = ceilS(last);
+  if (iv) {
+    from = Math.max(from, ceilS(iv[0]));
+    if (Number.isFinite(iv[1])) to = Math.min(to, iv[1] % 1000 === 0 ? iv[1] - 1000 : floorS(iv[1]));
   }
-  return `from=${toDtParam(from, true)}&to=${toDtParam(to, true)}`;
+  if (from > to || from > last || to < first) return null;
+  return [from, to];
 }
+
+const windowQuery = ([from, to]: [number, number]) => `from=${toDtParam(from, true)}&to=${toDtParam(to, true)}`;
+
+/** Выход из системы: в разделе «вход» по SECTION_SQL, но не вход. */
+export const LOGOUT_RE = /logout|logoff|log_off|signout|sign_out|sign-out|disconnect/i;
 
 /**
  * Журнал событий полосы или действия: структурные поля цели, окно активности
- * и граница субъекта. actor — самый частый у самого действия (язык поиска без
- * ИЛИ: ссылка показывает подмножество событий субъекта, но не чужие); окно
- * обрезано интервалом владения алиасом. Без actor — фильтр по адресу источника.
- * null — ссылку честно построить нельзя (нет интервала, условия длиннее лимита).
+ * и граница субъекта. Действие — конкретный TraceAction (источник + действие):
+ * actor и окно берутся у него. Граница субъекта — подтверждающий алиас: actor,
+ * иначе адрес источника, иначе узел (host-алиас); окно — пересечение активности
+ * с интервалом владения этого алиаса. null — ссылку честно построить нельзя
+ * (нет подтверждающего интервала, окно непредставимо, условия длиннее лимита).
  */
 export function spanEventsHref(
   origin: string,
   s: Pick<TraceSpan, "target" | "target_kind" | "dst_port" | "first" | "last" | "attached"> & { actors?: string[]; actions?: TraceAction[] },
   _bucketSec: number,
-  action?: string,
+  action?: TraceAction | string,
   owner?: OwnerScope,
 ): string | null {
   const L = { literal: true };
-  const act = action ? s.actions?.find((a) => a.action === action) : undefined;
+  const act = typeof action === "string" ? s.actions?.find((a) => a.action === action) : action;
+  const actionName = typeof action === "string" ? action : action?.action;
   const actor = (act ? act.actors : s.actors)?.[0];
   const useSrc = Boolean(origin && !s.attached);
   let q = "";
@@ -394,16 +408,34 @@ export function spanEventsHref(
     } else if (s.target_kind === "source") q = appendTerm(q, "source", s.target, L);
     else q = appendTerm(q, "object", s.target, L);
   }
-  if (action) q = appendTerm(q, "action", action, L);
+  if (act && typeof action !== "string" && s.target_kind !== "source") q = appendTerm(q, "source", act.source, L);
+  if (actionName) q = appendTerm(q, "action", actionName, L);
   if (q.length > TRACE_LINK_Q_MAX) return null;
-  const scope = owner ? (actor ? owner("actor", actor) : useSrc ? owner("src", origin) : null) : null;
-  const w = linkWindow(act ? act.first : s.first, act ? act.last : s.last, scope);
-  return w ? `/events?q=${encodeURIComponent(q)}&${w}` : null;
+  const first = act ? act.first : s.first;
+  const last = act ? act.last : s.last;
+  let w: [number, number] | null = null;
+  if (!owner) w = linkWindow(first, last, null);
+  else {
+    const anchors: ["actor" | "src" | "node", string][] = [];
+    if (actor) anchors.push(["actor", actor]);
+    if (useSrc) anchors.push(["src", origin]);
+    if (s.target_kind === "node" && s.target) anchors.push(["node", s.target]);
+    for (const [field, value] of anchors) {
+      for (const iv of owner(field, value)) {
+        if (iv[1] <= first || iv[0] > last) continue;
+        w = linkWindow(first, last, iv);
+        if (w) break;
+      }
+      if (w) break;
+    }
+  }
+  return w ? `/events?q=${encodeURIComponent(q)}&${windowQuery(w)}` : null;
 }
 
 /** Журнал по адресу источника в окне ветки: значение — литерал языка поиска; все субъекты. */
 export function originEventsHref(o: Pick<TraceOrigin, "origin" | "first" | "last">): string | null {
   const q = appendTerm("", "src", o.origin, { literal: true });
   if (q.length > TRACE_LINK_Q_MAX) return null;
-  return `/events?q=${encodeURIComponent(q)}&${linkWindow(o.first, o.last, null)}`;
+  const w = linkWindow(o.first, o.last, null);
+  return w ? `/events?q=${encodeURIComponent(q)}&${windowQuery(w)}` : null;
 }

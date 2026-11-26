@@ -86,7 +86,7 @@ function SpanRow({ origin, span, session, ctx }: { origin: string; span: TraceSp
         {(shownActions.length > 0 || span.sources.length > 0) && (
           <div className="mt-0.5 flex flex-wrap gap-x-2 pl-1 font-mono text-[11px] text-muted-foreground">
             {shownActions.map((a) => {
-              const ah = span.folded ? null : spanEventsHref(origin, span, ctx.bucketSec, a.action, ctx.owner);
+              const ah = span.folded ? null : spanEventsHref(origin, span, ctx.bucketSec, a, ctx.owner);
               const body = (
                 <>
                   {a.action}
