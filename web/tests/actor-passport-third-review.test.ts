@@ -97,3 +97,31 @@ test("R1: logout не подтверждает предшествующий вх
     .find((o) => o.spans.some((s) => s.section === "host"))!;
   assert.equal(host.origin, "");
 });
+
+
+test("review4: ссылка выбирает интервал с событиями выбранного actor", () => {
+  const [it] = feed([
+    row(),
+    row({ actor: "alice.admin", count: 10,
+      first_ts: stamp(600_000), last_ts: stamp(600_000) }),
+  ], [
+    alias(),
+    alias({ value: "alice.admin", valid_to: stamp(300_000) }),
+    alias({ value: "alice.admin", valid_from: stamp(540_000) }),
+  ]);
+  assert.notEqual(it.href, null);
+  const f = params(it.href!);
+  assert.equal(parseQuery(f.q).find((t) => t.field === "actor")?.value, "alice.admin");
+  assert.equal(inTime(stamp(600_000), f), true,
+    "единственные события alice.admin — в 08:10; старый интервал даёт пустой журнал");
+});
+
+test("review4: самая частая команда topK остаётся видимой в ленте", () => {
+  // Одна корзина: systemctl выполнена 100 раз, остальные команды — по одному.
+  const [it] = feed([row({
+    count: 104,
+    details: ["systemctl restart api", "apt update", "cat /etc/hosts", "df -h", "id"],
+  })], [alias()]);
+  assert.match(it.meta.join(" | "), /systemctl restart api/,
+    "общий count корзины нельзя приписывать каждой детали");
+});

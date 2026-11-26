@@ -20,8 +20,9 @@ export type TraceRow = {
   action: string;
   /** actor_name события ('' у NetFlow) — для ссылки в журнал в границах субъекта. */
   actor?: string;
-  /** Что именно на узле (команды sudo, объект сеанса) — topK корзины, только раздел host. */
-  details?: string[];
+  /** Что именно на узле (команды sudo, объект сеанса) — topK корзины со счётчиками
+   *  ({item, count}); строки без счётчика — в порядке убывания частоты. Только раздел host. */
+  details?: (string | { item: string; count: string | number })[];
   count: number;
   fails: number;
   first_ts: string;
@@ -31,6 +32,8 @@ export type TraceRow = {
 };
 
 export type TraceAction = { action: string; source: string; count: number; fails: number; first: number; last: number; actors: string[];
+  /** Активность каждого actor действия [первое, последнее] — для окна ссылки. */
+  actorSpan?: Record<string, Segment>;
   /** Команды/объекты действия на узле, частые — первыми (до TRACE_DETAILS_MAX). */
   details: string[] };
 
@@ -156,8 +159,23 @@ function buildSpan(items: Item[], joinMs: number): TraceSpan {
   }
   for (const e of actions.values()) {
     e.a.actors = rankActors(e.items);
+    const span: Record<string, Segment> = {};
+    for (const i of e.items) {
+      if (!i.actor) continue;
+      const cur = span[i.actor];
+      span[i.actor] = cur ? [Math.min(cur[0], i.firstMs), Math.max(cur[1], i.lastMs)] : [i.firstMs, i.lastMs];
+    }
+    e.a.actorSpan = span;
     const d = new Map<string, number>();
-    for (const i of e.items) for (const x of i.details ?? []) if (x) d.set(x, (d.get(x) ?? 0) + i.count);
+    for (const i of e.items) {
+      const list = i.details ?? [];
+      list.forEach((x, idx) => {
+        // Частота детали — её собственный счётчик topK, а не count всей корзины;
+        // без счётчика — убывающий вес по позиции (topK уже упорядочен).
+        const [item, w] = typeof x === "string" ? [x, i.count * (list.length - idx) / list.length] : [x.item, Number(x.count) || 0];
+        if (item) d.set(item, (d.get(item) ?? 0) + w);
+      });
+    }
     e.a.details = [...d.entries()].sort((x, y) => y[1] - x[1] || x[0].localeCompare(y[0])).slice(0, TRACE_DETAILS_MAX).map(([k]) => k);
   }
   const h = items[0];
@@ -411,8 +429,11 @@ export function spanEventsHref(
   if (act && typeof action !== "string" && s.target_kind !== "source") q = appendTerm(q, "source", act.source, L);
   if (actionName) q = appendTerm(q, "action", actionName, L);
   if (q.length > TRACE_LINK_Q_MAX) return null;
-  const first = act ? act.first : s.first;
-  const last = act ? act.last : s.last;
+  // Окно — активность выбранного actor, а не всего действия: иначе интервал
+  // владения подбирался бы под чужие события и журнал открывался пустым.
+  const own = actor ? act?.actorSpan?.[actor] : undefined;
+  const first = own ? own[0] : act ? act.first : s.first;
+  const last = own ? own[1] : act ? act.last : s.last;
   let w: [number, number] | null = null;
   if (!owner) w = linkWindow(first, last, null);
   else {

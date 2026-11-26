@@ -188,3 +188,14 @@ test("detail: уникальные команды не вытесняют отк
     assert.equal(trace.truncated, false);
   });
 });
+
+test("review4: частоты команд topK из SQL — самая частая первой", { skip }, async () => {
+  await withTrace((f) => [
+    ...Array.from({ length: 100 }, () => ({ node: f.node, action: "priv.sudo", object: "systemctl restart api" })),
+    ...["apt update", "cat /etc/hosts", "df -h", "id"].map((object) => ({ node: f.node, action: "priv.sudo", object })),
+  ], (trace) => {
+    const host = spans(trace).find((s) => s.section === "host")!;
+    assert.equal(host.actions[0].details[0], "systemctl restart api");
+    assert.equal(host.count, 104);
+  });
+});
