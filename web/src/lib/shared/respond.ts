@@ -2,7 +2,7 @@
 export const RESPOND_MODES = {
   ids: { label: "IDS — только детект", hint: "автоматика ничего не блокирует; кнопка оператора в карточке работает" },
   simulate: { label: "Симуляция", hint: "движок пишет в журнал, кого заблокировал бы, но исполнителей не вызывает" },
-  ips: { label: "IPS — автоблокировка", hint: "правила с блоком respond блокируют адреса на TTL через Wazuh/NGFW; allowlist не трогается" },
+  ips: { label: "IPS — автоблокировка", hint: "правила с реагированием сами блокируют адреса на заданный срок через Wazuh и NGFW; адреса из списка «Никогда не блокируются» не затрагиваются" },
 } as const;
 export type RespondMode = keyof typeof RESPOND_MODES;
 export type RespondModeFrom = "config" | "console";

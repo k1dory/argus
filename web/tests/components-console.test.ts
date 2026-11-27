@@ -448,7 +448,7 @@ test("прочие формы: пользователи, режим реагир
   const pw = html(h(passwordForm.PasswordForm, { force: true }));
   assert.match(pw, /type="password"/);
   assert.match(stripTags(pw), /Сменить пароль/);
-  assert.match(stripTags(html(h(totpForm.TotpControls, { enabled: false, user: "u" }))), /Сгенерировать секрет/);
+  assert.match(stripTags(html(h(totpForm.TotpControls, { enabled: false, user: "u" }))), /Включить 2FA/);
   assert.match(stripTags(html(h(totpForm.TotpControls, { enabled: true, user: "u" }))), /Отключить|выключить/i);
   assert.match(stripTags(html(h(manageForms.AgentGroupAdd, { agentId: "001", groups: ["web", "db"] }))), /web|группу|Добавить/i);
   assert.match(stripTags(html(h(manageForms.GroupCreateForm, {}))), /Создать|группа/i);

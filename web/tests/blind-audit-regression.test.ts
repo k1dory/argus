@@ -8,9 +8,10 @@ import { hideVerdicts } from "../src/lib/blind";
 const mocks = installNextMocks();
 const auth = loadAuth();
 /* eslint-disable @typescript-eslint/no-require-imports -- настоящая страница после Next/auth mocks */
-const settings = require("../src/app/(console)/settings/page") as { default: () => Promise<unknown> };
+const settings = require("../src/app/(console)/settings/page") as { default: (p: { params: Promise<Record<string, string>>; searchParams: Promise<Record<string, string>> }) => Promise<unknown> };
 /* eslint-enable @typescript-eslint/no-require-imports */
 
+const auditTab = { params: Promise.resolve({}), searchParams: Promise.resolve({ tab: "audit" }) };
 const id = "INC-4";
 const ts = "2026-11-01 10:00:00.123";
 const decision = "вердикт true_positive (high, человек: да) от fixture-bot, сессия fixture-session";
@@ -31,7 +32,7 @@ for (const role of ["viewer", "analyst", "admin"] as const) {
   test(`blind: /settings не раскрывает вердикт через общий аудит роли ${role}`, async () => {
     await auth.createSession(`sso:blind-audit-${role}`, role, true);
     assert.equal(hideVerdicts({ incident_id: id, status }), true);
-    const node = await settings.default();
+    const node = await settings.default(auditTab);
     const text = await pageText(node);
     assert.ok(text.includes(observation), "обычные действия по инциденту остаются видны");
     assert.ok(!JSON.stringify(node).includes(decision), "решение агента не должно попасть в props дерева страницы");
@@ -43,7 +44,7 @@ test("blind: после закрытия запись вердикта в общ
   status = "closed";
   await auth.createSession("sso:blind-audit-closed", "analyst", true);
   assert.equal(hideVerdicts({ incident_id: id, status }), false);
-  const text = await pageText(await settings.default());
+  const text = await pageText(await settings.default(auditTab));
   assert.ok(text.includes(decision));
   assert.ok(text.includes(observation));
 });

@@ -56,7 +56,7 @@ export function PasswordForm({ force = false }: { force?: boolean }) {
           Пароль изменён{force ? " — консоль разблокирована" : ""}
         </p>
       )}
-      <Button type="submit" size="lg" disabled={pending} className="min-h-12 w-full sm:w-auto">
+      <Button type="submit" disabled={pending} className="w-full sm:w-auto">
         <KeyRound strokeWidth={2} />
         {pending ? "Сохранение…" : "Сменить пароль"}
       </Button>
