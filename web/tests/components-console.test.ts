@@ -42,6 +42,7 @@ const histogram = C<typeof import("../src/components/console/time-histogram")>("
 const { SEVERITY, SEVERITY_MAX } = require("../src/lib/shared/severity") as typeof import("../src/lib/shared/severity");
 const raw = C<typeof import("../src/components/console/journal/raw-block")>("journal/raw-block");
 const feed = C<typeof import("../src/components/console/journal/event-feed")>("journal/event-feed");
+const searchHit = C<typeof import("../src/components/console/search-hit")>("search-hit");
 const filterBar = C<typeof import("../src/components/console/journal/filter-bar")>("journal/filter-bar");
 const alertsFilters = C<typeof import("../src/components/console/alerts-filters")>("alerts-filters");
 const rangeFilters = C<typeof import("../src/components/console/range-filters")>("range-filters");
@@ -195,14 +196,15 @@ test("response-log: пусто; симуляция и ручной режим; c
 test("search-hit: индекс alerts и events — ссылки по полям, тон серьёзности, время, подробности с JSON", () => {
   const cols = [{ key: "time", label: "Время" }, { key: "rule_level", label: "Ур." }, { key: "rule_id", label: "Правило" }, { key: "agent_name", label: "Агент" }, { key: "srcip", label: "srcip" }];
   const row = { time: NOW, rule_level: 12, rule_id: 5763, agent_name: "web-01", srcip: "203.0.113.5", raw: "{\"a\":1}" };
-  const a = html(h("table", null, h("tbody", null, h(hit.SearchHit, { row, columns: cols, index: "alerts" }))));
+  const a = html(h("table", null, h("tbody", null, h(hit.SearchHit, { row, columns: cols, index: "alerts", rowKey: "a" }))));
   assert.match(a, /status-err/, "уровень 12 — критичный тон");
   assert.match(a, /href="\/wazuh\/agents"/);
   assert.match(a, /srcip/);
   assert.match(a, /&quot;a&quot;: 1/, "raw JSON переформатирован");
   assert.match(a, /<dt[^>]*>rule_id<\/dt>/);
+  assert.match(a, /<tr id="hit-a" hidden=""/, "деталь скрыта до раскрытия");
   const ecols = [{ key: "time", label: "Время" }, { key: "severity", label: "Ур." }, { key: "source", label: "Источник" }, { key: "actor_name", label: "Субъект" }, { key: "node", label: "Узел" }, { key: "src_ip", label: "IP" }, { key: "object", label: "Объект" }];
-  const e = html(h("table", null, h("tbody", null, h(hit.SearchHit, { row: { time: NOW, severity: 3, source: "linux.auth", actor_name: "root", node: "bastion", src_ip: "0", object: "", raw: "not json" }, columns: ecols, index: "events" }))));
+  const e = html(h("table", null, h("tbody", null, h(hit.SearchHit, { row: { time: NOW, severity: 3, source: "linux.auth", actor_name: "root", node: "bastion", src_ip: "0", object: "", raw: "not json" }, columns: ecols, index: "events", rowKey: "e" }))));
   assert.match(e, /linux\.auth/);
   assert.match(e, /bastion/);
   assert.match(stripTags(e), /not json/);
@@ -360,6 +362,12 @@ test("journal: гистограмма с подписями и ссылками 
   assert.match(ft, /\/etc\/passwd/);
   assert.match(f, /status-err|text-err/, "серьёзность 9 — критичный тон");
   assert.match(stripTags(html(h(feed.EventFeed, { initial: [], incidents: {}, filters: filters as never, cursor: "c", liveAllowed: false, engineUp: true }), "/events")), /Событий нет/);
+
+  // Поиск: раскрытие строки — кнопка 24×24 с подписью «какая запись», а не «›» 6×16 без контекста.
+  const hit = html(h("table", null, h("tbody", null, h(searchHit.SearchHit, { row: { time: NOW, severity: 0, action: "priv.sudo", source: "linux.auth" }, columns: [{ key: "time", label: "Время" }, { key: "severity", label: "Уровень" }, { key: "action", label: "Действие" }], index: "events", rowKey: "1-0" }))));
+  assert.match(hit, /<button[^>]*aria-expanded="false"[^>]*aria-controls="hit-1-0"[^>]*aria-label="Раскрыть запись 10-29 10:00:00 priv\.sudo"/);
+  assert.match(hit, /size-6/);
+  assert.doesNotMatch(hit, /<details/);
 
   const fb = html(h(filterBar.JournalFilterBar, { filters: { ...filters, source: "gone.src", host: "bastion", sev: 7, rule: "5763", from: "2026-10-29T00:00" } as never, sources: ["linux.auth"], hosts: ["bastion"] }), "/events");
   assert.match(fb, /role="search"/);

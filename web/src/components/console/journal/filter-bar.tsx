@@ -63,7 +63,7 @@ export function JournalFilterBar({ filters, sources, hosts }: { filters: Journal
             placeholder={HINT}
             spellCheck={false}
             autoComplete="off"
-            className="h-10 border-0 bg-transparent px-0 font-mono shadow-none focus-visible:shadow-none"
+            className="h-10 border-0 bg-transparent px-0 font-mono shadow-none focus-visible:border-0 focus-visible:shadow-none focus-visible:ring-0"
           />
           <QuerySyntaxHelp index="events" onPick={(t) => setQ((cur) => addQueryTerm(cur, t))} />
         </div>
