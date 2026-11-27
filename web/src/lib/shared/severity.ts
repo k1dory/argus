@@ -14,3 +14,22 @@ export function severityTone(t: SeverityThresholds, v: number): Tone {
   if (v >= t.medium) return "neutral";
   return "muted";
 }
+
+/** Верх шкалы индекса: уровень правила Wazuh — до 15, серьёзность события — до 10. */
+export const SEVERITY_MAX: Record<"alerts" | "events", number> = { alerts: 15, events: 10 };
+
+export type SeverityBand = { key: "critical" | "high" | "low"; label: string; range: string };
+
+/**
+ * Полосы гистограммы по порогам индекса — та же таблица, что у SQL-ряда
+ * (low < high ≤ high < critical ≤ critical) и у тонов бейджей. Подписи
+ * легенды строятся только отсюда: шкала Wazuh не попадёт на график событий.
+ */
+export function severityBands(t: SeverityThresholds, max: number): SeverityBand[] {
+  const span = (a: number, b: number) => (a === b ? String(a) : `${a}–${b}`);
+  return [
+    { key: "critical", label: "критичные", range: span(t.critical, max) },
+    { key: "high", label: "высокие", range: span(t.high, t.critical - 1) },
+    { key: "low", label: "остальные", range: span(0, t.high - 1) },
+  ];
+}
