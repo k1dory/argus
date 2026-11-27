@@ -25,6 +25,12 @@ function FailChip({ label }: { label: string }) {
 /** Разрыв строки в meta FeedRow: детали встают отдельной (третьей) строкой. */
 const LINE_BREAK = <span aria-hidden className="block h-0 w-screen" />;
 
+/** «после входа с 10.8.0.5»: слова — обычным шрифтом, адрес — моно. */
+function From({ text }: { text: string }) {
+  const m = /^(.*?\s)(\S+)$/.exec(text);
+  return m ? <span title={text}>{m[1]}<span className="font-mono">{m[2]}</span></span> : <span className="font-mono">{text}</span>;
+}
+
 function Row({ it, now }: { it: FeedItem; now: number }) {
   const time = feedTimeRange(it, now);
   const timeTitle = it.count > 1 && it.first !== it.at ? `${formatTs(it.first)} → ${formatTs(it.at)}` : formatTs(it.at);
@@ -47,7 +53,7 @@ function Row({ it, now }: { it: FeedItem; now: number }) {
   const icon = it.flagged && it.kind === "login" ? ShieldAlert : ICON[it.kind];
   const details = it.details.slice(0, 3).join(" · ") + (it.details.length > 3 ? " …" : "");
   const meta: React.ReactNode[] = [
-    it.from ? <span key="from" className="font-mono" title={it.from}>{it.from}</span> : <span key="from" title="Источник не передал IP">адрес неизвестен</span>,
+    it.from ? <From key="from" text={it.from} /> : <span key="from" title="Источник не передал IP">адрес неизвестен</span>,
     it.actor ? <span key="actor">как <span className="font-mono">{it.actor}</span></span> : null,
     !it.badge && it.count > 1 ? <span key="n" className="font-mono">×{fmtNum(it.count)}</span> : null,
   ];

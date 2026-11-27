@@ -6,7 +6,7 @@ import { LevelBadge } from "@/components/console/incident-badges";
 import { Empty, Led, Panel } from "@/components/console/panel";
 import { cn } from "@/lib/utils";
 import { fmtDuration, originEventsHref, ownerScope, spanEventsHref, spanLabel, TRACE_SECTION_LABELS, type ActorTrace, type OwnerScope, type TraceOrigin, type TraceSession, type TraceSpan } from "@/lib/shared/actor-trace";
-import { shortTarget } from "@/lib/shared/actor-feed";
+import { feedKind, shortTarget } from "@/lib/shared/actor-feed";
 import { fmtNum, formatTs } from "@/lib/shared/time";
 import type { Alias, Section } from "@/lib/shared/actors";
 
@@ -95,11 +95,13 @@ function SpanRow({ origin, span, session, ctx }: { origin: string; span: TraceSp
   const href = span.folded ? null : spanEventsHref(origin, span, ctx.bucketSec, undefined, ctx.owner);
   const shownActions = span.actions.slice(0, 6);
   const failed = span.fails > 0;
+  // «Прочее», где все действия — запись/push, подписываем как в ленте: «изменение».
+  const shownSection: Section = span.section === "other" && span.actions.length > 0 && span.actions.every((a) => feedKind("other", a.action) === "change") ? "change" : span.section;
   return (
     <div className={`${ROW} border-t border-border/30 hover:bg-[var(--muted)]/30`}>
       <div className="min-w-0 pl-6">
         <div className="flex min-w-0 items-center gap-2 text-xs">
-          <SectionTag section={span.section} />
+          <SectionTag section={shownSection} />
           {href ? (
             <Link href={href} className={cn("truncate font-mono hover:underline", failed && "text-[var(--status-err)]")} title={s_title(span)}>{label}</Link>
           ) : (
@@ -129,7 +131,7 @@ function SpanRow({ origin, span, session, ctx }: { origin: string; span: TraceSp
         )}
       </div>
       <div title={`${formatTs(span.first)} → ${formatTs(span.last)}${failed ? ` · ${fmtNum(span.fails)} ${plural(span.fails, "отказ", "отказа", "отказов")}` : ""}`}>
-        <Track from={session.first} to={session.last} segments={span.segments} cls={SECTION_CLASS[span.section].bg} dim={span.section === "network"} fail={failed} />
+        <Track from={session.first} to={session.last} segments={span.segments} cls={SECTION_CLASS[shownSection].bg} dim={span.section === "network"} fail={failed} />
       </div>
       <div className="text-right font-mono text-xs">
         {fmtNum(span.count)}
