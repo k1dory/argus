@@ -470,6 +470,10 @@ services:
       # За Caddy: клиентский адрес для аудита и rate-limit берётся из X-Forwarded-For.
       TRUSTED_PROXY: "1"
       SESSION_SECURE: ${SESSION_SECURE:-true}
+      # Скользящая сессия: простой и потолки от входа в часах; пусто — 12 / 168 / 12.
+      ARGUS_SESSION_IDLE_HOURS: ${ARGUS_SESSION_IDLE_HOURS:-}
+      ARGUS_SESSION_MAX_HOURS: ${ARGUS_SESSION_MAX_HOURS:-}
+      ARGUS_SSO_SESSION_MAX_HOURS: ${ARGUS_SSO_SESSION_MAX_HOURS:-}
       # Модуль Wazuh: 1 — страницы «Управление»/SCA и панели алертов в консоли
       # (вместе с COMPOSE_PROFILES=wazuh для shipper и policyd); 0 — скрыты.
       ARGUS_INTEGRATION_WAZUH: ${ARGUS_INTEGRATION_WAZUH:-0}

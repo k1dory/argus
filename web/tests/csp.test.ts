@@ -26,7 +26,7 @@ test("CSP: nonce разный на каждый запрос и попадает
   const seen = new Set<string>();
   for (let i = 0; i < 3; i++) {
     const req = new NextRequest("http://localhost/login?next=%2Fincidents", { headers: { "x-nonce": "spoofed", "x-argus-path": "/spoofed" } });
-    const res = proxy(req);
+    const res = await proxy(req);
     const csp = res.headers.get("content-security-policy") ?? "";
     const nonce = /'nonce-([^']+)'/.exec(csp)?.[1];
     assert.ok(nonce && nonce.length >= 22, "nonce — base64 от 16 байт");
