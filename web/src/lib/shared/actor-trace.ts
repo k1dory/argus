@@ -358,7 +358,7 @@ export function attachIncidents(sessions: TraceSession[], incidents: ActorIncide
 /* ===== Подписи и ссылки ===== */
 
 export const TRACE_SECTION_LABELS: Record<Section, string> = {
-  login: "вход", host: "узел", network: "сеть", app: "приложение", change: "изменение", other: "прочее",
+  login: "вход", host: "команда", network: "сеть", app: "приложение", change: "изменение", other: "прочее",
 };
 
 /** Подпись объекта в строке; ключ и ссылка — по полному значению. */

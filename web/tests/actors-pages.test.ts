@@ -88,7 +88,7 @@ test("аналитик: просмотр пишется до чтения дан
   assert.equal(rec!.user, "analyst1");
   assert.equal(rec!.target, "i.petrov");
   assert.equal(rec!.detail, "30d");
-  assert.ok(textOf(tree).includes("Алиасы"));
+  assert.ok(/Иван Петров/.test(textOf(tree)), "паспорт с данными: шапка персоны");
   assert.ok(fetched.some((s) => s.includes("FROM identities")), "данные читались после записи");
   mocks.jar.clear();
 });

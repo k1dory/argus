@@ -190,8 +190,8 @@ test("паспорт: алиасы (действует / закрыт / на у�
   await auth.createSession("analyst1", "analyst");
   const text = await pageText(await actorPage.default(props({ id: "i.petrov" }, { range: "7d" })));
   assert.match(text, /Иван Петров i\.petrov/);
-  assert.match(text, /человек · команда platform · дежурный/);
-  assert.match(text, /Алиасы 4 · на удержании 1/);
+  assert.match(text, /человек · отдел platform · дежурный/);
+  assert.match(text, /Алиасы · 4 неоднозначных 1 · на удержании 1/);
   assert.match(text, /ivan\.petrov/);
   assert.match(text, /неоднозначно/, "login ivan.petrov действует и как uid у a.smirnova");
   assert.match(text, /на удержании/);
@@ -200,12 +200,11 @@ test("паспорт: алиасы (действует / закрыт / на у�
   assert.match(text, /2021-01-01 00:00:00/, "закрытый алиас — дата «по»");
   assert.match(text, /действует/);
   assert.match(text, /0\.30/);
-  assert.match(text, /Событий за 7 дней 10/);
-  assert.match(text, /Узлов 1/);
-  assert.match(text, /Адресов 1/);
-  assert.match(text, /Инцидентов 1/, "INC-8 начался до действия алиаса и не считается");
+  assert.match(text, /10 событий за 7 дней/);
+  assert.match(text, /Узлы · адреса 1 · 1/);
+  assert.match(text, /Инциденты\D*1 с участием субъекта/, "INC-8 начался до действия алиаса и не считается");
   assert.match(text, /syslog 7 · netflow 3/);
-  assert.match(text, /linux\.auth \(7/);
+  assert.match(text, /linux\.auth 7/);
   assert.match(text, /Входы · 1/);
   assert.match(text, /отказов 1/);
   assert.match(text, /Хосты и сеансы · 1/);
@@ -215,7 +214,7 @@ test("паспорт: алиасы (действует / закрыт / на у�
   assert.match(text, /INC-7/);
   assert.ok(!/INC-8/.test(text));
   assert.match(text, /Перебор SSH/);
-  assert.match(text, /Таймлайн · последние 7/);
+  assert.match(text, /Последние события · 7/);
   assert.match(text, /8\.8\.8\.8|bastion/);
   assert.match(text, /делятся с другой персоной/, "подсказка про неоднозначность");
   assert.match(text, /на удержании.*в сшивку не входят/);
@@ -262,8 +261,8 @@ test("паспорт: часть запросов упала — «Часть д
   let text = await pageText(await actorPage.default(props({ id: "i.petrov" })));
   assert.match(text, /Часть данных временно недоступна/);
   assert.match(text, /Не удалось загрузить: узлы/);
-  assert.match(text, /Узлов 0/);
-  assert.match(text, /Событий за 7 дней 10/, "остальные разделы на месте");
+  assert.match(text, /Узлы · адреса 0 · 1/);
+  assert.match(text, /10 событий за 7 дней/, "остальные разделы на месте");
 
   // Персона без алиасов: предикат событий — «0», и подмена ClickHouse на такие запросы ничего не возвращает.
   routes = fullRoutes().map((r) => ({ ...r, when: (s: string) => r.when(s) && !/ AND 0 /.test(s) }));
@@ -288,6 +287,43 @@ test("паспорт: неверный идентификатор и неизв�
   assert.match(text, /недоступн/i);
   assert.equal(await actorPage.generateMetadata!(props({ id: "i.petrov" })).then((m) => m.title), "i.petrov · Субъекты");
   assert.equal(await actorPage.generateMetadata!(props({ id: "Bad Id!" })).then((m) => m.title), "Субъект · Субъекты");
+});
+
+test("PR130: недоступная трасса не означает отсутствие отказов", async () => {
+  await auth.createSession("analyst1", "analyst");
+  routes.unshift({
+    when: (sql) => sql.includes("AS first_ok_ts"),
+    rows: () => [],
+    fail: true,
+  });
+  const text = await pageText(await actorPage.default(props({ id: "i.petrov" })));
+  assert.match(text, /Не удалось построить сеансы/);
+  assert.doesNotMatch(text, /Отказы\s+0\s+отклонённых действий нет/);
+});
+
+test("PR130: другой uid сохраняет подпись, даже если отличается только регистром", async () => {
+  await auth.createSession("analyst1", "analyst");
+  routes.unshift(
+    {
+      when: (sql) => sql.includes("FROM identity_aliases"),
+      rows: () => [
+        alias("i.petrov", "uid", "Alice"),
+        alias("i.petrov", "uid", "alice"),
+      ],
+    },
+    {
+      when: (sql) => sql.includes("AS first_ok_ts") && !sql.includes("dense_rank()"),
+      rows: () => [{
+        section: "app", origin: "203.0.113.5", target: "grafana",
+        target_kind: "object", dst_port: 0, source: "app",
+        action: "app.authorize", actor: "alice", details: [],
+        count: 1, fails: 0, first_ts: TS, last_ts: TS,
+      }],
+    },
+  );
+  const text = await pageText(await actorPage.default(props({ id: "i.petrov" })));
+  assert.match(text, /Доступ к grafana/);
+  assert.match(text, /как alice/, "uid Alice и uid alice — разные учётные записи");
 });
 
 /* ===== Резолв по алиасу ===== */
