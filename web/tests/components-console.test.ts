@@ -240,8 +240,10 @@ test("markdown-body: заголовки понижены, HTML вырезан, �
   assert.match(out, /<code class="font-mono text-xs">код<\/code>/);
   assert.match(out, /<pre[^>]*><code[^>]*>блок/);
   const w = text(h(wiki.IncidentWiki, { id: "INC-7", markdown: "## Разбор\n\nтекст", canEdit: true }));
-  assert.match(w, /Досье инцидента/);
-  assert.match(w, /Скачать \.md/);
+  assert.match(w, /Досье/);
+  assert.doesNotMatch(w, /Скачать \.md/, "экспорт — в меню шапки карточки");
+  assert.doesNotMatch(text(h(wiki.IncidentWiki, { id: "INC-7", markdown: "x", canEdit: true, blind: true })), /Переразобрать/, "в слепом разборе переразбор не предлагается");
+  assert.match(text(h(wiki.IncidentWiki, { id: "INC-7", markdown: "\n", canEdit: false })), /Записей пока нет/);
   assert.match(w, /Переразобрать|Повторить разбор|разбор/i);
   assert.match(w, /Разбор текст/);
   assert.doesNotMatch(text(h(wiki.IncidentWiki, { id: "INC-7", markdown: "x", canEdit: false })), /Отправить|Добавить запись/);
@@ -391,7 +393,8 @@ test("incident-status-form: взять/назначить без владель�
   assert.match(mine, /Статус расследования/);
   assert.match(mine, /эскалация в работе наблюдение закрыт ложное/, "варианты статуса; исключения появляются после выбора «ложное» на клиенте");
   const noone = stripTags(html(h(statusForm.IncidentStatusForm, { incidentId: "INC-7", status: "in_progress", owner: "analyst1", currentUser: "analyst1", isAdmin: true, users: [{ name: "analyst1", role: "analyst" }], exceptions: [] })));
-  assert.match(noone, /Некому назначить/);
+  assert.match(noone, /Назначить некому — добавьте аналитика в Настройках/);
+  assert.doesNotMatch(noone, /Выберите сотрудника/, "без кандидатов — одна строка вместо неактивного выбора");
   assert.match(stripTags(html(h(statusForm.IncidentStatusForm, { incidentId: "INC-7", status: "closed", owner: "analyst1", currentUser: "analyst1", isAdmin: false, users, exceptions }))), /Инцидент завершён/);
   assert.match(stripTags(html(h(statusForm.IncidentStatusForm, { incidentId: "INC-7", status: "in_progress", owner: "admin", currentUser: "analyst1", isAdmin: false, users, exceptions }))), /Статус меняет ответственный: admin/);
   assert.match(stripTags(html(h(statusForm.CommentForm, { incidentId: "INC-7" }))), /запис|комментар/i);

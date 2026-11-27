@@ -1,6 +1,7 @@
 "use client";
 
 import { useActionState, useEffect, useState } from "react";
+import Link from "next/link";
 import { toast } from "sonner";
 import type { FormState } from "@/lib/actions";
 import {
@@ -23,7 +24,8 @@ function Result({ state }: { state: FormState }) {
     : state.ok ? <p role="status" className="text-xs text-[var(--status-ok)]">Сохранено</p> : null;
 }
 
-function TakeForm({ incidentId }: { incidentId: string }) {
+/** «Взять в работу» — главное действие карточки (шапка) и запасное место в форме. */
+export function TakeForm({ incidentId }: { incidentId: string }) {
   const [state, action, pending] = useActionState(takeIncidentAction, initial);
   return <form action={action} aria-busy={pending} className="flex flex-wrap items-center gap-3">
     <input type="hidden" name="incident_id" value={incidentId} />
@@ -36,18 +38,22 @@ function AssignForm({ incidentId, owner, users }: { incidentId: string; owner: s
   const [state, action, pending] = useActionState(assignIncidentAction, initial);
   // Аналитики и администраторы, кроме текущего ответственного; наблюдателям не назначают.
   const analysts = users.filter((u) => (u.role === "analyst" || u.role === "admin") && u.name !== owner);
+  if (analysts.length === 0) {
+    return <p className="text-[13px] text-muted-foreground">
+      Назначить некому — добавьте аналитика в <Link href="/settings" className="text-[var(--ring)] hover:underline">Настройках</Link> или дождитесь его входа через SSO.
+    </p>;
+  }
   return <form action={action} aria-busy={pending} className="flex flex-col gap-2">
     <input type="hidden" name="incident_id" value={incidentId} />
-    <FieldGroup><Field data-disabled={pending || analysts.length === 0}>
+    <FieldGroup><Field data-disabled={pending}>
     <FieldLabel htmlFor="assign-owner">Назначить или передать аналитику</FieldLabel>
     <div className="flex flex-wrap items-center gap-2">
-      <select id="assign-owner" name="owner" required defaultValue="" className="h-10 min-w-44 border border-border bg-[var(--surface-deep)] px-2 text-sm" disabled={pending || analysts.length === 0}>
+      <select id="assign-owner" name="owner" required defaultValue="" className="h-10 min-w-44 border border-border bg-[var(--surface-deep)] px-2 text-sm" disabled={pending}>
         <option value="" disabled>Выберите сотрудника</option>
         {analysts.map((u) => <option key={u.name} value={u.name}>{u.name}{u.role === "admin" ? " (администратор)" : ""}</option>)}
       </select>
-      <Button type="submit" variant="secondary" disabled={pending || analysts.length === 0}>{pending ? "Назначаю…" : "Назначить"}</Button>
+      <Button type="submit" variant="secondary" disabled={pending}>{pending ? "Назначаю…" : "Назначить"}</Button>
     </div>
-    {analysts.length === 0 && <FieldDescription>Некому назначить: добавьте сотрудника с ролью аналитика в настройках или дождитесь его входа через SSO.</FieldDescription>}
     </Field></FieldGroup>
     <Result state={state} />
   </form>;
@@ -123,7 +129,7 @@ export function ClosureLabelFields({ ops, status, attack, disabled }: { ops: boo
   </FieldSet>;
 }
 
-function StatusForm({ incidentId, status, ops, attack, exceptions }: { incidentId: string; status: string; ops: boolean; attack: AttackFormOptions; exceptions: { field: string; value: string; label: string }[] }) {
+function StatusForm({ incidentId, status, ops, attack, exceptions, blind }: { incidentId: string; status: string; ops: boolean; attack: AttackFormOptions; exceptions: { field: string; value: string; label: string }[]; blind: boolean }) {
   const [next, setNext] = useState(status);
   const [reason, setReason] = useState("");
   const [selectedExceptions, setSelectedExceptions] = useState<string[]>([]);
@@ -136,9 +142,11 @@ function StatusForm({ incidentId, status, ops, attack, exceptions }: { incidentI
       <select id="inc-status" name="status" value={next} onChange={(e) => setNext(e.target.value)} disabled={pending} className="h-10 min-w-44 border border-border bg-[var(--surface-deep)] px-2 text-sm">
         {Object.entries(INCIDENT_STATUSES).filter(([key]) => key !== "new" && key !== "waiting_owner").map(([key, label]) => <option key={key} value={key}>{label}</option>)}
       </select>
-      <Button type="submit" disabled={pending || next === status}>{pending ? "Сохраняю…" : "Изменить статус"}</Button>
+      {/* Неизменённый статус — не главная кнопка: светлая заливка неактивной кнопки выглядит как призыв. */}
+      <Button type="submit" variant={next === status ? "secondary" : "default"} disabled={pending || next === status}>{pending ? "Сохраняю…" : isFinal(next) ? "Завершить" : "Изменить статус"}</Button>
     </div>
     </Field>
+    {isFinal(next) && blind && <p className="text-[13px] text-muted-foreground">Разбор вслепую: ответ сохранится с этой пометкой — по таким ответам проверяется качество подсказок модели.</p>}
     {isFinal(next) && <ClosureLabelFields ops={ops} status={next} attack={attack} disabled={pending} />}
     {isFinal(next) && <Field data-disabled={pending}>
       <FieldLabel htmlFor="inc-close-reason">Причина завершения</FieldLabel>
@@ -176,9 +184,9 @@ export function CommentForm({ incidentId }: { incidentId: string }) {
   return <form action={action} aria-busy={pending} className="flex flex-col gap-3">
     <input type="hidden" name="incident_id" value={incidentId} />
     <FieldGroup><Field data-disabled={pending}>
-    <FieldLabel htmlFor="inc-comment">Запись в досье (Markdown)</FieldLabel>
-    <textarea id="inc-comment" name="body" value={body} onChange={(e) => setBody(e.target.value)} required maxLength={8000} rows={5} disabled={pending}
-      placeholder={"### Проверено\n- Источник и время\n- Действия\n\nВывод и ссылка на заявку…"}
+    <FieldLabel htmlFor="inc-comment">Новая запись</FieldLabel>
+    <textarea id="inc-comment" name="body" value={body} onChange={(e) => setBody(e.target.value)} required maxLength={8000} rows={3} disabled={pending}
+      placeholder="Что проверили, что нашли, ссылка на заявку… Можно с разметкой Markdown."
       className="w-full resize-y border border-input bg-[var(--surface-deep)] p-3 text-sm focus-visible:border-[var(--border-strong)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)]/40" />
     </Field></FieldGroup>
     <div className="flex flex-wrap items-center gap-3">
@@ -188,7 +196,7 @@ export function CommentForm({ incidentId }: { incidentId: string }) {
   </form>;
 }
 
-export function IncidentStatusForm({ incidentId, status, ops, attack, owner, currentUser, isAdmin, users, exceptions }: {
+export function IncidentStatusForm({ incidentId, status, ops, attack, owner, currentUser, isAdmin, users, exceptions, blind = false, takeInHeader = false }: {
   incidentId: string;
   status: string;
   /** Эксплуатационное правило (теги ops.*): при завершении — форма DevOps. */
@@ -200,14 +208,18 @@ export function IncidentStatusForm({ incidentId, status, ops, attack, owner, cur
   isAdmin: boolean;
   users: { name: string; role: string }[];
   exceptions: { field: string; value: string; label: string }[];
+  /** Слепой разбор: пояснение над ответом при завершении. */
+  blind?: boolean;
+  /** «Взять в работу» уже стоит главным действием в шапке — здесь не дублировать. */
+  takeInHeader?: boolean;
 }) {
   const open = !isFinal(status);
   const mine = owner === currentUser;
   return <div className="flex flex-col gap-5">
     {!open && <p className="text-sm text-muted-foreground">Инцидент завершён. Дополнительные сведения можно добавить в досье.</p>}
-    {open && (!owner || mine && status !== "in_progress") && <TakeForm incidentId={incidentId} />}
+    {open && !takeInHeader && (!owner || mine && status !== "in_progress") && <TakeForm incidentId={incidentId} />}
     {open && isAdmin && <AssignForm incidentId={incidentId} owner={owner} users={users} />}
-    {open && mine && status !== "new" && status !== "waiting_owner" && <StatusForm key={status} incidentId={incidentId} status={status} ops={ops} attack={attack} exceptions={exceptions} />}
+    {open && mine && status !== "new" && status !== "waiting_owner" && <StatusForm key={status} incidentId={incidentId} status={status} ops={ops} attack={attack} exceptions={exceptions} blind={blind} />}
     {open && !mine && owner && !isAdmin && <p className="text-xs text-muted-foreground">Статус меняет ответственный: {owner}.</p>}
   </div>;
 }

@@ -40,3 +40,15 @@ test("при повторном закрытии отображается пос
   assert.equal(closingEvent("closed", [latest, older])?.actor, "analyst2");
   assert.equal(closingEvent("closed", [older, latest])?.reason, "Повторная проверка");
 });
+
+test("C3: уровень в досье по-русски; вид карточки — без шапки, хода расследования и пустых разделов", () => {
+  const open = { ...incident, status: "in_progress" as const, note: "смотрим" };
+  const md = incidentMarkdown(open, null, [], []);
+  assert.match(md, /Уровень: критический/);
+  assert.doesNotMatch(md, /critical/);
+  assert.match(md, /## Заметка автоматики/);
+  const view = incidentMarkdown(open, null, [{ revision: 1, changed_at: "2026-09-25 15:00:00", actor: "analyst1", kind: "take", status: "in_progress", owner: "analyst1", reason: "" }], [], { console: true, blind: true });
+  assert.doesNotMatch(view, /^# |Статус:|Ход расследования|Анализ модели|Записей пока нет|ещё не завершён/m);
+  assert.equal(view, "## Заметка автоматики\n\nсмотрим\n");
+  assert.equal(incidentMarkdown({ ...open, note: "" }, null, [], [], { console: true }).trim(), "", "пустое досье — пустая строка, карточка покажет «Записей пока нет»");
+});
