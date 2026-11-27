@@ -21,12 +21,40 @@ import { isEntityKind, TRIAGE_ENTITIES_MAX, TRIAGE_ENTITY_MAX_LEN, TRIAGE_RELATI
 const AUTH_FILE = path.resolve(/*turbopackIgnore: true*/ process.env.AUTH_FILE ?? "./.auth.json");
 /** Стартовый пароль admin: файл 0600 рядом с auth.json, удаляется при первой смене. */
 export const ADMIN_PASSWORD_FILE = path.join(path.dirname(AUTH_FILE), "admin-password.txt");
-const SESSION_COOKIE = "wazuh_console_session";
+export const SESSION_COOKIE = "wazuh_console_session";
 const LOGIN_TOTP_COOKIE = "wazuh_console_login_totp";
-const SESSION_TTL_SEC = 12 * 60 * 60;
 const LOGIN_TOTP_TTL_SEC = 5 * 60;
-/** SSO-сессия короче: роль приходит из групп IdP и должна пересматриваться чаще. */
-const SSO_SESSION_TTL_SEC = 60 * 60;
+
+/* Сессия консоли — скользящая: каждый запрос (не чаще раза в sessionRenewAfterSec())
+ * продлевает её на «простой» (idle), но не дальше потолка от момента входа
+ * (claim auth). SSO-потолок короче: роль из групп IdP пересматривается при
+ * повторном входе. Часы — из env, неверное значение — дефолт. */
+const HOUR_SEC = 60 * 60;
+/** Часы из env → секунды; проверяется итог (конечное безопасное целое, не меньше
+ *  минуты и не больше 10 лет), иначе дефолт: 1e308 не отменяет потолок, 1e-8 — не 0. */
+function envSeconds(name: string, defHours: number): number {
+  const sec = Math.round(Number(process.env[name]) * HOUR_SEC);
+  return Number.isSafeInteger(sec) && sec >= 60 && sec <= 10 * 366 * 24 * HOUR_SEC ? sec : Math.round(defHours * HOUR_SEC);
+}
+// Читаются при каждом вызове: дешёво, и proxy с приложением не расходятся в настройках.
+/** Простой, после которого сессия истекает. */
+export const sessionIdleSec = (): number => envSeconds("ARGUS_SESSION_IDLE_HOURS", 12);
+/** Потолок от входа: локальная — 7 суток, SSO — 12 ч. */
+export const sessionMaxSec = (sso: boolean): number =>
+  sso ? envSeconds("ARGUS_SSO_SESSION_MAX_HOURS", 12) : envSeconds("ARGUS_SESSION_MAX_HOURS", 7 * 24);
+/** Продлевать не чаще раза в 5 минут — но и не реже половины простоя, иначе короткий
+ *  простой превращает скользящую сессию в фиксированную. */
+export const sessionRenewAfterSec = (): number => Math.min(5 * 60, Math.floor(sessionIdleSec() / 2));
+/** Момент входа из токена; токены до скользящих сессий — без auth: момент входа = iat. */
+function authTimeOf(payload: { auth?: unknown; iat?: number }): number {
+  const a = Number(payload.auth);
+  return Number.isFinite(a) && a > 0 ? a : Number(payload.iat ?? 0);
+}
+
+/** exp сессии: простой от «сейчас», но не дальше потолка от входа. */
+export function sessionExp(nowSec: number, authSec: number, sso: boolean): number {
+  return Math.min(nowSec + sessionIdleSec(), authSec + sessionMaxSec(sso));
+}
 // Имена SSO-пользователей живут в своём пространстве: `sso:i.petrov`
 // никогда не совпадёт с локальным `i.petrov` или встроенным admin.
 import { SSO_PREFIX } from "./oidc";
@@ -119,6 +147,7 @@ let statePromise: Promise<AuthState> | null = null;
 async function loadOrInit(): Promise<AuthState> {
   try {
     const raw = await fs.readFile(AUTH_FILE, "utf8");
+    stateStamp = await fileStamp();
     return JSON.parse(raw) as AuthState;
   } catch (err) {
     // Пересоздаём состояние ТОЛЬКО если файла нет. Битый JSON или ошибка
@@ -153,6 +182,32 @@ export function getAuthState(): Promise<AuthState> {
   return statePromise;
 }
 
+/** Отпечаток auth.json, из которого собран кеш: mtime + размер. */
+let stateStamp = "";
+async function fileStamp(): Promise<string> {
+  try {
+    const st = await fs.stat(AUTH_FILE);
+    return `${st.mtimeMs}:${st.size}`;
+  } catch {
+    return "";
+  }
+}
+
+/** Перечитать auth.json, если его изменил другой экземпляр модуля (proxy и приложение
+ *  в Next — разные экземпляры). Ошибка чтения — остаёмся на кеше. */
+export async function refreshAuthStateIfChanged(): Promise<void> {
+  await getAuthState();
+  const stamp = await fileStamp();
+  if (!stamp || stamp === stateStamp) return;
+  try {
+    const next = JSON.parse(await fs.readFile(AUTH_FILE, "utf8")) as AuthState;
+    statePromise = Promise.resolve(next);
+    stateStamp = stamp;
+  } catch {
+    /* файл в процессе записи или битый — оставляем прежнее состояние */
+  }
+}
+
 // Все изменения auth.json идут через одну очередь: параллельные server
 // actions (создать юзера + включить TOTP) иначе читали бы одно состояние
 // и последний записавший стирал бы чужие правки.
@@ -163,6 +218,7 @@ async function writeAtomic(updated: AuthState): Promise<void> {
   await fs.writeFile(tmp, JSON.stringify(updated, null, 2), { mode: 0o600 });
   await fs.rename(tmp, AUTH_FILE); // rename атомарен: либо старый файл, либо новый
   statePromise = Promise.resolve(updated);
+  stateStamp = await fileStamp();
 }
 
 /** Прочитать состояние, применить изменение, записать — атомарно относительно
@@ -677,6 +733,11 @@ export async function clearLoginTotp(): Promise<void> {
   (await cookies()).delete({ name: LOGIN_TOTP_COOKIE, path: "/login" });
 }
 
+/** Параметры куки сессии — одни и те же при входе и при продлении. */
+export function sessionCookieOptions(maxAge: number) {
+  return { httpOnly: true, sameSite: "strict" as const, secure: cookieSecure(), path: "/", maxAge };
+}
+
 /** Единое правило Secure для всех кук консоли (сессия, OIDC state):
  *  в проде — только по TLS; SESSION_SECURE=false — осознанный plain HTTP. */
 export function cookieSecure(): boolean {
@@ -705,7 +766,7 @@ export type Session = {
 
 /** JWT сессии. Локальный пользователь получает tv = его tokenVersion;
  *  SSO-пользователь — только с префиксом sso: и коротким TTL. */
-export async function signSessionToken(user: string, role: Role, sso: boolean): Promise<string> {
+export async function signSessionToken(user: string, role: Role, sso: boolean, authSec?: number, nowSec = Math.floor(Date.now() / 1000)): Promise<string> {
   const state = await getAuthState();
   let tv = 0;
   if (sso) {
@@ -715,11 +776,39 @@ export async function signSessionToken(user: string, role: Role, sso: boolean): 
     if (!u) throw new Error("Пользователь не найден");
     tv = u.tokenVersion;
   }
-  return new SignJWT({ sub: user, role, sso, tv })
+  const auth = authSec ?? nowSec;
+  return new SignJWT({ sub: user, role, sso, tv, auth })
     .setProtectedHeader({ alg: "HS256" })
-    .setIssuedAt()
-    .setExpirationTime(`${sso ? SSO_SESSION_TTL_SEC : SESSION_TTL_SEC}s`)
+    .setIssuedAt(nowSec)
+    .setExpirationTime(sessionExp(nowSec, auth, sso))
     .sign(await secretKey());
+}
+
+/**
+ * Продление сессии при активности: новый токен с exp = min(сейчас + простой,
+ * вход + потолок). null — продлевать не нужно или нельзя: токен невалиден или
+ * отозван (verifySessionToken), выпущен меньше sessionRenewAfterSec() назад,
+ * потолок от входа исчерпан. Роль и tv переносятся из действующей сессии;
+ * момент входа (auth) не меняется — потолок не сдвигается продлением.
+ */
+export async function renewSessionToken(token: string, nowSec = Math.floor(Date.now() / 1000)): Promise<{ token: string; maxAge: number } | null> {
+  try {
+    // Proxy — отдельный экземпляр модуля: смена пароля или удаление в приложении
+    // меняют auth.json, но не его кеш. Перечитываем, если файл изменился.
+    await refreshAuthStateIfChanged();
+    const { payload } = await jwtVerify(token, await secretKey(), { currentDate: new Date(nowSec * 1000) });
+    const session = await verifySessionToken(token, nowSec);
+    if (!session || session.kind !== "console") return null;
+    const iat = Number(payload.iat ?? 0);
+    if (!iat || nowSec - iat < sessionRenewAfterSec()) return null;
+    const auth = authTimeOf(payload);
+    const exp = sessionExp(nowSec, auth, session.sso);
+    if (exp <= Number(payload.exp ?? 0) || exp <= nowSec) return null;
+    const role = session.sso ? (payload.role as Role) : session.role;
+    return { token: await signSessionToken(session.user, role, session.sso, auth, nowSec), maxAge: exp - nowSec };
+  } catch {
+    return null;
+  }
 }
 
 /** Сессия из токена или null. Роль и существование локального пользователя
@@ -727,11 +816,15 @@ export async function signSessionToken(user: string, role: Role, sso: boolean): 
  *  правах пользователь теряет доступ сразу; tv сверяется с tokenVersion —
  *  смена пароля отзывает выданные токены. SSO-ветка — только для payload.sso
  *  с именем в пространстве sso:, роль — из групп IdP, зафиксированных в токене. */
-export async function verifySessionToken(token: string): Promise<Session | null> {
+export async function verifySessionToken(token: string, nowSec?: number): Promise<Session | null> {
   try {
-    const { payload } = await jwtVerify(token, await secretKey());
+    const { payload } = await jwtVerify(token, await secretKey(), nowSec === undefined ? undefined : { currentDate: new Date(nowSec * 1000) });
     const user = String(payload.sub ?? "");
     if (!user) return null;
+    // Потолок от входа — при каждом принятии, а не только при продлении: уменьшенный
+    // в env потолок сразу ограничивает и уже выданные токены.
+    const now = nowSec ?? Math.floor(Date.now() / 1000);
+    if (now >= authTimeOf(payload) + sessionMaxSec(payload.sso === true)) return null;
     if (payload.sso === true) {
       if (!user.startsWith(SSO_PREFIX) || !isRole(payload.role)) return null;
       return { kind: "console", user, role: payload.role, sso: true, mustChangePassword: false };
@@ -748,15 +841,10 @@ export async function verifySessionToken(token: string): Promise<Session | null>
 }
 
 export async function createSession(user: string = ADMIN_USER, role: Role = "admin", sso = false): Promise<void> {
-  const token = await signSessionToken(user, role, sso);
+  const now = Math.floor(Date.now() / 1000);
+  const token = await signSessionToken(user, role, sso, now, now);
   const jar = await cookies();
-  jar.set(SESSION_COOKIE, token, {
-    httpOnly: true,
-    sameSite: "strict",
-    secure: cookieSecure(),
-    path: "/",
-    maxAge: sso ? SSO_SESSION_TTL_SEC : SESSION_TTL_SEC,
-  });
+  jar.set(SESSION_COOKIE, token, sessionCookieOptions(sessionExp(now, now, sso) - now));
 }
 
 export async function destroySession(): Promise<void> {
