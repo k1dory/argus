@@ -7,6 +7,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import ts from "typescript";
 
 const SRC = path.join(__dirname, "..", "src");
 
@@ -81,4 +82,31 @@ test("подписи видов алиасов — в lib/shared, по-русс�
   const { ALIAS_KIND_LABELS, ALIAS_KINDS } = await import("../src/lib/shared/actors");
   for (const k of ALIAS_KINDS) assert.ok(ALIAS_KIND_LABELS[k], `нет подписи для ${k}`);
   assert.equal(ALIAS_KIND_LABELS.email, "почта");
+});
+
+test("ServiceUnavailableView: клиентский импорт не достигает server-only", () => {
+  const seen = new Set<string>();
+  function visit(file: string, chain: string[] = []): void {
+    if (seen.has(file)) return;
+    seen.add(file);
+    const source = ts.createSourceFile(
+      file, fs.readFileSync(file, "utf8"), ts.ScriptTarget.Latest, true,
+    );
+    const first = source.statements[0];
+    // Импорт server action из клиента допустим.
+    if (first && ts.isExpressionStatement(first) &&
+        ts.isStringLiteral(first.expression) && first.expression.text === "use server") return;
+    for (const node of source.statements) {
+      if (!ts.isImportDeclaration(node) && !ts.isExportDeclaration(node)) continue;
+      if (ts.isImportDeclaration(node) && node.importClause?.isTypeOnly) continue;
+      if (ts.isExportDeclaration(node) && node.isTypeOnly) continue;
+      const spec = node.moduleSpecifier;
+      if (!spec || !ts.isStringLiteral(spec)) continue;
+      const trace = [...chain, path.relative(SRC, file), spec.text];
+      assert.notEqual(spec.text, "server-only", trace.join(" -> "));
+      const target = resolveImport(spec.text, file);
+      if (target) visit(target, [...chain, path.relative(SRC, file)]);
+    }
+  }
+  visit(path.join(SRC, "components/console/service-unavailable-view.tsx"));
 });
