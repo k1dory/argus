@@ -40,8 +40,8 @@ for (const [blindN, sightedN] of [[1, 1], [9, 10], [10, 10], [19, 20], [20, 20]]
     assert.equal(tiles.length, 4, "контроль: отрисованы все итоговые плитки");
 
     const proportions = [
-      { label: "Согласие · слепые", n: blindN },
-      { label: "Согласие · неслепые", n: sightedN },
+      { label: "Совпало (вслепую)", n: blindN },
+      { label: "Совпало (видели подсказку)", n: sightedN },
       { label: "Ложных срабатываний", n: blindN + sightedN },
     ];
     const visiblyWarned: string[] = [];

@@ -972,15 +972,17 @@ export async function auditTail(limit = 100): Promise<AuditRow[]> {
 
 /* ===== Ложные срабатывания по правилам (30 дней) ===== */
 
-export type RuleFP = { rule_id: string; total: number; false_positive: number; closed: number };
+/** title — название правила из последнего инцидента: страница правил показывает его, когда движок не отвечает. */
+export type RuleFP = { rule_id: string; total: number; false_positive: number; closed: number; title?: string; level?: string };
 
 export async function rulesFalsePositives(): Promise<Record<string, RuleFP>> {
-  const rows = await chQuery<{ rule_id: string; total: string; fp: string; closed: string }>(
-    `SELECT rule_id, count() AS total, countIf(status = 'false_positive') AS fp, countIf(status = 'closed') AS closed
+  const rows = await chQuery<{ rule_id: string; total: string; fp: string; closed: string; title: string; level: string }>(
+    `SELECT rule_id, count() AS total, countIf(status = 'false_positive') AS fp, countIf(status = 'closed') AS closed,
+            argMax(rule_title, created_at) AS title, argMax(level, created_at) AS level
      FROM (${LATEST}) WHERE created_at >= now() - INTERVAL 30 DAY GROUP BY rule_id`,
   );
   const out: Record<string, RuleFP> = {};
-  for (const r of rows) out[r.rule_id] = { rule_id: r.rule_id, total: Number(r.total), false_positive: Number(r.fp), closed: Number(r.closed) };
+  for (const r of rows) out[r.rule_id] = { rule_id: r.rule_id, total: Number(r.total), false_positive: Number(r.fp), closed: Number(r.closed), title: r.title || undefined, level: r.level || undefined };
   return out;
 }
 
