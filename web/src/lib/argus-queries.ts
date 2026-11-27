@@ -17,7 +17,10 @@ const engineBase = (): string => (process.env.ENGINE_URL ?? "http://localhost:80
 
 /** Ошибка движка: пользователю — коротко, полный текст — в лог сервера. */
 function engineError(scope: string, err: unknown): string {
-  console.error(`${scope}:`, err instanceof Error ? err.message : err);
+  // Недоступный движок — ожидаемая деградация: страница показывает «движок недоступен»
+  // и работает дальше. console.error здесь в next dev пересылается в браузер и
+  // поднимает оверлей «1 Issue» на каждой карточке инцидента — поэтому warn.
+  console.warn(`${scope}:`, err instanceof Error ? err.message : err);
   return "движок недоступен";
 }
 export { INCIDENT_STATUSES, EXCEPTION_FIELDS, isIncidentStatus, type IncidentStatus } from "./shared/incidents";
@@ -57,9 +60,26 @@ const LATEST = `SELECT * FROM incidents_current`;
 
 export type IncidentFilter = {
   status?: string; level?: string; q?: string; page?: number; pageSize?: number; queue?: "open" | "mine" | "unassigned" | "overdue"; user?: string; groupScans?: boolean;
+  /** Порядок списка: priority (по умолчанию) — срочное наверху; time — только по времени создания. */
+  sort?: "priority" | "time";
   /** Диапазоны (lib/shared/page-filters): окно по first_ts, уровень не ниже/не выше, число событий. */
   ranges?: Partial<IncidentRanges>;
 };
+
+/** Открыт: не закрыт и не ложное срабатывание. */
+const OPEN_SQL = "status NOT IN ('closed', 'false_positive')";
+/** Просрочена первичная реакция (сроки — lib/shared/incident-sla REACTION_SECONDS): только ещё не взятые в работу. */
+const OVERDUE_SQL = "status = 'new' AND dateDiff('second', created_at, now()) > multiIf(level = 'critical', 900, level = 'high', 3600, level = 'medium', 14400, 86400)";
+const LEVEL_RANK_SQL = "multiIf(level = 'critical', 4, level = 'high', 3, level = 'medium', 2, 1)";
+/**
+ * Порядок очереди по умолчанию: сначала срочные — просроченные реакции и открытые
+ * критические/высокие; внутри них по уровню (критический первым), при равном
+ * уровне просроченные выше; затем остальное по времени создания.
+ */
+const URGENT_SQL = `(${OVERDUE_SQL}) OR (${OPEN_SQL} AND level IN ('critical', 'high'))`;
+const PRIORITY_ORDER = `if(${URGENT_SQL}, 0, 1) ASC,
+  if(${URGENT_SQL}, ${LEVEL_RANK_SQL}, 0) DESC,
+  if(${OVERDUE_SQL}, 0, 1) ASC`;
 
 /** Условия очереди (поиск, статус, уровень, очередь) — общие для списка и групп сканов. */
 function incidentConditions(filter: IncidentFilter, params: Record<string, string | number>): string[] {
@@ -92,7 +112,7 @@ function incidentConditions(filter: IncidentFilter, params: Record<string, strin
     having.push("owner = '' AND status NOT IN ('closed', 'false_positive')");
   } else if (filter.queue === "overdue") {
     // Срок первичной реакции: только ещё не взятые в работу инциденты.
-    having.push("status = 'new' AND dateDiff('second', created_at, now()) > multiIf(level = 'critical', 900, level = 'high', 3600, level = 'medium', 14400, 86400)");
+    having.push(OVERDUE_SQL);
   }
   return having;
 }
@@ -114,7 +134,8 @@ export async function incidentsList(
     params.scan_rules = scanRulesParam();
   }
   const where = having.length ? "WHERE " + having.join(" AND ") : "";
-  const listSQL = `${LATEST} ${where} ORDER BY created_at DESC, incident_id DESC LIMIT {limit:UInt32} OFFSET {offset:UInt32}`;
+  const order = filter.sort === "time" ? "" : `${PRIORITY_ORDER}, `;
+  const listSQL = `${LATEST} ${where} ORDER BY ${order}created_at DESC, incident_id DESC LIMIT {limit:UInt32} OFFSET {offset:UInt32}`;
   const [initialRows, cnt] = await Promise.all([
     chQuery<IncidentRow>(
       listSQL,
@@ -134,7 +155,11 @@ export async function incidentsList(
 
 export type ScanGroup = {
   subnet: string; incidents: number; addresses: number; rules: string[];
+  /** Названия правил группы (для людей; rules — идентификаторы). */
+  titles?: string[];
   first_ts: string; last_ts: string; level: string; unassigned: number;
+  /** Один из адресов группы: группа из одного адреса показывается этим адресом, а не подсетью. */
+  sample?: string;
 };
 
 /**
@@ -149,20 +174,37 @@ export async function scanGroups(filter: IncidentFilter = {}, limit: number = GR
   const rows = await chQuery<ScanGroup & { level_rank: number | string; incidents: number | string; addresses: number | string; unassigned: number | string }>(
     // Агрегаты под своими именами и переименование снаружи: псевдоним first_ts над
     // min(first_ts) в том же SELECT перекрыл бы колонку внутри агрегата (184).
-    `SELECT subnet, incidents, addresses, rules, toString(f) AS first_ts, toString(l) AS last_ts, level_rank, unassigned FROM (
+    `SELECT subnet, incidents, addresses, rules, titles, toString(f) AS first_ts, toString(l) AS last_ts, level_rank, unassigned, sample FROM (
        SELECT ${subnetSQL("actor_name")} AS subnet, count() AS incidents, uniqExact(${addrSQL("actor_name")}) AS addresses,
-              arraySort(groupUniqArray(rule_id)) AS rules, min(first_ts) AS f, max(last_ts) AS l,
+              arraySort(groupUniqArray(rule_id)) AS rules, arraySort(groupUniqArray(rule_title)) AS titles, min(first_ts) AS f, max(last_ts) AS l,
               max(multiIf(level = 'critical', 4, level = 'high', 3, level = 'medium', 2, 1)) AS level_rank,
-              countIf(owner = '') AS unassigned
+              countIf(owner = '') AS unassigned, any(${addrSQL("actor_name")}) AS sample
        FROM (${LATEST} WHERE ${having.join(" AND ")})
        GROUP BY subnet)
-     ORDER BY l DESC, subnet LIMIT {limit:UInt32} OFFSET {offset:UInt32}`,
+     ORDER BY level_rank DESC, addresses DESC, l DESC, subnet LIMIT {limit:UInt32} OFFSET {offset:UInt32}`,
     params,
   );
   return rows.map((r) => ({
-    subnet: r.subnet, incidents: Number(r.incidents), addresses: Number(r.addresses), rules: r.rules,
+    subnet: r.subnet, incidents: Number(r.incidents), addresses: Number(r.addresses), rules: r.rules, titles: r.titles ?? [],
     first_ts: r.first_ts, last_ts: r.last_ts, level: levelOfRank(Number(r.level_rank)), unassigned: Number(r.unassigned),
+    sample: r.sample ?? "",
   }));
+}
+
+export type ScanSummary = { subnets: number; incidents: number; level: string; unassigned: number };
+
+/** Сводка открытых сканов снаружи под условиями очереди — одна строка над очередью. */
+export async function scanSummary(filter: IncidentFilter = {}): Promise<ScanSummary> {
+  const params: Record<string, string | number> = { scan_rules: scanRulesParam() };
+  const having = [SCAN_GROUPED, ...incidentConditions(filter, params)];
+  const [r] = await chQuery<{ subnets: string; incidents: string; level_rank: string; unassigned: string }>(
+    `SELECT uniqExact(${subnetSQL("actor_name")}) AS subnets, count() AS incidents,
+            max(${LEVEL_RANK_SQL}) AS level_rank, countIf(owner = '') AS unassigned
+     FROM (${LATEST} WHERE ${having.join(" AND ")})`,
+    params,
+  );
+  const incidents = Number(r?.incidents ?? 0);
+  return { subnets: Number(r?.subnets ?? 0), incidents, level: incidents ? levelOfRank(Number(r?.level_rank ?? 1)) : "", unassigned: Number(r?.unassigned ?? 0) };
 }
 
 function groupConditions(subnet: string, filter: IncidentFilter, params: Record<string, string | number>): string[] {
@@ -480,6 +522,36 @@ export async function incidentStats(): Promise<IncidentStats> {
      FROM (${LATEST})`,
   );
   return { total: Number(r?.total ?? 0), open: Number(r?.open ?? 0), escalated: Number(r?.escalated ?? 0), pii: Number(r?.pii ?? 0) };
+}
+
+/** Очередь дежурного: счётчики плиток. scans — та же метрика по свёрнутым сканам снаружи (в очереди их нет). */
+export type IncidentQueueStats = {
+  total: number;
+  criticalOpen: number; overdue: number; unassigned: number; mine: number;
+  scans: { criticalOpen: number; overdue: number; unassigned: number; mine: number };
+};
+
+export async function incidentQueueStats(user: string): Promise<IncidentQueueStats> {
+  const conds = {
+    critical_open: `level = 'critical' AND ${OPEN_SQL}`,
+    overdue: OVERDUE_SQL,
+    unassigned: `owner = '' AND ${OPEN_SQL}`,
+    mine: `owner = {user:String} AND ${OPEN_SQL}`,
+  };
+  const cols = Object.entries(conds).flatMap(([k, c]) => [
+    `countIf((${c}) AND NOT scan) AS ${k}`,
+    `countIf((${c}) AND scan) AS scan_${k}`,
+  ]);
+  const [r] = await chQuery<Record<string, string>>(
+    `SELECT count() AS total, ${cols.join(", ")} FROM (SELECT *, ${SCAN_GROUPED} AS scan FROM (${LATEST}))`,
+    { user, scan_rules: scanRulesParam() },
+  );
+  const n = (k: string) => Number(r?.[k] ?? 0);
+  return {
+    total: n("total"),
+    criticalOpen: n("critical_open"), overdue: n("overdue"), unassigned: n("unassigned"), mine: n("mine"),
+    scans: { criticalOpen: n("scan_critical_open"), overdue: n("scan_overdue"), unassigned: n("scan_unassigned"), mine: n("scan_mine") },
+  };
 }
 
 /* ===== Источники ===== */

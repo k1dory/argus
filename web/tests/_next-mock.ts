@@ -49,6 +49,8 @@ export type QueryMocks = {
   agentVerdictBySession: (incidentId: string, sessionId: string) => Promise<Record<string, unknown> | null>;
   /** Запросы страниц консоли (обзор, лента, источники, правила, настройки): по умолчанию — пусто. */
   incidentStats: () => Promise<{ total: number; open: number; escalated: number; pii: number }>;
+  incidentQueueStats: (user: string) => Promise<import("../src/lib/argus-queries").IncidentQueueStats>;
+  scanSummary: (filter?: unknown) => Promise<import("../src/lib/argus-queries").ScanSummary>;
   eventsByClass: (hours: number) => Promise<{ source_class: string; count: number; sources: number }[]>;
   eventsRecent: (source?: string, limit?: number) => Promise<Record<string, unknown>[]>;
   engineRules: () => Promise<{ rules: Record<string, unknown>[]; health: Record<string, unknown> | null; error: string | null }>;
@@ -163,6 +165,14 @@ export function installNextMocks(): Mocks {
     agentVerdictsFor: async () => [],
     agentVerdictBySession: async () => null,
     incidentStats: async () => ({ total: 0, open: 0, escalated: 0, pii: 0 }),
+    incidentQueueStats: async () => ({ total: 0, criticalOpen: 0, overdue: 0, unassigned: 0, mine: 0, scans: { criticalOpen: 0, overdue: 0, unassigned: 0, mine: 0 } }),
+    // По умолчанию сводка сканов — из подменённых групп, чтобы тесты групп не задавали её отдельно.
+    scanSummary: async () => {
+      const groups = (await queries.scanGroups()) as { incidents: number; unassigned: number; level: string }[];
+      const rank = ["low", "medium", "high", "critical"];
+      const level = groups.reduce((m, g) => (rank.indexOf(g.level) > rank.indexOf(m) ? g.level : m), groups.length ? "low" : "");
+      return { subnets: groups.length, incidents: groups.reduce((n, g) => n + g.incidents, 0), level, unassigned: groups.reduce((n, g) => n + g.unassigned, 0) };
+    },
     eventsByClass: async () => [],
     eventsRecent: async () => [],
     engineRules: async () => ({ rules: [], health: null, error: null }),
