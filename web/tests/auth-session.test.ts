@@ -73,11 +73,11 @@ test("mustChangePassword: admin со стартовым паролем блок�
   assert.equal((await auth.authorize("admin")).ok, true);
 });
 
-test("SSO: имя изолировано префиксом sso:, TTL сессии 1 ч, локальная — 12 ч", async () => {
+test("SSO: имя изолировано префиксом sso:, сессия — простой не дальше SSO-потолка, локальная — простой", async () => {
   await assert.rejects(auth.signSessionToken("admin", "admin", true), /sso:/);
   const t = await auth.signSessionToken("sso:admin", "admin", true);
   const p = decodeJwt(t);
-  assert.equal(p.exp! - p.iat!, 3600);
+  assert.equal(p.exp! - p.iat!, Math.min(auth.SESSION_IDLE_SEC, auth.SSO_SESSION_MAX_SEC));
   const s = await auth.verifySessionToken(t);
   assert.deepEqual(s, { kind: "console", user: "sso:admin", role: "admin", sso: true, mustChangePassword: false });
   // sso:admin — не встроенный admin: локальный пароль/2FA у него не существуют
@@ -87,7 +87,7 @@ test("SSO: имя изолировано префиксом sso:, TTL сесси
   await assert.rejects(auth.signSessionToken("sso:admin", "admin", false));
   const local = await auth.signSessionToken("bob", "analyst", false);
   const lp = decodeJwt(local);
-  assert.equal(lp.exp! - lp.iat!, 12 * 3600);
+  assert.equal(lp.exp! - lp.iat!, auth.SESSION_IDLE_SEC);
   assert.equal(lp.sso, false);
 });
 

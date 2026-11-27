@@ -27,6 +27,7 @@ npm run build && npm start
 | `ARGUS_API_TOKEN` | bearer-токен для `/api/*` (MCP, скрипты; только чтение, ≥32 символов) |
 | `ARGUS_TRIAGE_ISSUER_TOKEN`, `ARGUS_TRIAGE_SESSION_REQUESTS`, `ARGUS_TRIAGE_ANCHOR_MAX_SPREAD` | учётка-эмитент сессий разбора (`POST /api/triage/sessions`), бюджет запросов на сессию (100), порог частых значений для якорей (5) |
 | `ARGUS_INTEGRATION_WAZUH` | `1` — разделы модуля Wazuh (`/wazuh/*`), индекс `alerts` в поиске |
+| `ARGUS_SESSION_IDLE_HOURS`, `ARGUS_SESSION_MAX_HOURS`, `ARGUS_SSO_SESSION_MAX_HOURS` | скользящая сессия консоли: продлевается при активности на «простой» (12 ч), но не дальше потолка от входа — локальная 168 ч (7 суток), SSO 12 ч (роль из групп IdP пересматривается при повторном входе) |
 | `TRUSTED_PROXY`, `SESSION_SECURE` | доверять `X-Forwarded-For` за Caddy; кука без `Secure` для `http://127.0.0.1:3001` на стенде |
 | `OIDC_*` | SSO через IdP (см. `src/lib/oidc.ts`) |
 | `APP_VERSION` | версия в шапке (build-arg из `VERSION`) |

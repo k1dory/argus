@@ -21,12 +21,28 @@ import { isEntityKind, TRIAGE_ENTITIES_MAX, TRIAGE_ENTITY_MAX_LEN, TRIAGE_RELATI
 const AUTH_FILE = path.resolve(/*turbopackIgnore: true*/ process.env.AUTH_FILE ?? "./.auth.json");
 /** Стартовый пароль admin: файл 0600 рядом с auth.json, удаляется при первой смене. */
 export const ADMIN_PASSWORD_FILE = path.join(path.dirname(AUTH_FILE), "admin-password.txt");
-const SESSION_COOKIE = "wazuh_console_session";
+export const SESSION_COOKIE = "wazuh_console_session";
 const LOGIN_TOTP_COOKIE = "wazuh_console_login_totp";
-const SESSION_TTL_SEC = 12 * 60 * 60;
 const LOGIN_TOTP_TTL_SEC = 5 * 60;
-/** SSO-сессия короче: роль приходит из групп IdP и должна пересматриваться чаще. */
-const SSO_SESSION_TTL_SEC = 60 * 60;
+
+/* Сессия консоли — скользящая: каждый запрос (не чаще раза в SESSION_RENEW_AFTER_SEC)
+ * продлевает её на «простой» (idle), но не дальше потолка от момента входа
+ * (claim auth). SSO-потолок короче: роль из групп IdP пересматривается при
+ * повторном входе. Часы — из env, неверное значение — дефолт. */
+const HOUR_SEC = 60 * 60;
+function envHours(name: string, def: number): number {
+  const v = Number(process.env[name]);
+  return Number.isFinite(v) && v > 0 ? v : def;
+}
+export const SESSION_MAX_SEC = Math.round(envHours("ARGUS_SESSION_MAX_HOURS", 7 * 24) * HOUR_SEC);
+export const SSO_SESSION_MAX_SEC = Math.round(envHours("ARGUS_SSO_SESSION_MAX_HOURS", 12) * HOUR_SEC);
+export const SESSION_IDLE_SEC = Math.round(envHours("ARGUS_SESSION_IDLE_HOURS", 12) * HOUR_SEC);
+export const SESSION_RENEW_AFTER_SEC = 5 * 60;
+
+/** exp сессии: простой от «сейчас», но не дальше потолка от входа. */
+export function sessionExp(nowSec: number, authSec: number, sso: boolean): number {
+  return Math.min(nowSec + SESSION_IDLE_SEC, authSec + (sso ? SSO_SESSION_MAX_SEC : SESSION_MAX_SEC));
+}
 // Имена SSO-пользователей живут в своём пространстве: `sso:i.petrov`
 // никогда не совпадёт с локальным `i.petrov` или встроенным admin.
 import { SSO_PREFIX } from "./oidc";
@@ -677,6 +693,11 @@ export async function clearLoginTotp(): Promise<void> {
   (await cookies()).delete({ name: LOGIN_TOTP_COOKIE, path: "/login" });
 }
 
+/** Параметры куки сессии — одни и те же при входе и при продлении. */
+export function sessionCookieOptions(maxAge: number) {
+  return { httpOnly: true, sameSite: "strict" as const, secure: cookieSecure(), path: "/", maxAge };
+}
+
 /** Единое правило Secure для всех кук консоли (сессия, OIDC state):
  *  в проде — только по TLS; SESSION_SECURE=false — осознанный plain HTTP. */
 export function cookieSecure(): boolean {
@@ -705,7 +726,7 @@ export type Session = {
 
 /** JWT сессии. Локальный пользователь получает tv = его tokenVersion;
  *  SSO-пользователь — только с префиксом sso: и коротким TTL. */
-export async function signSessionToken(user: string, role: Role, sso: boolean): Promise<string> {
+export async function signSessionToken(user: string, role: Role, sso: boolean, authSec?: number, nowSec = Math.floor(Date.now() / 1000)): Promise<string> {
   const state = await getAuthState();
   let tv = 0;
   if (sso) {
@@ -715,11 +736,37 @@ export async function signSessionToken(user: string, role: Role, sso: boolean): 
     if (!u) throw new Error("Пользователь не найден");
     tv = u.tokenVersion;
   }
-  return new SignJWT({ sub: user, role, sso, tv })
+  const auth = authSec ?? nowSec;
+  return new SignJWT({ sub: user, role, sso, tv, auth })
     .setProtectedHeader({ alg: "HS256" })
-    .setIssuedAt()
-    .setExpirationTime(`${sso ? SSO_SESSION_TTL_SEC : SESSION_TTL_SEC}s`)
+    .setIssuedAt(nowSec)
+    .setExpirationTime(sessionExp(nowSec, auth, sso))
     .sign(await secretKey());
+}
+
+/**
+ * Продление сессии при активности: новый токен с exp = min(сейчас + простой,
+ * вход + потолок). null — продлевать не нужно или нельзя: токен невалиден или
+ * отозван (verifySessionToken), выпущен меньше SESSION_RENEW_AFTER_SEC назад,
+ * потолок от входа исчерпан. Роль и tv переносятся из действующей сессии;
+ * момент входа (auth) не меняется — потолок не сдвигается продлением.
+ */
+export async function renewSessionToken(token: string, nowSec = Math.floor(Date.now() / 1000)): Promise<{ token: string; maxAge: number } | null> {
+  try {
+    const { payload } = await jwtVerify(token, await secretKey(), { currentDate: new Date(nowSec * 1000) });
+    const session = await verifySessionToken(token, nowSec);
+    if (!session || session.kind !== "console") return null;
+    const iat = Number(payload.iat ?? 0);
+    if (!iat || nowSec - iat < SESSION_RENEW_AFTER_SEC) return null;
+    // Токены до скользящих сессий — без auth: момент входа = iat.
+    const auth = Number.isFinite(Number(payload.auth)) && Number(payload.auth) > 0 ? Number(payload.auth) : iat;
+    const exp = sessionExp(nowSec, auth, session.sso);
+    if (exp <= Number(payload.exp ?? 0) || exp <= nowSec) return null;
+    const role = session.sso ? (payload.role as Role) : session.role;
+    return { token: await signSessionToken(session.user, role, session.sso, auth, nowSec), maxAge: exp - nowSec };
+  } catch {
+    return null;
+  }
 }
 
 /** Сессия из токена или null. Роль и существование локального пользователя
@@ -727,9 +774,9 @@ export async function signSessionToken(user: string, role: Role, sso: boolean): 
  *  правах пользователь теряет доступ сразу; tv сверяется с tokenVersion —
  *  смена пароля отзывает выданные токены. SSO-ветка — только для payload.sso
  *  с именем в пространстве sso:, роль — из групп IdP, зафиксированных в токене. */
-export async function verifySessionToken(token: string): Promise<Session | null> {
+export async function verifySessionToken(token: string, nowSec?: number): Promise<Session | null> {
   try {
-    const { payload } = await jwtVerify(token, await secretKey());
+    const { payload } = await jwtVerify(token, await secretKey(), nowSec === undefined ? undefined : { currentDate: new Date(nowSec * 1000) });
     const user = String(payload.sub ?? "");
     if (!user) return null;
     if (payload.sso === true) {
@@ -748,15 +795,10 @@ export async function verifySessionToken(token: string): Promise<Session | null>
 }
 
 export async function createSession(user: string = ADMIN_USER, role: Role = "admin", sso = false): Promise<void> {
-  const token = await signSessionToken(user, role, sso);
+  const now = Math.floor(Date.now() / 1000);
+  const token = await signSessionToken(user, role, sso, now, now);
   const jar = await cookies();
-  jar.set(SESSION_COOKIE, token, {
-    httpOnly: true,
-    sameSite: "strict",
-    secure: cookieSecure(),
-    path: "/",
-    maxAge: sso ? SSO_SESSION_TTL_SEC : SESSION_TTL_SEC,
-  });
+  jar.set(SESSION_COOKIE, token, sessionCookieOptions(sessionExp(now, now, sso) - now));
 }
 
 export async function destroySession(): Promise<void> {
