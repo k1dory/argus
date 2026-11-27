@@ -1,35 +1,31 @@
 import type { Metadata } from "next";
 import Link from "next/link";
+import { Inbox, SlidersHorizontal, X } from "lucide-react";
 import { RefreshDataButton } from "@/components/console/refresh-data-button";
 import { Pager } from "@/components/console/pager";
-import { PageHeader, Panel, StatTile } from "@/components/console/panel";
-import { LevelBadge, StatusBadge } from "@/components/console/incident-badges";
+import { Empty, PageHeader, Panel, StatTile } from "@/components/console/panel";
+import { FeedDay, FeedList } from "@/components/console/feed";
+import { FilterTabs } from "@/components/console/filter-tabs";
 import { StorageUnavailable } from "@/components/console/storage-error";
+import { IncidentRow, type IncidentRowNote } from "@/components/console/incidents/incident-row";
+import { ScanSubnetTable, ScanSummaryBlock } from "@/components/console/incidents/scan-summary";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
 import { listUsers, requirePageSession } from "@/lib/auth";
 import { ScanGroupActions } from "@/components/console/scan-group-actions";
 import { attackFormOptions } from "@/lib/shared/attack";
-import { BLOCK_LABEL, GROUP_ACTION_MAX, GROUP_ROWS_PAGE, GROUPS_PAGE, isSubnetKey, SCAN_GROUP_RULES } from "@/lib/shared/scan-groups";
+import { GROUP_ACTION_MAX, GROUP_ROWS_PAGE, isSubnetKey } from "@/lib/shared/scan-groups";
 import { ROLE_RANK } from "@/lib/shared/incidents";
 import { safeQuery } from "@/lib/clickhouse";
-import { INCIDENT_STATUSES, incidentBlockStates, incidentClosuresFor, incidentStats, incidentsList, scanGroupIncidents, scanGroups, verdictsFor, type VerdictRow } from "@/lib/argus-queries";
-import { isIncidentStatus } from "@/lib/shared/incidents";
-import { reactionDeadline, reactionOverdue } from "@/lib/shared/incident-sla";
-import { verdictState, type VerdictState } from "@/lib/shared/incidents";
+import { INCIDENT_STATUSES, incidentBlockStates, incidentClosuresFor, incidentQueueStats, incidentsList, scanGroupIncidents, scanGroups, scanSummary, verdictsFor } from "@/lib/argus-queries";
+import { isIncidentStatus, verdictState } from "@/lib/shared/incidents";
+import { REACTION_SECONDS } from "@/lib/shared/incident-sla";
+import { incidentUrgency, isFinalStatus, plural } from "@/lib/shared/incident-view";
 import { hideVerdicts } from "@/lib/blind";
 import { INCIDENT_LEVEL_LABELS } from "@/lib/shared/labels";
 import { clampPage } from "@/lib/shared/limits";
-import { fmtNum, formatAgo, formatTs } from "@/lib/shared/time";
+import { groupFeedByDay } from "@/lib/shared/feed";
+import { fmtNum } from "@/lib/shared/time";
 import { RangeFilters } from "@/components/console/range-filters";
 import { RangePicker } from "@/components/console/range-picker";
 import { describeChips } from "@/lib/shared/filters";
@@ -38,36 +34,29 @@ import { INCIDENT_RANGE_FIELDS, INCIDENT_RANGE_KEYS, incidentRangeChips, parseIn
 export const dynamic = "force-dynamic";
 export const metadata: Metadata = { title: "Инциденты" };
 
-const VERDICT_CELL: Record<VerdictState, (v: VerdictRow | undefined) => React.ReactNode> = {
-  missing: () => <span className="font-mono text-xs">разбор ещё не готов</span>,
-  error: (v) => <span className="font-mono text-xs text-destructive">аналитик: {v?.error}</span>,
-  hidden: (v) => <span className="font-mono text-xs">уверенность {fmtNum(v?.confidence, 2)} ниже порога — разбор скрыт</span>,
-  shown: (v) => <span className="line-clamp-3" title={v?.summary_ru}>{v?.summary_ru}</span>,
-};
-function VerdictCell({ v, unavailable = false, blind = false }: { v: VerdictRow | undefined; unavailable?: boolean; blind?: boolean }) {
-  if (blind) return <span className="font-mono text-xs">разбор вслепую — скрыт до завершения</span>;
-  if (unavailable) return <span className="font-mono text-xs text-destructive">разбор временно недоступен</span>;
-  return <>{VERDICT_CELL[verdictState(v)](v)}</>;
-}
-
 const LEVELS = Object.keys(INCIDENT_LEVEL_LABELS);
+/** Сколько групп сканов показывать в раскрытой сводке за раз. */
+const SCAN_GROUPS_SHOWN = 10;
+const SLA_HINT = `Срок первой реакции, 24/7: ${Object.entries(REACTION_SECONDS).map(([l, s]) => `${INCIDENT_LEVEL_LABELS[l] ?? l} — ${s >= 3600 ? `${s / 3600} ч` : `${s / 60} мин`}`).join(", ")}`;
+/** Ключи диапазона в адресе: снять чип — убрать их. */
+const CHIP_KEYS: Record<string, string[]> = { time: ["range", "from", "to", "period"], level: ["level_min", "level_max"], events: ["events_min", "events_max"] };
 
 export default async function IncidentsPage({ searchParams }: PageProps<"/incidents">) {
   const session = await requirePageSession();
   const params = await searchParams;
   const status = isIncidentStatus(params.status) ? params.status : undefined;
+  // level=… — точный уровень (ссылки плиток и старые закладки); кнопок для него нет, в интерфейсе — диапазон.
   const level = typeof params.level === "string" && LEVELS.includes(params.level) ? params.level : undefined;
   const q = typeof params.q === "string" ? params.q.trim().slice(0, 200) : undefined;
   const page = clampPage(params.page);
   const queue = params.queue === "open" || params.queue === "mine" || params.queue === "unassigned" || params.queue === "overdue" ? params.queue : undefined;
-  // Сканы снаружи (правила inbound-scan) по умолчанию свёрнуты по подсети источника;
-  // scans=list — показать их в очереди по одному, как раньше.
+  // Сканы снаружи (правила inbound-scan) по умолчанию свёрнуты в сводку над очередью;
+  // scans=list — показать их в очереди по одному.
   const scansList = params.scans === "list";
   const subnet = typeof params.subnet === "string" && isSubnetKey(params.subnet) ? params.subnet : undefined;
   const gpage = clampPage(params.gpage);
   const spage = clampPage(params.spage);
   const canEdit = ROLE_RANK[session.role] >= ROLE_RANK.analyst;
-  // Диапазоны: окно по началу, уровень не ниже/не выше, событий в цепочке. level=… — прежний точный уровень (кнопки ниже).
   const ranges = parseIncidentRanges(params);
   const rangeQs = pickParams(params, INCIDENT_RANGE_KEYS);
   const rangeChips = incidentRangeChips(ranges);
@@ -86,12 +75,18 @@ export default async function IncidentsPage({ searchParams }: PageProps<"/incide
   };
 
   const r = await safeQuery(async () => {
-    const [list, stats] = await Promise.all([incidentsList({ status, level, q, page, queue, user: session.user, groupScans: !scansList, ranges }), incidentStats()]);
+    const [list, stats] = await Promise.all([
+      incidentsList({ status, level, q, page, queue, user: session.user, groupScans: !scansList, ranges }),
+      incidentQueueStats(session.user),
+    ]);
     return { list, stats };
   });
   const filter = { status, level, q, queue, user: session.user, ranges } as const;
-  // Группы и раскрытая подсеть — отдельно: их недоступность не мешает очереди.
-  const groups = r.ok && !scansList ? await safeQuery(() => scanGroups({ ...filter, page: gpage }, GROUPS_PAGE)) : null;
+  // Сводка и группы сканов — отдельно: их недоступность не мешает очереди.
+  const scans = r.ok && !scansList ? await safeQuery(async () => {
+    const [summary, groups] = await Promise.all([scanSummary(filter), safeQuery(() => scanGroups({ ...filter, page: gpage }, SCAN_GROUPS_SHOWN))]);
+    return { summary, groups };
+  }) : null;
   const expanded = r.ok && !scansList && subnet ? await safeQuery(async () => {
     const rows = await scanGroupIncidents(subnet, { ...filter, page: spage });
     const [blocks, users] = await Promise.all([
@@ -104,109 +99,46 @@ export default async function IncidentsPage({ searchParams }: PageProps<"/incide
   const closures = r.ok ? await safeQuery(() => incidentClosuresFor(r.data.list.rows.map((x) => x.incident_id))) : null;
   const now = new Date();
 
+  const chips: { key: string; label: string; remove: string }[] = [
+    ...(status ? [{ key: "status", label: `статус: ${INCIDENT_STATUSES[status]}`, remove: href({ status: undefined }) }] : []),
+    ...(level ? [{ key: "level-exact", label: `уровень: ${INCIDENT_LEVEL_LABELS[level]}`, remove: href({ level: undefined }) }] : []),
+    ...(q ? [{ key: "q", label: `поиск: «${q}»`, remove: href({ q: undefined }) }] : []),
+    ...rangeChips.map((c) => ({ key: c.key, label: `${c.label} ${c.value}`, remove: href(Object.fromEntries((CHIP_KEYS[c.key] ?? [`${c.key}_min`, `${c.key}_max`]).map((k) => [k, undefined]))) })),
+  ];
+  const panelFilters = (status ? 1 : 0) + (level ? 1 : 0) + rangeChips.length;
+
   return (
     <>
-      <PageHeader title="Инциденты">
-        <div className="flex flex-wrap items-center gap-4">
-          <RefreshDataButton />
-          <span className="c-label">лента дежурного · правила из rules/</span>
-        </div>
-      </PageHeader>
+      <PageHeader
+        title="Инциденты"
+        subtitle={<>Что сработало и кто этим занимается{r.ok && <> · всего <span className="tabular-nums">{fmtNum(r.data.stats.total)}</span></>}</>}
+        actions={<RefreshDataButton />}
+      />
 
       {!r.ok ? (
         <StorageUnavailable reason={r.error} />
       ) : (
         <>
-          <div className="grid grid-cols-2 gap-6 md:grid-cols-4">
-            <StatTile label="Всего" value={fmtNum(r.data.stats.total)} href="/incidents" />
-            <StatTile label="Открытых" value={fmtNum(r.data.stats.open)} href="/incidents?queue=open" led={r.data.stats.open > 0 ? "var(--status-warn)" : "var(--status-ok)"} />
-            <StatTile label="Эскалация" value={fmtNum(r.data.stats.escalated)} href="/incidents?status=escalated" led={r.data.stats.escalated > 0 ? "var(--status-err)" : "var(--status-ok)"} />
-            <StatTile label="С ПДн" value={fmtNum(r.data.stats.pii)} />
-          </div>
+          <QueueTiles stats={r.data.stats} withScans={scansList} />
 
-          {groups && (
-            <Panel label="Сканы снаружи · по подсетям" meta={groups.ok ? `${fmtNum(groups.data.length)} подсетей · правила ${SCAN_GROUP_RULES.join(", ")}` : "временно недоступно"}>
-              <div className="mb-3 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-                Открытые инциденты скана портов, обхода хостов и долбёжки сервиса свёрнуты по подсети источника (/24, IPv6 /48); в очереди ниже их нет.
-                <Link href={href({ scans: "list", subnet: undefined })} className="text-[var(--ring)] hover:underline">показать списком</Link>
-              </div>
-              {!groups.ok ? <p className="text-xs text-destructive">Группы сканов временно недоступны; очередь ниже — без них.</p>
-                : groups.data.length === 0 ? <p className="font-mono text-xs text-muted-foreground">открытых сканов нет</p>
-                : <div className="c-well overflow-x-auto p-2">
-                  <Table className="min-w-[900px]">
-                    <TableHeader>
-                      <TableRow className="border-border/60">
-                        <TableHead className="c-label">Подсеть</TableHead>
-                        <TableHead className="c-label">Адресов / инцидентов</TableHead>
-                        <TableHead className="c-label">Правила</TableHead>
-                        <TableHead className="c-label">Первое — последнее (UTC)</TableHead>
-                        <TableHead className="c-label">Уровень</TableHead>
-                        <TableHead className="c-label">Без ответственного</TableHead>
-                        <TableHead className="c-label"></TableHead>
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {groups.data.map((g) => {
-                        const open = g.subnet === subnet;
-                        return <TableRow key={g.subnet} className="border-border/40 align-top">
-                          <TableCell className="font-mono text-xs">{g.subnet}</TableCell>
-                          <TableCell className="font-mono text-xs">{fmtNum(g.addresses)} / {fmtNum(g.incidents)}</TableCell>
-                          <TableCell className="font-mono text-xs whitespace-normal">{g.rules.join(", ")}</TableCell>
-                          <TableCell className="font-mono text-xs whitespace-nowrap">{formatTs(g.first_ts, "datetime")} — {formatTs(g.last_ts, "datetime")}</TableCell>
-                          <TableCell><LevelBadge level={g.level} /></TableCell>
-                          <TableCell className="font-mono text-xs">{fmtNum(g.unassigned)}</TableCell>
-                          <TableCell className="text-xs">
-                            <Link href={href({ subnet: open ? undefined : g.subnet })} aria-expanded={open} className="text-[var(--ring)] hover:underline">{open ? "свернуть" : "раскрыть"}</Link>
-                          </TableCell>
-                        </TableRow>;
-                      })}
-                    </TableBody>
-                  </Table>
-                </div>}
-              {groups.ok && (gpage > 1 || groups.data.length === GROUPS_PAGE) && (
-                <div className="mt-2 flex flex-wrap gap-3 text-xs">
-                  <span className="text-muted-foreground">группы {fmtNum((gpage - 1) * GROUPS_PAGE + 1)}–{fmtNum((gpage - 1) * GROUPS_PAGE + groups.data.length)}</span>
-                  {gpage > 1 && <Link href={href({ gpage: gpage > 2 ? String(gpage - 1) : undefined, subnet: undefined, spage: undefined })} className="text-[var(--ring)] hover:underline">← предыдущие группы</Link>}
-                  {groups.data.length === GROUPS_PAGE && <Link href={href({ gpage: String(gpage + 1), subnet: undefined, spage: undefined })} className="text-[var(--ring)] hover:underline">следующие группы →</Link>}
-                </div>
-              )}
-              {subnet && expanded && (!expanded.ok ? <p className="mt-3 text-xs text-destructive">Инциденты подсети {subnet} временно недоступны.</p> : <div className="mt-4">
-                <div className="c-label mb-2">Подсеть {subnet} · {spage > 1 || expanded.data.rows.length === GROUP_ROWS_PAGE
+          {scans && (scans.ok ? (scans.data.summary.incidents > 0 || subnet) && (
+            <ScanSummaryBlock
+              summary={scans.data.summary}
+              groups={scans.data.groups.ok ? scans.data.groups.data : []}
+              groupsError={!scans.data.groups.ok}
+              pageSize={SCAN_GROUPS_SHOWN}
+              gpage={gpage}
+              subnet={subnet}
+              now={now}
+              href={href}
+            >
+              {subnet && expanded && (!expanded.ok ? <p className="mt-3 text-[13px] text-destructive">Инциденты подсети {subnet} временно недоступны.</p> : <div className="mt-4 space-y-2">
+                <div className="c-label">Подсеть {subnet} · {spage > 1 || expanded.data.rows.length === GROUP_ROWS_PAGE
                   ? `инциденты ${fmtNum((spage - 1) * GROUP_ROWS_PAGE + 1)}–${fmtNum((spage - 1) * GROUP_ROWS_PAGE + expanded.data.rows.length)}`
-                  : `${fmtNum(expanded.data.rows.length)} открытых инцидентов`}</div>
-                <div className="c-well overflow-x-auto p-2">
-                  <Table className="min-w-[900px]">
-                    <TableHeader>
-                      <TableRow className="border-border/60">
-                        <TableHead className="c-label">Инцидент</TableHead>
-                        <TableHead className="c-label">Адрес</TableHead>
-                        <TableHead className="c-label">Правило</TableHead>
-                        <TableHead className="c-label">Последнее (UTC)</TableHead>
-                        <TableHead className="c-label">Уровень</TableHead>
-                        <TableHead className="c-label">Статус</TableHead>
-                        <TableHead className="c-label">Ответственный</TableHead>
-                        <TableHead className="c-label">Блокировка</TableHead>
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {expanded.data.rows.map((row) => {
-                        const st = expanded.data.blocks[row.incident_id] ?? "none";
-                        return <TableRow key={row.incident_id} className="border-border/40">
-                          <TableCell className="font-mono text-xs"><Link href={`/incidents/${row.incident_id}`} className="text-[var(--ring)] hover:underline">{row.incident_id}</Link></TableCell>
-                          <TableCell className="font-mono text-xs">{row.actor_name}</TableCell>
-                          <TableCell className="font-mono text-xs">{row.rule_id}</TableCell>
-                          <TableCell className="font-mono text-xs whitespace-nowrap">{formatTs(row.last_ts, "datetime")}</TableCell>
-                          <TableCell><LevelBadge level={row.level} /></TableCell>
-                          <TableCell><StatusBadge status={row.status} /></TableCell>
-                          <TableCell className="font-mono text-xs">{row.owner || "не назначен"}</TableCell>
-                          <TableCell className={st === "blocked" ? "text-xs text-[var(--status-err)]" : st === "failed" ? "text-xs text-[var(--status-warn)]" : "text-xs text-muted-foreground"}>{BLOCK_LABEL[st]}</TableCell>
-                        </TableRow>;
-                      })}
-                    </TableBody>
-                  </Table>
-                </div>
+                  : `${fmtNum(expanded.data.rows.length)} ${plural(expanded.data.rows.length, ["открытый инцидент", "открытых инцидента", "открытых инцидентов"])}`}</div>
+                <ScanSubnetTable rows={expanded.data.rows} blocks={expanded.data.blocks} now={now} />
                 {(spage > 1 || expanded.data.rows.length === GROUP_ROWS_PAGE) && (
-                  <div className="mt-2 flex flex-wrap gap-3 text-xs">
+                  <div className="flex flex-wrap gap-3 text-[13px]">
                     {spage > 1 && <Link href={href({ spage: spage > 2 ? String(spage - 1) : undefined })} className="text-[var(--ring)] hover:underline">← предыдущие</Link>}
                     {expanded.data.rows.length === GROUP_ROWS_PAGE && <Link href={href({ spage: String(spage + 1) })} className="text-[var(--ring)] hover:underline">следующие →</Link>}
                   </div>
@@ -216,142 +148,96 @@ export default async function IncidentsPage({ searchParams }: PageProps<"/incide
                   attack={attackFormOptions([...new Set(expanded.data.rows.flatMap((x) => x.tags))])}
                   isAdmin={session.role === "admin"} users={expanded.data.users.map((u) => ({ name: u.name, role: u.role }))} />}
                 {canEdit && (spage > 1 || expanded.data.rows.length > GROUP_ACTION_MAX) && (
-                  <p className="mt-2 text-xs text-muted-foreground">Групповые действия — для группы до {GROUP_ACTION_MAX} инцидентов: уточните фильтр (уровень, очередь) или работайте с инцидентами по одному.</p>
+                  <p className="text-[13px] text-muted-foreground">Групповые действия — для группы до {GROUP_ACTION_MAX} инцидентов: уточните фильтр (уровень, очередь) или работайте с инцидентами по одному.</p>
                 )}
               </div>)}
-            </Panel>
-          )}
-          {scansList && <p className="text-xs text-muted-foreground">Сканы снаружи показаны в очереди по одному · <Link href={href({ scans: undefined })} className="text-[var(--ring)] hover:underline">свернуть по подсетям</Link></p>}
+            </ScanSummaryBlock>
+          ) : <p role="status" className="text-[13px] text-muted-foreground">Сводка сканов снаружи временно недоступна; очередь — без них.</p>)}
+          {scansList && <p className="text-[13px] text-muted-foreground">Сканы снаружи показаны в очереди по одному · <Link href={href({ scans: undefined })} className="text-[var(--ring)] hover:underline">свернуть по подсетям</Link></p>}
 
-          <Panel label={`Очередь · ${fmtNum(r.data.list.total)} инцидентов`} meta={`страница ${r.data.list.page} из ${Math.max(1, Math.ceil(r.data.list.total / r.data.list.pageSize))}`}>
+          <Panel label="Очередь" meta={`${fmtNum(r.data.list.total)} ${plural(r.data.list.total, ["инцидент", "инцидента", "инцидентов"])}`}>
+            <div className="mb-3 flex flex-wrap items-center gap-2">
+              <FilterTabs
+                label="Очередь работы"
+                current={queue ?? "all"}
+                items={[
+                  { key: "all", label: "Все", href: href({ queue: undefined }) },
+                  { key: "open", label: "Открытые", href: href({ queue: "open" }) },
+                  { key: "mine", label: "Мои", href: href({ queue: "mine" }) },
+                  { key: "unassigned", label: "Без ответственного", href: href({ queue: "unassigned" }) },
+                  { key: "overdue", label: "Просрочены", href: href({ queue: "overdue" }) },
+                ]}
+              />
+              <form action="/incidents" method="get" role="search" className="ml-auto flex min-w-0 items-center gap-2">
+                {status && <input type="hidden" name="status" value={status} />}
+                {level && <input type="hidden" name="level" value={level} />}
+                {queue && <input type="hidden" name="queue" value={queue} />}
+                {scansList && <input type="hidden" name="scans" value="list" />}
+                {[...new URLSearchParams(rangeQs)].map(([k, v]) => <input key={k} type="hidden" name={k} value={v} />)}
+                <label htmlFor="inc-q" className="sr-only">Поиск по инцидентам</label>
+                <Input id="inc-q" name="q" type="search" defaultValue={q ?? ""} maxLength={200} placeholder="Поиск: INC-…, правило, кто, где" className="h-9 w-48 px-3 xl:w-72" />
+                <Button type="submit" variant="secondary" size="sm" className="min-h-9">Найти</Button>
+              </form>
+              <details className="relative">
+                <summary className="flex min-h-9 cursor-pointer list-none items-center gap-1.5 rounded-lg border border-[var(--border-strong)] px-3 text-[13px] text-muted-foreground hover:bg-[var(--surface-elevated)] hover:text-foreground [&::-webkit-details-marker]:hidden">
+                  <SlidersHorizontal className="size-3.5" strokeWidth={1.5} aria-hidden />
+                  Фильтры{panelFilters > 0 && <span className="font-mono text-[12px] text-foreground">({panelFilters})</span>}
+                </summary>
+                <div className="absolute right-0 z-30 mt-2 w-[min(calc(100vw-2rem),40rem)] space-y-4 rounded-[10px] border border-[var(--border-strong)] bg-[var(--card)] p-4 shadow-xl">
+                  <div className="space-y-1.5">
+                    <div className="c-label">Статус</div>
+                    <FilterTabs
+                      label="Статус"
+                      current={status ?? "all"}
+                      items={[{ key: "all", label: "Любой", href: href({ status: undefined }) }, ...Object.entries(INCIDENT_STATUSES).map(([k, v]) => ({ key: k, label: v, href: href({ status: k }) }))]}
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <div className="c-label">Начало инцидента</div>
+                    <RangePicker value={ranges.time.range} keys={["24h", "7d", "30d"]} anyLabel="Всё время" />
+                  </div>
+                  <RangeFilters time timeLabel="Начало, точный интервал UTC" fields={INCIDENT_RANGE_FIELDS} legacy={["level"]} idPrefix="inc" />
+                </div>
+              </details>
+            </div>
+            {chips.length > 0 && (
+              <ul className="mb-3 flex flex-wrap items-center gap-2" aria-label="Выбранные фильтры">
+                {chips.map((c) => (
+                  <li key={c.key}>
+                    <Link href={c.remove} className="inline-flex min-h-7 items-center gap-1.5 rounded-md border border-border bg-[var(--surface-elevated)] px-2 text-[13px] text-[var(--fg-2)] hover:text-foreground" aria-label={`Снять фильтр: ${c.label}`}>
+                      {c.label}<X className="size-3.5" strokeWidth={1.5} aria-hidden />
+                    </Link>
+                  </li>
+                ))}
+                {chips.length > 1 && <li><Link href={href({ status: undefined, level: undefined, q: undefined, ...Object.fromEntries(INCIDENT_RANGE_KEYS.map((k) => [k, undefined])) })} className="text-[13px] text-[var(--ring)] hover:underline">сбросить все</Link></li>}
+              </ul>
+            )}
             {verdicts && !verdicts.ok && (
-              <p role="status" className="mb-4 text-xs text-destructive">
-                Вердикты модели временно недоступны; список инцидентов и действия остаются доступными.
+              <p role="status" className="mb-3 text-[13px] text-[var(--status-warn)]">
+                Короткие выводы модели временно недоступны; очередь и действия работают.
               </p>
             )}
-            <form action="/incidents" method="get" className="mb-4 flex flex-wrap items-end gap-2">
-              {status && <input type="hidden" name="status" value={status} />}
-              {level && <input type="hidden" name="level" value={level} />}
-              {queue && <input type="hidden" name="queue" value={queue} />}
-              {scansList && <input type="hidden" name="scans" value="list" />}
-              {[...new URLSearchParams(rangeQs)].map(([k, v]) => <input key={k} type="hidden" name={k} value={v} />)}
-              <div className="w-full space-y-1 sm:w-96">
-                <Label htmlFor="inc-q" className="c-label">Поиск</Label>
-                <Input id="inc-q" name="q" defaultValue={q ?? ""} maxLength={200} placeholder="INC-…, правило, субъект, узел, источник" className="h-10 px-3" />
-              </div>
-              <Button type="submit" variant="secondary" className="min-h-10">Найти</Button>
-              {q && (
-                <Button asChild variant="ghost" className="min-h-10"><Link href={href({ q: undefined })}>сбросить</Link></Button>
-              )}
-            </form>
-            <div className="mb-3 flex flex-wrap items-center gap-2" role="group" aria-label="Очередь работы">
-              {([ [undefined, "Все"], ["open", "Открытые"], ["mine", "Мои"], ["unassigned", "Без ответственного"], ["overdue", "Просрочены"] ] as const).map(([key, label]) => (
-                <Button key={key ?? "all"} asChild variant="secondary" size="sm" aria-pressed={queue === key}>
-                  <Link href={href({ queue: key })}>{label}</Link>
-                </Button>
-              ))}
-              <span className="text-[12px] text-[var(--text-tertiary)]">Реакция 24/7: критический — 15 мин, высокий — 1 ч, средний — 4 ч, низкий — 24 ч</span>
-            </div>
-            <div className="mb-5 flex flex-wrap items-center gap-2" role="group" aria-label="Фильтр по статусу и уровню">
-              <Button asChild variant="secondary" size="sm" aria-pressed={!status}>
-                <Link href={href({ status: undefined })}>все статусы</Link>
-              </Button>
-              {Object.entries(INCIDENT_STATUSES).map(([k, v]) => (
-                <Button key={k} asChild variant="secondary" size="sm" aria-pressed={status === k}>
-                  <Link href={href({ status: k })}>{v}</Link>
-                </Button>
-              ))}
-              <span className="mx-2 h-5 w-px bg-border" aria-hidden />
-              {LEVELS.map((l) => (
-                <Button key={l} asChild variant="secondary" size="sm" aria-pressed={level === l}>
-                  <Link href={href({ level: level === l ? undefined : l, level_min: undefined, level_max: undefined })}>{INCIDENT_LEVEL_LABELS[l]}</Link>
-                </Button>
-              ))}
-            </div>
-            <div className="mb-5 space-y-3 border-t border-border/60 pt-4">
-              <div className="flex flex-wrap items-center gap-3">
-                <span className="c-label">Начало инцидента</span>
-                <RangePicker value={ranges.time.range} keys={["24h", "7d", "30d"]} anyLabel="Всё время" />
-              </div>
-              <RangeFilters time timeLabel="Начало, точный интервал UTC" fields={INCIDENT_RANGE_FIELDS} legacy={["level"]} idPrefix="inc" />
-            </div>
-            <div className="c-well overflow-x-auto p-2">
-              <Table className="min-w-[1050px] table-fixed">
-                <colgroup>
-                  <col className="w-[7%]" /><col className="w-[11%]" /><col className="w-[10%]" /><col className="w-[19%]" />
-                  <col className="w-[9%]" /><col className="w-[21%]" /><col className="w-[12%]" /><col className="w-[11%]" />
-                </colgroup>
-                <TableHeader>
-                  <TableRow className="border-border/60">
-                    <TableHead className="c-label">Инцидент</TableHead>
-                    <TableHead className="c-label">Начало (UTC)</TableHead>
-                    <TableHead className="c-label">Источники</TableHead>
-                    <TableHead className="c-label">Правило</TableHead>
-                    <TableHead className="c-label">Уровень</TableHead>
-                    <TableHead className="c-label">Вердикт модели</TableHead>
-                    <TableHead className="c-label">Статус</TableHead>
-                    <TableHead className="c-label">Ответственный / реакция</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {r.data.list.rows.length === 0 && (
-                    <TableRow>
-                      <TableCell colSpan={8} className="py-8 text-center font-mono text-muted-foreground">
-                        {q || status || level || queue || rangeChips.length ? `По этим условиям инцидентов нет${rangeChips.length ? ` (${describeChips(rangeChips)})` : ""} — снимите фильтры` : "Инцидентов нет — движок ждёт событий (make replay заливает записанный трафик)"}
-                      </TableCell>
-                    </TableRow>
-                  )}
-                  {r.data.list.rows.map((row) => {
-                    // Слепая выборка: разбор модели не попадает и в ленту, пока инцидент открыт.
-                    const blind = hideVerdicts(row);
-                    const v = verdicts?.ok && !blind ? verdicts.data[row.incident_id] : undefined;
-                    const closure = closures?.ok ? closures.data[row.incident_id] : undefined;
-                    return (
-                      <TableRow key={row.incident_id} className="border-border/40">
-                        <TableCell className="font-mono text-xs whitespace-normal break-words">
-                          <Link href={`/incidents/${row.incident_id}`} className="text-[var(--ring)] hover:underline">
-                            {row.incident_id}
-                          </Link>
-                          {row.pii === 1 && <span className="ml-2 text-[var(--status-warn)]" title="содержит ПДн">ПДн</span>}
-                        </TableCell>
-                        <TableCell className="font-mono text-xs whitespace-nowrap">
-                          <time dateTime={formatTs(row.first_ts, "iso")} title={`${formatTs(row.first_ts)} · ${formatAgo(row.first_ts, now)}`}>
-                            {formatTs(row.first_ts, "datetime")}
-                          </time>
-                        </TableCell>
-                        <TableCell className="font-mono text-xs whitespace-normal break-words">{row.sources.join(" + ")}</TableCell>
-                        <TableCell className="text-sm whitespace-normal break-words">
-                          {row.rule_title}
-                          <div className="font-mono text-xs text-muted-foreground">{row.rule_id} · {row.actor_name || "—"}</div>
-                        </TableCell>
-                        <TableCell><LevelBadge level={row.level} /></TableCell>
-                        <TableCell className="text-sm whitespace-normal break-words text-muted-foreground">
-                          <VerdictCell v={v} blind={blind} unavailable={verdicts !== null && !verdicts.ok} />
-                        </TableCell>
-                        <TableCell className="whitespace-normal break-words">
-                          <StatusBadge status={row.status} />
-                          {(row.status === "closed" || row.status === "false_positive") && (
-                            <div className="mt-1 max-w-44 font-mono text-xs text-muted-foreground" title={closure?.reason || "Причина не зафиксирована"}>
-                              {closure ? closure.kind === "auto_close" ? "ARGUS · автоматически" : `закрыл: ${closure.actor}` : "кто закрыл: неизвестно"}
-                              <div className="line-clamp-2">{closure?.reason || "причина не записана"}</div>
-                            </div>
-                          )}
-                        </TableCell>
-                        <TableCell className="font-mono text-xs whitespace-normal break-words">
-                          <div>{row.owner || "не назначен"}</div>
-                          {row.status === "new" && reactionDeadline(row.created_at, row.level) && (
-                            <div className={reactionOverdue(row.created_at, row.level, row.status, now) ? "text-destructive" : "text-muted-foreground"}>
-                              {reactionOverdue(row.created_at, row.level, row.status, now) ? "просрочено · " : "до "}
-                              {formatTs(reactionDeadline(row.created_at, row.level), "datetime")} UTC
-                            </div>
-                          )}
-                        </TableCell>
-                      </TableRow>
-                    );
-                  })}
-                </TableBody>
-              </Table>
-            </div>
+            {r.data.list.rows.length === 0 ? (
+              q || status || level || queue || rangeChips.length
+                ? <Empty icon={Inbox} title="По этим условиям инцидентов нет" hint={rangeChips.length ? `Сейчас: ${describeChips(rangeChips)}.` : undefined}
+                    action={<Link href="/incidents" className="text-[13px] text-[var(--ring)] hover:underline">Снять фильтры</Link>} />
+                : <Empty icon={Inbox} title="Инцидентов нет" hint="Как только правило сработает, инцидент появится здесь." />
+            ) : (
+              <QueueFeed
+                rows={r.data.list.rows}
+                now={now}
+                note={(row) => {
+                  if (isFinalStatus(row.status)) {
+                    const c = closures?.ok ? closures.data[row.incident_id] : undefined;
+                    const who = c ? c.kind === "auto_close" ? "Закрыто автоматически" : `Закрыл ${c.actor}` : "Кто закрыл — не записано";
+                    return { kind: "closure", text: c?.reason ? `${who} · «${c.reason}»` : who, title: c?.reason || "Причина не записана" };
+                  }
+                  if (hideVerdicts(row) || !verdicts?.ok) return undefined;
+                  const v = verdicts.data[row.incident_id];
+                  return verdictState(v) === "shown" && v?.summary_ru ? { kind: "verdict", text: v.summary_ru } : undefined;
+                }}
+              />
+            )}
             <Pager
               page={r.data.list.page}
               pages={Math.max(1, Math.ceil(r.data.list.total / r.data.list.pageSize))}
@@ -363,5 +249,54 @@ export default async function IncidentsPage({ searchParams }: PageProps<"/incide
         </>
       )}
     </>
+  );
+}
+
+type Stats = Awaited<ReturnType<typeof incidentQueueStats>>;
+
+/** Плитки про действие: что требует реакции сейчас. Сканы снаружи — второй строкой, пока они свёрнуты. */
+function QueueTiles({ stats, withScans }: { stats: Stats; withScans: boolean }) {
+  const tile = (key: "criticalOpen" | "overdue" | "unassigned" | "mine") => {
+    const own = stats[key];
+    const scan = stats.scans[key];
+    return { value: withScans ? own + scan : own, scanSub: !withScans && scan > 0 ? `ещё ${fmtNum(scan)} в сканах снаружи` : undefined };
+  };
+  const crit = tile("criticalOpen");
+  const over = tile("overdue");
+  const free = tile("unassigned");
+  const mine = tile("mine");
+  return (
+    <div className="grid grid-cols-2 gap-4 lg:grid-cols-4 lg:gap-6">
+      <StatTile label="Критических открытых" value={fmtNum(crit.value)} href="/incidents?queue=open&level=critical" tone={crit.value > 0 ? "err" : undefined}
+        sub={crit.scanSub ?? (crit.value > 0 ? "требуют внимания сейчас" : "нет")} />
+      <StatTile label="Просрочено реакций" value={fmtNum(over.value)} href="/incidents?queue=overdue" tone={over.value > 0 ? "err" : undefined} hint={SLA_HINT}
+        sub={over.scanSub ?? "никто не взял в срок"} />
+      <StatTile label="Без ответственного" value={fmtNum(free.value)} href="/incidents?queue=unassigned" tone={free.value > 0 ? "warn" : undefined}
+        sub={free.scanSub ?? "открытые, никто не взял"} />
+      <StatTile label="Мои" value={fmtNum(mine.value)} href="/incidents?queue=mine" tone={mine.value > 0 ? "info" : undefined}
+        sub="открытые, где я ответственный" />
+    </div>
+  );
+}
+
+type ListRow = Awaited<ReturnType<typeof incidentsList>>["rows"][number];
+
+/** Лента очереди: сначала «Срочные» (тот же порядок, что ORDER BY запроса), затем по дням. */
+function QueueFeed({ rows, now, note }: { rows: ListRow[]; now: Date; note: (row: ListRow) => IncidentRowNote | undefined }) {
+  const urgent = rows.filter((x) => incidentUrgency(x, now) !== "normal");
+  const rest = rows.filter((x) => incidentUrgency(x, now) === "normal");
+  return (
+    <FeedList label="Очередь инцидентов" className="p-1">
+      {urgent.length > 0 && (
+        <FeedDay heading={`Срочные · ${fmtNum(urgent.length)}`}>
+          {urgent.map((row) => <IncidentRow key={row.incident_id} row={row} now={now} note={note(row)} blind={hideVerdicts(row)} />)}
+        </FeedDay>
+      )}
+      {groupFeedByDay(rest, (x) => x.created_at, now).map((g) => (
+        <FeedDay key={g.key} heading={g.heading}>
+          {g.items.map((row) => <IncidentRow key={row.incident_id} row={row} now={now} note={note(row)} blind={hideVerdicts(row)} />)}
+        </FeedDay>
+      ))}
+    </FeedList>
   );
 }

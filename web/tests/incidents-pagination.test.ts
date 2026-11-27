@@ -7,7 +7,8 @@ test("incident pagination recovers after the last page disappears", async (t) =>
   t.mock.method(globalThis, "fetch", async (url: URL, options: RequestInit) => {
     const sql = String(options.body);
     if (sql.includes("SELECT count() AS c")) return new Response('{"c":"12"}\n');
-    assert.match(sql, /ORDER BY created_at DESC, incident_id DESC/);
+    // Очередь по умолчанию — срочное наверху (просроченные и открытые критические/высокие), затем по времени.
+    assert.match(sql, /ORDER BY if\(.*status = 'new'.*level IN \('critical', 'high'\).*\), 0, 1\) ASC,[\s\S]*created_at DESC, incident_id DESC/);
     assert.match(sql, /positionCaseInsensitiveUTF8/);
     assert.equal(url.searchParams.get("param_q"), "ПРОВЕРКА");
     const offset = Number(url.searchParams.get("param_offset"));
@@ -31,4 +32,14 @@ test("empty incident results reset pagination without another list request", asy
   assert.equal(result.page, 1);
   assert.deepEqual(result.rows, []);
   assert.equal(calls, 2);
+});
+
+test("sort=time — только по времени создания, без приоритета", async (t) => {
+  t.mock.method(globalThis, "fetch", async (_url: URL, options: RequestInit) => {
+    const sql = String(options.body);
+    if (sql.includes("SELECT count() AS c")) return new Response('{"c":"1"}\n');
+    assert.match(sql, /ORDER BY created_at DESC, incident_id DESC/);
+    return new Response('{"incident_id":"INC-1","event_count":"1","pii":"0"}\n');
+  });
+  assert.equal((await incidentsList({ sort: "time" })).rows.length, 1);
 });

@@ -148,14 +148,15 @@ test("инциденты: сканы снаружи свёрнуты по под
   ];
   mocks.queries.incidentBlockStates = async () => ({ "INC-41": "blocked" });
   const folded = await pageText(await incidents.default(props({}, { queue: "open" })));
-  assert.match(folded, /Сканы снаружи · по подсетям/);
+  assert.match(folded, /Сканы снаружи/);
+  assert.match(folded, /1 подсеть · 3 инцидента · макс\. уровень средний/, "сводка одной строкой");
   assert.match(folded, /203\.0\.113\.0\/24/);
   assert.match(folded, /раскрыть/);
   assert.doesNotMatch(folded, /INC-41/, "свёрнутая группа не показывает инциденты");
   assert.equal((listed[0] as { groupScans?: boolean }).groupScans, true, "очередь без сканов, пока они свёрнуты");
 
   const open = await pageText(await incidents.default(props({}, { queue: "open", subnet: "203.0.113.0/24" })));
-  assert.match(open, /Подсеть 203\.0\.113\.0\/24 · 2 открытых инцидентов/);
+  assert.match(open, /Подсеть 203\.0\.113\.0\/24 · 2 открытых инцидента/);
   assert.match(open, /INC-41/);
   assert.match(open, /заблокирован/);
   assert.match(open, /свернуть/);
@@ -170,7 +171,7 @@ test("инциденты: сканы снаружи свёрнуты по под
 
   listed.length = 0;
   const flat = await pageText(await incidents.default(props({}, { scans: "list" })));
-  assert.doesNotMatch(flat, /Сканы снаружи · по подсетям/);
+  assert.doesNotMatch(flat, /Показать в очереди по одному/);
   assert.match(flat, /свернуть по подсетям/);
   assert.equal((listed[0] as { groupScans?: boolean }).groupScans, false);
   // Неподсеть в адресе страницы не раскрывает ничего.
@@ -189,28 +190,31 @@ test("инциденты: очередь с вердиктами, закрыти
   mocks.queries.verdictsFor = async () => ({ "INC-7": { incident_id: "INC-7", summary_ru: "Перебор с одного адреса", shown: 1, confidence: 0.9, error: "" }, "INC-8": { incident_id: "INC-8", summary_ru: "", shown: 0, confidence: 0.2, error: "" } });
   mocks.queries.incidentClosuresFor = async () => ({ "INC-8": { incident_id: "INC-8", actor: "analyst1", kind: "status", changed_at: NOW, reason: "дубликат" } });
   const text = await pageText(await incidents.default(props({}, { queue: "open", level: "high", q: "ssh" })));
-  assert.match(text, /Очередь · 2 инцидентов/);
+  assert.match(text, /Очередь/);
+  assert.match(text, /2 инцидента/);
   assert.match(text, /Перебор с одного адреса/, "показанный вердикт");
-  assert.match(text, /ниже порога — разбор скрыт/, "скрытый вердикт");
-  assert.match(text, /закрыл: analyst1/);
-  assert.match(text, /дубликат/);
-  assert.match(text, /просрочено ·/, "реакция по high просрочена");
-  assert.match(text, /ПДн/);
-  assert.match(text, /сбросить/, "поиск q — кнопка сброса");
+  assert.doesNotMatch(text, /ниже порога/, "скрытый вердикт не занимает строку");
+  assert.match(text, /Закрыл analyst1 · «дубликат»/);
+  assert.match(text, /Просрочено на/, "реакция по high просрочена");
+  assert.match(text, /Срочные · 1/, "просроченный — в блоке срочных наверху");
+  assert.match(text, /перс\. данные/);
+  assert.match(text, /поиск: «ssh»/, "поиск q — чип со сбросом");
+  assert.match(text, /уровень: высокий/, "точный уровень — чип");
 });
 
 test("инциденты: пусто с фильтрами и без; вердикты недоступны — лента остаётся", async () => {
   await auth.createSession("viewer1", "viewer");
   mocks.queries.incidentsList = async () => ({ rows: [], total: 0, page: 1, pageSize: 50 });
   mocks.queries.incidentStats = async () => ({ total: 0, open: 0, escalated: 0, pii: 0 });
-  assert.match(await pageText(await incidents.default(props({}, { status: "closed" }))), /снимите фильтры/);
-  assert.match(await pageText(await incidents.default(props())), /движок ждёт событий/);
+  assert.match(await pageText(await incidents.default(props({}, { status: "closed" }))), /По этим условиям инцидентов нет/);
+  const none = await pageText(await incidents.default(props()));
+  assert.match(none, /Инцидентов нет/);
+  assert.doesNotMatch(none, /make replay|движок ждёт/, "без подсказок разработчику");
 
   mocks.queries.incidentsList = async () => ({ rows: [incidentRow()], total: 1, page: 1, pageSize: 50 });
   mocks.queries.verdictsFor = async () => { throw down(); };
   const text = await pageText(await incidents.default(props()));
-  assert.match(text, /Вердикты модели временно недоступны/);
-  assert.match(text, /разбор временно недоступен/);
+  assert.match(text, /Короткие выводы модели временно недоступны/);
   assert.match(text, /INC-7/);
 
   mocks.queries.incidentsList = async () => { throw down(); };
@@ -230,27 +234,29 @@ test("карточка: аналитик видит цепочку, похожи
   await auth.createSession("analyst1", "analyst");
   let text = await pageText(await incident.default(props({ id: "INC-7" })));
   assert.match(text, /Перебор SSH/);
-  assert.match(text, /Цепочка событий · 12 шт\./);
+  assert.match(text, /Цепочка событий 12 событий/);
   assert.match(text, /login\.failed/);
   assert.match(text, /T1110/, "ATT&CK из тегов");
   assert.match(text, /Похожие закрытые инциденты/);
   assert.match(text, /INC-3/);
-  assert.match(text, /Обогащение/);
-  assert.match(text, /Реагирование · автоматика и оператор/);
-  assert.match(text, /Обратный канал · блокировка адреса/);
-  assert.match(text, /режим ips/);
+  assert.match(text, /Контекст из внешних систем/);
+  assert.match(text, /Реагирование/);
+  assert.match(text, /Блокировка адреса/);
+  assert.match(text, /автоблокировка включена/);
+  assert.match(text, /Кто 203\.0\.113\.5 Где bastion Когда/, "блок «кто / где / когда» под заголовком");
   assert.match(text, /198\.51\.100\.9/, "активная блокировка движка");
   assert.match(text, /Разбор агентом/);
   assert.match(text, /нужен человек/);
   assert.match(text, /взял в работу/, "история изменений");
-  assert.match(text, /Досье инцидента/);
-  assert.doesNotMatch(text, /менять отработку может аналитик/);
+  assert.match(text, /Досье/);
+  assert.doesNotMatch(text, /Менять статус и ответственного может аналитик/);
 
   mocks.jar.clear();
   await auth.createSession("viewer1", "viewer");
   text = await pageText(await incident.default(props({ id: "INC-7" })));
-  assert.match(text, /менять отработку может аналитик/);
-  assert.doesNotMatch(text, /Обратный канал/, "наблюдателю блокировки не показываются");
+  assert.match(text, /Менять статус и ответственного может аналитик/);
+  assert.doesNotMatch(text, /Блокировка адреса/, "наблюдателю блокировки не показываются");
+  assert.doesNotMatch(text, /Взять в работу/, "наблюдателю главного действия нет");
 });
 
 test("карточка: закрытый инцидент — блок завершения; недоступные части перечислены; 404 и ошибка хранилища", async () => {
@@ -260,7 +266,7 @@ test("карточка: закрытый инцидент — блок заве�
   mocks.queries.verdictGet = async () => { throw down(); };
   mocks.queries.incidentComments = async () => { throw down(); };
   let text = await pageText(await incident.default(props({ id: "INC-7" })));
-  assert.match(text, /Завершение инцидента/);
+  assert.match(text, /Завершение автоматически/);
   assert.match(text, /ARGUS \(автоматически\)/);
   assert.match(text, /тишина 24 ч/);
   assert.match(text, /Не удалось загрузить: анализ модели, записи команды/);
@@ -274,6 +280,34 @@ test("карточка: закрытый инцидент — блок заве�
   assert.match(text, /Хранилище недоступно/);
   assert.equal((await incident.generateMetadata!(props({ id: "INC-7" }))).title, "INC-7 · Инциденты");
   assert.equal((await incident.generateMetadata!(props({ id: "x" }))).title, "Инцидент · Инциденты");
+});
+
+test("карточка C3: пустая цепочка без «· 1», ATT&CK из тега T1003 без префикса, просрочка и уровень по-русски", async () => {
+  await auth.createSession("analyst1", "analyst");
+  const old = "2026-10-29 06:00:00"; // critical → срок 15 мин → давно просрочен
+  mocks.queries.incidentGet = async () => incidentRow({ level: "critical", created_at: old, first_ts: old, last_ts: old, event_count: 1, chain: [], tags: ["T1003", "linux"], status: "new" });
+  mocks.queries.incidentStateHistory = async () => [];
+  mocks.queries.incidentComments = async () => [];
+  mocks.queries.verdictGet = async () => null;
+  const text = await pageText(await incident.default(props({ id: "INC-7" })));
+  assert.doesNotMatch(text, /цепочка пуста/, "нет «пусто» при событиях > 0");
+  assert.match(text, /Событий: 1\. Строки цепочки движок не сохранил/);
+  assert.match(text, /Открыть в журнале за 06:00:00/);
+  assert.match(text, /ATT&CK T1003/, "техника из тега без префикса attack.");
+  assert.match(text, /Правило ssh\.bruteforce · linux ATT/, "техника не дублируется в тегах правила");
+  assert.match(text, /просрочено на/, "просрочка реакции у нового инцидента");
+  assert.match(text, /критический/);
+  assert.doesNotMatch(text, /\bcritical\b/, "уровень по-русски и в досье");
+  assert.match(text, /Взять в работу/, "одно главное действие — взять в работу");
+  const markup = html(await incident.default(props({ id: "INC-7" })) as React.ReactElement, "/incidents/INC-7");
+  assert.match(markup, /href="\/events\?q=actor%3A203\.0\.113\.5&amp;host=bastion&amp;from=2026-10-29T05%3A55&amp;to=2026-10-29T06%3A05"/, "ссылка в журнал за время инцидента");
+
+  // В работе без записи take: не «реакции не было», а честное «время взятия не записано».
+  mocks.queries.incidentGet = async () => incidentRow({ level: "critical", created_at: old, status: "in_progress", owner: "analyst1" });
+  const busy = await pageText(await incident.default(props({ id: "INC-7" })));
+  assert.match(busy, /В работе у analyst1 · время взятия не записано/);
+  assert.doesNotMatch(busy, /не зафиксирована в журнале/);
+  assert.match(busy, /Завершить…/, "своему инциденту в работе — главное действие «Завершить»");
 });
 
 /* ===== Источники ===== */
@@ -616,11 +650,11 @@ test("инциденты: окно по началу, уровень не ниж
     return { rows, total: rows.length, page: 1, pageSize: 50 };
   };
   let text = await pageText(await incidents.default(props({}, { level_min: "high" })));
-  assert.match(text, /Очередь · 2 инцидентов/);
+  assert.match(text, /2 инцидента/);
   assert.match(text, /INC-1/);
   assert.doesNotMatch(text, /INC-2/);
   text = await pageText(await incidents.default(props({}, { events_min: "10", from: "2026-10-28T00:00" })));
-  assert.match(text, /Очередь · 1 инцидентов/);
+  assert.match(text, /1 инцидент /);
   assert.match(text, /INC-1/);
   assert.deepEqual((seen.at(-1)!.ranges as { time: unknown }).time, { from: "2026-10-28T00:00" });
   // Прежняя ссылка level=medium — точный уровень, не диапазон.
@@ -629,11 +663,12 @@ test("инциденты: окно по началу, уровень не ниж
   assert.doesNotMatch(text, /INC-1/);
   // Пустая очередь называет активные диапазоны.
   text = await pageText(await incidents.default(props({}, { level_min: "critical", events_max: "5", range: "7d" })));
-  assert.match(text, /По этим условиям инцидентов нет \(начало 7 дней, уровень ≥ критический, событий ≤ 5\) — снимите фильтры/);
-  // Ссылки очереди сохраняют диапазоны; кнопка точного уровня их снимает.
+  assert.match(text, /По этим условиям инцидентов нет/);
+  assert.match(text, /Сейчас: начало 7 дней, уровень ≥ критический, событий ≤ 5/);
+  // Вкладки очереди сохраняют диапазоны; чип диапазона снимает только свой параметр.
   const markup = html(await incidents.default(props({}, { level_min: "high", from: "2026-10-28T00:00" })) as React.ReactElement, "/incidents");
   assert.match(markup, /href="\/incidents\?queue=open&amp;from=2026-10-28T00%3A00&amp;level_min=high"/);
-  assert.match(markup, /href="\/incidents\?level=critical&amp;from=2026-10-28T00%3A00"/);
+  assert.match(markup, /aria-label="Снять фильтр: уровень ≥ высокий" href="\/incidents\?from=2026-10-28T00%3A00"/);
 });
 
 test("источники: фильтры таблицы (последний приём, событий за час, EPS) и ленты (окно поступления, серьёзность)", async () => {

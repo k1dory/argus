@@ -54,12 +54,13 @@ test("scanGroups: те же условия очереди, уровень — м
   t.mock.method(globalThis, "fetch", async (url: URL, options: RequestInit) => {
     const sql = String(options.body);
     assert.match(sql, /GROUP BY subnet/);
+    assert.match(sql, /ORDER BY level_rank DESC, addresses DESC/, "сначала опасные и широкие группы");
     assert.match(sql, /owner = \{user:String\}/, "очередь «мои» действует и на группы");
     assert.equal(url.searchParams.get("param_user"), "anna");
     return new Response('{"subnet":"203.0.113.0/24","incidents":"3","addresses":"2","rules":["a41c-net-070","a41c-net-071"],"first_ts":"2026-11-01 10:00:00","last_ts":"2026-11-01 10:05:00","level_rank":"2","unassigned":"1"}\n');
   });
   const g = await scanGroups({ queue: "mine", user: "anna" });
-  assert.deepEqual(g, [{ subnet: "203.0.113.0/24", incidents: 3, addresses: 2, rules: ["a41c-net-070", "a41c-net-071"], first_ts: "2026-11-01 10:00:00", last_ts: "2026-11-01 10:05:00", level: "medium", unassigned: 1 }]);
+  assert.deepEqual(g, [{ subnet: "203.0.113.0/24", incidents: 3, addresses: 2, rules: ["a41c-net-070", "a41c-net-071"], first_ts: "2026-11-01 10:00:00", last_ts: "2026-11-01 10:05:00", level: "medium", unassigned: 1, titles: [], sample: "" }]);
 });
 
 test("scanGroupIncidents: неподсеть в запрос не попадает", async (t) => {
