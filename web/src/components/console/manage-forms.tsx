@@ -85,7 +85,7 @@ export function GroupCreateForm() {
         <Label htmlFor="group-name" className="c-label">
           Новая группа
         </Label>
-        <Input id="group-name" name="name" placeholder="webservers" required className="h-10 w-56 px-3" onChange={() => setTouchedFor(state)} />
+        <Input id="group-name" name="name" placeholder="webservers" required className="h-10 w-56 px-3 font-mono" onChange={() => setTouchedFor(state)} />
       </div>
       <Button type="submit" variant="secondary" disabled={pending} className="min-h-10">
         <FolderPlus strokeWidth={1.5} />
@@ -205,7 +205,7 @@ function XmlEditor({
         readOnly={readOnly}
         aria-invalid={xmlError ? true : undefined}
         aria-describedby={xmlError ? "xml-error" : undefined}
-        className="w-full resize-y border border-border bg-[var(--surface-deep)] p-4 font-mono text-[13px] leading-[1.6] read-only:opacity-70 focus-visible:border-[var(--border-strong)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)]/40 aria-invalid:border-destructive"
+        className="w-full resize-y border border-input bg-[var(--surface-deep)] p-4 font-mono text-[13px] leading-[1.6] read-only:opacity-70 focus-visible:border-[var(--border-strong)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)]/40 aria-invalid:border-destructive"
       />
       <div className="flex flex-wrap items-center gap-3">
         {readOnly ? (
@@ -314,7 +314,7 @@ export function NewRuleFileForm() {
           value={name}
           onChange={(e) => setName(e.target.value)}
           placeholder="local_rules_custom.xml"
-          className="h-10 w-64 px-3"
+          className="h-10 w-64 px-3 font-mono"
         />
       </div>
       <Button type="submit" variant="secondary" disabled={!valid} className="min-h-10">

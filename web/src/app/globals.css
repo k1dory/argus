@@ -91,7 +91,8 @@
   --accent-foreground: #e6e8eb;
   --destructive: #f07178;
   --border: #1e2127;
-  --input: #2a2e37;
+  /* Рамка полей ввода: ≥ 3:1 к surface #101216 и к холсту (WCAG 1.4.11). */
+  --input: #636a76;
   --ring: #82aaff; /* ведущий акцент: syntax-func */
   --surface-deep: #101216;
   --surface-elevated: #16181d;
@@ -100,8 +101,11 @@
   --text-disabled: #454b54;
   --fg-2: #c5c9d0;
   --status-ok: #c3e88d;
-  --status-warn: #f78c6c;
+  /* warn — жёлтый syntax-const: на точке 8px и в бейджах не сливается с err. */
+  --status-warn: #ffcb6b;
   --status-err: #f07178;
+  /* info — «новое, посмотрите»: ведущий акцент. */
+  --status-info: #82aaff;
   /* Серии графиков: низкая — серым, высокая — syntax-number, критичная — syntax-error */
   --chart-1: #4b515c;
   --chart-2: #f78c6c;
@@ -145,6 +149,17 @@
   code, kbd, samp, pre {
     font-variant-ligatures: none;
   }
+  /* Маркер <summary> не рисуем: раскрытие показывает своя иконка/подпись. */
+  summary {
+    list-style: none;
+    cursor: pointer;
+  }
+  summary::-webkit-details-marker {
+    display: none;
+  }
+  summary::marker {
+    content: "";
+  }
   /* Скип-линк: невидим до фокуса, при фокусе — окно в левом верхнем углу */
   .skip-link {
     position: absolute;
@@ -184,14 +199,12 @@
   [data-slot="select-trigger"],
   textarea {
     background: var(--background);
-    border: 1px solid var(--border-strong);
+    border: 1px solid var(--input);
     font-size: 13px;
     box-shadow: none;
   }
-  [data-slot="input"],
-  textarea {
-    font-family: var(--font-plex-mono), ui-monospace, monospace;
-  }
+  /* Шрифт полей — sans (имя, причина, поиск — человеческий текст); моно
+     включается классом font-mono там, где вводят IP, ID, запрос или код. */
   [data-slot="input"]:focus-visible,
   [data-slot="select-trigger"]:focus-visible,
   textarea:focus-visible {
@@ -215,7 +228,7 @@
     box-shadow: none;
   }
   [data-slot="badge"] {
-    font-size: 11px;
+    font-size: 12px;
     font-weight: 500;
     border-radius: 6px;
   }
@@ -228,8 +241,9 @@
   }
   .win__bar {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
-    gap: 10px;
+    gap: 4px 10px;
     min-height: 40px;
     padding: 8px 16px;
     border-bottom: 1px solid var(--border);
@@ -237,14 +251,26 @@
     overflow: hidden;
   }
   .win__title {
+    margin: 0;
     font-size: 13px;
     font-weight: 600;
     line-height: 1.2;
+    letter-spacing: 0;
     color: var(--foreground);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
     min-width: 0;
+    flex: 0 1 auto;
+  }
+  /* Иконка тона и заголовок — одним блоком: длинный заголовок обрезается, а не
+     уезжает на следующую строку от иконки. */
+  .win__head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    max-width: 100%;
     flex: 0 1 auto;
   }
   .win__rule {
@@ -259,7 +285,39 @@
     text-overflow: ellipsis;
     min-width: 0;
     flex: 0 1 auto;
-    max-width: 60%;
+    max-width: 100%;
+    margin-left: auto;
+  }
+  .win__actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 0 0 auto;
+  }
+  /* Тон панели: ошибка / деградация / новое — рамка и полоса заголовка. */
+  .win[data-tone="err"] { --win-tone: var(--status-err); }
+  .win[data-tone="warn"] { --win-tone: var(--status-warn); }
+  .win[data-tone="info"] { --win-tone: var(--status-info); }
+  .win[data-tone] {
+    border-color: color-mix(in oklab, var(--win-tone) 40%, transparent);
+  }
+  .win[data-tone] > .win__bar {
+    background: color-mix(in oklab, var(--win-tone) 6%, transparent);
+    border-bottom-color: color-mix(in oklab, var(--win-tone) 25%, transparent);
+    border-top-left-radius: 11px;
+    border-top-right-radius: 11px;
+  }
+  .win__tone-icon {
+    color: var(--win-tone);
+    width: 14px;
+    height: 14px;
+    flex: none;
+  }
+
+  /* Строка, требующая внимания (критичное, отказ): фон и полоса слева. */
+  .row-crit {
+    background: color-mix(in oklab, var(--status-err) 8%, transparent);
+    box-shadow: inset 2px 0 0 var(--status-err);
   }
   .win__body {
     min-width: 0;

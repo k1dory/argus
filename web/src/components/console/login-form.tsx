@@ -37,7 +37,7 @@ export function LoginForm({ next = "/" }: { next?: string }) {
               autoFocus
               aria-invalid={loginError || undefined}
               aria-describedby={loginError ? "login-error" : undefined}
-              className="h-12 px-4"
+              className="h-12 px-4 font-mono"
               disabled={pending}
             />
           </div>

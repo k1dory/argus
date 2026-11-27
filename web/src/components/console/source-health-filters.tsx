@@ -171,7 +171,7 @@ function SourceHealthFiltersForm({ shown, total, ranges }: Props) {
                             value={draft[name]}
                             placeholder={field.kind === "number" ? "—" : undefined}
                             onChange={(event) => set(name, event.target.value)}
-                            className="h-9 min-w-0 [color-scheme:dark]"
+                            className="h-9 min-w-0 font-mono [color-scheme:dark]"
                           />
                         </Field>
                       );
