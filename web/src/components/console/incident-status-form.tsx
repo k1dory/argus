@@ -144,7 +144,7 @@ function StatusForm({ incidentId, status, ops, attack, exceptions }: { incidentI
       <FieldLabel htmlFor="inc-close-reason">Причина завершения</FieldLabel>
       <textarea id="inc-close-reason" name="reason" value={reason} onChange={(e) => setReason(e.target.value)} aria-describedby="inc-close-help" required minLength={10} maxLength={2000} rows={3} disabled={pending}
         placeholder="Что проверено, какой результат, ссылка на заявку или доказательство…"
-        className="w-full resize-y border border-border bg-[var(--surface-deep)] p-3 text-sm focus-visible:outline-2 focus-visible:outline-[var(--ring)]" />
+        className="w-full resize-y border border-input bg-[var(--surface-deep)] p-3 text-sm focus-visible:outline-2 focus-visible:outline-[var(--ring)]" />
       <FieldDescription id="inc-close-help">От 10 до 2000 символов. Причина, автор и время сохраняются в истории инцидента.</FieldDescription>
     </Field>}
     {next === "false_positive" && exceptions.length > 0 && <FieldSet className="border border-border p-3" disabled={pending}>
@@ -179,7 +179,7 @@ export function CommentForm({ incidentId }: { incidentId: string }) {
     <FieldLabel htmlFor="inc-comment">Запись в досье (Markdown)</FieldLabel>
     <textarea id="inc-comment" name="body" value={body} onChange={(e) => setBody(e.target.value)} required maxLength={8000} rows={5} disabled={pending}
       placeholder={"### Проверено\n- Источник и время\n- Действия\n\nВывод и ссылка на заявку…"}
-      className="w-full resize-y border border-border bg-[var(--surface-deep)] p-3 text-sm focus-visible:border-[var(--border-strong)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)]/40" />
+      className="w-full resize-y border border-input bg-[var(--surface-deep)] p-3 text-sm focus-visible:border-[var(--border-strong)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)]/40" />
     </Field></FieldGroup>
     <div className="flex flex-wrap items-center gap-3">
       <Button type="submit" variant="secondary" disabled={pending || !body.trim()}>{pending ? "Сохраняю…" : "Добавить запись"}</Button>

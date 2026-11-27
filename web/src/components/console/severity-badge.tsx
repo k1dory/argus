@@ -5,5 +5,5 @@ import { TONE_CLASS, ruleLevelTone } from "./tone";
 
 /** Уровень правила Wazuh: тонированный бейдж + текст «уровень n», никогда не только цвет. */
 export function SeverityBadge({ level }: { level: number }) {
-  return <Badge variant="outline" className={cn("font-mono", TONE_CLASS[ruleLevelTone(level)])}>{ruleLevelLabel(level)}</Badge>;
+  return <Badge variant="outline" className={cn("font-sans tabular-nums", TONE_CLASS[ruleLevelTone(level)])}>{ruleLevelLabel(level)}</Badge>;
 }

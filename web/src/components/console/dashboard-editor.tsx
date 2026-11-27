@@ -136,7 +136,7 @@ export function DashboardEditor({ initial }: { initial: DashboardSpec }) {
           </div>
           <div className="space-y-2">
             <Label htmlFor={`${uid}-refresh`} className="c-label">Автообновление</Label>
-            <Input id={`${uid}-refresh`} value={spec.refresh ?? ""} onChange={(e) => setSpec({ ...spec, refresh: e.target.value || undefined })} placeholder="30s" pattern="^\d{2,4}s$" title={`число секунд и «s», не чаще ${SPEC_LIMITS.minRefreshSec}s`} className="h-10 w-28 px-3" />
+            <Input id={`${uid}-refresh`} value={spec.refresh ?? ""} onChange={(e) => setSpec({ ...spec, refresh: e.target.value || undefined })} placeholder="30s" pattern="^\d{2,4}s$" title={`число секунд и «s», не чаще ${SPEC_LIMITS.minRefreshSec}s`} className="h-10 w-28 px-3 font-mono" />
           </div>
           <Button type="submit" disabled={pending || !dirty} className="min-h-10">
             {pending ? <span className="ascii-spin" aria-hidden /> : <Save strokeWidth={1.5} />}
@@ -175,7 +175,7 @@ export function DashboardEditor({ initial }: { initial: DashboardSpec }) {
                 </div>
                 <div className="space-y-2">
                   <Label htmlFor={`${uid}-${p.id}-series`} className="c-label">Серии по колонке</Label>
-                  <Input id={`${uid}-${p.id}-series`} value={p.series ?? ""} maxLength={64} onChange={(e) => upd(i, { series: e.target.value || undefined })} placeholder="source_class" className="h-9 px-3" />
+                  <Input id={`${uid}-${p.id}-series`} value={p.series ?? ""} maxLength={64} onChange={(e) => upd(i, { series: e.target.value || undefined })} placeholder="source_class" className="h-9 px-3 font-mono" />
                 </div>
                 <div className="space-y-2">
                   <Label htmlFor={`${uid}-${p.id}-w`} className="c-label">Ширина (4–24)</Label>

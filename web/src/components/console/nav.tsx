@@ -84,9 +84,9 @@ export function ConsoleNav({ wazuh = false }: { wazuh?: boolean }) {
               href={href}
               aria-current={active ? "page" : undefined}
               className={cn(
-                "flex min-h-9 items-center gap-1.5 border-b text-[13px] transition-colors",
+                "-mb-px flex min-h-9 items-center gap-1.5 border-b-2 text-[13px] transition-colors",
                 active
-                  ? "border-[var(--ring)] text-foreground"
+                  ? "border-[var(--ring)] font-medium text-foreground"
                   : "border-transparent text-muted-foreground hover:text-foreground"
               )}
             >

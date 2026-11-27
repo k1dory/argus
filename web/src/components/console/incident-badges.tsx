@@ -2,13 +2,20 @@ import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 import { INCIDENT_STATUSES } from "@/lib/shared/incidents";
 import { incidentLevelLabel } from "@/lib/shared/labels";
-import { LEVEL_TONE, STATUS_TONE, TONE_CLASS, toneFor } from "./tone";
+import { LEVEL_TONE, STATUS_TONE, TONE_CLASS, TONE_OUTLINE_CLASS, TONE_SOLID_CLASS, toneFor } from "./tone";
 
-export function LevelBadge({ level }: { level: string }) {
-  return <Badge variant="outline" className={cn("font-mono", TONE_CLASS[toneFor(LEVEL_TONE, level)])}>{incidentLevelLabel(level)}</Badge>;
+/**
+ * Уровень инцидента: критичный и высокий — заливкой (главный сигнал строки),
+ * средний и низкий — контуром. Подпись — человеческое слово, шрифт sans.
+ */
+export function LevelBadge({ level, className }: { level: string; className?: string }) {
+  const tone = toneFor(LEVEL_TONE, level);
+  return <Badge variant="outline" data-tone={tone} className={cn("font-sans", TONE_SOLID_CLASS[tone] ?? TONE_CLASS[tone], className)}>{incidentLevelLabel(level)}</Badge>;
 }
 
-export function StatusBadge({ status }: { status: string }) {
+/** Статус инцидента: только контур — не путается с уровнем рядом в строке. */
+export function StatusBadge({ status, className }: { status: string; className?: string }) {
   const label = INCIDENT_STATUSES[status as keyof typeof INCIDENT_STATUSES] ?? status;
-  return <Badge variant="outline" className={cn("font-mono", TONE_CLASS[toneFor(STATUS_TONE, status)])}>{label}</Badge>;
+  const tone = toneFor(STATUS_TONE, status);
+  return <Badge variant="outline" data-tone={tone} className={cn("font-sans", TONE_OUTLINE_CLASS[tone], className)}>{label}</Badge>;
 }

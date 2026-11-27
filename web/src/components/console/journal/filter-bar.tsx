@@ -60,7 +60,7 @@ export function JournalFilterBar({ filters, sources, hosts }: { filters: Journal
             placeholder={HINT}
             spellCheck={false}
             autoComplete="off"
-            className="h-10 border-0 bg-transparent px-0 shadow-none focus-visible:shadow-none"
+            className="h-10 border-0 bg-transparent px-0 font-mono shadow-none focus-visible:shadow-none"
           />
         </div>
         <Button type="submit" size="lg" className="h-10 px-4">
@@ -113,7 +113,7 @@ export function JournalFilterBar({ filters, sources, hosts }: { filters: Journal
           </Select>
         </Field>
         <Field label="Правило" id="journal-rule" hint="5763 — правило Wazuh; a41c-… — события его инцидентов: источник, узел и окно инцидента. Берутся 5000 последних инцидентов правила — у шумного правила старые окна не попадут">
-          <Input id="journal-rule" aria-describedby="journal-rule-hint" value={rule} onChange={(e) => setRule(e.target.value)} placeholder="5763 · a41c-*" spellCheck={false} autoComplete="off" className="h-9" />
+          <Input id="journal-rule" aria-describedby="journal-rule-hint" value={rule} onChange={(e) => setRule(e.target.value)} placeholder="5763 · a41c-*" spellCheck={false} autoComplete="off" className="h-9 font-mono" />
         </Field>
         <fieldset className="flex min-w-0 flex-col gap-1.5">
           <legend className="c-label mb-1.5">Точный интервал, UTC</legend>

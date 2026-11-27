@@ -84,7 +84,7 @@ export function ScanGroupActions({ subnet, ids, filter, attack, isAdmin, users }
       </select>
       {/* Та же метка ответа, что в карточке инцидента (вердикт, уровень, ATT&CK). */}
       {closeStatus && <ClosureLabelFields ops={false} status={closeStatus} attack={attack} disabled={closing} />}
-      <textarea name="reason" required minLength={10} maxLength={2000} rows={2} placeholder="Причина (от 10 символов)" aria-label="Причина" className="w-full border border-border bg-[var(--surface-deep)] p-2 text-sm" />
+      <textarea name="reason" required minLength={10} maxLength={2000} rows={2} placeholder="Причина (от 10 символов)" aria-label="Причина" className="w-full border border-input bg-[var(--surface-deep)] p-2 text-sm" />
       <Confirm count={count} />
       <Button type="submit" size="sm" variant="secondary" disabled={closing}>{closing ? "Завершаю…" : "Завершить"}</Button>
       <Result state={closeState} />

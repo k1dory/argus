@@ -27,7 +27,7 @@ function CodeInput({ id, onChange }: { id: string; onChange?: () => void }) {
       placeholder="000000"
       maxLength={6}
       required
-      className="h-12 w-40 px-4"
+      className="h-12 w-40 px-4 font-mono"
       onChange={onChange}
     />
   );

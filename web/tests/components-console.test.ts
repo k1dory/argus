@@ -14,6 +14,10 @@ const React = require("react") as typeof import("react");
 const C = <T,>(p: string): T => require(`../src/components/console/${p}`) as T;
 const panel = C<typeof import("../src/components/console/panel")>("panel");
 const storage = C<typeof import("../src/components/console/storage-error")>("storage-error");
+const su = C<typeof import("../src/components/console/service-unavailable")>("service-unavailable");
+const feedC = C<typeof import("../src/components/console/feed")>("feed");
+const tabs = C<typeof import("../src/components/console/filter-tabs")>("filter-tabs");
+const ago = C<typeof import("../src/components/console/ago")>("ago");
 const badges = C<typeof import("../src/components/console/incident-badges")>("incident-badges");
 const sev = C<typeof import("../src/components/console/severity-badge")>("severity-badge");
 const tone = C<typeof import("../src/components/console/tone")>("tone");
@@ -80,18 +84,42 @@ test("panel: Led с подписью доступен, без неё — дек�
   assert.match(stripTags(tile), /Открытых → 3 %/);
   assert.doesNotMatch(html(h(panel.StatTile, { label: "x", value: "1" })), /<a /);
   const p = html(h(panel.Panel, { label: "Окно", meta: "мета", id: "w1" }, "тело"));
-  assert.match(p, /aria-label="Окно"/);
-  assert.match(p, /win__meta/);
+  assert.match(p, /<section[^>]*aria-labelledby="w1-title"/);
+  assert.match(p, /<h2 id="w1-title" class="win__title" title="Окно">Окно<\/h2>/, "заголовок панели — h2, полный текст в title");
+  assert.match(p, /class="win__meta" title="мета"/, "строковая meta с подсказкой");
+  const toned = html(h(panel.Panel, { label: "Сбой", tone: "err", actions: h("button", null, "Обновить") }, "тело"));
+  assert.match(toned, /data-tone="err"/);
+  assert.match(toned, /win__actions[^>]*><button>Обновить/);
+  assert.match(html(h(panel.Panel, { label: "Вложенная", headingLevel: 3 }, "т")), /<h3 /);
   assert.doesNotMatch(html(h(panel.Panel, {}, "тело")), /win__bar/, "без label шапки нет");
   assert.match(text(h(panel.PageHeader, { title: "Заголовок", subtitle: "подзаголовок" }, "справа")), /Заголовок подзаголовок справа/);
   assert.match(text(h(panel.Empty, { className: "x" }, "пусто")), /пусто/);
+  assert.match(html(h(panel.Empty, {}, "строка")), /^<p /, "короткая форма — прежний абзац");
+  const full = html(h(panel.Empty, { title: "Исключений нет", hint: "Появятся, когда…", action: h("a", { href: "/x" }, "Открыть") }));
+  assert.match(stripTags(full), /Исключений нет Появятся, когда… Открыть/);
+  const sub = html(h(panel.StatTile, { label: "Живы", value: "2", sub: "из 3 источников", tone: "err", size: "sm" }));
+  assert.match(stripTags(sub), /Живы 2 из 3 источников/, "sub — видимая вторая строка");
+  assert.match(sub, /color:var\(--status-err\)/, "tone красит значение");
+  assert.match(sub, /text-xl/);
+  const ph = html(h(panel.PageHeader, { title: "INC-7", back: { href: "/incidents", label: "Инциденты" }, status: h("span", null, "устарело"), actions: h("button", null, "Экспорт") }));
+  assert.match(ph, /items-start/);
+  assert.match(ph, /<a [^>]*href="\/incidents"[^>]*>.*Инциденты<\/a>/);
+  assert.match(stripTags(ph), /Инциденты INC-7 устарело Экспорт/);
 });
 
-test("storage-error и бейджи: причина и подсказка; уровни и статусы по тонам и подписям", () => {
-  const s = text(h(storage.StorageUnavailable, { reason: "нет соединения", label: "Своя подпись" }));
-  assert.match(s, /Своя подпись clickhouse/);
-  assert.match(s, /нет соединения/);
+test("storage-error и бейджи: причина и подсказка; уровни и статусы по тонам и подписям", async () => {
+  const s = text(h(su.ServiceUnavailableView, { service: "clickhouse", reason: "нет соединения", label: "Своя подпись", admin: true }));
+  assert.match(s, /Своя подпись/);
+  assert.match(s, /хранилище событий не отвечает/);
+  assert.match(s, /Подробности для администратора нет соединения/);
   assert.match(s, /CLICKHOUSE_\*/);
+  assert.match(s, /Проверить снова/);
+  assert.match(html(h(su.ServiceUnavailableView, { service: "engine", reason: "x" })), /data-tone="err"/);
+  const viewer = text(h(su.ServiceUnavailableView, { service: "wazuh", reason: "ECONNREFUSED 10.0.0.1", what: "список агентов" }));
+  assert.match(viewer, /Не удалось загрузить список агентов: менеджер Wazuh не отвечает/);
+  assert.doesNotMatch(viewer, /ECONNREFUSED|WAZUH_API/, "не администратору — без технических подробностей");
+  assert.match(viewer, /сообщите администратору/);
+  assert.match(await pageText(h(storage.StorageUnavailable, { reason: "нет соединения", admin: true })), /Хранилище недоступно .*нет соединения/);
   assert.match(html(h(badges.LevelBadge, { level: "critical" })), /status-err/);
   assert.match(text(h(badges.LevelBadge, { level: "critical" })), /критический|critical/i);
   assert.match(html(h(badges.StatusBadge, { status: "closed" })), /status-ok/);
@@ -196,8 +224,10 @@ test("skeletons: все варианты с aria-hidden, PageSkeleton объяв
 test("service-leds: зелёный/красный по SELECT 1 и /healthz, детали в sr-only", async (t) => {
   t.mock.method(globalThis, "fetch", async (input: URL | string) => (String(input).includes("/healthz") ? new Response("x", { status: 503 }) : new Response("1\n")));
   const out = await pageText(h(leds.ServiceLeds, {}));
-  assert.match(out, /clickhouse ClickHouse отвечает/);
-  assert.match(out, /движок движок: HTTP 503/);
+  assert.match(out, /хранилище .*ClickHouse отвечает/, "исправная служба — точка и подпись");
+  assert.match(out, /движок недоступен : движок: HTTP 503/, "отказ — пилюля с текстом");
+  const markup = html(h("div", null, await leds.ServiceLeds()));
+  assert.match(markup, /<a [^>]*status-err[^>]*href="\/sources"/, "пилюля отказа — ссылка");
 });
 
 test("markdown-body: заголовки понижены, HTML вырезан, ссылки в новой вкладке, картинок нет; incident-wiki", () => {
@@ -475,4 +505,88 @@ test("range-filters: значения из URL, поля числа/шкалы/�
   // Без диапазонов в URL — кнопки сброса нет; устаревший точный level тоже считается активным.
   assert.doesNotMatch(stripTags(html(h(rangeFilters.RangeFilters, { fields }), "/incidents", "q=x")), /сбросить диапазоны/);
   assert.match(stripTags(html(h(rangeFilters.RangeFilters, { fields, legacy: ["level"] }), "/incidents", "level=high")), /сбросить диапазоны/);
+});
+
+/* ===== Фундамент дизайна: бейджи, вкладки-фильтры, лента, время ===== */
+
+test("бейджи: критичный и высокий — заливкой, слова не моно; «новый» — info; «низкий» — не как отключённый", () => {
+  const crit = html(h(badges.LevelBadge, { level: "critical" }));
+  assert.match(crit, /bg-\[var\(--status-err\)\] /, "критичный — заливка");
+  assert.match(html(h(badges.LevelBadge, { level: "high" })), /bg-\[var\(--status-warn\)\] /);
+  assert.doesNotMatch(crit, /font-mono/);
+  assert.doesNotMatch(html(h(badges.StatusBadge, { status: "new" })), /font-mono/);
+  assert.match(html(h(badges.StatusBadge, { status: "new" })), /status-info/);
+  assert.equal(tone.toneFor(tone.LEVEL_TONE, "low") === "muted", false);
+  assert.match(html(h(badges.LevelBadge, { level: "low" })), / text-\[var\(--fg-2\)\]/, "низкий — читаемый текст, не приглушённый");
+});
+
+test("filter-tabs: текущая — aria-current, счётчики, ноль — неактивна, флаг отдельно", () => {
+  const out = html(h(tabs.FilterTabs, {
+    label: "Фильтр ленты",
+    current: "all",
+    flag: { key: "flagged", label: "Отмеченные", href: "?f=flagged", count: 3 },
+    items: [
+      { key: "all", label: "Все", href: "?f=all" },
+      { key: "login", label: "Входы", href: "?f=login", count: 12 },
+      { key: "app", label: "Приложения", href: "?f=app", count: 0 },
+    ],
+  }));
+  assert.match(out, /<nav aria-label="Фильтр ленты"/);
+  assert.match(out, /<a aria-current="page"[^>]*href="\?f=all"/);
+  assert.doesNotMatch(out, /aria-pressed/);
+  assert.match(stripTags(out), /Отмеченные 3 Все Входы 12 Приложения 0/);
+  assert.doesNotMatch(out, /href="\?f=app"/, "вкладка с нулём — не ссылка");
+  assert.match(out, /aria-disabled="true"[^>]*>Приложения/);
+  const flagged = html(h(tabs.FilterTabs, { label: "x", current: "flagged", flag: { key: "flagged", label: "Отмеченные", href: "?f=flagged", count: 0 }, items: [] }));
+  assert.match(flagged, /<a aria-current="page"[^>]*href="\?f=flagged"/, "выбранная вкладка активна даже при нуле");
+});
+
+test("feed: день, строка с бейджем, частями второй строки, временем справа; отмеченное подсвечено; ссылка на строку", () => {
+  const out = html(h(feedC.FeedList, { label: "Активность" },
+    h(feedC.FeedDay, { heading: "Сегодня" },
+      h(feedC.FeedRow, { title: "Вход заблокирован", badge: { label: "отказ" }, meta: ["i.petrov", "203.0.113.5", "", null], time: "2 мин назад", flagged: true, href: "/events?q=1", linkTitle: "Открыть в журнале" }),
+      h(feedC.FeedRow, { title: "Команда sudo", meta: ["i.petrov"], time: "10:42" }),
+    ),
+  ));
+  assert.match(out, /role="region" aria-label="Активность"/);
+  assert.match(out, /<h3[^>]*>Сегодня<\/h3>/);
+  assert.match(stripTags(out), /Сегодня Вход заблокирован отказ i\.petrov 203\.0\.113\.5 2 мин назад Команда sudo i\.petrov 10:42/);
+  assert.match(out, /<li data-flagged="true"><a [^>]*title="Открыть в журнале"[^>]*href="\/events\?q=1"|<li data-flagged="true"><a [^>]*href="\/events\?q=1"[^>]*title="Открыть в журнале"/);
+  assert.match(out, /--feed-tone:var\(--status-err\)/);
+  assert.equal((out.match(/<a /g) ?? []).length, 1, "строка без href — не ссылка");
+});
+
+test("ago: относительное время на виду, точное UTC в title и dateTime; порог давности", () => {
+  const now = new Date("2026-11-25T10:00:00Z");
+  const out = html(h(ago.Ago, { ts: "2026-11-25 09:48:00", now }));
+  assert.match(out, /<time dateTime="2026-11-25T09:48:00.000Z" title="2026-11-25 09:48:00 UTC"[^>]*>12 мин назад<\/time>/);
+  assert.match(html(h(ago.Ago, { ts: "2026-11-25 07:00:00", now, staleAfterMs: 3_600_000 })), /status-warn/);
+  assert.match(text(h(ago.Ago, { ts: null })), /—/);
+});
+
+test("panel: повторяющиеся и коллидирующие подписи не создают одинаковые id", () => {
+  for (const labels of [["Новая панель", "Новая панель"], ["Aa", "BB"]]) {
+    const out = html(h("div", null,
+      ...labels.map((label, i) => h(panel.Panel, { key: i, label }, "тело")),
+    ));
+    const ids = [...out.matchAll(/\bid="([^"]+)"/g)].map((m) => m[1]);
+    assert.equal(new Set(ids).size, ids.length, labels.join(" / "));
+    const headings = [...out.matchAll(/<h[23]\b[^>]*id="([^"]+)"[^>]*>(.*?)<\/h[23]>/g)];
+    const names = [...out.matchAll(/<section\b([^>]*)>/g)].map((m) => {
+      const ref = /aria-labelledby="([^"]+)"/.exec(m[1])?.[1];
+      return ref
+        ? stripTags(headings.find((heading) => heading[1] === ref)?.[2] ?? "")
+        : /aria-label="([^"]+)"/.exec(m[1])?.[1];
+    });
+    assert.deepEqual(names, labels);
+  }
+});
+
+test("ago: задержка до гидрации не меняет начальную разметку без now", (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-27T12:00:59Z") });
+  const props = { ts: "2026-11-27T12:00:00Z", staleAfterMs: 60_000 };
+  const server = html(h(ago.Ago, props));
+  t.mock.timers.tick(2_000);
+  const firstClientRender = html(h(ago.Ago, props));
+  assert.equal(firstClientRender, server);
 });

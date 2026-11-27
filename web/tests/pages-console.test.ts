@@ -124,7 +124,14 @@ test("обзор: пустой период — подсказка про ист
   mocks.queries.incidentStats = async () => { throw down(); };
   text = await pageText(await overview.default(props()));
   assert.match(text, /Хранилище недоступно/);
+  assert.match(text, /хранилище событий не отвечает/);
+  // Текст исключения и что проверить — только администратору; остальным — «сообщите администратору».
+  assert.doesNotMatch(text, /нет соединения|CLICKHOUSE_/);
+  assert.match(text, /сообщите администратору/);
+  await auth.createSession("admin", "admin");
+  text = await pageText(await overview.default(props()));
   assert.match(text, /нет соединения/);
+  assert.match(text, /CLICKHOUSE_\*/);
 });
 
 /* ===== Инциденты ===== */
@@ -556,7 +563,8 @@ test("layout консоли: без сессии — на /login с next; с с�
   assert.match(text, /analyst1 · аналитик/);
   assert.match(text, /тело страницы/);
   assert.match(text, /Выход/);
-  assert.match(text, /clickhouse ClickHouse отвечает/, "LED служб (SELECT 1 через fetch)");
+  assert.match(text, /хранилище .*ClickHouse отвечает/, "LED служб (SELECT 1 через fetch)");
+  assert.doesNotMatch(text, /\bvdev\b|v\d+\.\d+/, "версии в шапке нет — она в «Настройках»");
   assert.match(text, /движок/);
   assert.match(text, /Инциденты/, "навигация есть");
   assert.doesNotMatch(text, /Алерты Wazuh/);

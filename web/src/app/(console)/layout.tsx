@@ -5,7 +5,6 @@ import { headers } from "next/headers";
 import { LogOut, UserRound } from "lucide-react";
 import { getSession, loginUrlWithNext, ROLE_LABELS } from "@/lib/auth";
 import { logoutAction } from "@/lib/actions";
-import { APP_VERSION } from "@/lib/version";
 import { ConsoleNav } from "@/components/console/nav";
 import { wazuhEnabled } from "@/lib/integrations";
 import { ServiceLeds } from "@/components/console/service-leds";
@@ -25,7 +24,6 @@ export default async function ConsoleLayout({ children }: { children: React.Reac
           <Link href="/" className="text-[15px] font-semibold tracking-[-0.01em] text-foreground" aria-label="ARGUS SIEM — на обзор">
             argus<span className="text-[var(--text-tertiary)]">/siem</span>
           </Link>
-          <span className="hidden font-mono text-[12px] text-[var(--text-tertiary)] lg:inline">v{APP_VERSION}</span>
           <Suspense fallback={<span className="c-label" aria-hidden>··</span>}>
             <ServiceLeds />
           </Suspense>

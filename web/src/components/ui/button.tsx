@@ -11,7 +11,9 @@ const buttonVariants = cva(
       variant: {
         // terminal-dark: главная — светлая заливка; вторичные — волосяная рамка;
         // нажатая (aria-pressed) — слой elevated и рамка в цвет акцента.
-        default: "border-primary bg-primary text-primary-foreground hover:border-white hover:bg-white",
+        // Неактивная главная — не серая заливка (она читается как «главное действие»),
+        // а пустая рамка и приглушённый текст.
+        default: "border-primary bg-primary text-primary-foreground hover:border-white hover:bg-white disabled:border-[var(--border-strong)] disabled:bg-transparent disabled:text-[var(--text-tertiary)] disabled:opacity-100",
         outline:
           "border-[var(--border-strong)] bg-transparent text-foreground hover:border-[#3a3f4a] hover:bg-[var(--surface-elevated)] aria-expanded:bg-[var(--surface-elevated)] aria-pressed:border-[color-mix(in_oklab,var(--ring)_55%,transparent)] aria-pressed:bg-[var(--surface-elevated)]",
         secondary:

@@ -2,7 +2,6 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { ArrowLeft } from "lucide-react";
 import { Copyable } from "@/components/console/copyable";
-import { ALIAS_KIND_LABELS } from "@/components/console/actor-forms";
 import { ActorLookupForm } from "@/components/console/actor-lookup-form";
 import { Empty, Led, PageHeader, Panel } from "@/components/console/panel";
 import { StorageUnavailable } from "@/components/console/storage-error";
@@ -12,7 +11,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { safeQuery } from "@/lib/clickhouse";
 import { audit } from "@/lib/argus-queries";
 import { aliasHistory, aliasSightings, getPerson, resolveAlias } from "@/lib/actors";
-import { ALIAS_VALUE_MAX, isIp, parseActorRange, PERSON_ID_RE } from "@/lib/shared/actors";
+import { ALIAS_KIND_LABELS, ALIAS_VALUE_MAX, isIp, parseActorRange, PERSON_ID_RE } from "@/lib/shared/actors";
 import { RANGES } from "@/lib/shared/ranges";
 import { searchHref } from "@/lib/shared/search-href";
 import { fmtNum, formatTs } from "@/lib/shared/time";
