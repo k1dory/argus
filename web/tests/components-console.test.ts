@@ -568,3 +568,30 @@ test("ago: относительное время на виду, точное UTC
   assert.match(html(h(ago.Ago, { ts: "2026-11-25 07:00:00", now, staleAfterMs: 3_600_000 })), /status-warn/);
   assert.match(text(h(ago.Ago, { ts: null })), /—/);
 });
+
+test("panel: повторяющиеся и коллидирующие подписи не создают одинаковые id", () => {
+  for (const labels of [["Новая панель", "Новая панель"], ["Aa", "BB"]]) {
+    const out = html(h("div", null,
+      ...labels.map((label, i) => h(panel.Panel, { key: i, label }, "тело")),
+    ));
+    const ids = [...out.matchAll(/\bid="([^"]+)"/g)].map((m) => m[1]);
+    assert.equal(new Set(ids).size, ids.length, labels.join(" / "));
+    const headings = [...out.matchAll(/<h[23]\b[^>]*id="([^"]+)"[^>]*>(.*?)<\/h[23]>/g)];
+    const names = [...out.matchAll(/<section\b([^>]*)>/g)].map((m) => {
+      const ref = /aria-labelledby="([^"]+)"/.exec(m[1])?.[1];
+      return ref
+        ? stripTags(headings.find((heading) => heading[1] === ref)?.[2] ?? "")
+        : /aria-label="([^"]+)"/.exec(m[1])?.[1];
+    });
+    assert.deepEqual(names, labels);
+  }
+});
+
+test("ago: задержка до гидрации не меняет начальную разметку без now", (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-27T12:00:59Z") });
+  const props = { ts: "2026-11-27T12:00:00Z", staleAfterMs: 60_000 };
+  const server = html(h(ago.Ago, props));
+  t.mock.timers.tick(2_000);
+  const firstClientRender = html(h(ago.Ago, props));
+  assert.equal(firstClientRender, server);
+});
