@@ -153,14 +153,14 @@ test("статус: накопление added/trimmed между тактами
   assert.equal(errorStatus(null, "строка").error, "ошибка");
   assert.equal(errorStatus(null, "x").added, 0);
 
-  assert.equal(tailStatusText(null, true, false), "live-tail недоступен для прошлого интервала");
-  assert.equal(tailStatusText(null, false, true), "лента зафиксирована на момент загрузки");
+  assert.equal(tailStatusText(null, true, false), "слежение недоступно для прошлого интервала");
+  assert.equal(tailStatusText(null, false, true), "новые события не подгружаются");
   assert.equal(tailStatusText(null, true, true), "ждём новые события…");
   assert.equal(tailStatusText(e1, true, true), `ошибка обновления: HTTP 503 — повторим через ${TAIL_EVERY_MS / 1000} с, события не пропадут`);
   const th: TailStatus = { ...r2, throttled: 15 };
   assert.equal(tailStatusText(th, true, true), "пауза 15 с, догоняем — события не пропадут");
-  assert.equal(tailStatusText(r1, true, true), "обновлено 10:00:05 UTC · пришло с начала live 2 · догоняем, в очереди ещё 7");
-  assert.equal(tailStatusText(r2, true, true), "обновлено 10:00:10 UTC · пришло с начала live 3");
+  assert.equal(tailStatusText(r1, true, true), "обновлено 10:00:05 UTC · пришло с начала слежения 2 · догоняем, в очереди ещё 7");
+  assert.equal(tailStatusText(r2, true, true), "обновлено 10:00:10 UTC · пришло с начала слежения 3");
 });
 
 test("fetchDownload: blob при 2xx с same-origin; ошибка — текст {error} из JSON, иначе HTTP-статус", async () => {

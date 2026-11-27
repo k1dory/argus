@@ -437,8 +437,13 @@ test("журнал: заголовок с числом событий, чипы 
   assert.match(text, /3 события за 24 часа по фильтрам/);
   assert.match(text, /Убрать фильтр: источник linux\.auth|linux\.auth/);
   assert.match(text, /сбросить всё/);
-  assert.match(text, /Лента · страница 1 из 1/);
-  assert.match(text, /корзина 30 мин/, "гистограмма");
+  assert.match(text, /Журнал 3 события за 24 часа по фильтрам/, "заголовок — PageHeader, число — подзаголовком");
+  assert.match(text, /страница 1 из 1/);
+  assert.match(text, /столбик — 30 мин/, "гистограмма");
+  assert.match(text, /критичные \( ?8–10 ?\) 1/, "легенда — шкала событий");
+  assert.match(text, /Только важное 1/, "вкладка важного со счётчиком критичных и высоких");
+  assert.match(text, /Движок корреляции недоступен — связь событий с инцидентами не показывается/, "движок лежит (healthz 503) — плашка, а не «не связал»");
+  assert.doesNotMatch(text, /Показаны первые/, "до потолка 10 000 предупреждения нет");
 
   routes = [{ when: (s) => s.includes("{seal:UInt32}"), rows: () => [{ n: NOW }] }];
   text = await pageText(await journal.default(props()));

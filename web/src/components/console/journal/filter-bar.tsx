@@ -8,10 +8,13 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { journalHref, MAX_Q_LEN, SEV_MAX_OPTIONS, SEV_OPTIONS, type JournalFilters } from "@/lib/shared/journal";
+import { addQueryTerm } from "@/lib/shared/query-fields";
+import { QuerySyntaxHelp } from "@/components/console/query-syntax";
 
 const ANY = "__any"; // Radix Select не принимает пустое значение пункта
 
-const HINT = 'sshd · actor:i.petrov · src:10.20.* · -outcome:allow · attr.rule_groups:sshd · object:"/etc/passwd"';
+/** Один пример, а не перечень: полный синтаксис — в шпаргалке «?». */
+const HINT = "sshd actor:i.petrov -outcome:allow";
 
 /** Панель фильтров журнала: свободный запрос + источник, хост, серьёзность, правило, точный интервал UTC. */
 export function JournalFilterBar({ filters, sources, hosts }: { filters: JournalFilters; sources: string[]; hosts: string[] }) {
@@ -50,7 +53,7 @@ export function JournalFilterBar({ filters, sources, hosts }: { filters: Journal
     <form onSubmit={submit} className="flex flex-col gap-3" role="search" aria-label="Фильтры журнала" aria-busy={pending}>
       <div className="flex flex-wrap gap-2">
         <Label htmlFor="journal-q" className="sr-only">Свободный поиск</Label>
-        <div className="flex min-w-0 flex-1 items-center gap-2 rounded-lg border border-[var(--border-strong)] bg-background pl-3 focus-within:border-[color-mix(in_oklab,var(--ring)_60%,transparent)] sm:min-w-[28rem]">
+        <div className="flex min-w-0 flex-1 items-center gap-2 rounded-lg border border-[var(--border-strong)] bg-background pr-1.5 pl-3 focus-within:border-[color-mix(in_oklab,var(--ring)_60%,transparent)] sm:min-w-[28rem]">
           <span className="select-none font-mono text-[13px] text-[var(--text-tertiary)]" aria-hidden>$</span>
           <Input
             id="journal-q"
@@ -62,6 +65,7 @@ export function JournalFilterBar({ filters, sources, hosts }: { filters: Journal
             autoComplete="off"
             className="h-10 border-0 bg-transparent px-0 font-mono shadow-none focus-visible:shadow-none"
           />
+          <QuerySyntaxHelp index="events" onPick={(t) => setQ((cur) => addQueryTerm(cur, t))} />
         </div>
         <Button type="submit" size="lg" className="h-10 px-4">
           {pending ? <span className="ascii-spin" aria-hidden /> : <SearchIcon strokeWidth={1.5} aria-hidden />}
@@ -69,7 +73,7 @@ export function JournalFilterBar({ filters, sources, hosts }: { filters: Journal
         </Button>
       </div>
 
-      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-[repeat(5,minmax(0,1fr))_auto]">
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-[repeat(5,minmax(0,1fr))_auto]">
         <Field label="Источник" id="journal-source">
           <Select value={source} onValueChange={setSource}>
             <SelectTrigger id="journal-source" className="h-9 w-full font-mono text-[13px]"><SelectValue>{source === ANY ? "Все источники" : source}</SelectValue></SelectTrigger>
@@ -112,8 +116,21 @@ export function JournalFilterBar({ filters, sources, hosts }: { filters: Journal
             </SelectContent>
           </Select>
         </Field>
-        <Field label="Правило" id="journal-rule" hint="5763 — правило Wazuh; a41c-… — события его инцидентов: источник, узел и окно инцидента. Берутся 5000 последних инцидентов правила — у шумного правила старые окна не попадут">
-          <Input id="journal-rule" aria-describedby="journal-rule-hint" value={rule} onChange={(e) => setRule(e.target.value)} placeholder="5763 · a41c-*" spellCheck={false} autoComplete="off" className="h-9 font-mono" />
+        <Field
+          label="Правило"
+          id="journal-rule"
+          hint={
+            <details className="group/h">
+              <summary className="cursor-pointer list-none marker:hidden [&::-webkit-details-marker]:hidden">
+                номер правила Wazuh или ID инцидента <span className="text-[var(--ring)] group-open/h:hidden">· подробнее</span>
+              </summary>
+              <span className="mt-1 block">
+                5763 — события правила Wazuh. a41c-… — события инцидентов правила корреляции: источник, хост и окно каждого инцидента. Берутся 5000 последних инцидентов правила, поэтому у шумного правила старые окна не попадут.
+              </span>
+            </details>
+          }
+        >
+          <Input id="journal-rule" aria-describedby="journal-rule-hint" value={rule} onChange={(e) => setRule(e.target.value)} placeholder="5763 или a41c-*" spellCheck={false} autoComplete="off" className="h-9 font-mono" />
         </Field>
         <fieldset className="flex min-w-0 flex-col gap-1.5">
           <legend className="c-label mb-1.5">Точный интервал, UTC</legend>
@@ -128,12 +145,12 @@ export function JournalFilterBar({ filters, sources, hosts }: { filters: Journal
   );
 }
 
-function Field({ label, id, hint, children }: { label: string; id: string; hint?: string; children: React.ReactNode }) {
+function Field({ label, id, hint, children }: { label: string; id: string; hint?: React.ReactNode; children: React.ReactNode }) {
   return (
     <div className="flex min-w-0 flex-col gap-1.5">
       <Label htmlFor={id} className="c-label">{label}</Label>
       {children}
-      {hint && <p id={`${id}-hint`} className="text-[11px] leading-[1.4] text-[var(--text-tertiary)]">{hint}</p>}
+      {hint && <div id={`${id}-hint`} className="text-[12px] leading-[1.4] text-[var(--text-tertiary)]">{hint}</div>}
     </div>
   );
 }

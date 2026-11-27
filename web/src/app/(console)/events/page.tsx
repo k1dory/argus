@@ -1,20 +1,23 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { X } from "lucide-react";
+import { TriangleAlert, X } from "lucide-react";
 import { DownloadButton } from "@/components/console/download-button";
+import { FilterTabs } from "@/components/console/filter-tabs";
 import { JournalFilterBar } from "@/components/console/journal/filter-bar";
-import { JournalHistogram } from "@/components/console/journal/histogram";
+import { TimeHistogram } from "@/components/console/time-histogram";
 import { EventFeed } from "@/components/console/journal/event-feed";
-import { Empty, Panel } from "@/components/console/panel";
+import { Empty, PageHeader, Panel } from "@/components/console/panel";
+import { Button } from "@/components/ui/button";
 import { Pager } from "@/components/console/pager";
 import { RangePicker } from "@/components/console/range-picker";
 import { StorageUnavailable } from "@/components/console/storage-error";
 import { requirePageSession } from "@/lib/auth";
-import { safeQuery } from "@/lib/clickhouse";
+import { engineState, safeQuery } from "@/lib/clickhouse";
 import { JOURNAL_MAX_PAGE, journalSearch } from "@/lib/journal";
 import { activeChips, fillBars, journalHref, journalQuery, parseJournalParams, windowBounds } from "@/lib/shared/journal";
 import { RANGES } from "@/lib/shared/ranges";
-import { fmtMs, fmtNum, isLongRange } from "@/lib/shared/time";
+import { SEVERITY, SEVERITY_MAX } from "@/lib/shared/severity";
+import { fmtNum } from "@/lib/shared/time";
 
 export const dynamic = "force-dynamic";
 export const metadata: Metadata = { title: "Журнал событий" };
@@ -22,8 +25,7 @@ export const metadata: Metadata = { title: "Журнал событий" };
 export default async function JournalPage({ searchParams }: PageProps<"/events">) {
   await requirePageSession();
   const f = parseJournalParams(await searchParams);
-  const r = await safeQuery(() => journalSearch(f));
-  const longRange = isLongRange(f.range, f.from);
+  const [r, engine] = await Promise.all([safeQuery(() => journalSearch(f)), engineState()]);
   const period = f.from ? "за выбранный интервал" : `за ${RANGES[f.range].label}`;
   const chips = activeChips(f);
   const filtered = chips.length > 0 || f.q.trim() !== "";
@@ -32,21 +34,26 @@ export default async function JournalPage({ searchParams }: PageProps<"/events">
   if (f.to) exportQs.set("to", f.to);
   const exportName = `argus-journal-${new Date().toISOString().slice(0, 10)}`;
 
+  const sums = r.ok ? r.data.series.reduce((a, b) => ({ critical: a.critical + Number(b.critical), high: a.high + Number(b.high) }), { critical: 0, high: 0 }) : { critical: 0, high: 0 };
+  const important = sums.critical + sums.high;
+  const importantOnly = (f.sev ?? 0) >= SEVERITY.events.high;
+  const capLimit = r.ok ? r.data.pageSize * JOURNAL_MAX_PAGE : 0;
+  const capped = r.ok && r.data.total > capLimit;
+  const sourcesN = r.ok ? r.data.options.sources.length : 0;
+
   return (
     <>
-      <div className="flex flex-wrap items-end justify-between gap-4">
-        <h1 className="max-w-[60rem] text-[26px] leading-[1.15] sm:text-[32px]">
-          Журнал событий.{" "}
-          <span className="text-muted-foreground">
-            {r.ok && !r.data.error
-              ? `${fmtNum(r.data.total)} ${plural(r.data.total, "событие", "события", "событий")} ${period}${filtered ? " по фильтрам" : ` из ${fmtNum(r.data.options.sources.length)} ${plural(r.data.options.sources.length, "источника", "источников", "источников")}`}.`
-              : "Все источники в одной ленте."}
-          </span>
-        </h1>
-        <RangePicker value={f.range} />
-      </div>
+      <PageHeader
+        title="Журнал"
+        subtitle={
+          r.ok && !r.data.error
+            ? `${fmtNum(r.data.total)} ${plural(r.data.total, "событие", "события", "событий")} ${period}${filtered ? " по фильтрам" : ` · ${fmtNum(sourcesN)} ${plural(sourcesN, "источник", "источника", "источников")}`}`
+            : "Все источники в одной ленте"
+        }
+        actions={<RangePicker value={f.range} />}
+      />
 
-      <Panel label="Фильтры" meta="время в UTC · поля: source node severity rule actor object src dst action outcome attr.*">
+      <Panel label="Фильтры" meta="время — UTC">
         <JournalFilterBar filters={f} sources={r.ok ? r.data.options.sources : []} hosts={r.ok ? r.data.options.hosts : []} />
         {chips.length > 0 && (
           <ul className="mt-3 flex flex-wrap items-center gap-2" aria-label="Активные фильтры">
@@ -59,7 +66,9 @@ export default async function JournalPage({ searchParams }: PageProps<"/events">
               </li>
             ))}
             <li>
-              <Link href={journalHref({ q: "", range: f.range })} className="text-[12px] text-[var(--ring)] hover:underline">сбросить всё</Link>
+              <Button asChild variant="ghost" size="sm">
+                <Link href={journalHref({ q: "", range: f.range })}>сбросить всё</Link>
+              </Button>
             </li>
           </ul>
         )}
@@ -70,15 +79,16 @@ export default async function JournalPage({ searchParams }: PageProps<"/events">
         <StorageUnavailable reason={r.error} />
       ) : (
         <>
-          <section className="frame" aria-label="Гистограмма событий по времени">
+          <section className="frame" aria-label="События по времени">
             <div className="frame__inner px-4 pt-4 pb-3">
               {r.data.series.length === 0 ? (
                 <Empty className="py-10 text-center">Нет событий {period}{chips.length ? ` по фильтрам: ${chips.map((c) => `${c.label} ${c.value}`).join(", ")}` : ""}.</Empty>
               ) : (
-                <JournalHistogram
+                <TimeHistogram
                   bars={fillBars(r.data.series, r.data.bucketMinutes, windowBounds(f).startMs, windowBounds(f).endMs)}
                   bucketMinutes={r.data.bucketMinutes}
-                  longRange={longRange}
+                  scale={SEVERITY.events}
+                  scaleMax={SEVERITY_MAX.events}
                   hrefFor={(b) => journalHref(f, { from: b.from, to: b.to })}
                 />
               )}
@@ -86,16 +96,35 @@ export default async function JournalPage({ searchParams }: PageProps<"/events">
           </section>
 
           <Panel
-            label={`Лента · страница ${fmtNum(r.data.page)} из ${fmtNum(pagesOf(r.data.total, r.data.pageSize))}`}
-            meta={
-              <span className="flex items-center gap-1">
-                <span className="mr-2">{fmtMs(r.data.ms)}</span>
+            label="Лента"
+            actions={
+              <>
                 <DownloadButton href={`/api/search?${exportQs.toString()}&format=csv`} filename={`${exportName}.csv`} size="sm" variant="ghost">CSV</DownloadButton>
                 <DownloadButton href={`/api/search?${exportQs.toString()}&format=export`} filename={`${exportName}.json`} size="sm" variant="ghost">JSON</DownloadButton>
-              </span>
+              </>
             }
             bodyClassName="p-0"
           >
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-[var(--border)] px-4 py-3">
+              <FilterTabs
+                label="Фильтр ленты"
+                current={importantOnly ? "important" : "all"}
+                flag={{ key: "important", label: "Только важное", count: important, icon: TriangleAlert, href: journalHref(f, { sev: SEVERITY.events.high, sevMax: undefined }) }}
+                items={[{ key: "all", label: "Все", href: journalHref(f, { sev: undefined, sevMax: undefined }) }]}
+              />
+              <span className="text-[12px] text-[var(--text-tertiary)]">важное — серьёзность от {SEVERITY.events.high} из {SEVERITY_MAX.events}</span>
+              {capped && (
+                <p role="status" className="basis-full text-[13px] text-[var(--status-warn)] sm:ml-auto sm:basis-auto">
+                  Показаны первые {fmtNum(capLimit)} из {fmtNum(r.data.total)} — сузьте интервал или фильтры
+                </p>
+              )}
+            </div>
+            {!engine.ok && (
+              <p role="status" className="flex items-center gap-2 border-b border-[var(--border)] bg-[color-mix(in_oklab,var(--status-warn)_8%,transparent)] px-4 py-2 text-[13px] text-[var(--status-warn)]">
+                <TriangleAlert strokeWidth={1.5} className="size-4 shrink-0" aria-hidden />
+                Движок корреляции недоступен — связь событий с инцидентами не показывается
+              </p>
+            )}
             <EventFeed
               key={`${journalHref(f, { page: f.page })}|${r.data.cursor}`}
               initial={r.data.rows}
@@ -103,10 +132,10 @@ export default async function JournalPage({ searchParams }: PageProps<"/events">
               filters={f}
               cursor={r.data.cursor}
               liveAllowed={!f.from && r.data.page === 1}
-              showDate={f.range !== "1h" || Boolean(f.from)}
+              engineUp={engine.ok}
             />
             <div className="px-4 pb-4">
-              <Pager page={r.data.page} pages={pagesOf(r.data.total, r.data.pageSize)} total={r.data.total} pageSize={r.data.pageSize} capped={r.data.total > r.data.pageSize * JOURNAL_MAX_PAGE} href={(p) => journalHref(f, { page: p })} />
+              <Pager page={r.data.page} pages={pagesOf(r.data.total, r.data.pageSize)} total={r.data.total} pageSize={r.data.pageSize} capped={capped} href={(p) => journalHref(f, { page: p })} />
             </div>
           </Panel>
         </>
