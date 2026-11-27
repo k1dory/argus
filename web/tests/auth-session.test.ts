@@ -77,7 +77,7 @@ test("SSO: имя изолировано префиксом sso:, сессия �
   await assert.rejects(auth.signSessionToken("admin", "admin", true), /sso:/);
   const t = await auth.signSessionToken("sso:admin", "admin", true);
   const p = decodeJwt(t);
-  assert.equal(p.exp! - p.iat!, Math.min(auth.SESSION_IDLE_SEC, auth.SSO_SESSION_MAX_SEC));
+  assert.equal(p.exp! - p.iat!, Math.min(auth.sessionIdleSec(), auth.sessionMaxSec(true)));
   const s = await auth.verifySessionToken(t);
   assert.deepEqual(s, { kind: "console", user: "sso:admin", role: "admin", sso: true, mustChangePassword: false });
   // sso:admin — не встроенный admin: локальный пароль/2FA у него не существуют
@@ -87,7 +87,7 @@ test("SSO: имя изолировано префиксом sso:, сессия �
   await assert.rejects(auth.signSessionToken("sso:admin", "admin", false));
   const local = await auth.signSessionToken("bob", "analyst", false);
   const lp = decodeJwt(local);
-  assert.equal(lp.exp! - lp.iat!, auth.SESSION_IDLE_SEC);
+  assert.equal(lp.exp! - lp.iat!, auth.sessionIdleSec());
   assert.equal(lp.sso, false);
 });
 

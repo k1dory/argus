@@ -17,15 +17,15 @@ test("продление: через 5+ минут — новый exp = сейч
   assert.ok(r);
   const p = decodeJwt(r.token);
   assert.equal(p.auth, t0);
-  assert.equal(p.exp, t0 + 2 * H + auth.SESSION_IDLE_SEC);
-  assert.equal(r.maxAge, auth.SESSION_IDLE_SEC);
+  assert.equal(p.exp, t0 + 2 * H + auth.sessionIdleSec());
+  assert.equal(r.maxAge, auth.sessionIdleSec());
   assert.equal((await auth.verifySessionToken(r.token, t0 + 2 * H))?.user, "admin");
 });
 
 test("простой: после exp сессия не продлевается и не действует", async () => {
   const t0 = 1_800_000_000;
   const tok = await auth.signSessionToken("admin", "admin", false, t0, t0);
-  const after = t0 + auth.SESSION_IDLE_SEC + 1;
+  const after = t0 + auth.sessionIdleSec() + 1;
   assert.equal(await auth.renewSessionToken(tok, after), null);
   assert.equal(await auth.verifySessionToken(tok, after), null);
 });
@@ -42,18 +42,18 @@ test("потолок от входа: локальный — 7 суток, пр�
     tok = r.token;
   }
   const p = decodeJwt(tok);
-  assert.equal(p.exp, t0 + auth.SESSION_MAX_SEC);
+  assert.equal(p.exp, t0 + auth.sessionMaxSec(false));
   assert.equal(p.auth, t0);
 });
 
 test("SSO: потолок 12 ч от входа — продление его не сдвигает, роль из токена", async () => {
   const t0 = 1_800_000_000;
   const tok = await auth.signSessionToken("sso:i.petrov", "analyst", true, t0, t0);
-  assert.equal(decodeJwt(tok).exp, t0 + Math.min(auth.SESSION_IDLE_SEC, auth.SSO_SESSION_MAX_SEC));
+  assert.equal(decodeJwt(tok).exp, t0 + Math.min(auth.sessionIdleSec(), auth.sessionMaxSec(true)));
   assert.equal(decodeJwt(tok).role, "analyst");
   // По умолчанию простой = SSO-потолку: продлевать некуда, рабочий день — одна сессия.
   assert.equal(await auth.renewSessionToken(tok, t0 + 6 * H), null);
-  assert.equal(await auth.verifySessionToken(tok, t0 + auth.SSO_SESSION_MAX_SEC + 1), null, "после потолка — повторный вход через IdP");
+  assert.equal(await auth.verifySessionToken(tok, t0 + auth.sessionMaxSec(true) + 1), null, "после потолка — повторный вход через IdP");
 });
 
 test("отозванный токен (смена пароля) не продлевается", async () => {
