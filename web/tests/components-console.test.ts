@@ -270,12 +270,18 @@ test("dash-panels: pivot по series-колонке и по числовым к�
   assert.match(html(h(dash.BarPanel, { panel: { ...p, type: "bar", title: "" }, data: { columns: ["name", "n"], rows: [{ name: "a", n: 2 }], ms: 0 } })), /aria-label="столбцы"/);
   const err = html(h(dash.PanelBody, { panel: p, data: { columns: [], rows: [], ms: 0, error: "код 60: нет таблицы", errorDetail: "Code: 60. DB::Exception: …" }, longRange: false }));
   assert.match(err, /role="alert"/);
-  assert.match(stripTags(err), /код 60: нет таблицы полный ответ ClickHouse Code: 60/);
+  assert.match(stripTags(err), /код 60: нет таблицы Полный ответ хранилища Code: 60/);
   assert.match(text(h(dash.PanelBody, { panel: { ...p, type: "table" }, data: { columns: [], rows: [], ms: 0 }, longRange: false })), /нет данных/);
-  const grid = html(h(dash.DashboardGrid, { panels: [p, { ...p, id: "p2", type: "stat", title: "" }], data: { p1: { ...d, cached: true, truncated: true } }, longRange: false }));
+  const grid = html(h(dash.DashboardGrid, { panels: [p, { ...p, id: "p2", type: "stat", title: "" }], data: { p1: { ...d, cached: true, truncated: true } }, longRange: false, showType: true }));
   assert.match(stripTags(grid), /Ряд ряд · 3 мс · кэш · обрезано/);
   assert.match(stripTags(grid), /p2 число · 0 мс нет данных за период/, "панель без данных и без title — по id");
   assert.match(grid, /--dash-h:240px/);
+  // Читателю тип панели не нужен; общая ошибка доски сворачивает панели.
+  const reader = stripTags(html(h(dash.DashboardGrid, { panels: [p], data: { p1: d }, longRange: false })));
+  assert.match(reader, /Ряд 3 мс/);
+  const collapsed = html(h(dash.DashboardGrid, { panels: [p], data: { p1: { columns: [], rows: [], ms: 0, error: "x" } }, longRange: false, collapsed: true }));
+  assert.match(stripTags(collapsed), /Ряд ошибка Нет данных — см\. сообщение выше/);
+  assert.match(collapsed, /--dash-h:96px/);
 });
 
 test("charts: серии по серьёзности, топ правил и тактик — SVG с aria-label", () => {

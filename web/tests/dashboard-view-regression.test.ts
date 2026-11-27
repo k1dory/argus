@@ -89,7 +89,7 @@ test("редактор: удалённую панель можно вернут�
 
 test("доска: подписи колонок без snake_case; AS \"Событий\" — как есть", () => {
   assert.equal(columnLabel("source_class"), "Source class");
-  assert.equal(columnLabel("events"), "Events");
+  assert.equal(columnLabel("events"), "events");
   assert.equal(columnLabel("Событий"), "Событий");
   assert.equal(columnLabel("Открыто сейчас"), "Открыто сейчас");
 });

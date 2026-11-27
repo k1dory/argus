@@ -108,7 +108,7 @@ export function restoreAt<T extends { id: string }>(list: readonly T[], item: T,
 
 /** Подпись колонки SQL для читателя: source_class → «Source class». Имена с пробелами (AS "Событий") — как есть. */
 export function columnLabel(c: string): string {
-  if (/\s/.test(c) || !/_|^[a-z]/.test(c)) return c;
+  if (/\s/.test(c) || !c.includes("_")) return c;
   const s = c.replace(/_+/g, " ").trim();
   return s ? s[0].toUpperCase() + s.slice(1) : c;
 }

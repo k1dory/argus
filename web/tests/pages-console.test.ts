@@ -94,9 +94,16 @@ test("обзор: плитки инцидентов и классы источн
   mocks.queries.incidentStats = async () => ({ total: 10, open: 3, escalated: 1, pii: 0 });
   mocks.queries.eventsByClass = async () => [{ source_class: "syslog", count: 1200, sources: 4 }, { source_class: "k8s", count: 7, sources: 1 }];
   let text = await pageText(await overview.default(props({}, { range: "7d" })));
-  assert.match(text, /Открытых инцидентов/);
+  // Первым — «Требует внимания»; период — в подписи плитки; вместо «Классов источников» — «Молчат источники».
+  assert.ok(text.indexOf("Требует внимания") < text.indexOf("Открыто сейчас"));
+  assert.match(text, /Эскалировано: 1 инцидент/);
+  assert.match(text, /Открыто сейчас/);
+  assert.match(text, /Событий за 7 дней/);
+  assert.match(text, /Молчат источники/);
+  assert.doesNotMatch(text, /Классов источников/);
+  assert.match(text, /Последние инциденты/);
   assert.match(text, /syslog/);
-  assert.match(text, /4 ист\./);
+  assert.match(text, /4 источника/);
   assert.doesNotMatch(text, /Алертов Wazuh/, "без модуля витрин Wazuh нет");
 
   process.env.ARGUS_INTEGRATION_WAZUH = "1";
@@ -119,7 +126,8 @@ test("обзор: пустой период — подсказка про ист
   mocks.queries.incidentStats = async () => ({ total: 0, open: 0, escalated: 0, pii: 0 });
   mocks.queries.eventsByClass = async () => [];
   let text = await pageText(await overview.default(props()));
-  assert.match(text, /новые события не поступали/);
+  assert.match(text, /За период событий не поступало/);
+  assert.doesNotMatch(text, /make replay/, "команд разработчика в пустом состоянии нет");
 
   mocks.queries.incidentStats = async () => { throw down(); };
   text = await pageText(await overview.default(props()));
@@ -286,20 +294,23 @@ test("источники: живой и молчащий источник, фи�
   ];
   mocks.queries.eventsRecent = async (source) => [{ ts: NOW, received_at: NOW, source: source ?? "linux.auth", action: "login", outcome: "failure", severity: 5, actor_name: "root", object: "", node: "bastion", src_ip: "203.0.113.5", dst_ip: "", dst_port: 0, pii: 1 }];
   let text = await pageText(await sources.default(props({}, { source: "linux.auth" })));
-  assert.match(text, /Живы \(по ритму\) 1 \/ 2/);
-  assert.match(text, /12,5 %|12\.5 %/);
-  assert.match(text, /ci\.nightly/);
-  assert.match(text, /молчит|тишина/i);
-  assert.match(text, /События · linux\.auth/);
-  assert.match(text, /сбросить фильтр/);
-  assert.match(text, /\[ПДн\]/);
+  assert.match(text, /Молчат → 1 из 2/);
+  assert.match(text, /ПДн 12,5 %|ПДн 12\.5 %/);
+  // Группы: молчащие отдельно и выше работающих; статус, ритм и последний приём — одной фразой.
+  assert.ok(text.indexOf("Молчат — 1") < text.indexOf("Работают — 1"));
+  assert.ok(text.indexOf("ci.nightly") < text.indexOf("linux.auth"));
+  assert.match(text, /Молчит 3,5 сут · обычно шлёт раз в 24 ч · последнее событие/);
+  assert.match(text, /События источника linux\.auth/);
+  assert.match(text, /Закрыть/);
+  assert.match(text, /login · отказ/);
+  assert.doesNotMatch(text, /\[ПДн\]/);
 
   mocks.queries.sourcesHealth = async () => [];
   mocks.queries.eventsRecent = async () => [];
   text = await pageText(await sources.default(props()));
   assert.match(text, /событий нет/);
-  assert.match(text, /make replay/);
-  assert.match(text, /За 24 часа новых поступлений нет/);
+  assert.doesNotMatch(text, /make replay/, "команд разработчика в пустом состоянии нет");
+  assert.match(text, /Последние события всех источников — в Журнале/);
 
   mocks.queries.sourcesHealth = async () => { throw down(); };
   assert.match(await pageText(await sources.default(props())), /Хранилище недоступно/);
@@ -469,18 +480,20 @@ test("дашборды: список с источником; просмотр �
   routes = dashboardRoutes();
   await auth.createSession("viewer1", "viewer");
   let text = await pageText(await dashboards.default(props()));
-  assert.match(text, /Дашборды · 2/);
+  // Список, а не таблица: ID не виден, встроенный — бейджем, у своего — автор и число панелей.
   assert.match(text, /Операции/);
-  assert.match(text, /provisioning/);
+  assert.match(text, /Встроенный/);
+  assert.match(text, /3 панели/);
+  assert.match(text, /admin · /);
+  assert.doesNotMatch(text, /provisioning|ops-main/);
   assert.doesNotMatch(text, /Создать|Новый дашборд/i, "наблюдатель без формы создания");
 
   text = await pageText(await dashboard.default(props({ id: "ops-main" }, { range: "7d" })));
   assert.match(text, /Операции/);
   assert.match(text, /сводка/);
   assert.match(text, /автообновление 30 с/);
-  assert.match(text, /ряд ·/);
-  assert.match(text, /число ·/);
-  assert.match(text, /таблица ·/);
+  // Тип панели в мете — только редактору; читателю — время запроса.
+  assert.doesNotMatch(text, /ряд ·|число ·|таблица ·/);
   assert.match(text, /total 12 шт/);
   assert.match(text, /linux\.auth/);
   assert.doesNotMatch(text, /Редактировать/, "наблюдатель не редактирует");
@@ -490,10 +503,14 @@ test("дашборды: список с источником; просмотр �
   await auth.createSession("analyst1", "analyst");
   text = await pageText(await dashboard.default(props({ id: "ops-main" })));
   assert.match(text, /Редактировать/);
-  assert.match(text, /Удалить/, "кнопка удаления; текст диалога появляется только после клика");
+  assert.match(text, /ряд ·/);
+  assert.match(text, /таблица ·/);
+  assert.doesNotMatch(text, /Удалить/, "удаление — в редакторе, не рядом с фильтрами времени");
   text = await pageText(await dashboardEdit.default(props({ id: "ops-main" })));
-  assert.match(text, /Редактор · Операции/);
+  assert.match(text, /Операции Редактирование/);
   assert.match(text, /К дашборду/);
+  assert.match(text, /Удалить дашборд/);
+  assert.doesNotMatch(text, /console_dashboards/);
   assert.equal((await dashboard.generateMetadata!(props({ id: "ops-main" }))).title, "Операции · Дашборды");
   assert.equal((await dashboardEdit.generateMetadata!(props({ id: "BAD id" }))).title, "Редактор");
 });
@@ -505,7 +522,9 @@ test("дашборды: нет такого id — 404, плохой id — 404,
   await assert.rejects(dashboard.default(props({ id: "BAD id" })), isNotFound);
   await assert.rejects(dashboardEdit.default(props({ id: "nope" })), isNotFound);
   let text = await pageText(await dashboards.default(props()));
-  assert.match(text, /Дашбордов пока нет — создайте первый/);
+  assert.match(text, /Дашбордов пока нет/);
+  assert.match(text, /Новый дашборд/);
+  assert.doesNotMatch(text, /каталог dashboards/, "команд и путей разработчика в пустом состоянии нет");
 
   chDown = true;
   text = await pageText(await dashboards.default(props()));
@@ -660,12 +679,17 @@ test("источники: фильтры таблицы (последний пр
   text = await pageText(await sources.default(props({}, { eps_min: "100" })));
   assert.match(text, /Нет источников по фильтрам: EPS ≥ 100/);
 
+  // Лента — только у выбранного источника; общая лента всех источников живёт в «Журнале».
+  feedArgs = [];
   text = await pageText(await sources.default(props({}, { level_min: "5", range: "7d" })));
+  assert.equal(feedArgs.length, 0, "без выбранного источника лента не запрашивается");
+  assert.match(text, /Последние события всех источников — в Журнале/);
+  text = await pageText(await sources.default(props({}, { source: "linux.auth", level_min: "5", range: "7d" })));
   assert.match(text, /login/);
   assert.doesNotMatch(text, /cron\.run/);
   assert.deepEqual(feedArgs[2], { time: { range: "7d" }, severity: { min: 5 } });
-  text = await pageText(await sources.default(props({}, { level_min: "10" })));
-  assert.match(text, /Поступлений по фильтрам нет: серьёзность ≥ 10/);
+  text = await pageText(await sources.default(props({}, { source: "linux.auth", level_min: "10" })));
+  assert.match(text, /Поступлений от «linux\.auth» по фильтрам нет: серьёзность ≥ 10/);
 });
 
 test("правила: уровень не ниже, инцидентов за 30 дней и доля ложных — фильтр в памяти по ответу движка", async () => {
