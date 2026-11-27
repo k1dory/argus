@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildTrace, ownerScope, type TraceRow } from "../src/lib/shared/actor-trace";
+import { buildTrace, ownerScope, spanEventsHref, type TraceRow } from "../src/lib/shared/actor-trace";
 import { buildFeed } from "../src/lib/shared/actor-feed";
 import { classifyEvent, type Alias } from "../src/lib/shared/actors";
 import { inTime } from "../src/lib/shared/filters";
@@ -125,3 +125,51 @@ test("review4: самая частая команда topK остаётся ви
   assert.match(it.meta.join(" | "), /systemctl restart api/,
     "общий count корзины нельзя приписывать каждой детали");
 });
+
+
+test("review5: ссылка полосы использует время выбранного actor", () => {
+  const trace = buildTrace([
+    row(),
+    row({ actor: "alice.admin", count: 10,
+      first_ts: stamp(600_000), last_ts: stamp(600_000) }),
+  ]);
+  const span = trace.sessions[0].origins[0].spans[0];
+  const href = spanEventsHref("", span, trace.bucketSec, undefined, ownerScope([
+    alias(),
+    alias({ value: "alice.admin", valid_to: stamp(300_000) }),
+    alias({ value: "alice.admin", valid_from: stamp(540_000) }),
+  ]));
+  assert.ok(href);
+  const f = params(href);
+  assert.equal(parseQuery(f.q).find((t) => t.field === "actor")?.value, "alice.admin");
+  assert.equal(inTime(stamp(600_000), f), true);
+});
+
+test("review5: интервал владения в паузе не создаёт пустой журнал", () => {
+  const rows = [
+    row({ origin: "10.8.0.5" }),
+    row({ origin: "10.8.0.5",
+      first_ts: stamp(600_000), last_ts: stamp(600_000) }),
+  ];
+  const [it] = feed(rows, [
+    alias({ valid_from: stamp(180_000), valid_to: stamp(300_000) }),
+    alias({ kind: "ip", value: "10.8.0.5" }),
+  ]);
+  assert.ok(it.href);
+  const f = params(it.href);
+  assert.ok(rows.some((r) => inTime(r.first_ts, f)),
+    "оба события принадлежат субъекту по IP, но в 08:03–08:05 событий нет");
+});
+
+for (const actor of ["constructor", "__proto__"]) {
+  test(`review5: actor ${actor} сохраняет границы владения`, () => {
+    const [it] = feed([row({ actor })], [
+      alias({ value: actor, valid_to: stamp(60_000) }),
+    ]);
+    assert.ok(it.href);
+    const f = params(it.href);
+    assert.equal(inTime(stamp(0), f, T + 120_000), true);
+    assert.equal(inTime(stamp(70_000), f, T + 120_000), false,
+      "событие следующего владельца не должно попасть в журнал");
+  });
+}

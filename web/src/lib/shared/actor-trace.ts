@@ -32,14 +32,33 @@ export type TraceRow = {
 };
 
 export type TraceAction = { action: string; source: string; count: number; fails: number; first: number; last: number; actors: string[];
-  /** Активность каждого actor действия [первое, последнее] — для окна ссылки. */
-  actorSpan?: Record<string, Segment>;
+  /** Где действие реально было (корзины) — всего и по actor; для окна ссылки. */
+  activity?: Activity;
   /** Команды/объекты действия на узле, частые — первыми (до TRACE_DETAILS_MAX). */
   details: string[] };
 
 export const TRACE_DETAILS_MAX = 5;
 /** Интервал активности внутри полосы. */
 export type Segment = [from: number, to: number];
+
+/** Отрезки активности: строки-корзины без склейки через паузы. Map — имя actor из
+ *  данных не должно совпасть со свойством прототипа (constructor, __proto__). */
+export type Activity = { all: Segment[]; byActor: Map<string, Segment[]> };
+
+function activityOf(items: { actor?: string; firstMs: number; lastMs: number }[]): Activity {
+  const byActor = new Map<string, Segment[]>();
+  const all: Segment[] = [];
+  for (const i of items) {
+    const seg: Segment = [i.firstMs, i.lastMs];
+    all.push(seg);
+    if (!i.actor) continue;
+    const list = byActor.get(i.actor) ?? [];
+    list.push(seg);
+    byActor.set(i.actor, list);
+  }
+  const norm = (l: Segment[]) => mergeSegments(l, 0);
+  return { all: norm(all), byActor: new Map([...byActor].map(([k, v]) => [k, norm(v)])) };
+}
 
 export type TraceSpan = {
   section: Section;
@@ -55,6 +74,7 @@ export type TraceSpan = {
   actors: string[];
   actions: TraceAction[];
   segments: Segment[];
+  activity?: Activity;
   /** Свёрнутая строка «ещё N адресов» (только сеть). */
   folded?: number;
   /** Событие без адреса источника, привязанное к входу на тот же узел. */
@@ -159,13 +179,7 @@ function buildSpan(items: Item[], joinMs: number): TraceSpan {
   }
   for (const e of actions.values()) {
     e.a.actors = rankActors(e.items);
-    const span: Record<string, Segment> = {};
-    for (const i of e.items) {
-      if (!i.actor) continue;
-      const cur = span[i.actor];
-      span[i.actor] = cur ? [Math.min(cur[0], i.firstMs), Math.max(cur[1], i.lastMs)] : [i.firstMs, i.lastMs];
-    }
-    e.a.actorSpan = span;
+    e.a.activity = activityOf(e.items);
     const d = new Map<string, number>();
     for (const i of e.items) {
       const list = i.details ?? [];
@@ -187,6 +201,7 @@ function buildSpan(items: Item[], joinMs: number): TraceSpan {
     actors: rankActors(items),
     actions: [...actions.values()].map((e) => e.a).sort((a, b) => b.count - a.count || a.first - b.first),
     segments: mergeSegments(items.map((i) => [i.firstMs, i.lastMs]), joinMs),
+    activity: activityOf(items),
   };
 }
 
@@ -405,7 +420,7 @@ export const LOGOUT_RE = /logout|logoff|log_off|signout|sign_out|sign-out|discon
  */
 export function spanEventsHref(
   origin: string,
-  s: Pick<TraceSpan, "target" | "target_kind" | "dst_port" | "first" | "last" | "attached"> & { actors?: string[]; actions?: TraceAction[] },
+  s: Pick<TraceSpan, "target" | "target_kind" | "dst_port" | "first" | "last" | "attached"> & { actors?: string[]; actions?: TraceAction[]; activity?: Activity },
   _bucketSec: number,
   action?: TraceAction | string,
   owner?: OwnerScope,
@@ -429,25 +444,34 @@ export function spanEventsHref(
   if (act && typeof action !== "string" && s.target_kind !== "source") q = appendTerm(q, "source", act.source, L);
   if (actionName) q = appendTerm(q, "action", actionName, L);
   if (q.length > TRACE_LINK_Q_MAX) return null;
-  // Окно — активность выбранного actor, а не всего действия: иначе интервал
-  // владения подбирался бы под чужие события и журнал открывался пустым.
-  const own = actor ? act?.actorSpan?.[actor] : undefined;
-  const first = own ? own[0] : act ? act.first : s.first;
-  const last = own ? own[1] : act ? act.last : s.last;
+  // Окно — отрезки реальной активности (выбранного actor или всего действия/
+  // полосы) ∩ интервал владения подтверждающего алиаса. Не min..max: пауза
+  // между событиями с действующим в ней алиасом дала бы пустой журнал.
+  const activity = (act ?? s).activity;
+  const segsFor = (field: "actor" | "src" | "node"): Segment[] => {
+    if (!activity) return [[act ? act.first : s.first, act ? act.last : s.last]];
+    if (field === "actor" && actor) return activity.byActor.get(actor) ?? [];
+    return activity.all;
+  };
   let w: [number, number] | null = null;
-  if (!owner) w = linkWindow(first, last, null);
-  else {
+  if (!owner) {
+    const segs = segsFor(actor ? "actor" : "src");
+    if (segs.length) w = linkWindow(segs[0][0], segs[segs.length - 1][1], null);
+  } else {
     const anchors: ["actor" | "src" | "node", string][] = [];
     if (actor) anchors.push(["actor", actor]);
     if (useSrc) anchors.push(["src", origin]);
     if (s.target_kind === "node" && s.target) anchors.push(["node", s.target]);
-    for (const [field, value] of anchors) {
-      for (const iv of owner(field, value)) {
-        if (iv[1] <= first || iv[0] > last) continue;
-        w = linkWindow(first, last, iv);
-        if (w) break;
+    outer: for (const [field, value] of anchors) {
+      const ivs = owner(field, value);
+      // Свежая активность — первой: ссылка ведёт к последнему, что делал субъект.
+      for (const seg of [...segsFor(field)].reverse()) {
+        for (const iv of ivs) {
+          if (iv[1] <= seg[0] || iv[0] > seg[1]) continue;
+          w = linkWindow(Math.max(seg[0], iv[0]), Math.min(seg[1], iv[1]), iv);
+          if (w) break outer;
+        }
       }
-      if (w) break;
     }
   }
   return w ? `/events?q=${encodeURIComponent(q)}&${windowQuery(w)}` : null;
