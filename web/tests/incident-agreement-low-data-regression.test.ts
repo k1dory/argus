@@ -33,7 +33,7 @@ test("agreement: итоговые доли с n < 20 помечены как м�
   const tree = await page.default({ searchParams: Promise.resolve({}) });
   const tiles = statTiles(tree);
   const missing: string[] = [];
-  for (const label of ["Согласие · слепые", "Согласие · неслепые", "Ложных срабатываний"]) {
+  for (const label of ["Совпало (вслепую)", "Совпало (видели подсказку)", "Ложных срабатываний"]) {
     const tile = tiles.find((element) => element.props.label === label);
     assert.ok(tile, label);
     const text = await pageText(tile);

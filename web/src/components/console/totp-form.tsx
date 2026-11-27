@@ -56,9 +56,9 @@ function EnrollFlow({ user }: { user: string }) {
     <div className="space-y-5">
       {!enroll.secret && (
         <form action={generate} aria-busy={generating || undefined}>
-          <Button type="submit" variant="secondary" disabled={generating}>
+          <Button type="submit" disabled={generating}>
             <QrCode strokeWidth={1.5} />
-            {generating ? "Генерация…" : "Сгенерировать секрет"}
+            {generating ? "Генерация…" : "Включить 2FA"}
           </Button>
         </form>
       )}

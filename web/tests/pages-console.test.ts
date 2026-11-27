@@ -326,11 +326,23 @@ test("правила: таблица с порогом, профилем и до
   assert.match(text, /окно/);
   assert.match(text, /по событию/);
   assert.match(text, /cloud/);
-  assert.match(text, /4 \/ 1 · 25 %/);
+  assert.match(text, /25 % · 1/);
+  assert.doesNotMatch(text, /argus rules test/, "без команд CLI в подписи панели");
+  // Название правила — первой колонкой, перед ID.
+  assert.ok(text.indexOf("Перебор SSH") < text.indexOf("ssh.bruteforce"));
 
+  // Движок недоступен, ClickHouse жив: правила из статистики ложных + плашка отказа движка.
   mocks.queries.engineRules = async () => ({ rules: [], health: null, error: "движок недоступен" });
+  mocks.queries.rulesFalsePositives = async () => ({
+    "ssh.bruteforce": { rule_id: "ssh.bruteforce", total: 4, false_positive: 1, closed: 3, title: "Перебор SSH", level: "high" },
+    "noisy.rule": { rule_id: "noisy.rule", total: 10, false_positive: 8, closed: 2, title: "Шумное правило", level: "low" },
+  });
   text = await pageText(await rules.default(props()));
-  assert.match(text, /Движок корреляции не ответил/);
+  assert.match(text, /Движок корреляции недоступен/);
+  assert.match(text, /Правила с инцидентами за 30 дней/);
+  assert.match(text, /Перебор SSH/);
+  assert.ok(text.indexOf("Шумное правило") < text.indexOf("Перебор SSH"), "шумное — выше");
+  assert.match(text, /80 % · 8/);
 
   mocks.queries.engineRules = async () => ({ rules: [], health: null, error: null });
   mocks.queries.rulesFalsePositives = async () => { throw down(); };
@@ -341,57 +353,134 @@ test("правила: таблица с порогом, профилем и до
 
 /* ===== Настройки ===== */
 
-test("настройки: администратор — пользователи, исключения, реагирование, лицензия, аудит; наблюдатель — без форм", async () => {
+const respondModeForm = require("../src/components/console/respond-mode-form") as typeof import("../src/components/console/respond-mode-form"); // eslint-disable-line @typescript-eslint/no-require-imports
+const ReactRt = require("react") as typeof import("react"); // eslint-disable-line @typescript-eslint/no-require-imports
+
+/** Первый элемент данного типа в дереве; серверные (в т. ч. async) компоненты раскрываются вызовом. */
+async function findElement(n: unknown, type: unknown): Promise<React.ReactElement<Record<string, unknown>> | null> {
+  if (n instanceof Promise) return findElement(await n, type);
+  if (Array.isArray(n)) {
+    for (const c of n) { const f = await findElement(c, type); if (f) return f; }
+    return null;
+  }
+  if (!n || typeof n !== "object" || !("type" in n)) return null;
+  const el = n as React.ReactElement<Record<string, unknown>>;
+  if (el.type === type) return el;
+  if (typeof el.type === "function" && !(el.type as { prototype?: { isReactComponent?: unknown } }).prototype?.isReactComponent) {
+    try {
+      const out = await (el.type as (p: unknown) => unknown)(el.props);
+      const f = await findElement(out, type);
+      if (f) return f;
+    } catch { /* клиентский компонент с хуками — внутрь не идём */ }
+  }
+  return findElement(el.props?.children, type);
+}
+
+test("настройки: вкладки — учётная запись, пользователи, реагирование, исключения, журнал действий, система; наблюдатель — без форм", async () => {
   mocks.queries.listExceptions = async () => [{ rule_id: "ssh.bruteforce", field: "actor.name", value: "scanner", reason: "сканер ИБ", incident_id: "INC-2", created_by: "admin", created_at: NOW }];
   mocks.queries.auditTail = async () => [{ ts: NOW, user: "admin", action: "incident.status", target: "INC-2", detail: "closed" }];
   mocks.queries.licenseStats = async () => ({ peak_eps_30d: 150, avg_eps_7d: 12.34, events_30d: 1_000_000, retention_days: 180, netflow_retention_days: 30, sources: 9 });
   mocks.queries.respondStatus = async () => ({ mode: "ips", mode_from: "console", enabled: true, ttl: "1h", allowlist: ["10.0.0.0/8"], active: [{ ip: "198.51.100.9", incident: "INC-7", until: "0001-01-01 00:00:00", manual: true }], excluded: [{ ip: "192.0.2.44", since: "2026-11-01 10:00:00", until: "2026-11-02 10:00:00", actor: "admin", reason: "сканер партнёра" }], config_errors: ["нет пароля Wazuh"], pending: 2, requested: "ips" });
   mocks.queries.responseLog = async () => [{ ts: NOW, incident_id: "INC-7", rule_id: "r", ip: "198.51.100.9", mode: "manual", executor: "ngfw", dry_run: 0, ok: 0, detail: "timeout", reason: "оператор", actor: "admin" }];
+  const tab = async (t: string) => pageText(await settings.default(props({}, { tab: t })));
 
   await auth.createSession("admin", "admin");
   let text = await pageText(await settings.default(props()));
-  assert.match(text, /Пользователи и роли управляет администратор/);
+  assert.match(text, /^Настройки/, "заголовок через PageHeader");
+  assert.match(text, /Учётная запись Пользователи Реагирование Исключения Журнал действий Система/);
+  assert.match(text, /Смена пароля · admin/);
+  assert.match(text, /Второй фактор выключен/, "у администратора без 2FA — заметное предупреждение");
+  assert.doesNotMatch(text, /Wazuh: 8–64/);
+
+  text = await tab("users");
+  assert.match(text, /Пользователи и роли/);
   assert.match(text, /viewer1/);
   assert.match(text, /это вы/);
-  assert.match(text, /scanner/);
-  assert.match(text, /сканер ИБ/);
+  assert.match(text, /Второй фактор выключен.*Включить 2FA/, "предупреждение и на других вкладках — со ссылкой");
+
+  text = await tab("respond");
   assert.match(text, /IPS — автоблокировка/);
   assert.match(text, /TTL 1h · активных блокировок 1 · в очереди повторов 2/);
-  assert.match(text, /180 сут\., NetFlow — 30 сут\. \(TTL argus\.events\)/);
-  assert.match(text, /конфиг: нет пароля Wazuh/);
+  assert.match(text, /Ошибки в конфигурации исполнителей: нет пароля Wazuh/);
   assert.match(text, /198\.51\.100\.9 \( ?INC-7 ?\) постоянно/);
-  assert.match(text, /10\.0\.0\.0\/8/);
+  assert.match(text, /Никогда не блокируются 10\.0\.0\.0\/8/);
   assert.match(text, /192\.0\.2\.44 до .*admin ?: сканер партнёра/);
   assert.match(text, /Отозвать/);
   assert.match(text, /Исключить/);
-  assert.match(text, /пиковый EPS, 30 д 150/);
-  assert.match(text, /incident\.status/);
+  assert.match(text, /Не удалось заблокировать 198\.51\.100\.9 на ngfw/, "журнал реагирования — человеческим заголовком");
+  assert.doesNotMatch(text, /allowlist/);
+
+  text = await tab("exceptions");
+  assert.match(text, /scanner/);
+  assert.match(text, /сканер ИБ/);
   assert.doesNotMatch(text, /Заглушённые правила/, "без модуля Wazuh мьютов нет");
+
+  text = await tab("audit");
+  assert.match(text, /Когда Кто Действие Объект Подробности/);
+  assert.match(text, /сменил статус инцидента/);
+
+  text = await tab("system");
+  assert.match(text, /Пиковый поток, событий\/с 150/);
+  assert.match(text, /события — 180 сут\., NetFlow — 30 сут\./);
+  assert.doesNotMatch(text, /TTL argus\.events|collector_health_log/);
+  assert.match(text, /Версия консоли/);
 
   process.env.ARGUS_INTEGRATION_WAZUH = "1";
   routes = [{ when: (s) => s.includes("console_rule_mutes") && s.includes("LEFT JOIN"), rows: () => [{ rule_id: 5710, description: "sshd: attempt" }] }];
   mocks.jar.clear();
   await auth.createSession("viewer1", "viewer");
   text = await pageText(await settings.default(props()));
+  assert.doesNotMatch(text, /Второй фактор выключен/, "предупреждение — только администратору");
+  text = await tab("exceptions");
   assert.match(text, /Заглушённые правила/);
   assert.match(text, /# ?5710/);
-  assert.match(text, /наблюдатель — только чтение/);
-  assert.match(text, /переключает администратор/);
-  assert.match(text, /viewer1 · это вы/);
+  text = await tab("users");
+  assert.match(text, /Наблюдатель — только чтение/);
   assert.doesNotMatch(text, /Сбросить пароль/, "кнопки администратора наблюдателю не показываются");
+  text = await tab("respond");
+  assert.match(text, /переключает администратор/);
   assert.match(text, /192\.0\.2\.44 до/, "список исключений виден всем");
-  assert.match(text, /исключает и отзывает администратор/);
+  assert.match(text, /Исключает и отзывает администратор/);
   assert.doesNotMatch(text, /Отозвать/, "отзыв исключения — только администратору");
+  text = await tab("system");
+  assert.doesNotMatch(text, /schema_migrations/, "технические подробности — только администратору");
 });
 
-test("настройки: без ClickHouse правая колонка заменяется окном ошибки, учётная запись и «О системе» остаются", async () => {
+test("настройки: движок недоступен — режим IPS нельзя применить, объяснение рядом; журнал из ClickHouse остаётся", async () => {
+  mocks.queries.respondStatus = async () => ({ mode: "simulate", mode_from: "config", enabled: false, ttl: "", allowlist: [], active: [], excluded: [], config_errors: [], pending: 0, requested: null, error: "engine 502" });
+  mocks.queries.responseLog = async () => [{ ts: NOW, incident_id: "INC-8", rule_id: "r", ip: "203.0.113.7", mode: "ips", executor: "ngfw.edge", dry_run: 0, ok: 1, detail: "POST", reason: "", actor: "argus-engine" }];
+  await auth.createSession("admin", "admin");
+  const node = await settings.default(props({}, { tab: "respond" }));
+  const text = await pageText(node);
+  assert.match(text, /Движок корреляции недоступен/);
+  assert.match(text, /Режим можно сменить, когда движок корреляции ответит/);
+  // Форма режима получает disabled, и её «Применить» действительно неактивна.
+  const form = await findElement(node, respondModeForm.RespondModeForm);
+  assert.ok(form, "форма режима отрисована");
+  assert.equal(form.props.disabled, true, "движок не ответил — режим не применить");
+  const markup = html(ReactRt.createElement(respondModeForm.RespondModeForm, form.props as Parameters<typeof respondModeForm.RespondModeForm>[0]));
+  assert.match(markup, /<button[^>]*type="submit"[^>]*disabled=""[^>]*>Применить/, "«Применить» неактивна");
+  assert.match(text, /Заблокирован 203\.0\.113\.7 на ngfw\.edge/);
+  assert.doesNotMatch(text, /POST/, "HTTP-глагол исполнителя не показывается");
+});
+
+test("настройки: без ClickHouse ошибка — внутри своих панелей; учётная запись, режим реагирования и «О системе» остаются", async () => {
   await auth.createSession("analyst1", "analyst");
   mocks.queries.listExceptions = async () => { throw down(); };
-  const text = await pageText(await settings.default(props()));
-  assert.match(text, /Мьюты, исключения, реагирование, лицензия и аудит недоступны/);
+  mocks.queries.responseLog = async () => { throw down(); };
+  mocks.queries.licenseStats = async () => { throw down(); };
+  mocks.queries.respondStatus = async () => ({ mode: "ids", mode_from: "config", enabled: true, ttl: "1h", allowlist: [], active: [], excluded: [], config_errors: [], pending: 0, requested: null });
+  let text = await pageText(await settings.default(props()));
   assert.match(text, /Смена пароля · analyst1/);
+  text = await pageText(await settings.default(props({}, { tab: "exceptions" })));
+  assert.match(text, /Исключения недоступны/);
+  text = await pageText(await settings.default(props({}, { tab: "respond" })));
+  assert.match(text, /Сейчас: IDS — только детект/, "режим из движка виден и без хранилища");
+  assert.match(text, /Журнал реагирования недоступен/);
+  text = await pageText(await settings.default(props({}, { tab: "system" })));
+  assert.match(text, /Объём данных недоступен/);
   assert.match(text, /О системе/);
-  assert.match(text, /версия консоли/);
+  assert.match(text, /Версия консоли/);
 });
 
 /* ===== Поиск ===== */
@@ -521,16 +610,17 @@ test("дашборды: нет такого id — 404, плохой id — 404,
 test("вход: без сессии — форма; с SSO — кнопка и текст отказа; с сессией — редирект на next", async () => {
   delete process.env.OIDC_ISSUER;
   let text = await pageText(await login.default(props({}, { next: "//evil.example" })));
-  assert.match(text, /Вход в консоль/);
+  assert.match(text, /Вход в ARGUS/);
   assert.match(text, /Пользователь/);
-  assert.doesNotMatch(text, /SSO/);
+  assert.doesNotMatch(text, /корпоративн/);
+  assert.doesNotMatch(text, /стартовый пароль/, "пароль admin уже сменён — подсказки про файл нет");
 
   process.env.OIDC_ISSUER = "https://idp.example/application/o/argus/";
   process.env.OIDC_CLIENT_ID = "argus";
   process.env.OIDC_REDIRECT_URL = "https://argus.example:8443/api/auth/oidc/callback";
   text = await pageText(await login.default(props({}, { sso: "denied" })));
-  assert.match(text, /Войти через SSO/);
-  assert.match(text, /группа не сопоставлена роли/);
+  assert.match(text, /Войти через корпоративную учётную запись/);
+  assert.match(text, /не подтвердил учётную запись/);
   text = await pageText(await login.default(props({}, { sso: "state" })));
   assert.match(text, /https:\/\/argus\.example:8443/);
   delete process.env.OIDC_ISSUER;
@@ -684,7 +774,7 @@ test("правила: уровень не ниже, инцидентов за 30
     "vpn.geo": { rule_id: "vpn.geo", total: 10, false_positive: 8, closed: 2 },
   });
   let text = await pageText(await rules.default(props({}, { level_min: "high" })));
-  assert.match(text, /Загруженные правила · 2 из 3/);
+  assert.match(text, /Загруженные правила 2 из 3/);
   assert.doesNotMatch(text, /exec в pod/);
   text = await pageText(await rules.default(props({}, { fp_min: "50" })));
   assert.match(text, /VPN из новой страны/);
@@ -693,7 +783,7 @@ test("правила: уровень не ниже, инцидентов за 30
   assert.match(text, /Перебор SSH/);
   assert.doesNotMatch(text, /VPN из новой страны|exec в pod/);
   text = await pageText(await rules.default(props({}, { incidents_min: "100" })));
-  assert.match(text, /Нет правил по фильтрам: инцидентов ≥ 100/);
+  assert.match(text, /Нет правил по фильтрам.*инцидентов ≥ 100/);
 });
 
 test("поиск: level_min/level_max — условие на серьёзность индекса параметрами; форма запроса их сохраняет", async () => {

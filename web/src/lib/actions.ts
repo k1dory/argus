@@ -29,6 +29,8 @@ import { setRuleMuted } from "./queries";
 import { audit } from "./argus-queries";
 
 export type FormState = { error: string | null; ok?: boolean; requiresTotp?: boolean; totpUser?: string; message?: string;
+  /** Введённый логин: после неудачного входа форма показывает его снова (React 19 сбрасывает поля формы после action). */
+  user?: string;
   /** Действие выполнено, но с оговоркой (например, решение не сохранится после рестарта движка). */
   warning?: string };
 
@@ -63,14 +65,14 @@ export async function loginAction(_prev: FormState, formData: FormData): Promise
   await clearLoginTotp();
   const user = String(formData.get("user") ?? "").trim().toLowerCase().slice(0, 64);
   if (await loginThrottled(user)) {
-    return { error: "Слишком много неудачных попыток — подождите несколько минут" };
+    return { error: "Слишком много неудачных попыток — подождите несколько минут", user };
   }
   const password = String(formData.get("password") ?? "");
   const role = await verifyCredentials(user, password);
   if (!role) {
     await recordLoginFailure(user);
     await audit(user || "-", "session.login.failed", user || "-", "неверный логин или пароль");
-    return { error: "Неверный логин или пароль" };
+    return { error: "Неверный логин или пароль", user };
   }
   if (await isTotpEnabled(user)) {
     await beginLoginTotp(user);
