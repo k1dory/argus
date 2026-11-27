@@ -63,15 +63,17 @@ beforeEach(() => {
 
 test("агенты Wazuh: таблица с критичными; пусто; без хранилища", async () => {
   await auth.createSession("viewer1", "viewer");
+  mocks.wazuh.listAgents = async () => { throw new WazuhApiError("timeout", 0); };
   routes = [{ when: (s) => s.includes("uniqExact(rule_id) AS rules"), rows: () => [{ agent_name: "web-01", alerts: "40", critical: "3", rules: "7", last_alert: NOW }, { agent_name: "db-01", alerts: "2", critical: "0", rules: "1", last_alert: NOW }] }];
   let text = await pageText(await agents.default(props({}, { range: "7d" })));
-  assert.match(text, /Активность агентов · 2 шт\./);
+  assert.match(text, /Агенты · 2/);
   assert.match(text, /web-01/);
   assert.match(text, /40 3 7/, "алерты · критичные · правила");
+  assert.match(text, /Статус подключения неизвестен/, "без API — честная плашка, а не пустота");
 
   routes = [];
   text = await pageText(await agents.default(props()));
-  assert.match(text, /агенты либо молчат/);
+  assert.match(text, /Агентов нет/);
 
   chDown = true;
   assert.match(await pageText(await agents.default(props())), /Хранилище недоступно/);
@@ -90,7 +92,10 @@ test("алерты Wazuh: журнал с сортировкой, заглушё
   ];
   await auth.createSession("analyst1", "analyst");
   let text = await pageText(await alerts.default(props({}, { sort: "level", dir: "asc", level: "5", agent: "web-01", q: "ssh", page: "2", muted: "1" })));
-  assert.match(text, /Журнал · 250 записей/);
+  assert.match(text, /Алерты · 250/);
+  assert.equal((text.match(/Применить/g) ?? []).length, 1, "одна кнопка отправки фильтров");
+  assert.doesNotMatch(text, /Найти/);
+  assert.match(text, /sshd: attempt заглушено/, "заглушённое правило помечено словом, а не прозрачностью");
   assert.match(text, /заглушено правил: 1/);
   assert.match(text, /Скрыть заглушённые/);
   assert.match(text, /sshd: brute force/);
@@ -107,7 +112,7 @@ test("алерты Wazuh: журнал с сортировкой, заглушё
 
   routes = routes.filter((r) => !r.when("SELECT timestamp, agent_name, rule_id"));
   text = await pageText(await alerts.default(props()));
-  assert.match(text, /Ничего не найдено — измените фильтры/);
+  assert.match(text, /Алертов не найдено/);
 
   chDown = true;
   assert.match(await pageText(await alerts.default(props())), /Хранилище недоступно/);
@@ -149,39 +154,76 @@ test("политики: сводка, статусы pass/fail/unknown и соо
   assert.match(text, /Нарушений 1/);
   assert.match(text, /Неизвестно 1/);
   assert.match(text, /Соответствие 67 %/, "(3 − 1) / 3 без unknown");
-  assert.match(text, /версия устарела; агент отключён/);
+  assert.match(text, /нарушение агент web-01 wazuh\/agent версия устарела агент отключён/, "нарушения — списком, нарушение первым");
   assert.match(text, /SCA fetch failed/);
   assert.match(text, /оценка от 2026-10-29/);
 
   routes = [{ when: (s) => s.includes("system.columns"), rows: () => [{ n: "1" }] }];
   text = await pageText(await policies.default(props()));
-  assert.match(text, /Вердиктов пока нет/);
+  assert.match(text, /Результатов проверок пока нет/);
   assert.match(text, /Соответствие —/);
 
   chDown = true;
   assert.match(await pageText(await policies.default(props())), /Хранилище недоступно/);
 });
 
-test("уязвимости: активные и устранённые, бейджи серьёзности; пусто; без хранилища", async () => {
+/** Итоги витрины CVE так, как их посчитал бы агрегат vulnSummary. */
+const vulnSummaryRow = (rows: { severity: string; status: string }[]) => {
+  const active = rows.filter((v) => v.status !== "Solved");
+  return [{ total: String(rows.length), active: String(active.length), critical: String(active.filter((v) => v.severity === "Critical").length), high: String(active.filter((v) => v.severity === "High").length) }];
+};
+const isVulnSummary = (s: string) => s.includes("AS active") && s.includes("FROM wazuh_alerts");
+
+test("уязвимости: активные отдельно от устранённых, бейджи серьёзности; пусто с реальным периодом; без хранилища", async () => {
   await auth.createSession("viewer1", "viewer");
-  routes = [{ when: (s) => s.includes("vuln_cve AS cve"), rows: () => [
+  const VULNS = [
     { cve: "CVE-2026-0001", severity: "Critical", score: "9.8", pkg: "openssl", pkg_version: "3.0.1", agent_name: "web-01", status: "Active", last_seen: NOW },
     { cve: "CVE-2026-0002", severity: "High", score: "7.5", pkg: "curl", pkg_version: "", agent_name: "", status: "Solved", last_seen: NOW },
     { cve: "CVE-2026-0003", severity: "Low", score: "0", pkg: "vim", pkg_version: "", agent_name: "db-01", status: "", last_seen: NOW },
-  ] }];
+  ];
+  const sqls: string[] = [];
+  routes = [
+    { when: (s) => s.includes("vuln_cve AS cve"), rows: () => VULNS.filter((v) => (sqls.at(-1)?.includes("status != 'Solved'") ? v.status !== "Solved" : sqls.at(-1)?.includes("status = 'Solved'") ? v.status === "Solved" : true)) },
+    { when: isVulnSummary, rows: () => vulnSummaryRow(VULNS) },
+  ];
+  routes.unshift({ when: (s) => { if (s.includes("vuln_cve AS cve")) sqls.push(s); return false; }, rows: () => [] });
   let text = await pageText(await vulns.default(props()));
   assert.match(text, /Активных CVE 2/);
   assert.match(text, /Критических 1/);
   assert.match(text, /Устранено 1/);
   assert.match(text, /CVE-2026-0001/);
+  assert.doesNotMatch(text, /CVE-2026-0002/, "по умолчанию — только активные: устранённая скрыта");
   assert.match(text, /openssl 3\.0\.1/);
   assert.match(text, /9,8|9\.8/);
+  assert.match(text, /Активные 2 Устранённые 1 Все 3/);
+
+  text = await pageText(await vulns.default(props({}, { status: "solved" })));
+  assert.match(text, /CVE-2026-0002/);
+  assert.doesNotMatch(text, /CVE-2026-0001/);
 
   routes = [];
-  text = await pageText(await vulns.default(props()));
-  assert.match(text, /включите модуль в ossec\.conf/);
+  text = await pageText(await vulns.default(props({}, { range: "7d" })));
+  assert.match(text, /Уязвимостей за 7 дней не найдено/, "период — выбранный, а не «30 дней»");
+  assert.match(text, /попросите администратора/, "наблюдателю — без ossec.conf");
+  assert.doesNotMatch(text, /ossec\.conf/);
   chDown = true;
   assert.match(await pageText(await vulns.default(props())), /Хранилище недоступно/);
+});
+
+test("уязвимости: итоги — по всем записям, а не по обрезанному списку; обрезка помечена", async () => {
+  await auth.createSession("viewer1", "viewer");
+  const { VULN_LIMIT } = await import("../src/lib/queries");
+  const many = Array.from({ length: VULN_LIMIT }, (_, i) => ({ cve: `CVE-2026-${String(i).padStart(5, "0")}`, severity: "Medium", score: "5", pkg: "p", pkg_version: "", agent_name: "a", status: "Active", last_seen: NOW }));
+  routes = [
+    { when: (s) => s.includes("vuln_cve AS cve"), rows: () => many },
+    // В хранилище записей больше, чем влезло в таблицу: 500 активных, 12 критических.
+    { when: isVulnSummary, rows: () => [{ total: "520", active: "500", critical: "12", high: "40" }] },
+  ];
+  const text = await pageText(await vulns.default(props()));
+  assert.match(text, /Активных CVE 500/, "плитка — честный итог, а не длина списка");
+  assert.match(text, /Критических 12/);
+  assert.match(text, /Устранено 20/);
+  assert.match(text, new RegExp(`показаны первые ${VULN_LIMIT} из 500`));
 });
 
 /* ===== Диапазоны витрин: фильтр сужает выдачу по тому, что дошло до ClickHouse ===== */
@@ -206,7 +248,7 @@ test("алерты: level_min/level_max и точный интервал дох�
     { when: (s) => s.includes("count() AS total FROM wazuh_alerts"), rows: (p) => [{ total: String(pick(p).length) }] },
   ];
   let text = await pageText(await alerts.default(props({}, { level_min: "7", level_max: "12" })));
-  assert.match(text, /Журнал · 1 записей/);
+  assert.match(text, /Алерты · 1(?!\d)/);
   assert.match(text, /sshd: brute force/);
   assert.doesNotMatch(text, /rootkit found|sshd: attempt/);
   assert.equal(seen.at(-1)?.get("param_t_hours"), "24", "окно по умолчанию — 24 часа");
@@ -219,11 +261,11 @@ test("алерты: level_min/level_max и точный интервал дох�
   assert.equal(seen.at(-1)?.get("param_t_from"), "2026-10-28 00:00:00", "перепутанные границы — по порядку");
   assert.equal(seen.at(-1)?.get("param_t_to"), "2026-10-29 00:00:00");
   assert.equal(seen.at(-1)?.get("param_t_hours"), null, "точный интервал главнее пресета");
-  assert.match(text, /Ничего не найдено \(интервал 2026-10-28 00:00 — 2026-10-29 00:00 UTC, уровень ≥ 14\)/);
+  assert.match(text, /Алертов не найдено По фильтрам: интервал 2026-10-28 00:00 — 2026-10-29 00:00 UTC, уровень ≥ 14/);
 
   // Мусор в параметрах не роняет страницу и не доходит до запроса.
   text = await pageText(await alerts.default(props({}, { level_min: "abc", from: "2026-02-31T00:00", range: "1y" })));
-  assert.match(text, /Журнал · 3 записей/);
+  assert.match(text, /Алерты · 3/);
   assert.equal(seen.at(-1)?.get("param_lvl_min"), null);
   assert.equal(seen.at(-1)?.get("param_t_from"), null);
 });
@@ -235,15 +277,16 @@ test("агенты: пороги алертов/критичных (HAVING) и �
     { agent_name: "db-01", alerts: "2", critical: "0", rules: "1", last_alert: NOW },
   ];
   let seen: URLSearchParams | null = null;
+  mocks.wazuh.listAgents = async () => { throw new WazuhApiError("timeout", 0); };
   routes = [{ when: (s) => s.includes("uniqExact(rule_id) AS rules"), rows: (p) => { seen = p; return AGENTS_ROWS.filter((a) => within(p, "al", Number(a.alerts)) && within(p, "cr", Number(a.critical))); } }];
   let text = await pageText(await agents.default(props({}, { alerts_min: "10", level_min: "7", range: "7d" })));
-  assert.match(text, /Активность агентов · 1 шт\./);
+  assert.match(text, /Агенты · 1/);
   assert.match(text, /web-01/);
   assert.doesNotMatch(text, /db-01/);
   assert.equal(seen!.get("param_lvl_min"), "7");
   assert.equal(seen!.get("param_t_hours"), "168");
   text = await pageText(await agents.default(props({}, { critical_min: "5" })));
-  assert.match(text, /Нет агентов по фильтрам: критичных ≥ 5/);
+  assert.match(text, /Нет агентов по фильтрам критичных ≥ 5/);
 });
 
 test("MITRE: уровень правила и интервал сужают техники", async () => {
@@ -284,9 +327,9 @@ test("уязвимости: серьёзность не ниже и CVSS от–
   routes = [{ when: (s) => s.includes("vuln_cve AS cve"), rows: (p) => {
     seen = p;
     return VULNS.filter((v) => within(p, "cvss", Number(v.score)) && (p.get("param_sev_min") === null || within(p, "sev", rank(p, v.severity))));
-  } }];
+  } }, { when: isVulnSummary, rows: (p) => vulnSummaryRow(VULNS.filter((v) => within(p, "cvss", Number(v.score)) && (p.get("param_sev_min") === null || within(p, "sev", rank(p, v.severity))))) }];
   let text = await pageText(await vulns.default(props({}, { level_min: "high" })));
-  assert.match(text, /CVE по агентам и пакетам · 2 записей/);
+  assert.match(text, /CVE по агентам и пакетам · 2(?!\d)/);
   assert.doesNotMatch(text, /CVE-2026-0003/);
   assert.equal(seen!.get("param_t_hours"), "720", "окно по умолчанию — 30 дней");
   text = await pageText(await vulns.default(props({}, { cvss_min: "8", cvss_max: "10" })));
@@ -295,7 +338,7 @@ test("уязвимости: серьёзность не ниже и CVSS от–
   text = await pageText(await vulns.default(props({}, { from: "2026-01-01T00:00", to: "2026-10-29T00:00" })));
   assert.equal(seen!.get("param_t_from"), "2026-09-29 00:00:00", "точное окно подтянуто до 30 дней");
   text = await pageText(await vulns.default(props({}, { cvss_min: "9.9" })));
-  assert.match(text, /Нет CVE по фильтрам: CVSS ≥ 9\.9/);
+  assert.match(text, /Нет CVE по фильтрам CVSS ≥ 9\.9, за 30 дней/);
 });
 
 /* ===== Управление менеджером ===== */
@@ -318,14 +361,19 @@ test("управление: аналитик — мастер установки
   assert.match(text, /Добавить агента/);
   assert.match(text, /wazuh\.example/, "адрес менеджера из WAZUH_API_URL в команде установки");
   assert.match(text, /Менеджер 4\.9\.0/);
+  assert.match(text, /Управление Wazuh/);
   assert.match(text, /Агентов 3/);
-  assert.match(text, /Активных 2/);
+  assert.match(text, /Не на связи 1/, "отключённые посчитаны отдельно");
   assert.match(text, /Групп 2/);
-  assert.match(text, /web ×/, "группу можно убрать");
+  assert.match(text, /Убрать из группы web/, "группу убирает отдельная кнопка внутри бейджа");
+  assert.ok(text.indexOf("db-01") < text.indexOf("web-01"), "отключённый агент — наверху таблицы");
+  assert.ok(text.indexOf("db-01") < text.indexOf("Пароль регистрации") || !/Пароль регистрации/.test(text), "мастер установки — после таблицы");
+  assert.ok(text.lastIndexOf("Агенты · 3") < text.indexOf("команда установки"), "таблица агентов первой, мастер — ниже");
   assert.match(text, /Перезапустить агента/);
   assert.doesNotMatch(text, /Перезапустить менеджер/, "рестарт менеджера — только администратор");
   assert.match(text, /Debian/);
-  assert.match(text, /disconnected/);
+  assert.match(text, /отключён/, "статус — из словаря, не сырой");
+  assert.doesNotMatch(text, /disconnected|never_connected/);
 
   mocks.jar.clear();
   await auth.createSession("admin", "admin");
@@ -342,8 +390,15 @@ test("управление: аналитик — мастер установки
 
   mocks.wazuh.listAgents = async () => { throw new WazuhApiError("timeout", 0); };
   text = await pageText(await manage.default(props()));
-  assert.match(text, /Менеджер Wazuh не подключён/);
-  assert.match(text, /WAZUH_API_URL/);
+  assert.match(text, /Wazuh недоступен/);
+  assert.match(text, /менеджер Wazuh не отвечает/);
+  assert.doesNotMatch(text, /WAZUH_API_URL/, "переменные окружения — только администратору");
+  assert.doesNotMatch(text, /Добавить агента/);
+
+  mocks.jar.clear();
+  await auth.createSession("admin", "admin");
+  text = await pageText(await manage.default(props()));
+  assert.match(text, /WAZUH_API_URL/, "администратору — что проверить");
 });
 
 test("группы: список с удалением для администратора; карточка группы с agent.conf и 404; API недоступен", async () => {
@@ -353,19 +408,19 @@ test("группы: список с удалением для администр
 
   await auth.createSession("admin", "admin");
   let text = await pageText(await groups.default(props()));
-  assert.match(text, /Группы · 2 шт\./);
-  assert.match(text, /ab12/);
+  assert.match(text, /Группы · 2/);
+  assert.match(text, /default 2 заданы/, "вместо контрольной суммы — «заданы / не заданы»");
   assert.match(text, /Удалить группу/, "не default — можно удалить");
   assert.match(text, /Группа|Создать/);
 
   text = await pageText(await group.default(props({ group: "default" })));
-  assert.match(text, /Агенты в группе · 1 шт\./);
+  assert.match(text, /Агенты в группе · 1/);
   assert.match(text, /web-01/);
   assert.match(text, /localfile/, "реальный agent.conf");
   assert.match(text, /Ctrl\+S/);
 
   text = await pageText(await group.default(props({ group: "web" })));
-  assert.match(text, /Конфигурация группы; разъедется/, "404 на agent.conf — шаблон");
+  assert.match(text, /Настройки группы: применятся/, "404 на agent.conf — шаблон");
 
   mocks.jar.clear();
   await auth.createSession("viewer1", "viewer");
@@ -380,9 +435,9 @@ test("группы: список с удалением для администр
   await assert.rejects(group.default(props({ group: "ghost" })), isNotFound);
   mocks.wazuh.groupAgents = async () => { throw new WazuhApiError("boom", 500); };
   text = await pageText(await group.default(props({ group: "default" })));
-  assert.match(text, /Wazuh API недоступен/);
+  assert.match(text, /Wazuh недоступен/);
   mocks.wazuh.listGroups = async () => { throw new Error("ECONNREFUSED"); };
-  assert.match(await pageText(await groups.default(props())), /Wazuh API недоступен/);
+  assert.match(await pageText(await groups.default(props())), /Wazuh недоступен/);
 });
 
 test("правила Wazuh: список файлов; редактор файла; новый файл только администратору; API недоступен", async () => {
@@ -391,9 +446,10 @@ test("правила Wazuh: список файлов; редактор файл
 
   await auth.createSession("admin", "admin");
   let text = await pageText(await ruleFiles.default(props()));
-  assert.match(text, /Файлы правил · 1 шт\./);
-  assert.match(text, /local_rules\.xml/);
-  assert.match(text, /применяются рестартом менеджера/);
+  assert.match(text, /Правила Wazuh/);
+  assert.match(text, /Файлы правил · 1/);
+  assert.match(text, /local_rules\.xml включён/, "статус файла — словом");
+  assert.match(text, /вступают в силу после перезапуска менеджера/);
 
   text = await pageText(await ruleFile.default(props({ file: "local_rules.xml" })));
   assert.match(text, /Редактор · etc\/rules\/local_rules\.xml/);
@@ -412,9 +468,9 @@ test("правила Wazuh: список файлов; редактор файл
   await assert.rejects(ruleFile.default(props({ file: "../ossec.conf" })), isNotFound);
 
   mocks.wazuh.listRuleFiles = async () => [];
-  assert.match(await pageText(await ruleFiles.default(props())), /Кастомных файлов пока нет/);
+  assert.match(await pageText(await ruleFiles.default(props())), /Собственных файлов правил пока нет/);
   mocks.wazuh.listRuleFiles = async () => { throw new Error("ECONNREFUSED"); };
-  assert.match(await pageText(await ruleFiles.default(props())), /Wazuh API недоступен/);
+  assert.match(await pageText(await ruleFiles.default(props())), /Wazuh недоступен/);
   mocks.wazuh.getRuleFile = async () => { throw new WazuhApiError("boom", 500); };
-  assert.match(await pageText(await ruleFile.default(props({ file: "local_rules.xml" }))), /Wazuh API недоступен/);
+  assert.match(await pageText(await ruleFile.default(props({ file: "local_rules.xml" }))), /Wazuh недоступен/);
 });

@@ -5,6 +5,7 @@
 // команда просит ввести его на хосте.
 import { useState } from "react";
 import { Check, Copy } from "lucide-react";
+import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -60,7 +61,8 @@ export function AgentWizard({ version, managerHost, groups, passwordRequired }: 
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     } catch {
-      /* буфер недоступен (http без TLS) — команду можно выделить руками */
+      // Буфер недоступен (http без TLS) — команду можно выделить руками.
+      toast.error("Буфер обмена недоступен — выделите команду вручную");
     }
   };
 
@@ -79,8 +81,8 @@ export function AgentWizard({ version, managerHost, groups, passwordRequired }: 
           <Input id="agent-manager" value={manager} onChange={(e) => setManager(e.target.value.trim())} placeholder="wazuh.example.org" className="h-9 px-3 font-mono" />
         </div>
         <div className="min-w-0 space-y-2">
-          <Label htmlFor="agent-name" className="c-label">Имя агента (пусто — hostname)</Label>
-          <Input id="agent-name" value={name} onChange={(e) => setName(e.target.value)} placeholder="web-01" className="h-9 px-3 font-mono" />
+          <Label htmlFor="agent-name" className="c-label">Имя агента</Label>
+          <Input id="agent-name" value={name} onChange={(e) => setName(e.target.value)} placeholder="по умолчанию — имя хоста" className="h-9 px-3 font-mono" />
         </div>
         <div className="min-w-0 space-y-2">
           <Label htmlFor="agent-group" className="c-label">Группа</Label>

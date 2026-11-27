@@ -1,9 +1,11 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { ArrowLeft } from "lucide-react";
-import { Led, Panel } from "@/components/console/panel";
+import { Empty, PageHeader, Panel } from "@/components/console/panel";
 import { GroupConfEditor } from "@/components/console/manage-forms";
-import { Button } from "@/components/ui/button";
+import { ServiceUnavailable } from "@/components/console/service-unavailable";
+import { fmtNum } from "@/lib/shared/time";
+import { AgentStatusBadge } from "../../../_shared/status-badge";
+import { wazuhAgentHref } from "../../../_shared/links";
 import { getGroupConf, groupAgents, WazuhApiError, type WzAgent } from "@/lib/wazuh-api";
 import { requirePageSession } from "@/lib/auth";
 import { GROUP_NAME_RE } from "@/lib/shared/wazuh-names";
@@ -12,7 +14,7 @@ export const dynamic = "force-dynamic";
 export const metadata = { title: "Группа агентов" };
 
 const DEFAULT_CONF = `<agent_config>
-  <!-- Конфигурация группы; разъедется на агентов при следующем keepalive -->
+  <!-- Настройки группы: применятся к её агентам при следующем подключении -->
 </agent_config>
 `;
 
@@ -28,7 +30,7 @@ export default async function GroupDetailPage({
 
   let agents: WzAgent[] = [];
   let conf = DEFAULT_CONF;
-  let offline: string | null = null;
+  let error: string | null = null;
   try {
     // Шаблон подставляем ТОЛЬКО на 404 (файла ещё нет). Любая другая ошибка
     // (таймаут, 500) должна остановить рендер редактора — иначе «Сохранить»
@@ -42,47 +44,38 @@ export default async function GroupDetailPage({
     ]);
   } catch (err) {
     if (err instanceof WazuhApiError && err.status === 404) notFound();
-    console.error("manage/groups/[group]:", err instanceof Error ? err.message : err);
-    offline = "Wazuh API недоступен — подробности в логе консоли";
+    error = err instanceof Error ? err.message : String(err);
+    console.error("manage/groups/[group]:", error);
   }
 
   return (
     <>
-      <div className="flex flex-wrap items-center justify-between gap-4">
-        <h1 className="text-3xl tracking-tight">
-          Группа <span className="font-mono">{name}</span>
-        </h1>
-        <Button asChild variant="ghost" size="sm">
-          <Link href="/wazuh/manage/groups">
-            <ArrowLeft strokeWidth={1.5} />
-            Ко всем группам
-          </Link>
-        </Button>
-      </div>
+      <PageHeader
+        title={<>Группа <span className="font-mono">{name}</span></>}
+        back={{ href: "/wazuh/manage/groups", label: "Группы агентов" }}
+        subtitle="Настройки группы применяются ко всем её агентам при следующем подключении."
+      />
 
-      {offline ? (
-        <Panel label="Wazuh manager API · недоступен">
-          <p className="text-sm text-destructive">{offline}</p>
-        </Panel>
+      {error ? (
+        <ServiceUnavailable service="wazuh" what="агентов и настройки группы" reason={error} />
       ) : (
         <div className="grid gap-6 lg:grid-cols-[1fr_1.4fr]">
-          <Panel label={`Агенты в группе · ${agents.length} шт.`}>
+          <Panel label={`Агенты в группе · ${fmtNum(agents.length)}`}>
             {agents.length === 0 ? (
-              <p className="text-sm text-muted-foreground">
-                Пусто — добавьте агентов на странице «Управление»
-              </p>
+              <Empty
+                title="В группе нет агентов"
+                hint={<>Добавить агента в группу можно на странице <Link href="/wazuh/manage" className="text-[var(--ring)] hover:underline">«Управление Wazuh»</Link>.</>}
+              />
             ) : (
               <ul className="space-y-2">
                 {agents.map((a) => (
                   <li
                     key={a.id}
-                    className="flex items-center gap-3 border border-border bg-[var(--surface-deep)] px-3 py-2"
+                    className="flex items-center gap-3 rounded-md border border-border bg-[var(--surface-deep)] px-3 py-2"
                   >
-                    <Led
-                      color={a.status === "active" ? "var(--status-ok)" : "var(--status-err)"}
-                    />
                     <span className="font-mono text-xs text-muted-foreground">{a.id}</span>
-                    <span className="text-sm">{a.name}</span>
+                    <Link href={wazuhAgentHref(a.name)} className="text-sm hover:underline">{a.name}</Link>
+                    <AgentStatusBadge status={a.status} />
                     <span className="ml-auto font-mono text-xs text-muted-foreground">
                       {a.version ?? ""}
                     </span>
@@ -92,7 +85,7 @@ export default async function GroupDetailPage({
             )}
           </Panel>
 
-          <Panel label="agent.conf · централизованная конфигурация группы" meta={isAdmin ? "Ctrl+S — сохранить" : "только чтение"}>
+          <Panel label="Настройки группы (agent.conf)" meta={isAdmin ? "Ctrl+S — сохранить" : "только чтение — редактирует администратор"}>
             <GroupConfEditor group={name} initialXml={conf} readOnly={!isAdmin} />
           </Panel>
         </div>
