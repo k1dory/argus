@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { NextResponse, type NextRequest } from "next/server";
+import { renewSessionToken, SESSION_COOKIE, sessionCookieOptions } from "@/lib/auth";
 
 // Прокидывает путь запроса серверным компонентам (requirePageSession
 // строит из него ?next= при редиректе на /login) и выдаёт CSP с nonce на
@@ -29,7 +30,7 @@ export function cspHeader(nonce: string): string {
   ].join("; ");
 }
 
-export function proxy(req: NextRequest) {
+export async function proxy(req: NextRequest) {
   const nonce = randomBytes(16).toString("base64");
   const csp = cspHeader(nonce);
   const headers = new Headers(req.headers);
@@ -39,6 +40,13 @@ export function proxy(req: NextRequest) {
   headers.set("content-security-policy", csp);
   const res = NextResponse.next({ request: { headers } });
   res.headers.set("Content-Security-Policy", csp);
+  // Скользящая сессия: активный пользователь не вылетает посреди разбора.
+  // Только для запросов с кукой консоли; bearer-токены API не продлеваются.
+  const token = req.cookies.get(SESSION_COOKIE)?.value;
+  if (token) {
+    const renewed = await renewSessionToken(token).catch(() => null);
+    if (renewed) res.cookies.set(SESSION_COOKIE, renewed.token, sessionCookieOptions(renewed.maxAge));
+  }
   return res;
 }
 
