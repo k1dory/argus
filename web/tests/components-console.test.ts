@@ -38,9 +38,11 @@ const autoRefresh = C<typeof import("../src/components/console/auto-refresh")>("
 const download = C<typeof import("../src/components/console/download-button")>("download-button");
 const refresh = C<typeof import("../src/components/console/refresh-data-button")>("refresh-data-button");
 const copyable = C<typeof import("../src/components/console/copyable")>("copyable");
-const histogram = C<typeof import("../src/components/console/journal/histogram")>("journal/histogram");
+const histogram = C<typeof import("../src/components/console/time-histogram")>("time-histogram");
+const { SEVERITY, SEVERITY_MAX } = require("../src/lib/shared/severity") as typeof import("../src/lib/shared/severity");
 const raw = C<typeof import("../src/components/console/journal/raw-block")>("journal/raw-block");
 const feed = C<typeof import("../src/components/console/journal/event-feed")>("journal/event-feed");
+const searchHit = C<typeof import("../src/components/console/search-hit")>("search-hit");
 const filterBar = C<typeof import("../src/components/console/journal/filter-bar")>("journal/filter-bar");
 const alertsFilters = C<typeof import("../src/components/console/alerts-filters")>("alerts-filters");
 const rangeFilters = C<typeof import("../src/components/console/range-filters")>("range-filters");
@@ -194,14 +196,15 @@ test("response-log: пусто; симуляция и ручной режим; c
 test("search-hit: индекс alerts и events — ссылки по полям, тон серьёзности, время, подробности с JSON", () => {
   const cols = [{ key: "time", label: "Время" }, { key: "rule_level", label: "Ур." }, { key: "rule_id", label: "Правило" }, { key: "agent_name", label: "Агент" }, { key: "srcip", label: "srcip" }];
   const row = { time: NOW, rule_level: 12, rule_id: 5763, agent_name: "web-01", srcip: "203.0.113.5", raw: "{\"a\":1}" };
-  const a = html(h("table", null, h("tbody", null, h(hit.SearchHit, { row, columns: cols, index: "alerts" }))));
+  const a = html(h("table", null, h("tbody", null, h(hit.SearchHit, { row, columns: cols, index: "alerts", rowKey: "a" }))));
   assert.match(a, /status-err/, "уровень 12 — критичный тон");
   assert.match(a, /href="\/wazuh\/agents"/);
   assert.match(a, /srcip/);
   assert.match(a, /&quot;a&quot;: 1/, "raw JSON переформатирован");
   assert.match(a, /<dt[^>]*>rule_id<\/dt>/);
+  assert.match(a, /<tr id="hit-a" hidden=""/, "деталь скрыта до раскрытия");
   const ecols = [{ key: "time", label: "Время" }, { key: "severity", label: "Ур." }, { key: "source", label: "Источник" }, { key: "actor_name", label: "Субъект" }, { key: "node", label: "Узел" }, { key: "src_ip", label: "IP" }, { key: "object", label: "Объект" }];
-  const e = html(h("table", null, h("tbody", null, h(hit.SearchHit, { row: { time: NOW, severity: 3, source: "linux.auth", actor_name: "root", node: "bastion", src_ip: "0", object: "", raw: "not json" }, columns: ecols, index: "events" }))));
+  const e = html(h("table", null, h("tbody", null, h(hit.SearchHit, { row: { time: NOW, severity: 3, source: "linux.auth", actor_name: "root", node: "bastion", src_ip: "0", object: "", raw: "not json" }, columns: ecols, index: "events", rowKey: "e" }))));
   assert.match(e, /linux\.auth/);
   assert.match(e, /bastion/);
   assert.match(stripTags(e), /not json/);
@@ -332,11 +335,12 @@ test("range-picker, auto-refresh, download, refresh, copyable: SSR-размет�
 
 test("journal: гистограмма с подписями и ссылками корзин, raw-блок JSON/текст/пусто, лента с инцидентами и фильтры", () => {
   const bar = (startMs: number, total: number, critical = 0, high = 0) => ({ bucket: NOW, low: total - critical - high, high, critical, total, startMs, endMs: startMs + 60_000, from: "2026-10-29T10:00", to: "2026-10-29T10:01" });
-  const hg = html(h(histogram.JournalHistogram, { bars: [bar(0, 10, 2, 3), bar(60_000, 0), bar(120_000, 5)], longRange: false, hrefFor: (b: { from: string }) => `/events?from=${b.from}`, bucketMinutes: 1 }));
+  const hg = html(h(histogram.TimeHistogram, { bars: [bar(0, 10, 2, 3), bar(60_000, 0), bar(120_000, 5)], hrefFor: (b: { from: string }) => `/events?from=${b.from}`, bucketMinutes: 1, scale: SEVERITY.events, scaleMax: SEVERITY_MAX.events }));
   assert.match(hg, /aria-label="События по времени"/);
   assert.match(hg, /href="\/events\?from=2026-10-29T10:00"/);
-  assert.match(stripTags(hg), /критичная 2 высокая 3 ниже высокой 10 корзина 1 мин/);
+  assert.match(stripTags(hg), /критичные \(8–10\) 2 высокие \(5–7\) 3 остальные \(0–4\) 10 столбик — 1 мин/);
   assert.equal((hg.match(/role="listitem"/g) ?? []).length, 3);
+  assert.equal((hg.match(/data-critical/g) ?? []).length, 1, "столбик с критичными помечен точкой");
 
   const json = html(h(raw.RawBlock, { raw: "{\"a\":1,\"b\":[true,null]}", source: "k8s.audit" }));
   assert.match(stripTags(json), /raw\.json k8s\.audit JSON · 7 стр\./);
@@ -347,14 +351,23 @@ test("journal: гистограмма с подписями и ссылками 
 
   const ev = { time: NOW, received: NOW, id: "1", severity: 9, source: "linux.auth", source_class: "syslog", vendor: "", product: "", action: "login", outcome: "failure", actor_name: "root", actor_kind: "user", object: "/etc/passwd", node: "bastion", session_id: "", src_ip: "203.0.113.5", src_port: 0, dst_ip: "", dst_port: 0, proto: "", bytes: 0, packets: 0, value: 0, unit: "", pii: 0, attrs: { rule: "5763" }, raw: "x" };
   const filters = { q: "", range: "24h" as const, page: 1 };
-  const f = html(h(feed.EventFeed, { initial: [ev, { ...ev, id: "2", severity: 2, actor_name: "", object: "", src_ip: "" }], incidents: { "1": [{ incident_id: "INC-7", rule_id: "r", rule_title: "Перебор SSH", level: "high", status: "new", node: "bastion", actor_name: "root", sources: ["linux.auth"], first_ts: NOW, last_ts: NOW }] }, filters: filters as never, cursor: "c", liveAllowed: true, showDate: true }), "/events");
+  const f = html(h(feed.EventFeed, { initial: [ev, { ...ev, id: "2", severity: 2, actor_name: "", object: "", src_ip: "" }], incidents: { "1": [{ incident_id: "INC-7", rule_id: "r", rule_title: "Перебор SSH", level: "high", status: "new", node: "bastion", actor_name: "root", sources: ["linux.auth"], first_ts: NOW, last_ts: NOW }] }, filters: filters as never, cursor: "c", liveAllowed: true, engineUp: true }), "/events");
   const ft = stripTags(f);
-  assert.match(ft, /в ленте 2/);
+  assert.match(ft, /Неудачный вход/, "человеческий заголовок из словаря действий");
+  assert.match(ft, /login failure · root · bastion/, "сырые значения — второй строкой");
   assert.match(ft, /INC-7/);
+  assert.equal((f.match(/data-importance="err"/g) ?? []).length, 1, "критичная строка подсвечена, обычная — нет");
+  assert.match(f, /aria-label="Раскрыть событие 10:00:00 — Неудачный вход"/, "вся строка — кнопка с понятной подписью");
   assert.match(ft, /root/);
   assert.match(ft, /\/etc\/passwd/);
   assert.match(f, /status-err|text-err/, "серьёзность 9 — критичный тон");
-  assert.match(stripTags(html(h(feed.EventFeed, { initial: [], incidents: {}, filters: filters as never, cursor: "c", liveAllowed: false, showDate: false }), "/events")), /Событий нет/);
+  assert.match(stripTags(html(h(feed.EventFeed, { initial: [], incidents: {}, filters: filters as never, cursor: "c", liveAllowed: false, engineUp: true }), "/events")), /Событий нет/);
+
+  // Поиск: раскрытие строки — кнопка 24×24 с подписью «какая запись», а не «›» 6×16 без контекста.
+  const hit = html(h("table", null, h("tbody", null, h(searchHit.SearchHit, { row: { time: NOW, severity: 0, action: "priv.sudo", source: "linux.auth" }, columns: [{ key: "time", label: "Время" }, { key: "severity", label: "Уровень" }, { key: "action", label: "Действие" }], index: "events", rowKey: "1-0" }))));
+  assert.match(hit, /<button[^>]*aria-expanded="false"[^>]*aria-controls="hit-1-0"[^>]*aria-label="Раскрыть запись 10-29 10:00:00 priv\.sudo"/);
+  assert.match(hit, /size-6/);
+  assert.doesNotMatch(hit, /<details/);
 
   const fb = html(h(filterBar.JournalFilterBar, { filters: { ...filters, source: "gone.src", host: "bastion", sev: 7, rule: "5763", from: "2026-10-29T00:00" } as never, sources: ["linux.auth"], hosts: ["bastion"] }), "/events");
   assert.match(fb, /role="search"/);

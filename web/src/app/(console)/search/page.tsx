@@ -1,17 +1,16 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { Suspense, type ReactNode } from "react";
-import { Search as SearchIcon } from "lucide-react";
-import { AlertsSeriesChart } from "@/components/console/charts";
 import { DownloadButton } from "@/components/console/download-button";
+import { FilterTabs } from "@/components/console/filter-tabs";
+import { SearchForm } from "@/components/console/search-form";
+import { TimeHistogram } from "@/components/console/time-histogram";
 import { Empty, PageHeader, Panel } from "@/components/console/panel";
 import { Pager } from "@/components/console/pager";
 import { RangePicker } from "@/components/console/range-picker";
 import { SearchHit } from "@/components/console/search-hit";
 import { ChartSkeleton, PanelSkeleton } from "@/components/console/skeletons";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import { requirePageSession } from "@/lib/auth";
 import {
   availableIndexes, clampPage, FACET_SAMPLE, FACETS_SETTINGS, INDEXES, lowerBoundTotal, MAX_QUERY_LEN, PAGE_SIZE, pageCount, parseIndex, partErrorMessage, planSearch,
@@ -19,20 +18,26 @@ import {
 } from "@/lib/search";
 import type { SeriesPoint } from "@/lib/queries";
 import { appendTerm } from "@/lib/shared/search-query";
-import { fmtMs, fmtNum, isLongRange } from "@/lib/shared/time";
-import { RangeFilters } from "@/components/console/range-filters";
+import { fmtNum, formatTs } from "@/lib/shared/time";
 import { parseTimeFilter, rangeLabel } from "@/lib/shared/filters";
-import { parseSearchLevel, searchLevelField } from "@/lib/shared/page-filters";
+import { parseSearchLevel } from "@/lib/shared/page-filters";
+import { fillBars, windowBounds } from "@/lib/shared/journal";
+import { SEVERITY, SEVERITY_MAX } from "@/lib/shared/severity";
+import type { RangeKey } from "@/lib/shared/ranges";
 
 export const dynamic = "force-dynamic";
 export const metadata: Metadata = { title: "Поиск" };
 
-const INDEX_LABEL: Record<IndexKey, string> = { alerts: "алерты Wazuh", events: "события всех источников" };
+const INDEX_LABEL: Record<IndexKey, string> = { alerts: "Алерты Wazuh", events: "События" };
 
+/** Один пример, а не перечень: полный синтаксис — в шпаргалке «?». */
 const HINT = {
-  alerts: 'root 203.0.113.5 · agent:web-01 level>=10 · -group:syscheck · desc:"brute force" · srcip:10.0.* · mitre:T1110',
-  events: 'kubectl · source:k8s.audit actor:oidc:i.petrov · severity>=7 · attr.rule_groups:sshd · src:10.20.* -outcome:allow',
+  alerts: "agent:web-01 level>=10 -group:syscheck",
+  events: "sshd actor:i.petrov -outcome:allow",
 };
+
+/** Меньше записей — график свёрнут до строки: человек пришёл за строками, а не за тремя столбиками. */
+const SERIES_COLLAPSE_BELOW = 50;
 
 export default async function SearchPage({ searchParams }: PageProps<"/search">) {
   await requirePageSession();
@@ -66,7 +71,6 @@ export default async function SearchPage({ searchParams }: PageProps<"/search">)
   const href = (patch: Record<string, string | undefined>) => `/search?${query(patch).toString()}`;
   const exportHref = (format: string) => `/api/search?${query({ page: undefined, format }).toString()}`;
   const exportName = `argus-${input.index}-${new Date().toISOString().slice(0, 10)}`;
-  const longRange = isLongRange(input.range, input.from);
 
   // Страница результатов — сразу; гистограмма (с итогом) и поля догружаются
   // своими блоками: для частого слова за длинный интервал это полный скан, и
@@ -87,40 +91,42 @@ export default async function SearchPage({ searchParams }: PageProps<"/search">)
         <RangePicker value={input.range} />
       </PageHeader>
 
-      <Panel label="Запрос" meta={`${INDEX_LABEL[input.index]} · поля: ${Object.keys(def.fields).join(" ")}`}>
-        <form method="get" action="/search" className="space-y-3">
-          <input type="hidden" name="index" value={input.index} />
-          <input type="hidden" name="range" value={input.range} />
-          {input.showMuted && <input type="hidden" name="muted" value="1" />}
-          {input.from && <input type="hidden" name="from" value={input.from} />}
-          {input.to && <input type="hidden" name="to" value={input.to} />}
-          {level.min !== undefined && <input type="hidden" name="level_min" value={level.min} />}
-          {level.max !== undefined && <input type="hidden" name="level_max" value={level.max} />}
-          <div className="flex flex-wrap gap-2">
-            <Label htmlFor="search-q" className="sr-only">Строка запроса</Label>
-            <Input id="search-q" name="q" defaultValue={input.q} maxLength={MAX_QUERY_LEN} placeholder={HINT[input.index]} spellCheck={false} autoFocus className="h-10 min-w-0 flex-1 px-3 font-mono sm:min-w-[24rem]" />
-            <Button type="submit" className="min-h-10"><SearchIcon strokeWidth={1.5} />Искать</Button>
-          </div>
-          <div className="flex flex-wrap items-center gap-3 font-mono text-xs text-muted-foreground">
-            <span>индекс:</span>
-            {availableIndexes().map((k) => (
-              <Button key={k} asChild variant="secondary" size="sm" aria-pressed={k === input.index}>
-                <Link href={href({ index: k, page: undefined, level_min: undefined, level_max: undefined })}>{INDEX_LABEL[k]}</Link>
-              </Button>
-            ))}
-            {(input.from || input.to) && <Link href={href({ from: undefined, to: undefined, page: undefined })} className="underline">сбросить интервал</Link>}
-            {levelText && <Link href={href({ level_min: undefined, level_max: undefined, page: undefined })} className="underline">сбросить уровень {levelText}</Link>}
+      <Panel label="Запрос" meta="время — UTC">
+        {availableIndexes().length > 1 && (
+          <FilterTabs
+            className="mb-3"
+            label="Где искать"
+            current={input.index}
+            items={availableIndexes().map((k) => ({ key: k, label: INDEX_LABEL[k], href: href({ index: k, page: undefined, level_min: undefined, level_max: undefined }) }))}
+          />
+        )}
+        <SearchForm
+          key={query({}).toString()}
+          index={input.index}
+          q={input.q}
+          range={input.range}
+          from={input.from}
+          to={input.to}
+          levelMin={level.min}
+          levelMax={level.max}
+          showMuted={input.showMuted}
+          levelTop={SEVERITY_MAX[input.index]}
+          levelLabel={input.index === "alerts" ? "Уровень правила" : "Серьёзность"}
+          maxLength={MAX_QUERY_LEN}
+          placeholder={HINT[input.index]}
+        />
+        {((input.from || input.to) || levelText || input.index === "alerts") && (
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            {(input.from || input.to) && <Button asChild variant="ghost" size="sm"><Link href={href({ from: undefined, to: undefined, page: undefined })}>сбросить интервал</Link></Button>}
+            {levelText && <Button asChild variant="ghost" size="sm"><Link href={href({ level_min: undefined, level_max: undefined, page: undefined })}>сбросить уровень {levelText}</Link></Button>}
             {input.index === "alerts" && (
-              <Link href={href({ muted: input.showMuted ? undefined : "1", page: undefined })} className="underline">
-                {input.showMuted ? "скрыть заглушённые правила" : "показать заглушённые правила"}
-              </Link>
+              <Button asChild variant="ghost" size="sm">
+                <Link href={href({ muted: input.showMuted ? undefined : "1", page: undefined })}>{input.showMuted ? "скрыть заглушённые правила" : "показать заглушённые правила"}</Link>
+              </Button>
             )}
           </div>
-          {formError && <p role="alert" className="text-sm text-destructive">{formError}</p>}
-        </form>
-        <div className="mt-3 border-t border-border/60 pt-3">
-          <RangeFilters time fields={[searchLevelField(input.index)]} idPrefix="search" />
-        </div>
+        )}
+        {formError && <p role="alert" className="mt-3 text-sm text-destructive">{formError}</p>}
       </Panel>
 
       {plan && r?.ok && seriesP && facetsP ? (
@@ -134,7 +140,7 @@ export default async function SearchPage({ searchParams }: PageProps<"/search">)
           def={def}
           index={input.index}
           q={input.q}
-          longRange={longRange}
+          window={{ range: input.range, from: input.from, to: input.to }}
           href={href}
           exportHref={exportHref}
           exportName={exportName}
@@ -167,7 +173,7 @@ function SearchResults({
   def,
   index,
   q,
-  longRange,
+  window,
   href,
   exportHref,
   exportName,
@@ -184,7 +190,7 @@ function SearchResults({
   def: (typeof INDEXES)[IndexKey];
   index: IndexKey;
   q: string;
-  longRange: boolean;
+  window: { range: RangeKey; from?: string; to?: string };
   href: (patch: Record<string, string | undefined>) => string;
   exportHref: (format: string) => string;
   exportName: string;
@@ -199,10 +205,12 @@ function SearchResults({
     />
   );
   const approxPager = pager(lowerBoundTotal(plan, rows.length), false);
+  // Колонки, пустые у всех строк страницы, не показываем: «src/dst» с прочерками только съедают ширину.
+  const columns = rows.length === 0 ? def.columns : def.columns.filter((c) => c.key === "time" || rows.some((r) => { const v = r[c.key]; return v !== "" && v !== null && v !== undefined && v !== 0 && v !== "0"; }));
   return (
     <>
-      <Suspense fallback={<ChartSkeleton label="Распределение · считаем…" />}>
-        <SeriesBlock seriesP={seriesP} longRange={longRange} rowsMs={rowsMs} />
+      <Suspense fallback={<ChartSkeleton label="По времени · считаем…" />}>
+        <SeriesBlock seriesP={seriesP} index={index} bucketMinutes={plan.bucketMinutes} window={window} href={href} />
       </Suspense>
 
       <div className="grid gap-6 lg:grid-cols-[16rem_1fr]">
@@ -211,27 +219,28 @@ function SearchResults({
         </Suspense>
 
         <Panel
-          label={`Результаты · стр. ${fmtNum(plan.page)}`}
-          meta={
-            <span className="flex gap-2">
+          label={plan.page > 1 ? `Результаты · стр. ${fmtNum(plan.page)}` : "Результаты"}
+          meta={rowsMs > 1000 ? `ответ ${fmtNum(rowsMs / 1000, 1)} с` : undefined}
+          actions={
+            <>
               <DownloadButton href={exportHref("csv")} filename={`${exportName}.csv`} size="sm" variant="ghost">CSV</DownloadButton>
               <DownloadButton href={exportHref("export")} filename={`${exportName}.json`} size="sm" variant="ghost">JSON</DownloadButton>
-            </span>
+            </>
           }
         >
-          <div className="c-well overflow-x-auto p-2">
+          <div className="c-well overflow-x-auto p-2" tabIndex={0} aria-label="Таблица результатов, прокручивается по горизонтали">
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b border-border/60">
-                  <th scope="col" className="w-6"><span className="sr-only">подробности</span></th>
-                  {def.columns.map((c) => <th scope="col" key={c.key} className="c-label px-2 py-1 text-left">{c.key === "time" ? "Время (UTC)" : c.label}</th>)}
+                  <th scope="col" className="w-6"><span className="sr-only">Раскрыть</span></th>
+                  {columns.map((c) => <th scope="col" key={c.key} className="c-label px-2 py-1 text-left whitespace-nowrap">{c.key === "time" ? "Время, UTC" : c.label}</th>)}
                 </tr>
               </thead>
               <tbody>
                 {rows.length === 0 && (
-                  <tr><td colSpan={def.columns.length + 1} className="py-8 text-center font-mono text-muted-foreground">Ничего не найдено{emptyHint ? ` (активны: ${emptyHint})` : ""} — измените запрос или интервал</td></tr>
+                  <tr><td colSpan={columns.length + 1} className="py-8 text-center text-[13px] text-muted-foreground">Ничего не найдено{emptyHint ? ` (активны: ${emptyHint})` : ""} — измените запрос или интервал</td></tr>
                 )}
-                {rows.map((row, i) => <SearchHit key={`${String(row.time ?? "")}|${i}`} row={row} columns={def.columns} index={index} />)}
+                {rows.map((row, i) => <SearchHit key={`${String(row.time ?? "")}|${i}`} rowKey={`${plan.page}-${i}`} row={row} columns={columns} index={index} />)}
               </tbody>
             </table>
           </div>
@@ -244,20 +253,75 @@ function SearchResults({
   );
 }
 
-async function SeriesBlock({ seriesP, longRange, rowsMs }: { seriesP: Promise<Settled<SeriesPoint[]>>; longRange: boolean; rowsMs: number }) {
+async function SeriesBlock({
+  seriesP,
+  index,
+  bucketMinutes,
+  window,
+  href,
+}: {
+  seriesP: Promise<Settled<SeriesPoint[]>>;
+  index: IndexKey;
+  bucketMinutes: number;
+  window: { range: RangeKey; from?: string; to?: string };
+  href: (patch: Record<string, string | undefined>) => string;
+}) {
   const r = await seriesP;
   if (!r.ok) {
     return (
-      <Panel label="Распределение" meta={`страница — ${fmtMs(rowsMs)} · время UTC`}>
-        <p role="status" className="text-sm text-muted-foreground">Распределение и итог не посчитаны: {partErrorMessage(r.error, SERIES_SETTINGS.max_execution_time)}. Результаты ниже — полные для своей страницы.</p>
+      <Panel label="По времени">
+        <p role="status" className="text-sm text-muted-foreground">График и итог не посчитаны: {partErrorMessage(r.error, SERIES_SETTINGS.max_execution_time)}. Результаты ниже — полные для своей страницы.</p>
       </Panel>
     );
   }
+  const total = seriesTotal(r.data);
+  const noun = index === "alerts" ? ["алерт", "алерта", "алертов"] : ["запись", "записи", "записей"];
+  const found = `Найдено ${fmtNum(total)} ${plural(total, noun[0], noun[1], noun[2])}`;
+  if (r.data.length === 0) {
+    return (
+      <Panel label={found}>
+        <Empty>Ничего не найдено за выбранный интервал.</Empty>
+      </Panel>
+    );
+  }
+  const { startMs, endMs } = windowBounds(window);
+  const bars = fillBars(r.data, bucketMinutes, startMs, endMs);
+  const [a, b] = [formatTs(r.data[0].bucket, "short"), formatTs(r.data[r.data.length - 1].bucket, "short")];
+  const span = a === b ? a : `${a} – ${b}`;
+  const chart = (
+    <TimeHistogram
+      bars={bars}
+      bucketMinutes={bucketMinutes}
+      scale={SEVERITY[index]}
+      scaleMax={SEVERITY_MAX[index]}
+      height={96}
+      noun={index === "alerts" ? "алертов" : "записей"}
+      ariaLabel={index === "alerts" ? "Алерты по времени" : "Записи по времени"}
+      hrefFor={(b) => href({ from: b.from, to: b.to, range: undefined, page: undefined })}
+    />
+  );
   return (
-    <Panel label={`Распределение · ${fmtNum(seriesTotal(r.data))} записей`} meta={`страница — ${fmtMs(rowsMs)} · время UTC`}>
-      {r.data.length === 0 ? <Empty>Нет данных за выбранный интервал.</Empty> : <AlertsSeriesChart data={r.data} longRange={longRange} />}
+    <Panel label={found} meta={span}>
+      {total < SERIES_COLLAPSE_BELOW ? (
+        <details className="group/s">
+          <summary className="cursor-pointer list-none text-[13px] text-[var(--ring)] hover:underline [&::-webkit-details-marker]:hidden">
+            <span className="group-open/s:hidden">Показать распределение по времени</span>
+            <span className="hidden group-open/s:inline">Скрыть распределение</span>
+          </summary>
+          <div className="mt-3">{chart}</div>
+        </details>
+      ) : (
+        chart
+      )}
     </Panel>
   );
+}
+
+function plural(n: number, one: string, few: string, many: string): string {
+  const m10 = n % 10, m100 = n % 100;
+  if (m10 === 1 && m100 !== 11) return one;
+  if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return few;
+  return many;
 }
 
 async function FacetsBlock({ facetsP, q, href }: { facetsP: Promise<Settled<{ facets: Facet[]; sample: number }>>; q: string; href: (patch: Record<string, string | undefined>) => string }) {
@@ -273,14 +337,15 @@ async function FacetsBlock({ facetsP, q, href }: { facetsP: Promise<Settled<{ fa
   return (
     <Panel
       label="Поля"
-      meta={sampled ? `по последним ${fmtNum(FACET_SAMPLE)} совпадениям · клик — добавить в запрос` : "клик — добавить в запрос"}
       bodyClassName="space-y-4"
     >
-      {r.data.facets.map((f) => (
+      <p className="text-[12px] leading-snug text-[var(--text-tertiary)]">
+        Нажмите на значение, чтобы уточнить запрос{sampled ? `. По последним ${fmtNum(FACET_SAMPLE)} совпадениям` : ""}.
+      </p>
+      {r.data.facets.filter((f) => f.values.length > 0).map((f) => (
         <div key={f.field}>
-          <div className="c-label mb-1">{f.label} <span className="text-muted-foreground">{f.field}</span></div>
+          <div className="c-label mb-1" title={`поле запроса: ${f.field}`}>{f.label.charAt(0).toUpperCase() + f.label.slice(1)}</div>
           <ul className="space-y-0.5 font-mono text-xs">
-            {f.values.length === 0 && <li className="text-muted-foreground">—</li>}
             {f.values.map((v) => (
               <li key={v.value} className="flex justify-between gap-2">
                 <Link href={href({ q: appendTerm(q, f.field, v.value, { literal: true }), page: undefined })} className="truncate hover:underline" title={v.value}>{v.value}</Link>

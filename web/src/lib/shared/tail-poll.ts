@@ -106,9 +106,9 @@ export function errorStatus(prev: TailStatus | null, e: unknown, at = new Date()
 
 /** Подпись состояния ленты рядом с кнопкой live-tail. */
 export function tailStatusText(status: TailStatus | null, live: boolean, liveAllowed: boolean): string {
-  if (!liveAllowed) return "live-tail недоступен для прошлого интервала";
-  if (!status) return live ? "ждём новые события…" : "лента зафиксирована на момент загрузки";
+  if (!liveAllowed) return "слежение недоступно для прошлого интервала";
+  if (!status) return live ? "ждём новые события…" : "новые события не подгружаются";
   if (status.error) return `ошибка обновления: ${status.error} — повторим через ${TAIL_EVERY_MS / 1000} с, события не пропадут`;
   if (status.throttled) return `пауза ${status.throttled} с, догоняем — события не пропадут`;
-  return `обновлено ${formatTs(status.at, "time")} UTC · пришло с начала live ${status.added}${status.pending ? ` · догоняем, в очереди ещё ${status.pending}` : ""}`;
+  return `обновлено ${formatTs(status.at, "time")} UTC · пришло с начала слежения ${status.added}${status.pending ? ` · догоняем, в очереди ещё ${status.pending}` : ""}`;
 }
