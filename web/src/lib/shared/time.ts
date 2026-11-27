@@ -84,3 +84,34 @@ export function fmtMs(ms: number): string {
   if (!Number.isFinite(ms)) return "—";
   return ms < 1000 ? `${Math.round(ms)} мс` : `${fmtNum(ms / 1000, 1)} с`;
 }
+
+const WEEKDAYS_SHORT = ["вс", "пн", "вт", "ср", "чт", "пт", "сб"];
+const MONTHS_GEN = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"];
+const DAY_MS = 86_400_000;
+
+/**
+ * День по UTC для заголовков лент: «вт, 25 ноября»; другой год — с годом
+ * («пн, 29 декабря 2025»). Пустая/битая дата — «—».
+ */
+export function formatDay(value: string | number | Date | null | undefined, now: Date = new Date()): string {
+  const d = toDate(value);
+  if (!d) return "—";
+  const base = `${WEEKDAYS_SHORT[d.getUTCDay()]}, ${d.getUTCDate()} ${MONTHS_GEN[d.getUTCMonth()]}`;
+  return d.getUTCFullYear() === now.getUTCFullYear() ? base : `${base} ${d.getUTCFullYear()}`;
+}
+
+/** Ключ дня UTC (число суток от эпохи) — для группировки строк по дням. */
+export function utcDayKey(value: string | number | Date | null | undefined): number | null {
+  const d = toDate(value);
+  return d ? Math.floor(d.getTime() / DAY_MS) : null;
+}
+
+/** Заголовок дня ленты: «Сегодня», «Вчера», иначе formatDay. */
+export function dayHeading(value: string | number | Date | null | undefined, now: Date = new Date()): string {
+  const key = utcDayKey(value);
+  if (key === null) return "—";
+  const today = Math.floor(now.getTime() / DAY_MS);
+  if (key === today) return "Сегодня";
+  if (key === today - 1) return "Вчера";
+  return formatDay(value, now);
+}

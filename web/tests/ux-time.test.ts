@@ -73,3 +73,17 @@ test("formatTs: режим iso — ISO 8601 в UTC для <time dateTime>, на 
   assert.equal(formatTs("", "iso"), undefined);
   assert.equal(formatTs("не дата", "iso"), undefined);
 });
+
+test("formatDay / dayHeading: «вт, 25 ноября», сегодня/вчера, другой год — с годом; группировка ленты по дням", async () => {
+  const { formatDay, dayHeading } = await import("../src/lib/shared/time");
+  const { groupFeedByDay } = await import("../src/lib/shared/feed");
+  const now = new Date("2026-11-27T12:00:00Z");
+  assert.equal(formatDay("2026-11-25 23:59:00", now), "ср, 25 ноября");
+  assert.equal(formatDay("2025-12-29 08:00:00", now), "пн, 29 декабря 2025");
+  assert.equal(formatDay(null, now), "—");
+  assert.equal(dayHeading("2026-11-27 00:00:01", now), "Сегодня");
+  assert.equal(dayHeading("2026-11-26 23:59:59", now), "Вчера");
+  assert.equal(dayHeading("2026-11-24 10:00:00", now), "вт, 24 ноября");
+  const groups = groupFeedByDay([{ t: "2026-11-27 10:00:00" }, { t: "2026-11-27 01:00:00" }, { t: "2026-11-25 09:00:00" }], (x) => x.t, now);
+  assert.deepEqual(groups.map((g) => [g.heading, g.items.length]), [["Сегодня", 2], ["ср, 25 ноября", 1]]);
+});
