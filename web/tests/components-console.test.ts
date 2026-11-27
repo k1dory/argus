@@ -361,7 +361,17 @@ test("journal: гистограмма с подписями и ссылками 
   assert.match(stripTags(fb), /gone\.src/, "выбранный источник показан, даже если его нет в окне");
   assert.match(fb, /value="5763"/);
   assert.match(fb, /value="2026-10-29T00:00"/);
-  assert.match(stripTags(html(h(alertsFilters.AlertsFilters, { agents: ["web-01"] }), "/wazuh/alerts", "level=10&agent=web-01&q=ssh")), /Описание правила Агент Найти/);
+  // Алерты: описание и агент — в той же форме RangeFilters, одна кнопка «Применить» (поля не теряются).
+  const af = html(
+    h(rangeFilters.RangeFilters, { time: true, fields: [], extra: h(alertsFilters.AlertsExtraFields, { agents: ["web-01"] }), extraKeys: ["q", "agent"] }),
+    "/wazuh/alerts",
+    "level=10&agent=web-01&q=ssh",
+  );
+  assert.equal((af.match(/<form/g) ?? []).length, 1, "одна форма фильтров");
+  assert.match(af, /name="q"[^>]*value="ssh"|value="ssh"[^>]*name="q"/, "описание из URL — в поле формы");
+  assert.match(stripTags(af), /Описание правила/);
+  assert.match(stripTags(af), /Применить/);
+  assert.doesNotMatch(stripTags(af), /Найти|Enter — применить/, "второй кнопки отправки нет");
 });
 
 /* ===== Формы действий (SSR без обработчиков) ===== */

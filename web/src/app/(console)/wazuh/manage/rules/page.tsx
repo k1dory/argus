@@ -1,5 +1,8 @@
 import Link from "next/link";
-import { Panel } from "@/components/console/panel";
+import { Empty, PageHeader, Panel } from "@/components/console/panel";
+import { ServiceUnavailable } from "@/components/console/service-unavailable";
+import { StatusBadge } from "../../_shared/status-badge";
+import { fmtNum } from "@/lib/shared/time";
 import { NewRuleFileForm } from "@/components/console/manage-forms";
 import {
   Table,
@@ -19,43 +22,42 @@ export default async function RulesPage() {
   const session = await requirePageSession();
   const isAdmin = session.role === "admin";
   let files: WzRuleFile[] = [];
-  let offline: string | null = null;
+  let error: string | null = null;
   try {
     files = await listRuleFiles();
   } catch (err) {
-    console.error("manage/rules:", err instanceof Error ? err.message : err);
-    offline = "Wazuh API недоступен — подробности в логе консоли";
+    error = err instanceof Error ? err.message : String(err);
+    console.error("manage/rules:", error);
   }
 
   return (
     <>
-      <div className="flex flex-wrap items-center justify-between gap-4">
-        <h1 className="text-3xl tracking-tight">Правила</h1>
-        <span className="c-label">etc/rules — кастомные, ruleset Wazuh не трогаем</span>
-      </div>
+      <PageHeader
+        title="Правила Wazuh"
+        back={{ href: "/wazuh/manage", label: "Управление Wazuh" }}
+        subtitle={<>Собственные правила из каталога <span className="font-mono">etc/rules</span>. Встроенные правила Wazuh здесь не редактируются.</>}
+      />
 
-      {offline ? (
-        <Panel label="Wazuh manager API · недоступен">
-          <p className="text-sm text-destructive">{offline}</p>
-        </Panel>
+      {error ? (
+        <ServiceUnavailable service="wazuh" what="список файлов правил" reason={error} />
       ) : (
-        <Panel label={`Файлы правил · ${files.length} шт.`} meta={isAdmin ? "применяются рестартом менеджера" : "только чтение — редактирует администратор"}>
+        <Panel label={`Файлы правил · ${fmtNum(files.length)}`} meta={isAdmin ? "вступают в силу после перезапуска менеджера" : "только чтение — редактирует администратор"}>
           {isAdmin && (
             <div className="mb-6">
               <NewRuleFileForm />
             </div>
           )}
           {files.length === 0 ? (
-            <p className="text-sm text-muted-foreground">
-              Кастомных файлов пока нет{isAdmin ? " — создайте первый, например local_rules_custom.xml" : ""}
-            </p>
+            <Empty
+              title="Собственных файлов правил пока нет"
+              hint={isAdmin ? "Создайте первый, например local_rules_custom.xml." : "Файлы правил создаёт администратор."}
+            />
           ) : (
             <div className="c-well overflow-x-auto p-2">
               <Table>
                 <TableHeader>
                   <TableRow className="border-border/60">
                     <TableHead className="c-label">Файл</TableHead>
-                    <TableHead className="c-label">Каталог</TableHead>
                     <TableHead className="c-label">Статус</TableHead>
                   </TableRow>
                 </TableHeader>
@@ -70,10 +72,15 @@ export default async function RulesPage() {
                           {f.filename}
                         </Link>
                       </TableCell>
-                      <TableCell className="font-mono text-xs text-muted-foreground">
-                        {f.relative_dirname}
+                      <TableCell>
+                        {f.status === "enabled" ? (
+                          <StatusBadge label="включён" tone="ok" />
+                        ) : f.status === "disabled" ? (
+                          <StatusBadge label="выключен" tone="muted" />
+                        ) : (
+                          <span className="text-xs text-muted-foreground">{f.status ?? "—"}</span>
+                        )}
                       </TableCell>
-                      <TableCell className="font-mono text-xs">{f.status ?? "—"}</TableCell>
                     </TableRow>
                   ))}
                 </TableBody>

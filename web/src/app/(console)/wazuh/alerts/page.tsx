@@ -1,16 +1,20 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { Bell, BellOff } from "lucide-react";
+import { Bell, BellOff, SearchX } from "lucide-react";
 import { ActionForm } from "@/components/console/action-form";
-import { AlertsFilters } from "@/components/console/alerts-filters";
+import { AlertsExtraFields } from "@/components/console/alerts-filters";
 import { Copyable } from "@/components/console/copyable";
 import { searchHref } from "@/lib/shared/search-href";
 import { Pager, SortLink } from "@/components/console/pager";
-import { PageHeader, Panel } from "@/components/console/panel";
+import { Empty, PageHeader, Panel } from "@/components/console/panel";
 import { RangePicker } from "@/components/console/range-picker";
 import { SeverityBadge } from "@/components/console/severity-badge";
 import { StorageUnavailable } from "@/components/console/storage-error";
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { TONE_CLASS } from "@/components/console/tone";
+import { SEVERITY } from "@/lib/shared/severity";
+import { cn } from "@/lib/utils";
 import {
   Table,
   TableBody,
@@ -28,8 +32,12 @@ import { describeChips } from "@/lib/shared/filters";
 import { ALERT_LEVEL_FIELD, alertRangeChips, parseAlertRanges } from "@/lib/shared/page-filters";
 import { fmtNum, formatTs } from "@/lib/shared/time";
 import { requirePageSession, ROLE_RANK } from "@/lib/auth";
+import { wazuhAgentHref } from "../_shared/links";
 
 export const dynamic = "force-dynamic";
+
+/** Поля AlertsExtraFields (описание, агент) — уходят той же формой, что уровень и интервал. */
+const ALERTS_EXTRA_KEYS = ["q", "agent"];
 export const metadata: Metadata = { title: "Алерты Wazuh" };
 
 const str = (v: unknown): string | undefined => (typeof v === "string" && v ? v : undefined);
@@ -59,7 +67,6 @@ export default async function AlertsPage({ searchParams }: PageProps<"/wazuh/ale
     dir,
   };
 
-  // Ключ фильтров — строка параметров: при навигации controlled-форма пересоздаётся с новыми значениями.
   const qs = new URLSearchParams();
   for (const [k, v] of Object.entries(params)) if (typeof v === "string" && v) qs.set(k, v);
   const href = (patch: Record<string, string | undefined>) => {
@@ -80,19 +87,29 @@ export default async function AlertsPage({ searchParams }: PageProps<"/wazuh/ale
         <RangePicker value={range} />
       </PageHeader>
 
+      <Panel label="Фильтры" meta="время в UTC">
+        <RangeFilters
+          time
+          fields={[ALERT_LEVEL_FIELD]}
+          legacy={["level"]}
+          idPrefix="alerts"
+          extra={<AlertsExtraFields agents={r.ok ? r.data[1] : []} />}
+          extraKeys={ALERTS_EXTRA_KEYS}
+        />
+      </Panel>
+
       {!r.ok ? (
         <StorageUnavailable reason={r.error} />
       ) : (
         <AlertsTable
           list={r.data[0]}
-          agents={r.data[1]}
           muted={r.data[2]}
           canEdit={canEdit}
           showMuted={showMuted}
           sort={sort}
           dir={dir}
           href={href}
-          filtersKey={qs.toString()}
+          agentHref={(name) => wazuhAgentHref(name, qs)}
           filtersText={describeChips(alertRangeChips(ranges))}
         />
       )}
@@ -102,45 +119,48 @@ export default async function AlertsPage({ searchParams }: PageProps<"/wazuh/ale
 
 function AlertsTable({
   list,
-  agents,
   muted,
   canEdit,
   showMuted,
   sort,
   dir,
   href,
-  filtersKey,
+  agentHref,
   filtersText,
 }: {
   list: Awaited<ReturnType<typeof alertsList>>;
-  agents: string[];
   muted: number[];
   canEdit: boolean;
   showMuted: boolean;
   sort: string;
   dir: "asc" | "desc";
   href: (patch: Record<string, string | undefined>) => string;
-  filtersKey: string;
+  agentHref: (name: string) => string;
   filtersText: string;
 }) {
   const mutedSet = new Set(muted);
   const sortHref = (s: string, d: "asc" | "desc") => href({ sort: s === "ts" && d === "desc" ? undefined : s, dir: s === "ts" && d === "desc" ? undefined : d, page: undefined });
   return (
     <Panel
-      label={`Журнал · ${fmtNum(list.total)} записей`}
+      label={`Алерты · ${fmtNum(list.total)}`}
       meta={muted.length > 0 ? `заглушено правил: ${fmtNum(muted.length)} · по ${ALERTS_PAGE_SIZE} на странице` : `по ${ALERTS_PAGE_SIZE} на странице`}
-    >
-      <div className="mb-5 flex flex-wrap items-end gap-3">
-        <AlertsFilters key={filtersKey} agents={agents} />
-        <RangeFilters time fields={[ALERT_LEVEL_FIELD]} legacy={["level"]} idPrefix="alerts" />
-        {muted.length > 0 && (
-          <Button asChild variant="secondary" size="sm" className="mb-2">
+      actions={
+        muted.length > 0 ? (
+          <Button asChild variant="ghost" size="sm">
             <Link href={href({ muted: showMuted ? undefined : "1", page: undefined })}>
               {showMuted ? "Скрыть заглушённые" : `Показать заглушённые (${fmtNum(muted.length)})`}
             </Link>
           </Button>
-        )}
-      </div>
+        ) : undefined
+      }
+    >
+      {list.rows.length === 0 ? (
+        <Empty
+          icon={SearchX}
+          title="Алертов не найдено"
+          hint={filtersText ? `По фильтрам: ${filtersText}. Измените фильтры или расширьте период.` : "За выбранный период алертов нет. Расширьте период или снимите фильтры."}
+        />
+      ) : (
       <div className="c-well overflow-x-auto p-2">
         <Table>
           <TableHeader>
@@ -153,24 +173,23 @@ function AlertsTable({
               </TableHead>
               <TableHead className="c-label">Правило</TableHead>
               <TableHead className="c-label">Агент</TableHead>
-              <TableHead className="c-label">Источник</TableHead>
-              {canEdit && <TableHead className="c-label text-right">Шум</TableHead>}
+              <TableHead className="c-label">IP / журнал</TableHead>
+              {canEdit && <TableHead className="c-label text-right"><span className="sr-only">Заглушить</span></TableHead>}
             </TableRow>
           </TableHeader>
           <TableBody>
-            {list.rows.length === 0 && (
-              <TableRow>
-                <TableCell colSpan={canEdit ? 6 : 5} className="py-8 text-center font-mono text-muted-foreground">
-                  Ничего не найдено{filtersText ? ` (${filtersText})` : ""} — измените фильтры или диапазон
-                </TableCell>
-              </TableRow>
-            )}
             {list.rows.map((r, i) => {
               const isMuted = mutedSet.has(r.rule_id);
+              const critical = r.rule_level >= SEVERITY.alerts.critical;
               return (
                 <TableRow
                   key={`${r.timestamp}|${r.rule_id}|${r.agent_name}|${r.srcip}|${i}`}
-                  className={isMuted ? "border-border/40 opacity-50" : "border-border/40"}
+                  data-critical={critical || undefined}
+                  className={cn(
+                    "border-border/40",
+                    critical && !isMuted && "bg-[var(--status-err)]/[0.06] shadow-[inset_2px_0_0_var(--status-err)]",
+                    isMuted && "text-muted-foreground",
+                  )}
                 >
                   <TableCell className="font-mono text-xs whitespace-nowrap">
                     {formatTs(r.timestamp)}
@@ -179,20 +198,33 @@ function AlertsTable({
                     <SeverityBadge level={r.rule_level} />
                   </TableCell>
                   <TableCell className="max-w-md whitespace-normal">
-                    <Copyable value={String(r.rule_id)} href={searchHref.rule(r.rule_id)} label="Правило" className="text-xs">#{r.rule_id}</Copyable>{" "}
-                    {r.rule_description}
+                    <div className={cn("text-sm", isMuted ? "text-muted-foreground" : "text-foreground")}>
+                      {r.rule_description || "—"}
+                      {isMuted && (
+                        <Badge variant="outline" className={cn("ml-2 align-middle", TONE_CLASS.muted)}>заглушено</Badge>
+                      )}
+                    </div>
+                    <div className="text-xs text-muted-foreground">
+                      <Copyable value={String(r.rule_id)} href={searchHref.rule(r.rule_id)} label="Правило">#{r.rule_id}</Copyable>
+                    </div>
                   </TableCell>
                   <TableCell className="font-mono text-xs">
-                    {r.agent_name ? <Copyable value={r.agent_name} href="/wazuh/agents" label="Агент" /> : "—"}
+                    {r.agent_name ? <Copyable value={r.agent_name} href={agentHref(r.agent_name)} label="Агент" /> : "—"}
                   </TableCell>
                   <TableCell className="font-mono text-xs">
-                    {r.srcip ? <Copyable value={r.srcip} href={searchHref.srcip(r.srcip)} label="IP" /> : r.location || "—"}
+                    {r.srcip ? (
+                      <Copyable value={r.srcip} href={searchHref.srcip(r.srcip)} label="IP" />
+                    ) : r.location ? (
+                      <span className="block max-w-56 truncate text-muted-foreground" title={r.location}>{r.location}</span>
+                    ) : (
+                      "—"
+                    )}
                   </TableCell>
                   {canEdit && (
                     <TableCell className="text-right">
                       <ActionForm
                         action={muteRuleAction}
-                        successText={isMuted ? `Правило #${r.rule_id} включено обратно` : `Правило #${r.rule_id} заглушено во всех витринах`}
+                        successText={isMuted ? `Правило #${r.rule_id} снова показывается` : `Правило #${r.rule_id} заглушено: его алерты скрыты в журнале, на обзоре и в дашбордах`}
                         className="inline"
                       >
                         <input type="hidden" name="rule_id" value={r.rule_id} />
@@ -204,7 +236,7 @@ function AlertsTable({
                           title={
                             isMuted
                               ? `Включить правило #${r.rule_id} обратно`
-                              : `Заглушить правило #${r.rule_id} во всех витринах`
+                              : `Заглушить правило #${r.rule_id}: перестанет показываться в алертах, на обзоре и в дашбордах`
                           }
                         >
                           {isMuted ? <Bell strokeWidth={1.5} /> : <BellOff strokeWidth={1.5} />}
@@ -221,6 +253,7 @@ function AlertsTable({
           </TableBody>
         </Table>
       </div>
+      )}
       <Pager page={list.page} pages={list.pages} total={list.total} pageSize={list.pageSize} href={(p) => href({ page: p > 1 ? String(p) : undefined })} capped={list.total > ALERTS_MAX_PAGE * ALERTS_PAGE_SIZE} />
     </Panel>
   );

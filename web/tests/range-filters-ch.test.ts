@@ -128,6 +128,16 @@ test("диапазоны витрин на живом ClickHouse: сужают �
       assert.deepEqual(await cves({ severity: { max: "High" } }), ["CVE-2026-0002", "CVE-2026-0003"]);
       assert.deepEqual(await cves({ cvss: { min: 7, max: 9 } }), ["CVE-2026-0002"]);
       assert.deepEqual(await cves({ time }), [], "окно месяц назад — свежих CVE в нём нет");
+
+      // Устранённая CVE: последняя запись Solved — в «активных» её нет, итоги считают её отдельно.
+      await ch().chCommand(`INSERT INTO wazuh_alerts (timestamp, agent_name, rule_id, rule_level, vuln_cve, vuln_severity, vuln_score, vuln_package, vuln_status) VALUES
+        (now64(3) - 120, 'db-01', 23505, 10, 'CVE-2026-0004', 'Critical', 9.1, 'bash', 'Active'),
+        (now64(3) - 30, 'db-01', 23505, 3, 'CVE-2026-0004', 'Critical', 9.1, 'bash', 'Solved')`);
+      assert.deepEqual(await cves({ status: "active" }), ["CVE-2026-0001", "CVE-2026-0002", "CVE-2026-0003"]);
+      assert.deepEqual(await cves({ status: "solved" }), ["CVE-2026-0004"]);
+      assert.equal((await cves({})).length, 4, "без статуса — все");
+      assert.deepEqual(await queries().vulnSummary({}), { total: 4, active: 3, critical: 1, high: 1, solved: 1 });
+      assert.deepEqual(await queries().vulnSummary({ severity: { min: "High" } }), { total: 3, active: 2, critical: 1, high: 1, solved: 1 });
     });
 
     await t.test("лента «Источников»: окно по received_at (skip-индекс) и серьёзность", async () => {

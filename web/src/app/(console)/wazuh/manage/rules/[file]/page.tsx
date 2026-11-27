@@ -1,7 +1,7 @@
-import Link from "next/link";
 import { notFound } from "next/navigation";
-import { ArrowLeft, RotateCw } from "lucide-react";
-import { Panel } from "@/components/console/panel";
+import { RotateCw } from "lucide-react";
+import { PageHeader, Panel } from "@/components/console/panel";
+import { ServiceUnavailable } from "@/components/console/service-unavailable";
 import { RuleFileEditor } from "@/components/console/manage-forms";
 import { ConfirmActionForm } from "@/components/console/action-form";
 import { Button } from "@/components/ui/button";
@@ -35,7 +35,7 @@ export default async function RuleFilePage({
   if (!RULE_FILE_RE.test(filename)) notFound();
 
   let xml = RULE_TEMPLATE;
-  let offline: string | null = null;
+  let error: string | null = null;
   let existedAlready = false;
   try {
     // И для «нового» файла проверяем существование: сохранение идёт с
@@ -49,23 +49,22 @@ export default async function RuleFilePage({
       if (!isAdmin) notFound();
       xml = RULE_TEMPLATE;
     } else {
-      console.error("manage/rules/[file]:", err instanceof Error ? err.message : err);
-      offline = "Wazuh API недоступен — подробности в логе консоли";
+      error = err instanceof Error ? err.message : String(err);
+      console.error("manage/rules/[file]:", error);
     }
   }
 
   return (
     <>
-      <div className="flex flex-wrap items-center justify-between gap-4">
-        <h1 className="text-3xl tracking-tight">
-          <span className="font-mono">{filename}</span>
-        </h1>
-        <div className="flex flex-wrap gap-2">
-          {isAdmin && (
+      <PageHeader
+        title={<span className="font-mono">{filename}</span>}
+        back={{ href: "/wazuh/manage/rules", label: "Правила Wazuh" }}
+        actions={
+          isAdmin && !error ? (
             <ConfirmActionForm
               action={restartManagerAction}
               title="Перезапустить менеджер Wazuh?"
-              description="Обработка событий прервётся на время рестарта. Перед этим убедитесь, что проверка конфигурации после сохранения прошла."
+              description="Обработка событий прервётся на время перезапуска. Перед этим убедитесь, что проверка после сохранения прошла."
               confirmLabel="Перезапустить"
               successText="Менеджер перезапускается"
             >
@@ -74,24 +73,16 @@ export default async function RuleFilePage({
                 Перезапустить менеджер
               </Button>
             </ConfirmActionForm>
-          )}
-          <Button asChild variant="ghost" size="sm">
-            <Link href="/wazuh/manage/rules">
-              <ArrowLeft strokeWidth={1.5} />
-              Ко всем файлам
-            </Link>
-          </Button>
-        </div>
-      </div>
+          ) : undefined
+        }
+      />
 
-      {offline ? (
-        <Panel label="Wazuh manager API · недоступен">
-          <p className="text-sm text-destructive">{offline}</p>
-        </Panel>
+      {error ? (
+        <ServiceUnavailable service="wazuh" what="файл правил" reason={error} />
       ) : (
         <Panel
           label={`Редактор · etc/rules/${filename}`}
-          meta={isAdmin ? "сохранить → проверка менеджером → рестарт" : "только чтение — редактирует администратор"}
+          meta={isAdmin ? "сохранение → проверка менеджером → перезапуск" : "только чтение — редактирует администратор"}
         >
           {existedAlready && (
             <p className="mb-4 text-sm text-[var(--status-warn)]">
