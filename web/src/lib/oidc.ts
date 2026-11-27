@@ -112,6 +112,14 @@ export function consoleUrl(cfg: Pick<OidcConfig, "redirectUrl">, path: string): 
   return new URL(path, cfg.redirectUrl).toString();
 }
 
+/** IdP подтвердил вход, но ни одна группа пользователя не сопоставлена роли ARGUS. */
+export class OidcNoRoleError extends Error {
+  constructor() {
+    super("OIDC: ни одна группа не сопоставлена роли ARGUS");
+    this.name = "OidcNoRoleError";
+  }
+}
+
 export type OidcUser = { name: string; role: Role; groups: string[] };
 
 export async function exchange(cfg: OidcConfig, code: string, verifier: string, nonce: string): Promise<OidcUser> {
@@ -135,7 +143,7 @@ export async function exchange(cfg: OidcConfig, code: string, verifier: string, 
     }
   }
   const role = mapRole(groups, cfg);
-  if (!role) throw new Error("OIDC: ни одна группа не сопоставлена роли ARGUS");
+  if (!role) throw new OidcNoRoleError();
   const name = ssoUserName(String(payload.preferred_username ?? payload.email ?? payload.sub ?? "sso-user"));
   return { name, role, groups };
 }

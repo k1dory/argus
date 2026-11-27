@@ -210,9 +210,10 @@ test("callback: повторный вход с другой группой ме�
 test("callback: отказ — нет групп для роли, nonce не совпал, чужой issuer/audience, подпись чужим ключом, IdP отверг код, нет id_token", async () => {
   const other = await generateKeyPair("RS256");
   const otherKeys: Keys = { privateKey: other.privateKey, jwk: { ...(await exportJWK(other.publicKey)), kid: "k1", alg: "RS256", use: "sig" } };
-  const cases: { name: string; token: (nonce: string) => Promise<Record<string, unknown>>; status?: number; why: RegExp }[] = [
-    { name: "группы не сопоставлены", token: async (nonce) => ({ id_token: await idToken({ nonce, preferred_username: "x", groups: ["guests"] }) }), why: /ни одна группа/ },
-    { name: "нет групп и нет access_token для userinfo", token: async (nonce) => ({ id_token: await idToken({ nonce, preferred_username: "x" }) }), why: /ни одна группа/ },
+  // code — что увидит пользователь на /login: no_role (вход прошёл, группы не дают доступа) отдельно от denied.
+  const cases: { name: string; token: (nonce: string) => Promise<Record<string, unknown>>; status?: number; why: RegExp; code?: string }[] = [
+    { name: "группы не сопоставлены", token: async (nonce) => ({ id_token: await idToken({ nonce, preferred_username: "x", groups: ["guests"] }) }), why: /ни одна группа/, code: "no_role" },
+    { name: "нет групп и нет access_token для userinfo", token: async (nonce) => ({ id_token: await idToken({ nonce, preferred_username: "x" }) }), why: /ни одна группа/, code: "no_role" },
     { name: "nonce", token: async () => ({ id_token: await idToken({ nonce: "stale", preferred_username: "x", groups: ["argus-admins"] }) }), why: /nonce не совпал/ },
     { name: "issuer", token: async (nonce) => ({ id_token: await idToken({ nonce, groups: ["argus-admins"] }, { issuer: "https://evil.example" }) }), why: /iss/ },
     { name: "audience", token: async (nonce) => ({ id_token: await idToken({ nonce, groups: ["argus-admins"] }, { audience: "other-client" }) }), why: /aud/ },
@@ -226,7 +227,7 @@ test("callback: отказ — нет групп для роли, nonce не с�
     idp.tokenStatus = c.status ?? 200;
     const r = await callback(`code=c&state=${state}`);
     assert.equal(r.status, 302, c.name);
-    assert.equal(r.headers.get("location"), "https://argus.example:8443/login?sso=denied", c.name);
+    assert.equal(r.headers.get("location"), `https://argus.example:8443/login?sso=${c.code ?? "denied"}`, c.name);
     assert.equal(await auth.getSession(), null, `${c.name}: сессии нет`);
     assert.equal(lastAudit().action, "session.login.failed", c.name);
     assert.equal(lastAudit().user, "sso", c.name);

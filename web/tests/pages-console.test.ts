@@ -326,11 +326,23 @@ test("правила: таблица с порогом, профилем и до
   assert.match(text, /окно/);
   assert.match(text, /по событию/);
   assert.match(text, /cloud/);
-  assert.match(text, /4 \/ 1 · 25 %/);
+  assert.match(text, /25 % · 1/);
+  assert.doesNotMatch(text, /argus rules test/, "без команд CLI в подписи панели");
+  // Название правила — первой колонкой, перед ID.
+  assert.ok(text.indexOf("Перебор SSH") < text.indexOf("ssh.bruteforce"));
 
+  // Движок недоступен, ClickHouse жив: правила из статистики ложных + плашка отказа движка.
   mocks.queries.engineRules = async () => ({ rules: [], health: null, error: "движок недоступен" });
+  mocks.queries.rulesFalsePositives = async () => ({
+    "ssh.bruteforce": { rule_id: "ssh.bruteforce", total: 4, false_positive: 1, closed: 3, title: "Перебор SSH", level: "high" },
+    "noisy.rule": { rule_id: "noisy.rule", total: 10, false_positive: 8, closed: 2, title: "Шумное правило", level: "low" },
+  });
   text = await pageText(await rules.default(props()));
-  assert.match(text, /Движок корреляции не ответил/);
+  assert.match(text, /Движок корреляции недоступен/);
+  assert.match(text, /Правила с инцидентами за 30 дней/);
+  assert.match(text, /Перебор SSH/);
+  assert.ok(text.indexOf("Шумное правило") < text.indexOf("Перебор SSH"), "шумное — выше");
+  assert.match(text, /80 % · 8/);
 
   mocks.queries.engineRules = async () => ({ rules: [], health: null, error: null });
   mocks.queries.rulesFalsePositives = async () => { throw down(); };
@@ -521,16 +533,17 @@ test("дашборды: нет такого id — 404, плохой id — 404,
 test("вход: без сессии — форма; с SSO — кнопка и текст отказа; с сессией — редирект на next", async () => {
   delete process.env.OIDC_ISSUER;
   let text = await pageText(await login.default(props({}, { next: "//evil.example" })));
-  assert.match(text, /Вход в консоль/);
+  assert.match(text, /Вход в ARGUS/);
   assert.match(text, /Пользователь/);
-  assert.doesNotMatch(text, /SSO/);
+  assert.doesNotMatch(text, /корпоративн/);
+  assert.doesNotMatch(text, /стартовый пароль/, "пароль admin уже сменён — подсказки про файл нет");
 
   process.env.OIDC_ISSUER = "https://idp.example/application/o/argus/";
   process.env.OIDC_CLIENT_ID = "argus";
   process.env.OIDC_REDIRECT_URL = "https://argus.example:8443/api/auth/oidc/callback";
   text = await pageText(await login.default(props({}, { sso: "denied" })));
-  assert.match(text, /Войти через SSO/);
-  assert.match(text, /группа не сопоставлена роли/);
+  assert.match(text, /Войти через корпоративную учётную запись/);
+  assert.match(text, /не подтвердил учётную запись/);
   text = await pageText(await login.default(props({}, { sso: "state" })));
   assert.match(text, /https:\/\/argus\.example:8443/);
   delete process.env.OIDC_ISSUER;
@@ -684,7 +697,7 @@ test("правила: уровень не ниже, инцидентов за 30
     "vpn.geo": { rule_id: "vpn.geo", total: 10, false_positive: 8, closed: 2 },
   });
   let text = await pageText(await rules.default(props({}, { level_min: "high" })));
-  assert.match(text, /Загруженные правила · 2 из 3/);
+  assert.match(text, /Загруженные правила 2 из 3/);
   assert.doesNotMatch(text, /exec в pod/);
   text = await pageText(await rules.default(props({}, { fp_min: "50" })));
   assert.match(text, /VPN из новой страны/);
@@ -693,7 +706,7 @@ test("правила: уровень не ниже, инцидентов за 30
   assert.match(text, /Перебор SSH/);
   assert.doesNotMatch(text, /VPN из новой страны|exec в pod/);
   text = await pageText(await rules.default(props({}, { incidents_min: "100" })));
-  assert.match(text, /Нет правил по фильтрам: инцидентов ≥ 100/);
+  assert.match(text, /Нет правил по фильтрам.*инцидентов ≥ 100/);
 });
 
 test("поиск: level_min/level_max — условие на серьёзность индекса параметрами; форма запроса их сохраняет", async () => {

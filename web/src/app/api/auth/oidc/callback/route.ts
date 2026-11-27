@@ -1,7 +1,7 @@
 import { cookies } from "next/headers";
 import { createSession, recordLoginFailure, recordSsoLogin } from "@/lib/auth";
 import { audit } from "@/lib/argus-queries";
-import { consoleUrl, exchange, oidcConfig } from "@/lib/oidc";
+import { consoleUrl, exchange, oidcConfig, OidcNoRoleError } from "@/lib/oidc";
 
 export async function GET(req: Request): Promise<Response> {
   const cfg = oidcConfig();
@@ -34,6 +34,7 @@ export async function GET(req: Request): Promise<Response> {
     await recordLoginFailure("sso");
     await audit("sso", "session.login.failed", "sso", e instanceof Error ? e.message.slice(0, 200) : "ошибка обмена кода");
     console.error("oidc callback:", e instanceof Error ? e.message : e);
-    return Response.redirect(consoleUrl(cfg, "/login?sso=denied"), 302);
+    // no_role — вход в IdP прошёл, но группы не дают доступа: пользователю нужен администратор, а не повторная попытка.
+    return Response.redirect(consoleUrl(cfg, e instanceof OidcNoRoleError ? "/login?sso=no_role" : "/login?sso=denied"), 302);
   }
 }
