@@ -4,7 +4,7 @@ import { notFound } from "next/navigation";
 import { ArrowLeft } from "lucide-react";
 import { Copyable } from "@/components/console/copyable";
 import { DownloadButton } from "@/components/console/download-button";
-import { ActorRangeLinks, ALIAS_KIND_LABELS, BindAliasForm, CloseAliasButton, ConfirmAliasButton } from "@/components/console/actor-forms";
+import { ActorRangeLinks, BindAliasForm, CloseAliasButton, ConfirmAliasButton } from "@/components/console/actor-forms";
 import { LevelBadge, StatusBadge } from "@/components/console/incident-badges";
 import { Empty, Led, PageHeader, Panel, StatTile } from "@/components/console/panel";
 import { StorageUnavailable } from "@/components/console/storage-error";
@@ -15,7 +15,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { safeQuery } from "@/lib/clickhouse";
 import { audit } from "@/lib/argus-queries";
 import { actorReport, getPerson, personAliases } from "@/lib/actors";
-import { aliasEventsHref, aliasKey, holdPolicy, isHeld, parseActorRange, PERSON_ID_RE, primaryAlias, SECTION_LABELS, SECTIONS, type ActorReport, type Section } from "@/lib/shared/actors";
+import { ALIAS_KIND_LABELS, aliasEventsHref, aliasKey, holdPolicy, isHeld, parseActorRange, PERSON_ID_RE, primaryAlias, SECTION_LABELS, SECTIONS, type ActorReport, type Section } from "@/lib/shared/actors";
 import { isIncidentStatus } from "@/lib/shared/incidents";
 import type { LogItem } from "@/lib/shared/log-query";
 import { RANGES } from "@/lib/shared/ranges";

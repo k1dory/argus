@@ -13,6 +13,11 @@ import { termToString } from "./search-query";
 export const ALIAS_KINDS = ["email", "login", "uid", "ip", "host", "sid", "peer", "phone"] as const;
 export type AliasKind = (typeof ALIAS_KINDS)[number];
 export const isAliasKind = (x: unknown): x is AliasKind => typeof x === "string" && (ALIAS_KINDS as readonly string[]).includes(x);
+/** Подписи видов алиасов для людей. Здесь, а не в клиентском модуле формы:
+ *  серверные страницы, импортируя из "use client", получают заглушку вместо объекта. */
+export const ALIAS_KIND_LABELS: Record<AliasKind, string> = {
+  email: "почта", login: "логин", uid: "uid", ip: "IP-адрес", host: "хост", sid: "SID", peer: "узел VPN", phone: "телефон",
+};
 
 /** Виды алиасов, сравниваемые без учёта регистра (хранятся в нижнем). */
 export const LOWERCASE_KINDS: readonly AliasKind[] = ["email", "login", "host"];

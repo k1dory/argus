@@ -6,7 +6,7 @@ import { useRouter } from "next/navigation";
 import { BadgeCheck, Link2, Unlink } from "lucide-react";
 import { toast } from "sonner";
 import { bindAliasAction, closeAliasAction, confirmAliasAction, type BindAliasState } from "@/lib/actor-actions";
-import { ALIAS_KINDS, type AliasKind } from "@/lib/shared/actors";
+import { ALIAS_KIND_LABELS, ALIAS_KINDS, type AliasKind } from "@/lib/shared/actors";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -14,10 +14,6 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { ConfirmActionForm } from "@/components/console/action-form";
 
 const initial: BindAliasState = { error: null };
-
-export const ALIAS_KIND_LABELS: Record<AliasKind, string> = {
-  email: "email", login: "логин", uid: "uid", ip: "IP-адрес", host: "хост", sid: "SID", peer: "узел VPN", phone: "телефон",
-};
 
 export type PersonOption = { person_id: string; display: string };
 
