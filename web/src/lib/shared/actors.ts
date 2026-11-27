@@ -796,7 +796,7 @@ export function actorMarkdown(r: ActorReport): string {
     "",
     `- Идентификатор: ${literal(p.person_id)}`,
     `- Вид: ${p.kind === "service" ? "служебная учётка" : "человек"}`,
-    `- Команда: ${p.team ? literal(p.team) : "не указана"}`,
+    `- Отдел: ${p.team ? literal(p.team) : "не указан"}`,
     `- Период: ${literal(r.range.from)} → ${literal(r.range.to)} UTC (${RANGE_WORDS[r.range.key]})`,
     `- Сформирован: ${literal(r.generated_at)} UTC`,
   ];
