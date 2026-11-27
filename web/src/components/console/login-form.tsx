@@ -1,6 +1,6 @@
 "use client";
 
-import { useActionState, useState } from "react";
+import { useActionState, useEffect, useRef, useState } from "react";
 import { Eye, EyeOff, LogIn } from "lucide-react";
 import { loginAction, type FormState } from "@/lib/actions";
 import { Button } from "@/components/ui/button";
@@ -31,6 +31,11 @@ export function LoginFields({ state, pending = false, next = "/" }: { state: For
   const loginError = Boolean(state.error);
   const [showPassword, setShowPassword] = useState(false);
   const [capsLock, setCapsLock] = useState(false);
+  const passwordRef = useRef<HTMLInputElement>(null);
+  // После ошибки логин уже введён — фокус на пароль (autoFocus срабатывает только при монтировании).
+  useEffect(() => {
+    if (state.error && state.user && !totpStep) passwordRef.current?.focus();
+  }, [state, totpStep]);
   const onKey = (e: React.KeyboardEvent<HTMLInputElement>) => setCapsLock(e.getModifierState?.("CapsLock") ?? false);
   const describedBy = [loginError ? "login-error" : "", capsLock ? "login-caps" : ""].filter(Boolean).join(" ") || undefined;
   return (
@@ -87,6 +92,7 @@ export function LoginFields({ state, pending = false, next = "/" }: { state: For
             <Label htmlFor="password" className={LABEL}>Пароль</Label>
             <div className="relative">
               <Input
+                ref={passwordRef}
                 id="password"
                 name="password"
                 type={showPassword ? "text" : "password"}
