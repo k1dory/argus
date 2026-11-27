@@ -173,3 +173,38 @@ for (const actor of ["constructor", "__proto__"]) {
       "событие следующего владельца не должно попасть в журнал");
   });
 }
+
+for (const kind of ["ip", "host"] as const) {
+  for (const actionLink of [false, true]) {
+    test(`review6: ${kind}, ${actionLink ? "действие" : "полоса"} — окно выбранного actor`, () => {
+      const origin = kind === "ip" ? "10.8.0.5" : "";
+      const rows = [
+        row({ origin, count: 2 }),
+        row({ origin, actor: "bob", first_ts: stamp(600_000), last_ts: stamp(600_000) }),
+      ];
+      const trace = buildTrace(rows);
+      const span = trace.sessions[0].origins[0].spans[0];
+      const owner = ownerScope([alias({ kind, value: kind === "ip" ? origin : "srv" })]);
+      const href = spanEventsHref(origin, span, trace.bucketSec,
+        actionLink ? span.actions[0] : undefined, owner);
+      assert.ok(href);
+      const f = params(href);
+      assert.equal(parseQuery(f.q).find((t) => t.field === "actor")?.value, "alice");
+      assert.equal(inTime(rows[0].first_ts, f), true,
+        "окно bob не содержит событий выбранного alice");
+    });
+  }
+}
+
+test("review6: пауза внутри SQL-корзины не подтверждает окно ссылки", () => {
+  // Ровно два события в одной 60-секундной корзине; между ними событий нет.
+  const r = row({ origin: "10.8.0.5", count: 2, last_ts: stamp(50_000) });
+  const [it] = feed([r], [
+    alias({ valid_from: stamp(10_000), valid_to: stamp(20_000) }),
+    alias({ kind: "ip", value: r.origin }),
+  ]);
+  assert.ok(it.href, "IP подтверждает оба события и позволяет построить ссылку");
+  const f = params(it.href);
+  assert.ok([r.first_ts, r.last_ts].some((ts) => inTime(ts, f)),
+    "в окне 08:00:10–08:00:19 нет ни одного из двух событий");
+});

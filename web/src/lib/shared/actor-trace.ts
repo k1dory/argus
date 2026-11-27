@@ -43,21 +43,33 @@ export type Segment = [from: number, to: number];
 
 /** Отрезки активности: строки-корзины без склейки через паузы. Map — имя actor из
  *  данных не должно совпасть со свойством прототипа (constructor, __proto__). */
-export type Activity = { all: Segment[]; byActor: Map<string, Segment[]> };
+export type Activity = { all: Segment[]; byActor: Map<string, Segment[]>;
+  /** Известные моменты событий (first/last корзин): внутри корзины между ними событий может не быть. */
+  points: { all: number[]; byActor: Map<string, number[]> } };
 
 function activityOf(items: { actor?: string; firstMs: number; lastMs: number }[]): Activity {
   const byActor = new Map<string, Segment[]>();
   const all: Segment[] = [];
+  const pAll: number[] = [];
+  const pBy = new Map<string, number[]>();
   for (const i of items) {
     const seg: Segment = [i.firstMs, i.lastMs];
     all.push(seg);
+    pAll.push(i.firstMs, i.lastMs);
     if (!i.actor) continue;
     const list = byActor.get(i.actor) ?? [];
     list.push(seg);
     byActor.set(i.actor, list);
+    const pl = pBy.get(i.actor) ?? [];
+    pl.push(i.firstMs, i.lastMs);
+    pBy.set(i.actor, pl);
   }
   const norm = (l: Segment[]) => mergeSegments(l, 0);
-  return { all: norm(all), byActor: new Map([...byActor].map(([k, v]) => [k, norm(v)])) };
+  const sortU = (l: number[]) => [...new Set(l)].sort((a, b) => a - b);
+  return {
+    all: norm(all), byActor: new Map([...byActor].map(([k, v]) => [k, norm(v)])),
+    points: { all: sortU(pAll), byActor: new Map([...pBy].map(([k, v]) => [k, sortU(v)])) },
+  };
 }
 
 export type TraceSpan = {
@@ -448,14 +460,17 @@ export function spanEventsHref(
   // полосы) ∩ интервал владения подтверждающего алиаса. Не min..max: пауза
   // между событиями с действующим в ней алиасом дала бы пустой журнал.
   const activity = (act ?? s).activity;
-  const segsFor = (field: "actor" | "src" | "node"): Segment[] => {
-    if (!activity) return [[act ? act.first : s.first, act ? act.last : s.last]];
-    if (field === "actor" && actor) return activity.byActor.get(actor) ?? [];
-    return activity.all;
-  };
+  // Запрос с actor показывает только его события — значит, и окно строится по
+  // его активности, каким бы алиасом (actor, IP, узел) ни подтверждалась
+  // принадлежность субъекту.
+  const fallback: Segment[] = [[act ? act.first : s.first, act ? act.last : s.last]];
+  const segs = !activity ? fallback : actor ? activity.byActor.get(actor) ?? [] : activity.all;
+  const points = !activity ? fallback[0] : actor ? activity.points.byActor.get(actor) ?? [] : activity.points.all;
+  // Окно годится, только если в нём лежит известное событие (граница корзины):
+  // пересечение с интервалом агрегата ещё не значит, что внутри что-то было.
+  const hasEvent = ([from, to]: [number, number]) => points.some((p) => p >= from && p <= to);
   let w: [number, number] | null = null;
   if (!owner) {
-    const segs = segsFor(actor ? "actor" : "src");
     if (segs.length) w = linkWindow(segs[0][0], segs[segs.length - 1][1], null);
   } else {
     const anchors: ["actor" | "src" | "node", string][] = [];
@@ -465,11 +480,11 @@ export function spanEventsHref(
     outer: for (const [field, value] of anchors) {
       const ivs = owner(field, value);
       // Свежая активность — первой: ссылка ведёт к последнему, что делал субъект.
-      for (const seg of [...segsFor(field)].reverse()) {
+      for (const seg of [...segs].reverse()) {
         for (const iv of ivs) {
           if (iv[1] <= seg[0] || iv[0] > seg[1]) continue;
-          w = linkWindow(Math.max(seg[0], iv[0]), Math.min(seg[1], iv[1]), iv);
-          if (w) break outer;
+          const cand = linkWindow(Math.max(seg[0], iv[0]), Math.min(seg[1], iv[1]), iv);
+          if (cand && hasEvent(cand)) { w = cand; break outer; }
         }
       }
     }
