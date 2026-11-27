@@ -74,6 +74,11 @@ export async function allAliases(): Promise<Alias[]> {
   return aliasesOf(await chQuery<AliasRow>(`SELECT * FROM (${ALIASES_LATEST}) ORDER BY person_id, alias_kind, valid_from LIMIT 100000`));
 }
 
+/** Персоны для выбора в форме привязки: только справочник, без подсчёта активности. */
+export async function listPersonOptions(): Promise<Person[]> {
+  return (await chQuery<PersonRow>(`${PERSONS_LATEST} ORDER BY display, person_id LIMIT 5000`)).map(toPerson);
+}
+
 export type PersonSummary = Person & { aliases: number; events: number; incidents: number; last_ts: string | null };
 
 /** Персон в одном запросе инцидентов: на каждую — countIf по её предикату. */
@@ -233,7 +238,10 @@ export async function aliasHistory(value: string, limit = 500): Promise<AliasHis
 const CASE_INSENSITIVE_ACTOR_SQL = ACTOR_KINDS.filter((k) => LOWERCASE_KINDS.includes(k)).map((k) => `'${k}'`).join(", ");
 const CASE_SENSITIVE_ACTOR_SQL = ACTOR_KINDS.filter((k) => k !== "phone" && !LOWERCASE_KINDS.includes(k)).map((k) => `'${k}'`).join(", ");
 
-export type Sighting = { source: string; action: string; who: string; where: string; ips: string[]; events: number; first_ts: string; last_ts: string };
+/** Отказы и ошибки в «где встречалось» — то же правило исхода, что у трассы паспорта. */
+const SIGHT_FAIL_SQL = `countIf(match(lowerUTF8(outcome), 'fail|deny|denied|error'))`;
+
+export type Sighting = { source: string; action: string; who: string; where: string; ips: string[]; events: number; fails: number; first_ts: string; last_ts: string };
 export type VpnConnection = { actor_name: string; peer_name: string; peer_ip: string; events: number; first_ts: string; last_ts: string };
 export type Sightings = { kind: "ip" | "actor"; rows: Sighting[]; vpn: VpnConnection[] };
 
@@ -248,13 +256,13 @@ export async function aliasSightings(value: string, range: ActorRange, now = Dat
   const w = clampWindow(rangeWindow(range, now));
   const win = { from: chTs(w.fromMs), to: chTs(w.toMs) };
   const ts = `ts >= parseDateTime64BestEffort({from:String}, 3, 'UTC') AND ts < parseDateTime64BestEffort({to:String}, 3, 'UTC')`;
-  type Row = { source: string; action: string; who: string; at_node: string; ips: string[]; events: string | number; first_ts: string; last_ts: string };
-  const toSighting = (r: Row): Sighting => ({ source: r.source, action: r.action, who: r.who, where: r.at_node, ips: (r.ips ?? []).filter(Boolean), events: Number(r.events), first_ts: r.first_ts, last_ts: r.last_ts });
+  type Row = { source: string; action: string; who: string; at_node: string; ips: string[]; events: string | number; fails?: string | number; first_ts: string; last_ts: string };
+  const toSighting = (r: Row): Sighting => ({ source: r.source ?? "", action: r.action ?? "", who: r.who ?? "", where: r.at_node ?? "", ips: (r.ips ?? []).filter(Boolean), events: Number(r.events), fails: Number(r.fails ?? 0), first_ts: r.first_ts, last_ts: r.last_ts });
   const ip = canonicalIp(value);
   if (ip) {
     const [rows, vpn] = await Promise.all([
       chQuery<Row>(
-        `SELECT source, action, actor_name AS who, any(node) AS at_node, groupUniqArray(5)(dst_ip) AS ips, count() AS events, toString(min(ts)) AS first_ts, toString(max(ts)) AS last_ts
+        `SELECT source, action, actor_name AS who, any(node) AS at_node, groupUniqArray(5)(dst_ip) AS ips, count() AS events, ${SIGHT_FAIL_SQL} AS fails, toString(min(ts)) AS first_ts, toString(max(ts)) AS last_ts
          FROM events WHERE ${ts} AND src_ip = {ip:String} AND source_class != 'netflow'
          GROUP BY source, action, actor_name ORDER BY last_ts DESC LIMIT 100`,
         { ...win, ip },
@@ -293,7 +301,7 @@ export async function aliasSightings(value: string, range: ActorRange, now = Dat
     `WITH
        (SELECT groupArray((person_id, valid_from, valid_to_raw)) FROM (${aliasesLatestWhere(`alias_kind IN (${CASE_INSENSITIVE_ACTOR_SQL}) AND alias_value = {lv:String}`)}) WHERE ${live}) AS ci,
        (SELECT groupArray((alias_value, person_id, valid_from, valid_to_raw)) FROM (${aliasesLatestWhere(`alias_kind IN (${CASE_SENSITIVE_ACTOR_SQL}) AND lowerUTF8(alias_value) = {lv:String}`)}) WHERE ${live}) AS fx
-     SELECT source, action, actor_name AS who, node AS at_node, groupUniqArray(5)(src_ip) AS ips, count() AS events, toString(min(ts)) AS first_ts, toString(max(ts)) AS last_ts
+     SELECT source, action, actor_name AS who, node AS at_node, groupUniqArray(5)(src_ip) AS ips, count() AS events, ${SIGHT_FAIL_SQL} AS fails, toString(min(ts)) AS first_ts, toString(max(ts)) AS last_ts
      FROM events WHERE ${ts}
        AND hasAny(${ACTOR_KEYS_EXPR}, {keys:Array(String)})
        AND (actor_name IN ({v:String}, {pv:String})
@@ -307,13 +315,23 @@ export async function aliasSightings(value: string, range: ActorRange, now = Dat
   return { kind: "actor", rows: rows.map(toSighting), vpn: [] };
 }
 
+/** Последние поиски «Кому принадлежит» этого пользователя (из журнала действий, свои же значения). */
+export async function recentLookups(user: string, limit = 6): Promise<{ value: string; last_ts: string }[]> {
+  return chQuery<{ value: string; last_ts: string }>(
+    `SELECT target AS value, toString(max(ts)) AS last_ts FROM console_audit
+     WHERE user = {user:String} AND action = 'actor.lookup' AND ts >= now() - INTERVAL 30 DAY AND target != ''
+     GROUP BY target ORDER BY max(ts) DESC LIMIT {limit:UInt32}`,
+    { user, limit },
+  );
+}
+
 export type UnboundSubject = { actor_name: string; count: number; first_ts: string; last_ts: string; sources: string[] };
 
 /** Топ actor_name за период без действующего (на момент последней активности) субъектного алиаса. */
 // Системные субъекты (actor_kind system: телеметрия самого ARGUS, сторожа) людям не
 // принадлежат и в список не попадают; сервисные учётки остаются — их заводят персонами вида service.
-export async function unboundSubjects(range: ActorRange, limit = 30, now = Date.now()): Promise<UnboundSubject[]> {
-  const w = clampWindow(rangeWindow(range, now));
+export async function unboundSubjects(range: ActorRange | Window, limit = 30, now = Date.now()): Promise<UnboundSubject[]> {
+  const w = clampWindow(typeof range === "string" ? rangeWindow(range, now) : range);
   const [top, aliases] = await Promise.all([
     chQuery<{ actor_name: string; count: string | number; first_ts: string; last_ts: string; sources: string[] }>(
       `SELECT actor_name, count() AS count, toString(min(ts)) AS first_ts, toString(max(ts)) AS last_ts, groupUniqArray(5)(source) AS sources

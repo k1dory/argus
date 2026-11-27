@@ -5,6 +5,7 @@ import { test, before } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { installNextMocks, loadAuth } from "./_next-mock";
+import { pageText } from "./_render";
 
 const auth = loadAuth();
 const mocks = installNextMocks();
@@ -93,6 +94,19 @@ test("аналитик: просмотр пишется до чтения дан
   mocks.jar.clear();
 });
 
+test("привязка (admin): пустая дата без флажка «на всю историю» — отказ до журнала и записи", async () => {
+  mocks.jar.clear();
+  await auth.createSession("admin", "admin");
+  const n = fetched.length;
+  const audits = mocks.audit.length;
+  const fd = new FormData();
+  fd.set("person_id", "i.petrov"); fd.set("kind", "login"); fd.set("value", "root"); fd.set("from", "");
+  assert.match((await actions.bindAliasAction({ error: null }, fd)).error ?? "", /на всю историю/);
+  assert.equal(fetched.length, n, "хранилище не трогается");
+  assert.equal(mocks.audit.length, audits, "в журнал не пишется");
+  mocks.jar.clear();
+});
+
 // «Кому принадлежит» (/actors/lookup): та же граница доступа, поиск пишется в
 // журнал до чтения данных, история владения — все интервалы алиасов
 // (включая закрытые), IP дополнительно ищется как внешний адрес клиента VPN.
@@ -120,7 +134,8 @@ test("lookup: пустой запрос — только форма; IP — ис
   const before = mocks.audit.length;
   let n = fetched.length;
   textOf(await lookupPage.default(props()));
-  assert.equal(fetched.length, n, "без значения хранилище не опрашивается");
+  const empty = fetched.slice(n);
+  assert.ok(empty.every((q) => q.includes("FROM console_audit") && q.includes("{user:String}")), "без значения — только свои недавние поиски из журнала действий");
   assert.equal(mocks.audit.length, before, "и в журнал не пишется");
 
   const realFetch = globalThis.fetch;
@@ -137,7 +152,7 @@ test("lookup: пустой запрос — только форма; IP — ис
   }) as typeof fetch;
   try {
     n = fetched.length;
-    const text = textOf(await lookupPage.default(props({}, { v: "10.0.0.5", range: "30d" })));
+    const text = await pageText(await lookupPage.default(props({}, { v: "10.0.0.5", range: "30d" })));
     assert.ok(mocks.audit.some((a) => a.action === "actor.lookup" && a.target === "10.0.0.5"), "поиск в журнале действий");
     for (const s of ["История владения", "Алексей Сидоров", "Иван Петров", "действует", "Подключения к VPN", "Где встречалось"]) assert.ok(text.includes(s), s);
     const sqls = fetched.slice(n);

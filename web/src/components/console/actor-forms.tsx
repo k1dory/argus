@@ -3,10 +3,12 @@
 import { useActionState, useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { BadgeCheck, Link2, Unlink } from "lucide-react";
+import { BadgeCheck, Link2, TriangleAlert, Unlink } from "lucide-react";
 import { toast } from "sonner";
 import { bindAliasAction, closeAliasAction, confirmAliasAction, type BindAliasState } from "@/lib/actor-actions";
 import { ALIAS_KIND_LABELS, ALIAS_KINDS, type AliasKind } from "@/lib/shared/actors";
+import { ALL_HISTORY_FIELD, bindRisk, todayUtc } from "@/lib/shared/actors-ui";
+import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -18,15 +20,30 @@ const initial: BindAliasState = { error: null };
 export type PersonOption = { person_id: string; display: string };
 
 /**
- * Привязка алиаса (admin): к существующей персоне из списка или к новой.
- * Если персона задана (страница паспорта) — выбор скрыт. После успеха —
- * переход в паспорт персоны.
+ * Привязка алиаса (admin): к существующей персоне (поиск по имени и id) или к
+ * новой. Если персона задана (страница паспорта) — выбор скрыт. Начало
+ * действия по умолчанию — сегодня (UTC): привязка «на всю историю» отдаёт
+ * персоне все прошлые события значения, поэтому включается отдельным флажком
+ * с предупреждением. После успеха — переход в паспорт персоны.
  */
-export function BindAliasForm({ persons, value = "", kind = "login", personId }: { persons: PersonOption[]; value?: string; kind?: AliasKind; personId?: string }) {
+export function BindAliasForm({
+  persons, value = "", kind = "login", personId, today, kindGuessed = false,
+}: {
+  persons: PersonOption[];
+  value?: string;
+  kind?: AliasKind;
+  personId?: string;
+  /** Дата по умолчанию (YYYY-MM-DD, UTC); без неё — сегодня. */
+  today?: string;
+  /** Вид подобран по значению автоматически — показать «проверьте». */
+  kindGuessed?: boolean;
+}) {
   const router = useRouter();
   const [mode, setMode] = useState<"existing" | "new">(personId || persons.length ? "existing" : "new");
-  const [selected, setSelected] = useState(personId ?? persons[0]?.person_id ?? "");
+  const [query, setQuery] = useState(personId ?? "");
   const [aliasKind, setAliasKind] = useState<AliasKind>(kind);
+  const [aliasValue, setAliasValue] = useState(value);
+  const [allHistory, setAllHistory] = useState(false);
   const [state, action, pending] = useActionState(bindAliasAction, initial);
   useEffect(() => {
     if (state.error) toast.error(state.error);
@@ -35,26 +52,46 @@ export function BindAliasForm({ persons, value = "", kind = "login", personId }:
       router.push(`/actors/${encodeURIComponent(state.person_id)}`);
     }
   }, [state, router]);
+  const q = query.trim().toLowerCase();
+  // Совпадение по id или точному имени: в форму уходит id выбранной персоны.
+  const picked = personId || !q ? null : persons.find((p) => p.person_id === q) ?? persons.find((p) => p.display.trim().toLowerCase() === q) ?? null;
+  const risk = bindRisk(aliasKind, aliasValue);
   return (
-    <form action={action} className="space-y-3" aria-busy={pending || undefined}>
+    <form action={action} className="space-y-4" aria-busy={pending || undefined}>
       <input type="hidden" name="kind" value={aliasKind} />
-      {mode === "existing" && <input type="hidden" name="person_id" value={selected} />}
+      {personId && <input type="hidden" name="person_id" value={personId} />}
+      {!personId && mode === "existing" && <input type="hidden" name="person_id" value={picked?.person_id ?? query.trim()} />}
+      {allHistory && <input type="hidden" name={ALL_HISTORY_FIELD} value="1" />}
       {!personId && (
-        <div className="flex flex-wrap items-center gap-3 text-[13px]">
-          <label className="flex items-center gap-1.5"><input type="radio" name="_mode" checked={mode === "existing"} onChange={() => setMode("existing")} disabled={!persons.length} /> существующая персона</label>
-          <label className="flex items-center gap-1.5"><input type="radio" name="_mode" checked={mode === "new"} onChange={() => setMode("new")} /> новая персона</label>
+        <div role="radiogroup" aria-label="К кому привязать" className="inline-flex items-center gap-0.5 rounded-lg border border-border bg-[var(--surface-deep)] p-0.5">
+          {([["existing", "Существующая персона"], ["new", "Новая персона"]] as const).map(([m, label]) => (
+            <button
+              key={m} type="button" role="radio" aria-checked={mode === m}
+              disabled={m === "existing" && !persons.length}
+              onClick={() => setMode(m)}
+              className={cn(
+                "min-h-8 rounded-md px-3 text-[13px] transition-colors disabled:cursor-default disabled:text-[var(--text-disabled)]",
+                mode === m ? "bg-[var(--surface-elevated)] font-medium text-foreground shadow-[inset_0_0_0_1px_var(--border-strong)]" : "text-muted-foreground hover:text-foreground",
+              )}
+            >{label}</button>
+          ))}
         </div>
       )}
-      <div className="flex flex-wrap items-end gap-3">
+      <div className="flex flex-wrap items-start gap-3">
         {!personId && mode === "existing" && (
           <div className="space-y-2">
             <Label htmlFor="bind-person" className="c-label">Персона</Label>
-            <Select value={selected} onValueChange={setSelected}>
-              <SelectTrigger id="bind-person" className="h-10 w-64"><SelectValue placeholder="выберите" /></SelectTrigger>
-              <SelectContent>
-                {persons.map((p) => <SelectItem key={p.person_id} value={p.person_id}>{p.display || p.person_id} <span className="font-mono text-muted-foreground">{p.person_id}</span></SelectItem>)}
-              </SelectContent>
-            </Select>
+            <Input
+              id="bind-person" list="bind-person-list" value={query} onChange={(e) => setQuery(e.target.value)}
+              placeholder="начните вводить имя или id" autoComplete="off" spellCheck={false} required
+              className="h-10 w-64 px-3 font-mono placeholder:font-sans" aria-describedby="bind-person-hint"
+            />
+            <datalist id="bind-person-list">
+              {persons.map((p) => <option key={p.person_id} value={p.person_id}>{p.display && p.display !== p.person_id ? p.display : undefined}</option>)}
+            </datalist>
+            <p id="bind-person-hint" className="min-h-4 text-xs text-muted-foreground">
+              {picked ? <span className="text-foreground">{picked.display || picked.person_id} <span className="font-mono text-[var(--text-tertiary)]">{picked.person_id}</span></span> : q ? <span className="text-[var(--status-warn)]">нет такой персоны — выберите из подсказок</span> : `${persons.length} в справочнике`}
+            </p>
           </div>
         )}
         {!personId && mode === "new" && (
@@ -68,7 +105,7 @@ export function BindAliasForm({ persons, value = "", kind = "login", personId }:
               <Input id="bind-display" name="display" placeholder="Иван Петров" className="h-10 w-52 px-3" />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="bind-team" className="c-label">Команда</Label>
+              <Label htmlFor="bind-team" className="c-label">Отдел</Label>
               <Input id="bind-team" name="team" placeholder="platform" className="h-10 w-36 px-3" />
             </div>
           </>
@@ -76,26 +113,51 @@ export function BindAliasForm({ persons, value = "", kind = "login", personId }:
         <div className="space-y-2">
           <Label htmlFor="bind-kind" className="c-label">Вид</Label>
           <Select value={aliasKind} onValueChange={(v) => setAliasKind(v as AliasKind)}>
-            <SelectTrigger id="bind-kind" className="h-10 w-36"><SelectValue /></SelectTrigger>
+            <SelectTrigger id="bind-kind" className="h-10 w-36" aria-describedby={kindGuessed ? "bind-kind-hint" : undefined}><SelectValue /></SelectTrigger>
             <SelectContent>
               {ALIAS_KINDS.map((k) => <SelectItem key={k} value={k}>{ALIAS_KIND_LABELS[k]}</SelectItem>)}
             </SelectContent>
           </Select>
+          {kindGuessed && <p id="bind-kind-hint" className="text-xs text-muted-foreground">подобран по значению — проверьте</p>}
         </div>
         <div className="space-y-2">
           <Label htmlFor="bind-value" className="c-label">Значение</Label>
-          <Input id="bind-value" name="value" defaultValue={value} className="h-10 w-56 px-3 font-mono" required />
+          <Input id="bind-value" name="value" value={aliasValue} onChange={(e) => setAliasValue(e.target.value)} className="h-10 w-56 px-3 font-mono" required />
         </div>
         <div className="space-y-2">
           <Label htmlFor="bind-from" className="c-label">Действует с (UTC)</Label>
-          <Input id="bind-from" name="from" type="date" className="h-10 w-44 px-3" />
+          <Input
+            id="bind-from" name="from" type="date" defaultValue={today ?? todayUtc()} disabled={allHistory} required={!allHistory}
+            className="h-10 w-44 px-3 [color-scheme:dark] disabled:opacity-40"
+          />
+          <label className="flex items-center gap-2 text-[13px] text-muted-foreground">
+            <input
+              type="checkbox" checked={allHistory} onChange={(e) => setAllHistory(e.target.checked)}
+              className="size-4 accent-[var(--status-warn)] [color-scheme:dark]" aria-describedby={allHistory ? "bind-all-warning" : undefined}
+            />
+            на всю историю
+          </label>
         </div>
+      </div>
+      {allHistory && (
+        <p id="bind-all-warning" role="alert" className="flex items-start gap-2 border-l-2 border-[var(--status-warn)] pl-3 text-[13px] text-[var(--status-warn)]">
+          <TriangleAlert className="mt-0.5 size-4 shrink-0" strokeWidth={1.5} aria-hidden />
+          Все прошлые события и инциденты с этим значением будут отнесены к персоне — в том числе те, что были до того, как значение стало её.
+        </p>
+      )}
+      {risk && (
+        <p className="flex items-start gap-2 border-l-2 border-[var(--status-warn)] pl-3 text-[13px] text-foreground">
+          <TriangleAlert className="mt-0.5 size-4 shrink-0 text-[var(--status-warn)]" strokeWidth={1.5} aria-hidden />
+          {risk}
+        </p>
+      )}
+      <div className="flex flex-wrap items-center gap-3">
         <Button type="submit" variant="secondary" disabled={pending} className="min-h-10">
           <Link2 strokeWidth={1.5} />
           {pending ? "Привязка…" : "Привязать"}
         </Button>
+        <p className="text-xs text-muted-foreground">Запись попадёт в журнал действий от вашего имени.</p>
       </div>
-      <p className="text-xs text-muted-foreground">Пустая дата — алиас действует на всю историю журнала; укажите дату, чтобы ограничить начало. Источник записи — api, запись попадает в журнал действий.</p>
       {state.error && <p role="alert" className="text-sm text-destructive">{state.error}</p>}
     </form>
   );

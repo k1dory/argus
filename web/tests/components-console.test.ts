@@ -468,10 +468,16 @@ test("прочие формы: пользователи, режим реагир
   assert.match(stripTags(ed), /SELECT 1/);
   assert.match(stripTags(html(h(dashCreate.CreateDashboardForm, {}))), /Создать|Новый/i);
   const bind = html(h(actorForms.BindAliasForm, { persons: [{ person_id: "i.petrov", display: "Иван Петров" }], value: "ipetrov", kind: "login" }));
-  assert.match(stripTags(bind), /существующая персона новая персона Персона Вид Значение/);
+  assert.match(stripTags(bind), /Существующая персона Новая персона Персона .* Вид Значение Действует с \(UTC\) на всю историю/);
   assert.match(stripTags(bind), /Привязать/);
   assert.match(bind, /value="ipetrov"/);
-  assert.match(bind, /Иван Петров|i\.petrov/, "персоны — в списке выбора (Radix Select рендерит значения только после открытия)");
+  assert.match(bind, /<datalist id="bind-person-list"><option value="i\.petrov">Иван Петров<\/option>/, "персоны — подсказками поиска по имени и id");
+  // Риск атрибуции: по умолчанию привязка действует с сегодняшнего дня, а не на всю историю.
+  assert.match(bind, new RegExp(`name="from"[^>]*value="${new Date().toISOString().slice(0, 10)}"`), "дата по умолчанию — сегодня (UTC)");
+  assert.match(bind, /<input[^>]*id="bind-from"[^>]*required=""/, "пустая дата не отправляется без флажка");
+  assert.doesNotMatch(bind, /name="all_history"/, "флажок «на всю историю» по умолчанию снят");
+  assert.match(html(h(actorForms.BindAliasForm, { persons: [], value: "2026-11-01", today: "2026-11-01", kind: "login" })), /name="from"[^>]*value="2026-11-01"/);
+  assert.match(stripTags(html(h(actorForms.BindAliasForm, { persons: [], value: "root", kind: "login" }))), /общая системная учётка/, "предупреждение для root");
   assert.match(html(h(actorForms.CloseAliasButton, { personId: "i.petrov", kind: "login", value: "ipetrov" })), /ipetrov/);
   assert.match(html(h(actorForms.ConfirmAliasButton, { personId: "i.petrov", kind: "login", value: "ipetrov", policy: "подтвердить" })), /ipetrov/);
   const rl = html(h(actorForms.ActorRangeLinks, { current: "7d", base: "/actors/i.petrov" }));

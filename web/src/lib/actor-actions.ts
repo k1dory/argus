@@ -12,6 +12,7 @@ import type { FormState } from "./actions";
 import { audit } from "./argus-queries";
 import { bindAlias, closeAlias, confirmAlias, getPerson } from "./actors";
 import { isAliasKind, parseAliasInput, PERSON_ID_RE, TEXT_MAX, type Person } from "./shared/actors";
+import { ALL_HISTORY_FIELD, bindFromInput } from "./shared/actors-ui";
 
 export type BindAliasState = FormState & { person_id?: string };
 
@@ -29,7 +30,8 @@ function shortError(scope: string, err: unknown): string {
 
 /**
  * Поля: person_id (существующая персона) ИЛИ new_person_id + display (новая);
- * kind, value, from (YYYY-MM-DD или RFC 3339; пусто — сейчас), note.
+ * kind, value, from (YYYY-MM-DD или RFC 3339), note. Пустой from (вся история
+ * журнала) — только вместе с all_history=1, иначе ошибка.
  */
 export async function bindAliasAction(_prev: BindAliasState, formData: FormData): Promise<BindAliasState> {
   const a = await authorize("admin");
@@ -39,10 +41,13 @@ export async function bindAliasAction(_prev: BindAliasState, formData: FormData)
   const display = String(formData.get("display") ?? "").trim();
   const team = String(formData.get("team") ?? "").trim();
   const kind = String(formData.get("kind") ?? "");
-  const parsed = parseAliasInput({ kind, value: formData.get("value"), from: formData.get("from") || undefined, note: formData.get("note") ?? "" });
+  // Пустая дата — привязка на всю историю журнала: только с явным флажком формы.
+  const from = bindFromInput(formData.get("from"), formData.get(ALL_HISTORY_FIELD));
+  if (!from.ok) return { error: from.error };
+  const parsed = parseAliasInput({ kind, value: formData.get("value"), from: from.from ?? undefined, note: formData.get("note") ?? "" });
   if (!parsed.ok) return { error: `Алиас: ${parsed.field ? parsed.field + " — " : ""}${parsed.error}` };
   if (!isAliasKind(kind)) return { error: "Неизвестный вид алиаса" };
-  if (display.length > TEXT_MAX || team.length > TEXT_MAX) return { error: `Имя и команда — до ${TEXT_MAX} символов` };
+  if (display.length > TEXT_MAX || team.length > TEXT_MAX) return { error: `Имя и отдел — до ${TEXT_MAX} символов` };
   let person: Person;
   let create = false;
   try {
