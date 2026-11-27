@@ -251,6 +251,9 @@ export async function latestVerdictsSummary(): Promise<VerdictSummary> {
   return { total: Number(row?.total ?? 0), failed: Number(row?.failed ?? 0), unknown: Number(row?.unknown ?? 0), evaluatedAt: Number(row?.total ?? 0) ? row.evaluated_max : null };
 }
 
+/** Вердиктов на странице «Политики»: нарушения сверху, остальное — следующими страницами. */
+export const POLICY_PAGE_SIZE = 100;
+
 export async function latestVerdicts(page = 1): Promise<VerdictRow[]> {
   const withStatus = await hasVerdictStatus();
   const statusExpr = withStatus ? "status" : "if(compliant = 1, 'pass', 'fail')";
@@ -260,7 +263,7 @@ export async function latestVerdicts(page = 1): Promise<VerdictRow[]> {
      WHERE evaluated_at = (SELECT max(evaluated_at) FROM policy_verdicts)
      ORDER BY status = 'fail' DESC, status = 'unknown' DESC, entity_name, policy, entity_id
      LIMIT {limit:UInt32} OFFSET {offset:UInt32}`,
-    { limit: MAX_LIST_ROWS, offset: (clampPage(page) - 1) * MAX_LIST_ROWS },
+    { limit: POLICY_PAGE_SIZE, offset: (clampPage(page) - 1) * POLICY_PAGE_SIZE },
   );
   return rows.map((r) => ({ ...r, compliant: Number(r.compliant), status: verdictStatusOf(Number(r.compliant), r.status) }));
 }
@@ -359,17 +362,67 @@ export type VulnRow = {
 
 export const VULN_LIMIT = 300;
 
-/** Фильтры витрины CVE: окно по timestamp (не шире 30 дней), серьёзность и CVSS последней записи (HAVING). */
-export type VulnFilters = { time?: TimeFilter; severity?: OrdinalRange; cvss?: NumRange };
+/** Какие CVE показывать: активные (всё, что не Solved, — в том числе Pending и пустой статус), устранённые или все. */
+export type VulnStatusFilter = "active" | "solved" | "all";
 
-export async function vulnList(f: VulnFilters = {}): Promise<VulnRow[]> {
-  const params: Record<string, string | number> = { limit: VULN_LIMIT };
+export function parseVulnStatus(v: unknown): VulnStatusFilter {
+  return v === "solved" || v === "all" ? v : "active";
+}
+
+/** Фильтры витрины CVE: окно по timestamp (не шире 30 дней), серьёзность и CVSS последней записи (HAVING). */
+export type VulnFilters = { time?: TimeFilter; severity?: OrdinalRange; cvss?: NumRange; status?: VulnStatusFilter };
+
+/** WHERE и HAVING витрины CVE (без фильтра статуса) — общие для списка и итогов. */
+function vulnConds(f: VulnFilters, params: Record<string, string | number>): { where: string; having: string[] } {
   const where = ["vuln_cve != ''", alertTime(f.time ?? "30d", params)].join(" AND ");
   const having = [
     ...(f.severity ? ordinalConditions("severity", f.severity, VULN_SEVERITIES, params, "sev") : []),
     // CVSS 0 — «нет оценки»: порог снизу её отсекает, как и должен.
     ...(f.cvss && hasRange(f.cvss) ? numConditions("toFloat64(score)", f.cvss, params, "cvss", "Float64") : []),
   ];
+  return { where, having };
+}
+
+export type VulnSummary = { total: number; active: number; critical: number; high: number; solved: number };
+
+/**
+ * Честные итоги витрины CVE: агрегат по тем же группам (CVE × пакет × агент)
+ * и тем же фильтрам, что и список, но без LIMIT — плитки не занижаются, когда
+ * в таблицу попадают только первые VULN_LIMIT строк. Критические/высокие —
+ * среди активных.
+ */
+export async function vulnSummary(f: VulnFilters = {}): Promise<VulnSummary> {
+  const params: Record<string, string | number> = {};
+  const { where, having } = vulnConds(f, params);
+  const [row] = await chQuery<{ total: string; active: string; critical: string; high: string }>(
+    `SELECT count() AS total,
+            countIf(status != 'Solved') AS active,
+            countIf(status != 'Solved' AND severity = 'Critical') AS critical,
+            countIf(status != 'Solved' AND severity = 'High') AS high
+     FROM (
+       SELECT vuln_cve AS v_cve,
+              argMax(vuln_severity, timestamp) AS severity,
+              argMax(vuln_score, timestamp) AS score,
+              vuln_package AS v_pkg,
+              agent_name,
+              argMax(vuln_status, timestamp) AS status
+       FROM wazuh_alerts
+       WHERE ${where}
+       GROUP BY v_cve, v_pkg, agent_name
+       ${having.length ? `HAVING ${having.join(" AND ")}` : ""}
+     )`,
+    params,
+  );
+  const total = Number(row?.total ?? 0);
+  const active = Number(row?.active ?? 0);
+  return { total, active, critical: Number(row?.critical ?? 0), high: Number(row?.high ?? 0), solved: total - active };
+}
+
+export async function vulnList(f: VulnFilters = {}): Promise<VulnRow[]> {
+  const params: Record<string, string | number> = { limit: VULN_LIMIT };
+  const { where, having: base } = vulnConds(f, params);
+  const status = f.status ?? "all";
+  const having = [...base, ...(status === "active" ? ["status != 'Solved'"] : status === "solved" ? ["status = 'Solved'"] : [])];
   const rows = await chQuery<VulnRow>(
     `SELECT vuln_cve AS cve,
             argMax(vuln_severity, timestamp) AS severity,

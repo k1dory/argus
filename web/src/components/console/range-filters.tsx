@@ -23,13 +23,29 @@ function keysOf(f: RangeField): [string, string] {
  * на сервере (lib/shared/filters): форма только собирает строку запроса.
  * time — точный интервал from/to (UTC); пресеты — RangePicker рядом.
  */
-export function RangeFilters(props: { time?: boolean; timeLabel?: string; fields?: RangeField[]; legacy?: string[]; idPrefix?: string }) {
+type RangeFiltersProps = {
+  time?: boolean;
+  timeLabel?: string;
+  fields?: RangeField[];
+  legacy?: string[];
+  idPrefix?: string;
+  /**
+   * Дополнительные поля в той же форме (поиск, селект агента): неуправляемые
+   * контролы с атрибутом name, значения читаются из формы при отправке. Одна
+   * кнопка «Применить» отправляет всё сразу — ни одно поле не теряется.
+   */
+  extra?: React.ReactNode;
+  /** Имена полей extra; пустое значение (или «__any»/«__all») убирает параметр из URL. */
+  extraKeys?: string[];
+};
+
+export function RangeFilters(props: RangeFiltersProps) {
   const params = useSearchParams();
   // Ключ — строка запроса: после навигации поля берут значения из нового URL.
   return <RangeFiltersForm key={params.toString()} {...props} />;
 }
 
-function RangeFiltersForm({ time = false, timeLabel = "Точный интервал, UTC", fields = [], legacy = [], idPrefix = "rf" }: { time?: boolean; timeLabel?: string; fields?: RangeField[]; legacy?: string[]; idPrefix?: string }) {
+function RangeFiltersForm({ time = false, timeLabel = "Точный интервал, UTC", fields = [], legacy = [], idPrefix = "rf", extra, extraKeys = [] }: RangeFiltersProps) {
   const router = useRouter();
   const pathname = usePathname();
   const params = useSearchParams();
@@ -39,8 +55,17 @@ function RangeFiltersForm({ time = false, timeLabel = "Точный интерв
   const set = (k: string, v: string) => setValues((s) => ({ ...s, [k]: v }));
   const active = all.some((k) => params.get(k)) || legacy.some((k) => params.get(k));
 
-  const go = (vals: Record<string, string>, reset = false) => {
+  const go = (vals: Record<string, string>, reset = false, form?: HTMLFormElement) => {
     const next = new URLSearchParams(params);
+    if (form) {
+      const data = new FormData(form);
+      for (const k of extraKeys) {
+        const raw = data.get(k);
+        const v = typeof raw === "string" ? raw.trim() : "";
+        if (v && v !== ANY && v !== "__all") next.set(k, v);
+        else next.delete(k);
+      }
+    }
     const val = (k: string) => {
       const v = (vals[k] ?? "").trim();
       return v && v !== ANY ? v : "";
@@ -76,9 +101,10 @@ function RangeFiltersForm({ time = false, timeLabel = "Точный интерв
       aria-busy={pending}
       onSubmit={(e) => {
         e.preventDefault();
-        if (!pending) go(values);
+        if (!pending) go(values, false, e.currentTarget);
       }}
     >
+      {extra}
       {time && <DateRange id={`${idPrefix}-time`} legend={timeLabel} from={values.from} to={values.to} onFrom={(v) => set("from", v)} onTo={(v) => set("to", v)} />}
       {fields.map((f) => {
         const [lo, hi] = keysOf(f);
