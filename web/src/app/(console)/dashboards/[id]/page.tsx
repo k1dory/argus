@@ -1,8 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { Pencil, Trash2 } from "lucide-react";
-import { ConfirmActionForm } from "@/components/console/action-form";
+import { Pencil } from "lucide-react";
 import { AutoRefresh } from "@/components/console/auto-refresh";
 import { DashboardGrid } from "@/components/console/dash-panels";
 import { Empty, PageHeader, Panel } from "@/components/console/panel";
@@ -11,11 +10,12 @@ import { StorageUnavailable } from "@/components/console/storage-error";
 import { Button } from "@/components/ui/button";
 import { requirePageSession, ROLE_RANK } from "@/lib/auth";
 import { safeQuery } from "@/lib/clickhouse";
-import { deleteDashboardAction } from "@/lib/dashboard-actions";
 import { getDashboard, refreshSeconds, runPanelQuery, stripPanelDetail, type PanelData } from "@/lib/dashboards";
 import { isLongRange } from "@/lib/shared/time";
 import { RangeFilters } from "@/components/console/range-filters";
-import { parseTimeFilter } from "@/lib/shared/filters";
+import { BoardErrorBanner } from "@/components/console/dashboard-board";
+import { boardTime, commonPanelError, intervalLabel } from "@/lib/shared/dashboard-view";
+import { patchHref } from "@/lib/shared/filters";
 
 export const dynamic = "force-dynamic";
 
@@ -36,9 +36,10 @@ export default async function DashboardPage({ params, searchParams }: PageProps<
   const sp = await searchParams;
   // Пресет (range или period) — только из белого списка общего парсера; точный интервал
   // (from/to, UTC) главнее пресета: макросы $__timeFilter/$__from/$__to получают его границы параметрами.
-  const time = parseTimeFilter(sp, { defaultRange: "24h" });
-  const range = time.range ?? "24h";
-  const window = time.from ? time : range;
+  // При точном интервале ни один пресет не подсвечен (boardTime.picker = undefined).
+  const bt = boardTime(sp);
+  const { time, range } = bt;
+  const window = bt.window;
   const specRes = await safeQuery(() => getDashboard(id));
   if (!specRes.ok) {
     return (
@@ -56,35 +57,47 @@ export default async function DashboardPage({ params, searchParams }: PageProps<
   const ttlMs = refreshSec > 0 ? refreshSec * 1000 : 0;
   const results = await Promise.all(spec.panels.map((p) => runPanelQuery(p.sql, window, ttlMs)));
   const data: Record<string, PanelData> = {};
+  const admin = session.role === "admin";
   spec.panels.forEach((p, i) => (data[p.id] = canEdit ? results[i] : stripPanelDetail(results[i])));
+  // Одна причина на всю доску — одна плашка над сеткой, панели свёрнуты.
+  const common = commonPanelError(results);
+  const interval = intervalLabel(time);
 
   return (
     <>
-      <PageHeader title={spec.title} subtitle={spec.description}>
-        <div className="flex flex-wrap items-center gap-3">
-          {refreshSec > 0 && <AutoRefresh seconds={refreshSec} />}
-          <RangePicker value={range} />
-          {canEdit && (
-            <>
-              <Button asChild variant="secondary" size="sm"><Link href={`/dashboards/${spec.id}/edit?range=${range}`}><Pencil strokeWidth={1.5} />Редактировать</Link></Button>
-              <ConfirmActionForm
-                action={deleteDashboardAction}
-                title="Удалить дашборд"
-                description={<>Дашборд «{spec.title}» ({spec.id}) будет скрыт из списка. Версии остаются в console_dashboards, вернуть можно вручную.</>}
-                confirmLabel="Да, удалить"
-              >
-                <input type="hidden" name="id" value={spec.id} />
-                <Button type="submit" variant="ghost" size="sm"><Trash2 strokeWidth={1.5} />Удалить</Button>
-              </ConfirmActionForm>
-            </>
-          )}
-        </div>
-      </PageHeader>
-      <RangeFilters time idPrefix="dash" />
+      <PageHeader
+        title={spec.title}
+        subtitle={spec.description}
+        actions={
+          <>
+            {refreshSec > 0 && <AutoRefresh seconds={refreshSec} />}
+            {canEdit && (
+              <Button asChild variant="secondary" size="sm"><Link href={`/dashboards/${spec.id}/edit?${bt.query}`}><Pencil strokeWidth={1.5} />Редактировать</Link></Button>
+            )}
+          </>
+        }
+      />
+      <div className="flex flex-wrap items-center gap-3">
+        <RangePicker value={bt.picker} />
+        {interval ? (
+          <Button asChild variant="secondary" size="sm" aria-pressed="true">
+            <Link href={patchHref(`/dashboards/${spec.id}`, sp, { from: undefined, to: undefined })} aria-label={`Сбросить интервал ${interval}`}>
+              <span className="font-mono tabular-nums">{interval}</span> ✕
+            </Link>
+          </Button>
+        ) : null}
+        <details className="group">
+          <summary className="cursor-pointer list-none text-[13px] text-muted-foreground hover:text-foreground">
+            Свой интервал <span aria-hidden className="inline-block transition-transform group-open:rotate-180">▾</span>
+          </summary>
+          <div className="mt-3"><RangeFilters time idPrefix="dash" /></div>
+        </details>
+      </div>
+      {common && spec.panels.length > 0 && <BoardErrorBanner error={common.error} detail={admin ? common.detail : undefined} admin={admin} />}
       {spec.panels.length === 0 ? (
         <Panel label="Пусто"><Empty>В дашборде нет панелей{canEdit ? " — добавьте их в редакторе." : "."}</Empty></Panel>
       ) : (
-        <DashboardGrid panels={spec.panels} data={data} longRange={isLongRange(range, time.from)} />
+        <DashboardGrid panels={spec.panels} data={data} longRange={isLongRange(range, time.from)} collapsed={Boolean(common)} showType={canEdit} />
       )}
     </>
   );
