@@ -1,11 +1,13 @@
 "use client";
 
 // Редактор дашборда: панели с SQL, размеры сетки, проверка запроса, JSON-модель.
-import { useActionState, useEffect, useId, useState, useTransition } from "react";
+import { useActionState, useEffect, useId, useRef, useState, useTransition } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { ArrowDown, ArrowUp, Play, Plus, Save, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { previewPanelAction, saveDashboardAction, type PreviewState, type SaveState } from "@/lib/dashboard-actions";
+import { REFRESH_OPTIONS, removeAt, restoreAt } from "@/lib/shared/dashboard-view";
+import { useUnsavedGuard } from "@/components/console/unsaved-guard";
 import { parseDashboardJson, SPEC_LIMITS, type DashboardSpec, type Panel, type PanelType } from "@/lib/shared/dashboard-spec";
 import { parseRange, RANGES } from "@/lib/shared/ranges";
 import { fmtMs } from "@/lib/shared/time";
@@ -61,6 +63,7 @@ function PreviewButton({ sql }: { sql: string }) {
 export function DashboardEditor({ initial }: { initial: DashboardSpec }) {
   const router = useRouter();
   const uid = useId();
+  const formRef = useRef<HTMLFormElement>(null);
   const [spec, setSpec] = useState<DashboardSpec>(initial);
   const [saved, setSaved] = useState<string>(JSON.stringify(initial));
   const [json, setJson] = useState<string>("");
@@ -81,20 +84,16 @@ export function DashboardEditor({ initial }: { initial: DashboardSpec }) {
     setSeenState(state);
     if (state.ok) setSaved(submitted);
   }
+  // Несохранённые правки: закрытие вкладки, ссылки внутри приложения и «Назад» браузера.
+  const guard = useUnsavedGuard(dirty, () => formRef.current?.requestSubmit());
+  const { saved: guardSaved, cancelAfterSave } = guard;
+  // Ошибка сохранения — только инлайн (role="alert"); тост — для успеха.
   useEffect(() => {
-    if (state.ok) toast.success("Дашборд сохранён");
-    else if (state.error) toast.error(state.error);
-  }, [state]);
-
-  // Несохранённые правки — предупреждение при закрытии вкладки.
-  useEffect(() => {
-    if (!dirty) return;
-    const onUnload = (e: BeforeUnloadEvent) => {
-      e.preventDefault();
-    };
-    window.addEventListener("beforeunload", onUnload);
-    return () => window.removeEventListener("beforeunload", onUnload);
-  }, [dirty]);
+    if (state.ok) {
+      toast.success("Дашборд сохранён");
+      guardSaved();
+    } else if (state.error) cancelAfterSave();
+  }, [state]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const upd = (i: number, patch: Partial<Panel>) =>
     setSpec((s) => ({ ...s, panels: s.panels.map((p, j) => (j === i ? { ...p, ...patch } : p)) }));
@@ -108,7 +107,17 @@ export function DashboardEditor({ initial }: { initial: DashboardSpec }) {
     });
   const add = () =>
     setSpec((s) => (s.panels.length >= SPEC_LIMITS.maxPanels ? s : { ...s, panels: [...s.panels, { id: `p${Date.now().toString(36)}`, title: "Новая панель", type: "table", w: 12, h: 8, sql: "SELECT source, count() AS events FROM events WHERE $__timeFilter(ts) GROUP BY source ORDER BY events DESC LIMIT 10" }] }));
-  const remove = (i: number) => setSpec((s) => ({ ...s, panels: s.panels.filter((_, j) => j !== i) }));
+  // Удаление панели — с «Вернуть» в тосте: вместе с панелью пропадал её SQL.
+  const remove = (i: number) => {
+    const { list, removed } = removeAt(spec.panels, i);
+    if (!removed) return;
+    setSpec((s) => ({ ...s, panels: list }));
+    toast(`Панель «${removed.title || `Панель ${i + 1}`}» удалена`, {
+      description: "Пока дашборд не сохранён, её можно вернуть.",
+      duration: 10_000,
+      action: { label: "Вернуть", onClick: () => setSpec((s) => ({ ...s, panels: restoreAt(s.panels, removed, i) })) },
+    });
+  };
 
   const applyJson = () => {
     const parsed = parseDashboardJson(json, spec.id);
@@ -126,38 +135,47 @@ export function DashboardEditor({ initial }: { initial: DashboardSpec }) {
 
   return (
     <div className="space-y-6">
-      <form action={submit} className="space-y-6" aria-busy={pending}>
+      {guard.dialog}
+      <form ref={formRef} action={submit} className="space-y-6" aria-busy={pending}>
         <input type="hidden" name="id" value={spec.id} />
         <input type="hidden" name="spec" value={JSON.stringify(spec)} />
-        <div className="grid gap-4 sm:grid-cols-[1fr_auto_auto] sm:items-end">
-          <div className="space-y-2">
-            <Label htmlFor={`${uid}-title`} className="c-label">Название</Label>
-            <Input id={`${uid}-title`} value={spec.title} maxLength={120} onChange={(e) => setSpec({ ...spec, title: e.target.value })} className="h-10 px-3" />
+        <div className="sticky top-0 z-10 -mx-1 space-y-2 border-b border-border bg-background/95 px-1 py-3 backdrop-blur">
+          <div className="grid gap-4 sm:grid-cols-[1fr_auto_auto] sm:items-end">
+            <div className="space-y-2">
+              <Label htmlFor={`${uid}-title`} className="c-label">Название</Label>
+              <Input id={`${uid}-title`} value={spec.title} maxLength={120} onChange={(e) => setSpec({ ...spec, title: e.target.value })} className="h-10 px-3" />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor={`${uid}-refresh`} className="c-label">Автообновление</Label>
+              <Select value={REFRESH_OPTIONS.some((o) => o.value === spec.refresh) ? spec.refresh : spec.refresh ? spec.refresh : "off"} onValueChange={(v) => setSpec({ ...spec, refresh: v === "off" ? undefined : v })}>
+                <SelectTrigger id={`${uid}-refresh`} className="h-10 w-36"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  {REFRESH_OPTIONS.map((o) => <SelectItem key={o.value} value={o.value}>{o.label}</SelectItem>)}
+                  {spec.refresh && !REFRESH_OPTIONS.some((o) => o.value === spec.refresh) && <SelectItem value={spec.refresh}>{spec.refresh.replace(/s$/, " с")}</SelectItem>}
+                </SelectContent>
+              </Select>
+            </div>
+            <Button type="submit" disabled={pending || !dirty} className="min-h-10">
+              {pending ? <span className="ascii-spin" aria-hidden /> : <Save strokeWidth={1.5} />}
+              {pending ? "Сохранение…" : dirty ? "Сохранить" : "Сохранено"}
+            </Button>
           </div>
-          <div className="space-y-2">
-            <Label htmlFor={`${uid}-refresh`} className="c-label">Автообновление</Label>
-            <Input id={`${uid}-refresh`} value={spec.refresh ?? ""} onChange={(e) => setSpec({ ...spec, refresh: e.target.value || undefined })} placeholder="30s" pattern="^\d{2,4}s$" title={`число секунд и «s», не чаще ${SPEC_LIMITS.minRefreshSec}s`} className="h-10 w-28 px-3 font-mono" />
-          </div>
-          <Button type="submit" disabled={pending || !dirty} className="min-h-10">
-            {pending ? <span className="ascii-spin" aria-hidden /> : <Save strokeWidth={1.5} />}
-            {pending ? "Сохранение…" : dirty ? "Сохранить" : "Сохранено"}
-          </Button>
+          <p className="text-[13px] text-muted-foreground" aria-live="polite">
+            {dirty ? <span className="text-[var(--status-warn)]">Есть несохранённые правки</span> : showSaved ? <span className="text-[var(--status-ok)]">Сохранено · <button type="button" className="underline" onClick={() => router.push(`/dashboards/${spec.id}`)}>открыть дашборд</button></span> : <>Панелей: {spec.panels.length} из {SPEC_LIMITS.maxPanels}</>}
+          </p>
+          {state.error && <p role="alert" className="text-sm text-destructive">{state.error}</p>}
         </div>
-        <p className="text-xs text-muted-foreground" aria-live="polite">
-          {dirty ? <span className="text-[var(--status-warn)]">есть несохранённые правки</span> : showSaved ? <span className="text-[var(--status-ok)]">Сохранено · <button type="button" className="underline" onClick={() => router.push(`/dashboards/${spec.id}`)}>открыть дашборд</button></span> : <>панелей: {spec.panels.length} из {SPEC_LIMITS.maxPanels}</>}
-        </p>
-        {state.error && <p role="alert" className="text-sm text-destructive">{state.error}</p>}
 
         {spec.panels.map((p, i) => (
           <Win
             key={p.id}
-            label={`панель ${i + 1}`}
+            label={p.title || `Панель ${i + 1}`}
             bodyClassName="grid gap-4 lg:grid-cols-[1fr_1.2fr]"
             meta={
               <span className="flex gap-1">
-                <Button type="button" variant="ghost" size="icon" disabled={i === 0} onClick={() => move(i, -1)} aria-label={`Панель ${i + 1}: переместить выше`} title="выше"><ArrowUp strokeWidth={1.5} /></Button>
-                <Button type="button" variant="ghost" size="icon" disabled={i === spec.panels.length - 1} onClick={() => move(i, 1)} aria-label={`Панель ${i + 1}: переместить ниже`} title="ниже"><ArrowDown strokeWidth={1.5} /></Button>
-                <Button type="button" variant="ghost" size="icon" onClick={() => remove(i)} aria-label={`Панель ${i + 1}: удалить`} title="удалить"><Trash2 strokeWidth={1.5} /></Button>
+                <Button type="button" variant="ghost" size="icon" disabled={i === 0} onClick={() => move(i, -1)} aria-label={`Панель ${i + 1}: переместить выше`}><ArrowUp strokeWidth={1.5} /></Button>
+                <Button type="button" variant="ghost" size="icon" disabled={i === spec.panels.length - 1} onClick={() => move(i, 1)} aria-label={`Панель ${i + 1}: переместить ниже`}><ArrowDown strokeWidth={1.5} /></Button>
+                <Button type="button" variant="ghost" size="icon" onClick={() => remove(i)} aria-label={`Панель ${i + 1}: удалить`}><Trash2 strokeWidth={1.5} /></Button>
               </span>
             }
           >
@@ -174,7 +192,7 @@ export function DashboardEditor({ initial }: { initial: DashboardSpec }) {
                   </Select>
                 </div>
                 <div className="space-y-2">
-                  <Label htmlFor={`${uid}-${p.id}-series`} className="c-label">Серии по колонке</Label>
+                  <Label htmlFor={`${uid}-${p.id}-series`} className="c-label">Разбить на линии по колонке</Label>
                   <Input id={`${uid}-${p.id}-series`} value={p.series ?? ""} maxLength={64} onChange={(e) => upd(i, { series: e.target.value || undefined })} placeholder="source_class" className="h-9 px-3 font-mono" />
                 </div>
                 <div className="space-y-2">
@@ -191,7 +209,7 @@ export function DashboardEditor({ initial }: { initial: DashboardSpec }) {
                 </div>
               </div>
               <div className="space-y-2">
-                <Label htmlFor={`${uid}-${p.id}-sql`} className="c-label">SQL (только SELECT, read-only пользователь)</Label>
+                <Label htmlFor={`${uid}-${p.id}-sql`} className="c-label">Запрос SQL (только чтение, SELECT)</Label>
                 <textarea id={`${uid}-${p.id}-sql`} value={p.sql} onChange={(e) => upd(i, { sql: e.target.value })} rows={8} spellCheck={false} maxLength={SPEC_LIMITS.maxSqlLen}
                   aria-describedby={`${uid}-macros`}
                   className="w-full resize-y p-3 font-mono text-[12.5px] leading-[1.6] text-foreground" />
@@ -205,16 +223,22 @@ export function DashboardEditor({ initial }: { initial: DashboardSpec }) {
         </div>
       </form>
 
-      <Win label="Макросы времени" meta="как в Grafana" bodyClassName="grid gap-2 sm:grid-cols-2" id={`${uid}-macros`}>
+      <Win label="Макросы времени" bodyClassName="grid gap-2 sm:grid-cols-2" id={`${uid}-macros`}>
         {MACROS.map((m) => (
-          <div key={m.m} className="flex items-baseline gap-3 font-mono text-xs">
-            <code className="text-[var(--ring)]">{m.m}</code>
+          <div key={m.m} className="flex items-baseline gap-3 text-xs">
+            <code className="font-mono text-[var(--ring)]">{m.m}</code>
             <span className="text-muted-foreground">{m.d}</span>
           </div>
         ))}
+        <p className="text-xs text-muted-foreground sm:col-span-2">Подпись колонки на доске — через <code className="font-mono">AS &quot;Событий&quot;</code>.</p>
       </Win>
 
-      <Win label="JSON-модель" meta="экспорт / импорт" bodyClassName="space-y-2">
+      <details className="win group">
+        <summary className="flex cursor-pointer list-none items-center gap-2 px-5 py-3 text-sm font-medium text-foreground">
+          Импорт и экспорт JSON
+          <span aria-hidden className="ml-auto text-muted-foreground transition-transform group-open:rotate-180">▾</span>
+        </summary>
+        <div className="space-y-2 px-5 pb-4">
           <Label htmlFor={`${uid}-json`} className="sr-only">JSON спецификации</Label>
           <textarea id={`${uid}-json`} value={json || JSON.stringify(spec, null, 2)} onChange={(e) => { setJson(e.target.value); setJsonError(null); }} rows={10} spellCheck={false}
             aria-invalid={jsonError ? true : undefined} aria-describedby={jsonError ? `${uid}-json-error` : undefined}
@@ -226,7 +250,8 @@ export function DashboardEditor({ initial }: { initial: DashboardSpec }) {
             </Button>
             <span className="font-mono text-xs text-muted-foreground">до {SPEC_LIMITS.maxPanels} панелей · до {Math.round(SPEC_LIMITS.maxJsonBytes / 1024)} КБ · лишние поля отбрасываются</span>
           </div>
-      </Win>
+        </div>
+      </details>
     </div>
   );
 }

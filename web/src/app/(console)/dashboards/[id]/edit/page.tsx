@@ -1,14 +1,17 @@
 import type { Metadata } from "next";
-import Link from "next/link";
 import { notFound, redirect } from "next/navigation";
-import { ArrowLeft } from "lucide-react";
+import { Trash2 } from "lucide-react";
+import { ConfirmActionForm } from "@/components/console/action-form";
+import { Badge } from "@/components/ui/badge";
+import { deleteDashboardAction } from "@/lib/dashboard-actions";
+import { boardTime } from "@/lib/shared/dashboard-view";
 import { DashboardEditor } from "@/components/console/dashboard-editor";
-import { PageHeader } from "@/components/console/panel";
+import { PageHeader, Panel } from "@/components/console/panel";
 import { RangePicker } from "@/components/console/range-picker";
 import { StorageUnavailable } from "@/components/console/storage-error";
 import { Button } from "@/components/ui/button";
 import { requirePageSession, ROLE_RANK } from "@/lib/auth";
-import { parseRange, safeQuery } from "@/lib/clickhouse";
+import { safeQuery } from "@/lib/clickhouse";
 import { getDashboard } from "@/lib/dashboards";
 
 export const dynamic = "force-dynamic";
@@ -28,12 +31,12 @@ export default async function DashboardEditPage({ params, searchParams }: PagePr
   if (!ID_RE.test(id)) notFound();
   // Наблюдателю редактор не показываем — обратно на просмотр, без страницы ошибки.
   if (ROLE_RANK[session.role] < ROLE_RANK.analyst) redirect(`/dashboards/${id}`);
-  const range = parseRange((await searchParams).range as string | undefined);
+  const bt = boardTime(await searchParams);
   const r = await safeQuery(() => getDashboard(id));
   if (!r.ok) {
     return (
       <>
-        <PageHeader title={<>Редактор · <span className="text-muted-foreground">{id}</span></>} />
+        <PageHeader title={id} back={{ href: `/dashboards/${id}?${bt.query}`, label: "К дашборду" }} />
         <StorageUnavailable reason={r.error} />
       </>
     );
@@ -42,13 +45,27 @@ export default async function DashboardEditPage({ params, searchParams }: PagePr
   if (!spec) notFound();
   return (
     <>
-      <PageHeader title={<>Редактор · <span className="text-muted-foreground">{spec.title}</span></>}>
-        <div className="flex flex-wrap items-center gap-3">
-          <RangePicker value={range} />
-          <Button asChild variant="ghost" size="sm"><Link href={`/dashboards/${spec.id}?range=${range}`}><ArrowLeft strokeWidth={1.5} />К дашборду</Link></Button>
-        </div>
-      </PageHeader>
+      <PageHeader
+        title={spec.title}
+        back={{ href: `/dashboards/${spec.id}?${bt.query}`, label: "К дашборду" }}
+        status={<Badge variant="outline">Редактирование</Badge>}
+        actions={<RangePicker value={bt.picker} />}
+      />
       <DashboardEditor initial={spec} />
+      <Panel label="Удаление дашборда" tone="err">
+        <div className="flex flex-wrap items-center justify-between gap-3 text-sm">
+          <p className="text-muted-foreground">Дашборд «{spec.title}» исчезнет из списка у всех. Его можно восстановить из истории версий — для этого обратитесь к администратору.</p>
+          <ConfirmActionForm
+            action={deleteDashboardAction}
+            title="Удалить дашборд?"
+            description={<>Дашборд «{spec.title}» исчезнет из списка. Его можно восстановить из истории версий (обратитесь к администратору).</>}
+            confirmLabel="Да, удалить"
+          >
+            <input type="hidden" name="id" value={spec.id} />
+            <Button type="submit" variant="destructive" size="sm"><Trash2 strokeWidth={1.5} />Удалить дашборд</Button>
+          </ConfirmActionForm>
+        </div>
+      </Panel>
     </>
   );
 }
