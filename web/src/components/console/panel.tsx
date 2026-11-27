@@ -22,13 +22,6 @@ export function Led({ color = "var(--status-ok)", title }: { color?: string; tit
   );
 }
 
-/** Стабильный id заголовка без хуков: панель рендерится и на сервере, и в клиентских границах. */
-function headingId(label: string, id?: string): string {
-  if (id) return `${id}-title`;
-  let h = 0;
-  for (let i = 0; i < label.length; i++) h = (Math.imul(31, h) + label.charCodeAt(i)) | 0;
-  return `win-${(h >>> 0).toString(36)}`;
-}
 
 /**
  * Панель: поверхность surface с волосяной границей и строкой заголовка
@@ -66,11 +59,13 @@ export function Panel({
   style?: React.CSSProperties;
   id?: string;
 }) {
-  const hid = label ? headingId(label, id) : undefined;
+  // Уникальный id заголовка без хуков есть только у панели с id; без него секция
+  // подписана aria-label — иначе одинаковые подписи дали бы одинаковые id.
+  const hid = label && id ? `${id}-title` : undefined;
   const Heading = headingLevel === 3 ? "h3" : "h2";
   const ToneIcon = tone ? TONE_ICON[tone] : null;
   return (
-    <section className={cn("win min-w-0", className)} style={style} id={id} aria-labelledby={hid} data-tone={tone}>
+    <section className={cn("win min-w-0", className)} style={style} id={id} aria-labelledby={hid} aria-label={label && !hid ? label : undefined} data-tone={tone}>
       {label && (
         <div className="win__bar">
           <div className="win__head">
