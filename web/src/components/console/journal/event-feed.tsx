@@ -338,7 +338,7 @@ function EventDetail({ e, incidents, filters, engineUp }: { e: JournalEvent; inc
 }
 
 function fmtField(key: keyof JournalEvent, v: unknown): string {
-  if (key === "time" || key === "received") return `${formatTs(String(v))} UTC`;
+  if (key === "time" || key === "received") return formatTs(String(v));
   if (key === "pii") return v ? "да" : "нет";
   return String(v);
 }

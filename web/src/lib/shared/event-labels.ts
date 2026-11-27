@@ -82,7 +82,7 @@ export function outcomeWord(outcome: string): string {
  */
 export function actionTitle(action: string, outcome = ""): { title: string; known: boolean } {
   const a = action.trim();
-  if (!a || a === "x") return { title: "Событие без действия", known: false };
+  if (!a || a === "x") return { title: "Событие без действия", known: true };
   const p = ACTION_LABELS[a] ?? ACTION_LABELS[a.toLowerCase()];
   if (p) {
     if (typeof p === "string") return { title: p, known: true };

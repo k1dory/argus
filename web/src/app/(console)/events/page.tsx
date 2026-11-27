@@ -110,7 +110,7 @@ export default async function JournalPage({ searchParams }: PageProps<"/events">
                 label="Фильтр ленты"
                 current={importantOnly ? "important" : "all"}
                 flag={{ key: "important", label: "Только важное", count: important, icon: TriangleAlert, href: journalHref(f, { sev: SEVERITY.events.high, sevMax: undefined }) }}
-                items={[{ key: "all", label: "Все", href: journalHref(f, { sev: undefined, sevMax: undefined }) }]}
+                items={[{ key: "all", label: "Все", count: r.data.total, href: journalHref(f, { sev: undefined, sevMax: undefined }) }]}
               />
               <span className="text-[12px] text-[var(--text-tertiary)]">важное — серьёзность от {SEVERITY.events.high} из {SEVERITY_MAX.events}</span>
               {capped && (

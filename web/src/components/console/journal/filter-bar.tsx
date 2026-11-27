@@ -73,7 +73,7 @@ export function JournalFilterBar({ filters, sources, hosts }: { filters: Journal
         </Button>
       </div>
 
-      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-[repeat(5,minmax(0,1fr))_auto]">
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-[repeat(5,minmax(0,1fr))_auto]">
         <Field label="Источник" id="journal-source">
           <Select value={source} onValueChange={setSource}>
             <SelectTrigger id="journal-source" className="h-9 w-full font-mono text-[13px]"><SelectValue>{source === ANY ? "Все источники" : source}</SelectValue></SelectTrigger>
@@ -132,7 +132,7 @@ export function JournalFilterBar({ filters, sources, hosts }: { filters: Journal
         >
           <Input id="journal-rule" aria-describedby="journal-rule-hint" value={rule} onChange={(e) => setRule(e.target.value)} placeholder="5763 или a41c-*" spellCheck={false} autoComplete="off" className="h-9 font-mono" />
         </Field>
-        <fieldset className="flex min-w-0 flex-col gap-1.5">
+        <fieldset className="flex min-w-0 flex-col gap-1.5 sm:col-span-2 xl:col-span-1">
           <legend className="c-label mb-1.5">Точный интервал, UTC</legend>
           <div className="flex items-center gap-1.5">
             <input type="datetime-local" value={from} onChange={(e) => setFrom(e.target.value)} aria-label="Начало интервала, UTC" className="h-9 min-w-0 rounded-lg border border-[var(--border-strong)] bg-background px-2 font-mono text-[12px] text-foreground [color-scheme:dark]" />
