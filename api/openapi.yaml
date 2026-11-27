@@ -1123,7 +1123,7 @@ paths:
       security: []
       responses:
         "302":
-          description: Перенаправление на IdP.
+          description: Перенаправление на IdP, а если IdP не ответил (discovery) — на `/login?sso=unavailable` с объяснением для пользователя.
           headers:
             Location:
               schema: { type: string, format: uri }
@@ -1133,18 +1133,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
-        "502":
-          description: Не удалось получить конфигурацию IdP.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
 
   /api/auth/oidc/callback:
     get:
       tags: [auth]
-      summary: Обратный вызов OIDC
-      description: Проверяет `state`, обменивает `code` на токены, создаёт SSO-сессию (`sso:<имя>`, роль из групп IdP) и перенаправляет на `/`. Ошибки — перенаправление на `/login?sso=state` (state не совпал) или `/login?sso=denied` (обмен не удался); обе попытки пишутся в журнал действий.
+      summary: Возврат с IdP — экран «Входим в ARGUS…»
+      description: Адрес `redirect_uri`. Сразу отдаёт HTML-экран загрузки, который сам отправляет `code` и `state` POST-ом на этот же адрес (без JS — кнопка «Продолжить»); пока идут обмен кода и первая загрузка консоли, пользователь видит экран загрузки. Отказ IdP (`error=…`) или ответ без `code`/`state` — сразу перенаправление на страницу входа (`/login?sso=denied` или `/login?sso=state`), с записью в журнал действий.
       operationId: oidcCallback
       security: []
       parameters:
@@ -1154,8 +1148,43 @@ paths:
         - name: state
           in: query
           schema: { type: string }
+        - name: error
+          in: query
+          schema: { type: string }
       responses:
-        "302":
+        "200":
+          description: Экран загрузки с формой автоотправки (no-store, no-referrer).
+          content:
+            text/html:
+              schema: { type: string }
+        "303":
+          description: Отказ IdP или неполный ответ — на страницу входа с кодом ошибки.
+          headers:
+            Location:
+              schema: { type: string }
+        "501":
+          description: OIDC не настроен.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    post:
+      tags: [auth]
+      summary: Завершение входа OIDC
+      description: Проверяет `state` по cookie, обменивает `code` на токены, создаёт SSO-сессию (`sso:<имя>`, роль из групп IdP) и перенаправляет на `/` (303). Ошибки — `/login?sso=state` (state не совпал или нет cookie), `/login?sso=no_role` (нет группы с доступом), `/login?sso=denied` (обмен не удался); каждая попытка пишется в журнал действий.
+      operationId: oidcCallbackComplete
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                code: { type: string }
+                state: { type: string }
+      responses:
+        "303":
           description: Перенаправление в консоль или на страницу входа с кодом ошибки.
           headers:
             Location:

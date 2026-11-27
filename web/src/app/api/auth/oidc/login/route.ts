@@ -1,7 +1,7 @@
 import crypto from "crypto";
 import { cookieSecure } from "@/lib/auth";
 import { cookies } from "next/headers";
-import { authUrl, oidcConfig, pkce } from "@/lib/oidc";
+import { authUrl, consoleUrl, oidcConfig, pkce } from "@/lib/oidc";
 
 export async function GET(): Promise<Response> {
   const cfg = oidcConfig();
@@ -17,6 +17,8 @@ export async function GET(): Promise<Response> {
   try {
     return Response.redirect(await authUrl(cfg, state, nonce, challenge), 302);
   } catch (e) {
-    return Response.json({ error: e instanceof Error ? e.message : String(e) }, { status: 502 });
+    // IdP не отвечает (discovery): человеку — страница входа с объяснением, причина — в журнал контейнера.
+    console.warn("oidc login:", e instanceof Error ? e.message : e);
+    return Response.redirect(consoleUrl(cfg, "/login?sso=unavailable"), 302);
   }
 }

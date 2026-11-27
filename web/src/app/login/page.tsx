@@ -3,9 +3,8 @@ import { redirect } from "next/navigation";
 import { getAuthState, isAuthenticated } from "@/lib/auth";
 import { LoginForm } from "@/components/console/login-form";
 import { oidcConfig } from "@/lib/oidc";
+import { SsoButton } from "@/components/console/sso-button";
 import { safeNextPath } from "@/lib/shared/next-path";
-import { Button } from "@/components/ui/button";
-import { KeyRound } from "lucide-react";
 import { Panel } from "@/components/console/panel";
 import { ssoErrorText } from "@/lib/shared/login";
 
@@ -46,9 +45,7 @@ export default async function LoginPage({ searchParams }: PageProps<"/login">) {
         <Panel>
           {sso ? (
             <>
-              <Button asChild className="min-h-12 w-full">
-                <a href="/api/auth/oidc/login"><KeyRound strokeWidth={1.5} />Войти через корпоративную учётную запись</a>
-              </Button>
+              <SsoButton />
               <div className="my-5 flex items-center gap-3 text-[13px] text-muted-foreground" aria-hidden>
                 <span className="h-px flex-1 bg-border" />или<span className="h-px flex-1 bg-border" />
               </div>

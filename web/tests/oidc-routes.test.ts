@@ -24,7 +24,7 @@ const mocks = installNextMocks();
 
 /* eslint-disable @typescript-eslint/no-require-imports -- маршруты грузятся после моков */
 const loginRoute = require("../src/app/api/auth/oidc/login/route") as { GET: () => Promise<Response> };
-const callbackRoute = require("../src/app/api/auth/oidc/callback/route") as { GET: (req: Request) => Promise<Response> };
+const callbackRoute = require("../src/app/api/auth/oidc/callback/route") as { GET: (req: Request) => Promise<Response>; POST: (req: Request) => Promise<Response> };
 /* eslint-enable @typescript-eslint/no-require-imports */
 
 const DISCOVERY = {
@@ -91,7 +91,11 @@ async function startLogin(): Promise<{ state: string; nonce: string; verifier: s
   return { state: mocks.jar.get("oidc_state")!, nonce: mocks.jar.get("oidc_nonce")!, verifier: mocks.jar.get("oidc_verifier")!, location: new URL(r.headers.get("location")!) };
 }
 
-const callback = (qs: string) => callbackRoute.GET(new Request(`http://0.0.0.0:3000/api/auth/oidc/callback?${qs}`));
+/** Второй шаг возврата с IdP: экран загрузки отправляет code/state POST-ом (GET отдаёт сам экран). */
+const callback = (qs: string) => {
+  const p = new URLSearchParams(qs);
+  return callbackRoute.POST(new Request("http://0.0.0.0:3000/api/auth/oidc/callback", { method: "POST", body: p }));
+};
 const lastAudit = () => mocks.audit.at(-1)!;
 
 test("без OIDC_ISSUER/OIDC_CLIENT_ID оба маршрута — 501, cookie не ставятся", async () => {
@@ -108,12 +112,12 @@ test("без OIDC_ISSUER/OIDC_CLIENT_ID оба маршрута — 501, cookie 
   }
 });
 
-test("discovery недоступен — 502 с причиной (первый вызов: кэш discovery ещё пуст)", async () => {
+test("discovery недоступен — обратно на страницу входа с понятной причиной, а не сырой JSON", async () => {
   idp.discoveryStatus = 503;
   try {
     const r = await loginRoute.GET();
-    assert.equal(r.status, 502);
-    assert.match(((await r.json()) as { error: string }).error, /OIDC discovery 503/);
+    assert.equal(r.status, 302);
+    assert.equal(r.headers.get("location"), "https://argus.example:8443/login?sso=unavailable");
   } finally {
     idp.discoveryStatus = 200;
   }
@@ -138,10 +142,10 @@ test("login: 302 на authorize с client_id, redirect_uri, scope с claim гр�
   assert.notEqual(second.verifier, verifier);
 });
 
-test("callback: нет cookie state / нет code / state не совпал — 302 на /login?sso=state от OIDC_REDIRECT_URL, запись в журнал, cookie стёрты", async () => {
+test("callback: нет cookie state / нет code / state не совпал — 303 на /login?sso=state от OIDC_REDIRECT_URL, запись в журнал, cookie стёрты", async () => {
   mocks.jar.clear();
   let r = await callback("code=abc&state=xyz");
-  assert.equal(r.status, 302);
+  assert.equal(r.status, 303);
   assert.equal(r.headers.get("location"), "https://argus.example:8443/login?sso=state", "origin — из OIDC_REDIRECT_URL, не из адреса прослушивания");
   assert.equal(lastAudit().action, "session.login.failed");
   assert.match(lastAudit().detail, /cookie oidc_state нет: вход начат не с https:\/\/argus\.example:8443/);
@@ -163,7 +167,7 @@ test("callback: успешный вход — обмен кода с verifier и
   const { state, nonce, verifier } = await startLogin();
   idp.tokenBody = { id_token: await idToken({ nonce, preferred_username: "Ivan.Petrov", groups: ["staff", "argus-admins"] }), access_token: "at-1" };
   const r = await callback(`code=code-1&state=${state}`);
-  assert.equal(r.status, 302);
+  assert.equal(r.status, 303);
   assert.equal(r.headers.get("location"), "https://argus.example:8443/");
   const tr = idp.tokenRequests.at(-1)!;
   assert.equal(tr.body.get("grant_type"), "authorization_code");
@@ -226,7 +230,7 @@ test("callback: отказ — нет групп для роли, nonce не с�
     idp.tokenBody = await c.token(nonce);
     idp.tokenStatus = c.status ?? 200;
     const r = await callback(`code=c&state=${state}`);
-    assert.equal(r.status, 302, c.name);
+    assert.equal(r.status, 303, c.name);
     assert.equal(r.headers.get("location"), `https://argus.example:8443/login?sso=${c.code ?? "denied"}`, c.name);
     assert.equal(await auth.getSession(), null, `${c.name}: сессии нет`);
     assert.equal(lastAudit().action, "session.login.failed", c.name);
@@ -244,4 +248,36 @@ test("callback: имена с префиксом sso: и локальные ло
   assert.ok(s!.user.startsWith("sso:") && !s!.user.startsWith("sso:sso:"), s!.user);
   assert.ok(s!.user.length <= 4 + 120);
   assert.ok((await auth.listUsers()).every((u) => !u.sso || u.name.startsWith("sso:")), "все SSO-записи — в своём пространстве имён");
+});
+
+test("callback GET: сразу экран «Входим в ARGUS…», code/state — в скрытых полях (экранированы), cookie не тронуты", async () => {
+  const { state } = await startLogin();
+  const r = await callbackRoute.GET(new Request(`http://0.0.0.0:3000/api/auth/oidc/callback?code=${encodeURIComponent('a"><script>x')}&state=${state}`, { headers: { "x-nonce": "n0nce" } }));
+  assert.equal(r.status, 200);
+  assert.match(r.headers.get("content-type") ?? "", /text\/html/);
+  assert.equal(r.headers.get("cache-control"), "no-store");
+  assert.equal(r.headers.get("referrer-policy"), "no-referrer");
+  const html = await r.text();
+  assert.match(html, /Входим в ARGUS/);
+  assert.match(html, /<form id="f" method="post" action="\/api\/auth\/oidc\/callback">/);
+  assert.match(html, /name="code" value="a&quot;&gt;&lt;script&gt;x"/, "значение экранировано");
+  assert.ok(!html.includes('a"><script>x'), "сырого значения нет");
+  assert.match(html, new RegExp(`name="state" value="${state}"`));
+  assert.match(html, /<script nonce="n0nce">/, "скрипт автоотправки — с nonce из CSP");
+  assert.match(html, /<noscript><button type="submit">Продолжить<\/button><\/noscript>/);
+  assert.equal(mocks.jar.get("oidc_state"), state, "cookie state живы до POST");
+});
+
+test("callback GET: отказ IdP (error=access_denied) — сразу на /login?sso=denied, запись в журнал", async () => {
+  await startLogin();
+  const r = await callbackRoute.GET(new Request("http://0.0.0.0:3000/api/auth/oidc/callback?error=access_denied&state=x"));
+  assert.equal(r.status, 303);
+  assert.equal(r.headers.get("location"), "https://argus.example:8443/login?sso=denied");
+  assert.match(lastAudit().detail, /access_denied/);
+  assert.equal(mocks.jar.get("oidc_state"), undefined, "cookie стёрты");
+});
+
+test("страница входа: sso=unavailable — человеческое объяснение и путь «по паролю»", async () => {
+  const { ssoErrorText } = await import("../src/lib/shared/login");
+  assert.match(ssoErrorText("unavailable", null), /не отвечает.*по паролю/);
 });
