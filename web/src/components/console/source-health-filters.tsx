@@ -7,7 +7,6 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Field, FieldGroup, FieldLabel, FieldLegend, FieldSet } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
-import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { patchHref } from "@/lib/shared/filters";
 import { SOURCE_HEALTH_FIELDS, sourceHealthChips, type SourceRanges } from "@/lib/shared/page-filters";
 import { cn } from "@/lib/utils";
@@ -39,9 +38,9 @@ function SourceHealthFiltersForm({ shown, total, ranges }: Props) {
   // Applied ranges come from the server, exactly as used to filter the table.
   const chips = sourceHealthChips(ranges);
   const active = keys.some((key) => params.get(key)?.trim());
+  // Статус «молчит/работает» — вкладками на странице; здесь — точные условия.
   const activity = ranges.events.max === 0 && ranges.events.min === undefined ? "empty"
-    : ranges.events.min === 1 && ranges.events.max === undefined ? "active"
-      : ranges.events.min === undefined && ranges.events.max === undefined ? "all" : "";
+    : ranges.events.min === 1 && ranges.events.max === undefined ? "active" : "";
 
   const close = () => {
     setOpen(false);
@@ -58,27 +57,7 @@ function SourceHealthFiltersForm({ shown, total, ranges }: Props) {
 
   return (
     <div className="flex min-w-0 flex-col gap-3" aria-busy={pending}>
-      <div className="flex flex-wrap items-end justify-between gap-3">
-        <div className="flex min-w-0 flex-col gap-2">
-          <span id="src-health-activity-label" className="text-xs text-muted-foreground">События за час</span>
-          <ToggleGroup
-            type="single"
-            value={activity}
-            onValueChange={(value) => {
-              if (!value) return;
-              navigate({ events_min: value === "active" ? "1" : undefined, events_max: value === "empty" ? "0" : undefined });
-            }}
-            disabled={pending}
-            aria-labelledby="src-health-activity-label"
-            variant="outline"
-            size="lg"
-            spacing={0}
-          >
-            <ToggleGroupItem value="all">Все</ToggleGroupItem>
-            <ToggleGroupItem value="active">Есть события</ToggleGroupItem>
-            <ToggleGroupItem value="empty">Без событий</ToggleGroupItem>
-          </ToggleGroup>
-        </div>
+      <div className="flex flex-wrap items-center justify-end gap-3">
         <div className="flex w-full flex-wrap items-center justify-between gap-2 sm:w-auto sm:justify-start sm:gap-3">
           <span className="text-xs tabular-nums text-muted-foreground" role="status" aria-live="polite" aria-atomic="true">
             {pending ? "Обновляем список…" : `Показано ${number.format(shown)} из ${number.format(total)}`}

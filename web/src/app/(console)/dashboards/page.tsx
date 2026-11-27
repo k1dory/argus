@@ -1,17 +1,32 @@
 import type { Metadata } from "next";
 import Link from "next/link";
+import { LayoutDashboard } from "lucide-react";
+import { Ago } from "@/components/console/ago";
 import { Empty, PageHeader, Panel } from "@/components/console/panel";
 import { StorageUnavailable } from "@/components/console/storage-error";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Badge } from "@/components/ui/badge";
 import { requirePageSession, ROLE_RANK } from "@/lib/auth";
 import { safeQuery } from "@/lib/clickhouse";
-import { listDashboards } from "@/lib/dashboards";
-import { DASHBOARD_ORIGIN_LABELS } from "@/lib/shared/labels";
-import { fmtNum, formatAgo, formatTs } from "@/lib/shared/time";
-import { CreateDashboardForm } from "@/components/console/dashboard-create";
+import { listDashboards, type DashboardRow } from "@/lib/dashboards";
+import { countOf, PANELS_FORMS } from "@/lib/shared/plural";
+import { fmtNum } from "@/lib/shared/time";
+import { CreateDashboardButton } from "@/components/console/dashboard-create";
 
 export const dynamic = "force-dynamic";
 export const metadata: Metadata = { title: "Дашборды" };
+
+/** Описание и число панелей — из сохранённой спецификации; битый JSON не роняет список. */
+function summary(d: DashboardRow): { description: string; panels: number | null } {
+  try {
+    const s = JSON.parse(d.spec) as { description?: unknown; panels?: unknown };
+    return {
+      description: typeof s.description === "string" ? s.description : "",
+      panels: Array.isArray(s.panels) ? s.panels.length : null,
+    };
+  } catch {
+    return { description: "", panels: null };
+  }
+}
 
 export default async function DashboardsPage() {
   const session = await requirePageSession();
@@ -20,42 +35,53 @@ export default async function DashboardsPage() {
   const now = new Date();
   return (
     <>
-      <PageHeader title="Дашборды">
-        <span className="c-label">конструктор · панели · SQL · сетка 24</span>
-      </PageHeader>
+      <PageHeader
+        title="Дашборды"
+        subtitle="Подборки графиков и таблиц по событиям и инцидентам."
+        actions={canEdit ? <CreateDashboardButton /> : undefined}
+      />
       {!r.ok ? (
         <StorageUnavailable reason={r.error} />
+      ) : r.data.length === 0 ? (
+        <Panel label="Дашборды">
+          <Empty
+            icon={LayoutDashboard}
+            title="Дашбордов пока нет"
+            hint={canEdit ? "Создайте первый кнопкой «Новый дашборд» вверху." : "Аналитик может создать их в конструкторе."}
+          />
+        </Panel>
       ) : (
-        <Panel label={`Дашборды · ${fmtNum(r.data.length)}`} meta={`${DASHBOARD_ORIGIN_LABELS.provisioned} — JSON из dashboards/`}>
-          {canEdit && <div className="mb-5"><CreateDashboardForm /></div>}
-          {r.data.length === 0 ? (
-            <Empty>Дашбордов пока нет — {canEdit ? "создайте первый выше или положите JSON в каталог dashboards/." : "аналитик может создать их в конструкторе."}</Empty>
-          ) : (
-            <div className="c-well overflow-x-auto p-2">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead className="c-label">Название</TableHead>
-                    <TableHead className="c-label">ID</TableHead>
-                    <TableHead className="c-label">Обновлён (UTC)</TableHead>
-                    <TableHead className="c-label">Кем</TableHead>
-                    <TableHead className="c-label">Источник</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {r.data.map((d) => (
-                    <TableRow key={d.id}>
-                      <TableCell className="whitespace-normal"><Link href={`/dashboards/${d.id}`} className="text-[var(--ring)] hover:underline">{d.title}</Link></TableCell>
-                      <TableCell className="font-mono text-xs text-muted-foreground">{d.id}</TableCell>
-                      <TableCell className="font-mono text-xs" title={formatAgo(d.updated_at, now)}>{formatTs(d.updated_at)}</TableCell>
-                      <TableCell className="text-xs">{d.updated_by}</TableCell>
-                      <TableCell className="text-xs">{d.provisioned ? DASHBOARD_ORIGIN_LABELS.provisioned : DASHBOARD_ORIGIN_LABELS.console}</TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </div>
-          )}
+        <Panel label="Дашборды" meta={fmtNum(r.data.length)} bodyClassName="p-0">
+          <ul className="divide-y divide-border/70">
+            {r.data.map((d) => {
+              const s = summary(d);
+              return (
+                <li key={d.id}>
+                  <Link
+                    href={`/dashboards/${d.id}`}
+                    title={d.id}
+                    className="flex items-start gap-4 px-5 py-3 transition-colors hover:bg-[var(--surface-elevated)] focus-visible:outline-offset-[-2px]"
+                  >
+                    <LayoutDashboard className="mt-0.5 size-4 shrink-0 text-muted-foreground" strokeWidth={1.5} aria-hidden />
+                    <span className="min-w-0 flex-1">
+                      <span className="flex items-center gap-2">
+                        <span className="truncate text-sm font-medium text-foreground">{d.title}</span>
+                        {d.provisioned ? <Badge variant="outline" className="shrink-0 text-[11px]">Встроенный</Badge> : null}
+                      </span>
+                      {s.description && <span className="mt-0.5 line-clamp-1 block text-xs text-muted-foreground">{s.description}</span>}
+                    </span>
+                    <span className="shrink-0 text-right text-xs text-muted-foreground">
+                      {s.panels !== null && <span className="block">{countOf(s.panels, PANELS_FORMS)}</span>}
+                      <span className="block">
+                        {d.provisioned ? "обновлён " : `${d.updated_by} · `}
+                        <Ago ts={d.updated_at} now={now} />
+                      </span>
+                    </span>
+                  </Link>
+                </li>
+              );
+            })}
+          </ul>
         </Panel>
       )}
     </>

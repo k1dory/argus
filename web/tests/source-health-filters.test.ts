@@ -71,7 +71,6 @@ function find(predicate: (element: Element) => boolean): Element {
 const labelled = (text: string) => find((element) => realReact.Children.toArray(element.props.children).includes(text));
 const input = (id: string) => find((element) => element.props.id === `src-health-${id}`);
 const toggle = () => find((element) => element.props["aria-controls"] === "src-health-conditions");
-const activity = () => find((element) => element.props["aria-labelledby"] === "src-health-activity-label");
 const form = () => find((element) => element.type === "form");
 const panel = () => find((element) => element.props.id === "src-health-conditions");
 function destination(): URLSearchParams {
@@ -90,30 +89,10 @@ beforeEach(() => {
   pending = false;
 });
 
-for (const [selected, expected] of [["empty", { events_max: "0" }], ["active", { events_min: "1" }], ["all", {}]] as const) {
-  test(`activity ${selected}: changes only the hourly event range`, () => {
-    params.set("events_min", "10");
-    params.set("events_max", "20");
-    params.set("seen_from", "2026-11-01T05:00");
-    activity().props.onValueChange!(selected);
-    const next = destination();
-    assert.equal(next.get("eps_max"), "0");
-    assert.equal(next.get("seen_from"), "2026-11-01T05:00");
-    assert.deepEqual(Object.fromEntries([...next].filter(([key]) => key.startsWith("events_"))), expected);
-  });
-}
-
-test("activity reflects zero, nonzero and custom ranges from the URL", () => {
-  assert.equal(activity().props.value, "all");
-  params.set("events_max", "0");
-  assert.equal(activity().props.value, "empty");
-  params.delete("events_max");
-  params.set("events_min", "1");
-  assert.equal(activity().props.value, "active");
-  params.set("events_min", "100");
-  assert.equal(activity().props.value, "", "a custom range must not look like All");
-  activity().props.onValueChange!("");
-  assert.deepEqual(pushed, [], "clicking the selected choice does not clear it");
+// Переключатель «События за час: Все / Есть / Без событий» убран: «без событий за час» ≠ «молчит».
+// Статус — вкладками «Все · Молчат · Работают» на странице (status=), здесь — только точные условия.
+test("no hourly-activity toggle: status lives in page tabs", () => {
+  assert.equal(nodes(render()).some((element) => element.props["aria-labelledby"] === "src-health-activity-label"), false);
 });
 
 for (const dismiss of ["cancel", "escape", "toggle"] as const) {
@@ -172,9 +151,8 @@ test("reset all: clears only collector conditions", () => {
 test("pending navigation: controls disabled and a second navigation is ignored", () => {
   pending = true;
   assert.equal(toggle().props.disabled, true);
-  assert.equal(activity().props.disabled, true);
   assert.equal(labelled("Сбросить всё").props.disabled, true);
-  activity().props.onValueChange!("empty");
+  labelled("Сбросить всё").props.onClick!();
   form().props.onSubmit!({ preventDefault() {} });
   assert.deepEqual(pushed, []);
 });

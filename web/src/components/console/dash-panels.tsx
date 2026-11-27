@@ -8,6 +8,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import type { Panel as PanelSpec, PanelData } from "@/lib/dashboards";
 import { panelSpanMedium } from "@/lib/shared/dashboard-spec";
 import { seriesSlug } from "@/lib/shared/chart-css";
+import { columnLabel } from "@/lib/shared/dashboard-view";
 import { fmtMs, fmtNum, formatAxisTs, formatTs } from "@/lib/shared/time";
 import { Empty, Panel } from "@/components/console/panel";
 
@@ -102,7 +103,7 @@ export function StatPanel({ panel, data }: { panel: PanelSpec; data: PanelData }
     <dl className="grid h-full grid-cols-2 gap-4">
       {cols.map((c) => (
         <div key={c}>
-          <dt className="c-label">{c}</dt>
+          <dt className="c-label">{columnLabel(c)}</dt>
           <dd className="mt-1 font-mono text-3xl font-medium text-foreground">
             {typeof row[c] === "number" ? fmtNum(row[c] as number, Number.isInteger(row[c]) ? 0 : 1) : String(row[c] ?? "—")}
             {panel.unit && <span className="ml-1 text-base text-muted-foreground">{panel.unit}</span>}
@@ -121,7 +122,7 @@ export function TablePanel({ data }: { data: PanelData }) {
     <div className="h-full overflow-auto">
       <Table>
         <TableHeader>
-          <TableRow>{data.columns.map((c) => <TableHead key={c}>{c}</TableHead>)}</TableRow>
+          <TableRow>{data.columns.map((c) => <TableHead key={c} title={c}>{columnLabel(c)}</TableHead>)}</TableRow>
         </TableHeader>
         <TableBody>
           {data.rows.slice(0, 200).map((r, i) => (
@@ -142,12 +143,12 @@ export function TablePanel({ data }: { data: PanelData }) {
 /** Ошибка панели: короткая причина всем, полный ответ ClickHouse — только редактору (в <details>). */
 function PanelError({ data }: { data: PanelData }) {
   return (
-    <div className="space-y-2 font-mono text-xs">
+    <div className="space-y-2 text-xs">
       <p className="text-destructive" role="alert">{data.error}</p>
       {data.errorDetail && (
         <details>
-          <summary className="cursor-pointer text-muted-foreground hover:text-foreground">полный ответ ClickHouse</summary>
-          <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap bg-[var(--surface-deep)] p-2 text-[11px] leading-[1.4] text-muted-foreground">{data.errorDetail}</pre>
+          <summary className="cursor-pointer text-muted-foreground hover:text-foreground">Полный ответ хранилища</summary>
+          <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap bg-[var(--surface-deep)] p-2 font-mono text-xs leading-[1.4] text-muted-foreground">{data.errorDetail}</pre>
         </details>
       )}
     </div>
@@ -174,8 +175,10 @@ const TYPE_LABEL: Record<PanelSpec["type"], string> = { timeseries: "ряд", ba
  * Сетка 24 колонки как в Grafana: w — ширина в колонках, h — высота в строках
  * по 40px. Адаптив — в CSS (.dash-panel): < lg все панели во всю ширину,
  * lg…xl узкие панели по половине, ≥ xl как задано.
+ * collapsed — у всех панелей одна общая ошибка (плашка над сеткой): панели
+ * низкие, с серым «нет данных». showType — метка типа панели (только редактору).
  */
-export function DashboardGrid({ panels, data, longRange }: { panels: PanelSpec[]; data: Record<string, PanelData>; longRange: boolean }) {
+export function DashboardGrid({ panels, data, longRange, collapsed = false, showType = false }: { panels: PanelSpec[]; data: Record<string, PanelData>; longRange: boolean; collapsed?: boolean; showType?: boolean }) {
   return (
     <div className="dash-grid">
       {panels.map((p) => {
@@ -184,15 +187,21 @@ export function DashboardGrid({ panels, data, longRange }: { panels: PanelSpec[]
           <Panel
             key={p.id}
             label={p.title || p.id}
-            meta={`${TYPE_LABEL[p.type]} · ${fmtMs(d.ms)}${d.cached ? " · кэш" : ""}${d.truncated ? " · обрезано" : ""}`}
+            meta={panelMeta(p, d, showType)}
             className="dash-panel flex min-w-0 flex-col"
             bodyClassName="min-h-0 flex-1"
-            style={{ "--w": p.w, "--wm": panelSpanMedium(p.w), "--dash-h": `${p.h * 40}px` } as React.CSSProperties}
+            style={{ "--w": p.w, "--wm": panelSpanMedium(p.w), "--dash-h": collapsed ? "96px" : `${p.h * 40}px` } as React.CSSProperties}
           >
-            <PanelBody panel={p} data={d} longRange={longRange} />
+            {collapsed ? <Empty className="text-xs">Нет данных — см. сообщение выше</Empty> : <PanelBody panel={p} data={d} longRange={longRange} />}
           </Panel>
         );
       })}
     </div>
   );
+}
+
+/** Мета панели: у упавшей — «ошибка» (без «0 мс»), иначе время запроса, кэш, обрезка. */
+export function panelMeta(p: PanelSpec, d: PanelData, showType = false): React.ReactNode {
+  if (d.error) return <span className="text-[var(--status-err)]">ошибка</span>;
+  return [showType ? TYPE_LABEL[p.type] : null, fmtMs(d.ms), d.cached ? "кэш" : null, d.truncated ? "обрезано" : null].filter(Boolean).join(" · ");
 }
