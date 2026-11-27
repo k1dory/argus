@@ -8,7 +8,8 @@ import { test, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { installNextMocks, isRedirect, loadAuth } from "./_next-mock";
-import { pageText } from "./_render";
+import type React from "react";
+import { html, pageText, stripTags } from "./_render";
 
 const auth = loadAuth();
 const mocks = installNextMocks();
@@ -69,7 +70,7 @@ const logRow = (action: string, outcome: string, over: Record<string, unknown> =
 /** Маршруты для всех запросов паспорта. */
 function fullRoutes(): Route[] {
   return [
-    { when: (s) => s.includes("FROM identities") && !s.includes("identity_aliases") && s.includes("WHERE person_id = {id:String}"), rows: () => persons.filter((p) => p.person_id === "i.petrov") },
+    { when: (s) => s.includes("FROM identities") && !s.includes("identity_aliases") && s.includes("WHERE person_id = {id:String}"), rows: (q) => persons.filter((p) => p.person_id === (q.get("param_id") ?? "i.petrov")) },
     { when: (s) => s.includes("FROM identities") && !s.includes("identity_aliases") && s.includes("ORDER BY display"), rows: () => persons },
     { when: (s) => s.includes("LEFT JOIN"), rows: () => [] },
     { when: (s) => s.includes("FROM identity_aliases") && s.includes("WHERE person_id = {id:String}"), rows: () => aliases.filter((a) => a.person_id === "i.petrov") },
@@ -128,18 +129,25 @@ beforeEach(() => {
 
 /* ===== Список ===== */
 
-test("список: сводка по персонам — события и инциденты только у персон с алиасами, вид и команда, последняя активность", async () => {
+/** Часть страницы списка с таблицей персон (после вкладок): плитки сверху тоже называют персон. */
+const personsPart = (text: string): string => text.slice(text.indexOf("Какие персоны показать"));
+
+test("список: плитки про риск, персоны по риску и свежести, неактивные свёрнуты, отдел и последняя активность", async () => {
   await auth.createSession("analyst1", "analyst");
   const text = await pageText(await actorsPage.default(props({}, { range: "24h" })));
-  assert.match(text, /Персон 3/);
-  assert.match(text, /Активны за 24 часа 1/, "события есть только у i.petrov");
-  assert.match(text, /Служебных учёток 1/);
-  assert.match(text, /С инцидентами 1/, "два инцидента у a.smirnova");
-  assert.match(text, /Иван Петров/);
-  assert.match(text, /svc\.backup/, "персона без display показана по идентификатору");
-  assert.match(text, /служебная/);
-  assert.match(text, /platform/);
-  assert.match(text, /2026-10-29 09:00:00/, "последняя активность i.petrov");
+  assert.match(text, /С инцидентами\D*1 персона/, "два инцидента у a.smirnova");
+  assert.match(text, /Без владельца\D*1 учёток/, "guest7 — единственная учётка без действующего алиаса");
+  assert.match(text, /Последняя активность .* Иван Петров/);
+  assert.match(text, /Активны 1 из 3/, "события есть только у i.petrov");
+  assert.match(text, /служебных 1/);
+  assert.doesNotMatch(text, /Команда/, "подразделение подписано «Отдел»");
+  const table = personsPart(text);
+  assert.match(table, /Персона Отдел Инциденты Событий Последняя активность/);
+  assert.ok(table.indexOf("Анна Смирнова") < table.indexOf("Иван Петров"), "сначала персона с инцидентами");
+  assert.match(table, /platform/);
+  assert.match(table, /2026-10-29 09:00/, "последняя активность i.petrov (точное время — в подсказке)");
+  assert.match(table, /Ещё 1 без активности за 24 часа.*svc\.backup/, "персона без активности свёрнута, показана по id");
+  assert.match(table, /служебная/);
   const evs = fetched.filter((s) => s.includes("FROM events") && s.includes("GROUP BY hits"));
   assert.equal(evs.length, 1, "события всех персон — одним проходом");
   assert.match(evs[0], /transform\(lowerUTF8\(actor_name\), \{ap_k1:Array\(String\)\}/, "login сравнивается без регистра");
@@ -147,32 +155,45 @@ test("список: сводка по персонам — события и и�
   assert.ok(fetched.some((s) => s.includes("FROM events") && s.includes("parseDateTime64BestEffort({from:String}")), "окно периода параметрами");
 });
 
-test("список: непривязанные субъекты — привязанные отфильтрованы, аналитик видит «проверить», администратор — «привязать»", async () => {
+test("список: один период на всю страницу — учётки без владельца считаются за выбранный период", async () => {
+  await auth.createSession("analyst1", "analyst");
+  const text = await pageText(await actorsPage.default(props({}, { range: "30d" })));
+  assert.match(text, /Учётки без владельца · за 30 дней/);
+  const unbound = fetched.filter((s) => s.includes("groupUniqArray(5)(source)"));
+  assert.ok(unbound.length >= 1, "запрос учёток без владельца");
+  assert.doesNotMatch(text, /actor_name/, "без внутренних имён полей");
+});
+
+test("список: учётки без владельца — привязанные отфильтрованы, аналитик видит «Чья это учётка?», администратор — «Привязать»", async () => {
   await auth.createSession("analyst1", "analyst");
   let text = await pageText(await actorsPage.default(props()));
   assert.match(text, /guest7/);
-  assert.match(text, /linux\.auth, vpn/);
+  assert.match(text, /linux\.auth vpn/, "источники — отдельными метками");
   assert.ok(!/a\.smirnova 40/.test(text), "a.smirnova привязана действующим алиасом");
-  assert.match(text, /проверить/);
-  assert.ok(!/привязать/.test(text));
+  assert.match(text, /Чья это учётка\?/);
+  assert.ok(!/Привязать/.test(text));
   mocks.jar.clear();
   await auth.createSession("admin", "admin");
   text = await pageText(await actorsPage.default(props()));
-  assert.match(text, /привязать/);
+  assert.match(text, /Привязать/);
 });
 
-test("список: нет персон — подсказка про источники; все субъекты привязаны — отдельная фраза", async () => {
+test("список: нет персон — подсказка без API (техника — только администратору); все учётки связаны — отдельная фраза", async () => {
   await auth.createSession("analyst1", "analyst");
   routes = [
     { when: (s) => s.includes("FROM identities") && !s.includes("identity_aliases"), rows: () => [] },
     { when: (s) => s.includes("FROM identity_aliases"), rows: () => [] },
     { when: (s) => s.includes("groupUniqArray"), rows: () => [] },
   ];
-  const text = await pageText(await actorsPage.default(props()));
+  let text = await pageText(await actorsPage.default(props()));
   assert.match(text, /Персон пока нет/);
-  assert.match(text, /identities\.yml/);
-  assert.match(text, /Все активные субъекты за сутки привязаны/);
-  assert.match(text, /Персон 0/);
+  assert.doesNotMatch(text, /identities\.yml|PUT \/api/, "аналитику — без путей API");
+  assert.match(text, /Все учётки, активные за 7 дней ?, связаны с людьми/);
+  assert.match(text, /Активны 0 из 0/);
+  mocks.jar.clear();
+  await auth.createSession("admin", "admin");
+  text = await pageText(await actorsPage.default(props()));
+  assert.match(text, /identities\.yml/, "администратору — в свёрнутом блоке");
 });
 
 test("список: хранилище недоступно — панель «недоступно» вместо таблицы и алерт у непривязанных, страница не падает", async () => {
@@ -181,7 +202,7 @@ test("список: хранилище недоступно — панель «�
   const text = await pageText(await actorsPage.default(props()));
   assert.match(text, /недоступн/i);
   assert.match(text, /Список недоступен/);
-  assert.ok(!/Персон 3/.test(text));
+  assert.ok(!/из 3/.test(text));
 });
 
 /* ===== Паспорт ===== */
@@ -292,60 +313,88 @@ test("паспорт: неверный идентификатор и неизв�
 
 /* ===== Резолв по алиасу ===== */
 
-test("по алиасу: без v — подсказка; одна персона — переход в паспорт (регистр и пробелы не мешают)", async () => {
+const redirectTo = (e: unknown): string => (isRedirect(e) ? String((e as { digest?: string }).digest).split(";")[2] : "");
+const lookupPage = require("../src/app/(console)/actors/lookup/page") as Page; // eslint-disable-line @typescript-eslint/no-require-imports
+
+test("по алиасу: без v — пустой поиск «Кому принадлежит»; одна персона — паспорт с тем же периодом (регистр и пробелы не мешают)", async () => {
   await auth.createSession("analyst1", "analyst");
-  const text = await pageText(await byAliasPage.default(props()));
-  assert.match(text, /Нет значения/);
-  assert.match(text, /параметре v/);
+  await assert.rejects(byAliasPage.default(props({}, { range: "30d" })), (e: unknown) => redirectTo(e) === "/actors/lookup?range=30d");
   assert.equal(fetched.filter((s) => s.includes("LEFT JOIN")).length, 0, "без значения резолв не выполняется");
 
   for (const r of routes) if (r.when("LEFT JOIN")) r.rows = () => [{ ...aliases[0], display: "Иван Петров", kind: "person" }];
-  await assert.rejects(byAliasPage.default(props({}, { v: "  Ivan.Petrov " })), (e: unknown) => isRedirect(e) && /\/actors\/i\.petrov/.test(String((e as { digest?: string }).digest)));
+  await assert.rejects(byAliasPage.default(props({}, { v: "  Ivan.Petrov ", range: "24h" })), (e: unknown) => redirectTo(e) === "/actors/i.petrov?range=24h");
   const q = fetched.find((s) => s.includes("LEFT JOIN"))!;
   assert.match(q, /\{lv:String\}/, "нижний регистр — параметром, не в SQL");
 });
 
-test("по алиасу: не привязан — ссылка в журнал (actor для логина, src для адреса); форма привязки только у admin; удержанный алиас не резолвит", async () => {
+test("по алиасу: ничьё и неоднозначно — переход в «Кому принадлежит» с периодом; хранилище недоступно — панель", async () => {
   await auth.createSession("analyst1", "analyst");
-  let text = await pageText(await byAliasPage.default(props({}, { v: "guest7" })));
-  assert.match(text, /Не привязан/);
-  assert.match(text, /guest7/);
-  assert.match(text, /Привязать алиас к персоне может администратор/);
+  await assert.rejects(byAliasPage.default(props({}, { v: "guest7", range: "30d" })), (e: unknown) => redirectTo(e) === "/actors/lookup?v=guest7&range=30d");
+  for (const r of routes) if (r.when("LEFT JOIN")) r.rows = () => [
+    { ...aliases[0], display: "Иван Петров", kind: "person" },
+    { ...aliases[5], display: "Анна Смирнова", kind: "person" },
+  ];
+  await assert.rejects(byAliasPage.default(props({}, { v: "ivan.petrov" })), (e: unknown) => redirectTo(e) === "/actors/lookup?v=ivan.petrov&range=7d");
+  chDown = true;
+  const text = await pageText(await byAliasPage.default(props({}, { v: "guest7" })));
+  assert.match(text, /недоступн/i);
+});
+
+test("кому принадлежит: ничьё — вывод «сейчас ничьё», форма привязки только у admin (дата по умолчанию — сегодня); удержанный алиас не резолвит", async () => {
+  await auth.createSession("analyst1", "analyst");
+  let text = await pageText(await lookupPage.default(props({}, { v: "guest7" })));
+  assert.match(text, /guest7 сейчас ничьё/);
+  assert.match(text, /Привязать его к персоне может администратор/);
   assert.ok(!/Привязать к персоне/.test(text));
 
   for (const r of routes) if (r.when("LEFT JOIN")) r.rows = () => [{ ...aliases[2], display: "Иван Петров", kind: "person" }];
-  text = await pageText(await byAliasPage.default(props({}, { v: "ivan@corp.local" })));
-  assert.match(text, /Не привязан/, "алиас на удержании персону не резолвит");
+  text = await pageText(await lookupPage.default(props({}, { v: "ivan@corp.local" })));
+  assert.match(text, /сейчас ничьё/, "алиас на удержании персону не резолвит");
+  assert.match(text, /на удержании политика «many-logins»/, "пометка удержания — по-человечески");
+  assert.doesNotMatch(text, /policy:hold/);
+  assert.match(text, /событие входа в IdP/, "источник алиаса — по-человечески");
 
   mocks.jar.clear();
   await auth.createSession("admin", "admin");
-  text = await pageText(await byAliasPage.default(props({}, { v: "203.0.113.9" })));
-  assert.match(text, /Не привязан/);
+  routes = fullRoutes();
+  const markup = html(await lookupPage.default(props({}, { v: "203.0.113.9" })) as React.ReactElement);
+  text = stripTags(markup);
+  assert.match(text, /сейчас ничьё/);
   assert.match(text, /Привязать к персоне/);
-  assert.match(text, /только администратор/);
-  assert.ok(!/может администратор/.test(text));
+  assert.match(text, /подобран по значению — проверьте/);
+  assert.match(text, /IP-адрес часто общий/, "предупреждение для адреса");
+  assert.match(markup, new RegExp(`name="from"[^>]*value="${new Date().toISOString().slice(0, 10)}"`), "по умолчанию — сегодня, не вся история");
+  assert.match(markup, /<option value="i\.petrov"/, "персоны — подсказками поиска");
   assert.ok(fetched.some((s) => s.includes("FROM identities") && s.includes("ORDER BY display")), "admin получает список персон для формы");
 });
 
-test("по алиасу: неоднозначно — кандидаты с интервалами, выбор не делается; хранилище недоступно — панель", async () => {
+test("кому принадлежит: принадлежит — вывод с паспортом того же периода; неоднозначно — кандидаты с закрытием алиаса у admin", async () => {
+  await auth.createSession("analyst1", "analyst");
+  for (const r of routes) if (r.when("LEFT JOIN")) r.rows = () => [{ ...aliases[0], display: "Иван Петров", kind: "person" }];
+  let tree = await lookupPage.default(props({}, { v: "ivan.petrov", range: "30d" }));
+  let text = await pageText(tree);
+  assert.match(text, /ivan\.petrov сейчас принадлежит Иван Петров \( ?i\.petrov ?\) логин · с 2020-01-01/);
+  assert.match(html(tree as React.ReactElement), /href="\/actors\/i\.petrov\?range=30d"/, "паспорт с тем же периодом");
+
+  // id персоны без алиаса с таким значением — ответ «это id персоны», без формы привязки.
+  for (const r of routes) if (r.when("LEFT JOIN")) r.rows = () => [];
+  text = await pageText(await lookupPage.default(props({}, { v: "svc.backup" })));
+  assert.match(text, /svc\.backup — это id персоны svc\.backup Открыть паспорт/);
+  assert.doesNotMatch(text, /ничьё/);
+
+  mocks.jar.clear();
   await auth.createSession("admin", "admin");
   for (const r of routes) if (r.when("LEFT JOIN")) r.rows = () => [
     { ...aliases[0], display: "Иван Петров", kind: "person" },
     { ...aliases[5], display: "Анна Смирнова", kind: "person" },
     { ...aliases[5], valid_from: "2019-01-01 00:00:00.000", valid_to_raw: "2019-06-01 00:00:00.000", display: "Анна Смирнова", kind: "person" },
   ];
-  let text = await pageText(await byAliasPage.default(props({}, { v: "ivan.petrov" })));
-  assert.match(text, /Неоднозначно 2 совпадений/);
-  assert.match(text, /Иван Петров · i\.petrov · login · с 2020-01-01 00:00:00/);
-  assert.match(text, /Анна Смирнова · a\.smirnova · uid · с 2020-01-01 00:00:00/, "на персону одна запись — открытый интервал предпочтительнее");
-  assert.ok(!/по 2019-06-01/.test(text));
-  assert.match(text, /Закройте лишний алиас/);
-  assert.match(text, /Привязать к персоне/, "admin может привязать и при неоднозначности");
-
-  chDown = true;
-  text = await pageText(await byAliasPage.default(props({}, { v: "guest7" })));
-  assert.match(text, /недоступн/i);
-  assert.ok(!/Привязать к персоне/.test(text), "без хранилища форма не показывается");
+  tree = await lookupPage.default(props({}, { v: "ivan.petrov" }));
+  text = await pageText(tree);
+  assert.match(text, /сейчас принадлежит нескольким персонам/);
+  assert.match(text, /Иван Петров i\.petrov логин · с 2020-01-01/);
+  assert.match(text, /Анна Смирнова a\.smirnova uid · с 2020-01-01/, "на персону одна запись — открытый интервал предпочтительнее");
+  assert.match(html(tree as React.ReactElement), /aria-label="Закрыть алиас ivan\.petrov"/, "закрыть лишний алиас на месте");
 });
 
 /* ===== Диапазоны списка ===== */
@@ -353,23 +402,23 @@ test("по алиасу: неоднозначно — кандидаты с ин
 test("список: пороги событий/инцидентов сужают персон; точное окно уходит в запрос параметрами", async () => {
   await auth.createSession("analyst1", "analyst");
   // events_min=1 — только i.petrov (5 событий).
-  let text = await pageText(await actorsPage.default(props({}, { range: "24h", events_min: "1" })));
+  let text = personsPart(await pageText(await actorsPage.default(props({}, { range: "24h", events_min: "1" }))));
   assert.match(text, /Иван Петров/);
   assert.doesNotMatch(text, /Анна Смирнова/, "у a.smirnova нет событий за окно");
   assert.doesNotMatch(text, /служебная/, "svc.backup без событий");
   // incidents_min=1 — только a.smirnova (два инцидента).
-  text = await pageText(await actorsPage.default(props({}, { incidents_min: "1" })));
+  text = personsPart(await pageText(await actorsPage.default(props({}, { incidents_min: "1" }))));
   assert.match(text, /Анна Смирнова/);
   assert.doesNotMatch(text, /Иван Петров/);
   // Пороги, под которые никто не подходит, — пустое состояние с перечнем фильтров.
   text = await pageText(await actorsPage.default(props({}, { events_min: "100", incidents_max: "0" })));
   assert.match(text, /Нет персон по фильтрам: событий ≥ 100, инцидентов ≤ 0/);
-  assert.match(text, /Персон 3/, "сводные плитки — по всем персонам");
+  assert.match(text, /Активны 1 из 3/, "сводные плитки — по всем персонам");
   // Точное окно: границы — параметрами from/to запроса событий, подпись — интервал.
   const seen: URLSearchParams[] = [];
   routes = routes.map((r) => (r.when("GROUP BY hits FROM events") ? { ...r, rows: (p: URLSearchParams) => { seen.push(p); return r.rows(p); } } : r));
   text = await pageText(await actorsPage.default(props({}, { from: "2026-10-28T00:00", to: "2026-10-29T00:00" })));
-  assert.match(text, /активность интервал 2026-10-28 00:00 — 2026-10-29 00:00 UTC/);
+  assert.match(text, /Персоны · 2026-10-28 00:00 — 2026-10-29 00:00 UTC/);
   assert.equal(seen[0]?.get("param_from"), "2026-10-28 00:00:00.000");
   assert.equal(seen[0]?.get("param_to"), "2026-10-29 00:00:00.000");
 });
