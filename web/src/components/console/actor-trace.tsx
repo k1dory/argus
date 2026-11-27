@@ -239,6 +239,8 @@ export function ActorTraceView({ trace, aliases }: { trace: ActorTrace; aliases?
   const interactive = trace.sessions.filter((s) => !s.networkOnly);
   const netOnly = trace.sessions.filter((s) => s.networkOnly);
   const netEvents = netOnly.reduce((n, s) => n + s.count, 0);
+  // Отказы сетевых периодов (deny на межсетевом экране) видны в заголовке свёрнутой группы.
+  const netFails = netOnly.reduce((n, s) => n + s.fails, 0);
   // Раскрыты: последний сеанс и все сеансы с отказами или инцидентами.
   const isOpen = (s: TraceSession, i: number) => i === 0 || s.fails > 0 || s.incidents.length > 0;
   const meta = `сеанс — активность с паузами не длиннее ${fmtDuration(trace.gapMs)}${trace.truncated ? " · показаны самые свежие" : ""}`;
@@ -252,11 +254,13 @@ export function ActorTraceView({ trace, aliases }: { trace: ActorTrace; aliases?
             <details className="group/netonly">
               <summary className="flex cursor-pointer list-none items-center gap-3 px-3 py-2.5 text-xs text-muted-foreground hover:bg-[var(--muted)]/30 hover:text-foreground">
                 <ChevronRight className="size-3.5 shrink-0 transition-transform group-open/netonly:rotate-90" strokeWidth={1.5} aria-hidden />
+                {netFails > 0 && <Led color="var(--status-err)" title="В сетевых периодах были отказы" />}
                 <span>Только сетевой трафик · {fmtNum(netOnly.length)} {plural(netOnly.length, "период", "периода", "периодов")} · {fmtNum(netEvents)} {plural(netEvents, "событие", "события", "событий")}</span>
+                {netFails > 0 && <span className="text-[var(--status-err)]">{fmtNum(netFails)} {plural(netFails, "отказ", "отказа", "отказов")}</span>}
                 <span className="ml-auto text-[11px]" title="Потоки без входов, команд и приложений: фон, а не поступки">топ {fmtNum(trace.networkTop)} адресов на источник</span>
               </summary>
               <div className="border-t border-border">
-                {netOnly.map((s) => <SessionBlock key={s.id} s={s} ctx={ctx} open={false} />)}
+                {netOnly.map((s) => <SessionBlock key={s.id} s={s} ctx={ctx} open={s.fails > 0} />)}
               </div>
             </details>
           )}

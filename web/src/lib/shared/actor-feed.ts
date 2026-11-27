@@ -1,8 +1,8 @@
 // Лента активности субъекта: те же агрегаты, что у трассировки, но плоским
 // списком «что произошло» — понятный заголовок, кто/откуда/что, время, отметка
 // отказов и инцидентов. Сеть в ленту не идёт: это фон, а не поступки.
-import type { ActorIncident, Section } from "./actors";
-import { tsMs } from "./actors";
+import type { ActorIncident, Alias, Section } from "./actors";
+import { aliasMatches, tsMs } from "./actors";
 import { LOGOUT_RE, spanLabel, spanEventsHref, type ActorTrace, type OwnerScope, type TraceAction, type TraceSpan } from "./actor-trace";
 
 export const FEED_FILTERS = ["flagged", "all", "login", "host", "app", "change"] as const;
@@ -105,13 +105,14 @@ export function failBadge(fails: number, count: number): string | undefined {
   return `${fails} из ${count} ${fails === 1 ? "отклонён" : "отклонены"}`;
 }
 
-/** primary — значение основного алиаса субъекта: его логин в строках не повторяется. */
-export type BuildFeedOptions = { incidents?: ActorIncident[]; owner?: OwnerScope; primary?: string };
+/** primary — основной алиас субъекта: его имя в строках не повторяется. Сравнение —
+ *  по правилу вида алиаса (aliasMatches): uid/sid/peer — с учётом регистра. */
+export type BuildFeedOptions = { incidents?: ActorIncident[]; owner?: OwnerScope; primary?: Pick<Alias, "kind" | "value"> };
 
 /** Действия трассы → строки ленты (свежие первыми) + инциденты. */
 export function buildFeed(trace: ActorTrace, opts: BuildFeedOptions = {}): FeedItem[] {
   const out: FeedItem[] = [];
-  const primary = opts.primary?.toLowerCase();
+  const primary = opts.primary;
   for (const s of trace.sessions) {
     for (const o of s.origins) {
       for (const span of o.spans) {
@@ -119,7 +120,7 @@ export function buildFeed(trace: ActorTrace, opts: BuildFeedOptions = {}): FeedI
         for (const act of span.actions) {
           const kind = feedKind(span.section as Exclude<Section, "network">, act.action);
           const badge = failBadge(act.fails, act.count);
-          const actor = act.actors[0] && act.actors[0].toLowerCase() !== primary ? act.actors[0] : undefined;
+          const actor = act.actors[0] && !(primary && aliasMatches(primary, act.actors[0])) ? act.actors[0] : undefined;
           const from = o.origin ? (span.attached ? `после входа с ${o.origin}` : `с ${o.origin}`) : undefined;
           const meta: string[] = [];
           if (actor) meta.push(actor);

@@ -92,7 +92,7 @@ export default async function ActorPage({ params, searchParams }: PageProps<"/ac
       <PageHeader
         back={{ href: "/actors", label: "Субъекты" }}
         title={<>{person.display || person.person_id} <span className="font-mono text-muted-foreground">{person.person_id}</span></>}
-        subtitle={[person.kind === "service" ? "служебная учётка" : "человек", person.team && `команда ${person.team}`, person.note].filter(Boolean).join(" · ")}
+        subtitle={[person.kind === "service" ? "служебная учётка" : "человек", person.team && `отдел ${person.team}`, person.note].filter(Boolean).join(" · ")}
         actions={
           <div className="flex flex-wrap items-center gap-2">
             <ActorRangeLinks current={range} base={base} />
@@ -200,7 +200,7 @@ function ReportBody({ r, range, trace, traceError, feed, base, aliasesBlock }: {
   // «Сейчас» — момент сборки отчёта: чистый рендер, и время ленты сходится с окном.
   const now = tsMs(r.generated_at) ?? 0;
   const primary = primaryAlias(r.aliases);
-  const feedItems = trace ? buildFeed(trace, { incidents: r.incidents, owner: ownerScope(r.aliases), primary: primary?.value }) : [];
+  const feedItems = trace ? buildFeed(trace, { incidents: r.incidents, owner: ownerScope(r.aliases), primary: primary ?? undefined }) : [];
   const feedHref = (f: FeedFilter) => `${base}?range=${range}${f === "all" ? "" : `&feed=${f}`}#activity`;
   const failedRows = feedItems.filter((i) => i.fails > 0).length;
   const fails = feedItems.reduce((n, i) => n + i.fails, 0);
@@ -218,14 +218,19 @@ function ReportBody({ r, range, trace, traceError, feed, base, aliasesBlock }: {
         </Alert>
       )}
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
-        <StatTile
-          label="Отказы"
-          value={fmtNum(fails)}
-          tone={fails > 0 ? "err" : undefined}
-          sub={fails > 0 ? `${plural(fails, "отклонённое событие", "отклонённых события", "отклонённых событий")} в ${fmtNum(failedRows)} ${plural(failedRows, "действии", "действиях", "действиях")}` : "отклонённых действий нет"}
-          href={fails > 0 ? feedHref("flagged") : undefined}
-          hint="Действия с отказами — отмеченные строки ленты"
-        />
+        {trace ? (
+          <StatTile
+            label="Отказы"
+            value={fmtNum(fails)}
+            tone={fails > 0 ? "err" : undefined}
+            sub={fails > 0 ? `${plural(fails, "отклонённое событие", "отклонённых события", "отклонённых событий")} в ${fmtNum(failedRows)} ${plural(failedRows, "действии", "действиях", "действиях")}` : "отклонённых действий нет"}
+            href={fails > 0 ? feedHref("flagged") : undefined}
+            hint="Действия с отказами — отмеченные строки ленты"
+          />
+        ) : (
+          // Сеансы не построились — отказы неизвестны, а не «нет»: ноль здесь был бы ложью.
+          <StatTile label="Отказы" value="—" sub="неизвестно: сеансы не загрузились" hint="Отказы считаются по сеансам; см. «События списком» ниже" />
+        )}
         <StatTile
           label="Инциденты"
           value={fmtNum(r.summary.incidents)}

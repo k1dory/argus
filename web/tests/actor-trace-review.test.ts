@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { ActorTraceView } from "../src/components/console/actor-trace";
 import { buildTrace, spanEventsHref, type TraceRow } from "../src/lib/shared/actor-trace";
 import { parseQuery } from "../src/lib/shared/search-query";
-import { html } from "./_render";
+import { html, stripTags } from "./_render";
 import { journalQuery, parseJournalParams } from "../src/lib/shared/journal";
 
 const T0 = Date.parse("2026-11-20T08:00:00Z");
@@ -115,4 +115,19 @@ test("R4: на границе лимита ссылка есть и пережи
   const terms = parseQuery(journalQuery(parseJournalParams(url.searchParams)));
   assert.ok(terms.some((t) => t.field === "object" && t.value === target));
   assert.ok(terms.some((t) => t.field === "action" && t.value === "app.open"));
+});
+
+test("PR130: отказы сетевого сеанса видны до раскрытия блоков", () => {
+  const trace = buildTrace([{
+    ...ssh(0), section: "network", target: "198.51.100.10",
+    target_kind: "dst", source: "ngfw", action: "net.firewall",
+    count: 3, fails: 3,
+  }]);
+  assert.equal(trace.sessions[0].networkOnly, true);
+  const markup = html(ActorTraceView({ trace }));
+  const summary = /<details\b([^>]*)>\s*<summary\b[^>]*>([\s\S]*?)<\/summary>/.exec(markup);
+  assert.ok(summary);
+  const expanded = /\bopen(?:[=\s]|$)/.test(summary[1]);
+  const warns = /3\s+отказ|отказов\s+3/.test(stripTags(summary[2]));
+  assert.ok(expanded || warns, "закрытая группа не должна скрывать наличие отказов");
 });

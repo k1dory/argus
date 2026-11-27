@@ -78,7 +78,7 @@ test("пометка отказов с числами", () => {
 
 test("логин основного алиаса не повторяется, другой алиас — показан", () => {
   const t = buildTrace([ssh(0), row({ min: 1, section: "app", target: "grafana", target_kind: "object", action: "app.authorize", actor: "alice@example.test" })]);
-  const f = buildFeed(t, { primary: "Alice" });
+  const f = buildFeed(t, { primary: { kind: "login", value: "alice" } });
   const login = f.find((i) => i.kind === "login")!;
   const app = f.find((i) => i.kind === "app")!;
   assert.equal(login.actor, undefined);
@@ -105,4 +105,11 @@ test("команды — отдельным полем, длинный URL со�
   const [it] = buildFeed(buildTrace([row({ min: 0, section: "app", target: url, target_kind: "object", action: "app.authorize" })]));
   assert.equal(it.title, "Доступ к git.example.test/…/README.md");
   assert.equal(it.titleFull, `Доступ к ${url}`);
+});
+
+test("основной алиас сравнивается по правилу вида: uid с учётом регистра", () => {
+  const t = buildTrace([row({ min: 0, section: "app", target: "grafana", target_kind: "object", action: "app.authorize", actor: "alice" })]);
+  assert.equal(buildFeed(t, { primary: { kind: "uid", value: "Alice" } })[0].actor, "alice", "uid Alice и uid alice — разные учётки");
+  assert.equal(buildFeed(t, { primary: { kind: "uid", value: "alice" } })[0].actor, undefined);
+  assert.equal(buildFeed(t, { primary: { kind: "login", value: "alice" } })[0].actor, undefined);
 });
